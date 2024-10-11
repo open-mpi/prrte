@@ -27,7 +27,7 @@
 SUBDIRS = config contrib src include docs
 EXTRA_DIST = README.md VERSION LICENSE autogen.pl
 
-include examples/Makefile.include
+
 
 # Check for common symbols.  Use a "-hook" to increase the odds that a
 # developer will see it at the end of their installation process.
