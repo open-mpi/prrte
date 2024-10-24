@@ -81,7 +81,6 @@ additional information may be of help:
 .. code::
 
    Message:     %s
-   Cache level: %d
 
 [missing-cpulist]
 
