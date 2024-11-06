@@ -48,4 +48,5 @@ libprrte_la_SOURCES += \
         runtime/prte_mca_params.c \
         runtime/prte_wait.c \
         runtime/prte_data_server.c \
-        runtime/prte_progress_threads.c
+        runtime/prte_progress_threads.c \
+        runtime/prte_launcher.c
