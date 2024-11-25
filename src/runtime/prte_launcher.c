@@ -246,7 +246,7 @@ static char *pmix_getline(FILE *fp)
 }
 #endif
 
-int main(int argc, char *argv[])
+int prte_launch(int argc, char *argv[])
 {
     int rc = 1, i;
     char *param, *timeoutenv, *tpath, *cptr;

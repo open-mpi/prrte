@@ -19,6 +19,7 @@ jobs:
             repository: openpmix/openpmix
             path: openpmix/master
             ref: master
+            fetch-depth: 0
     - name: Build OpenPMIx
       run: |
         cd openpmix/master
@@ -28,6 +29,7 @@ jobs:
         # configure.
         libevent_cppflags=$(pkg-config libevent --cflags)
         libevent_ldflags=$(pkg-config libevent --libs | perl -pe 's/^.*(-L[^ ]+).*$/\1/')
+        git checkout 08e41ed5
         ./autogen.pl
         ./configure --prefix=$RUNNER_TEMP/pmixinstall \
             CPPFLAGS=$libevent_cppflags \
@@ -93,9 +95,11 @@ jobs:
             repository: openpmix/openpmix
             path: openpmix/master
             ref: master
+            fetch-depth: 0
     - name: Build OpenPMIx
       run: |
         cd openpmix/master
+        git checkout 08e41ed5
         ./autogen.pl
         ./configure --prefix=$RUNNER_TEMP/pmixinstall
         make -j
@@ -141,9 +145,11 @@ jobs:
             repository: openpmix/openpmix
             path: openpmix/master
             ref: master
+            fetch-depth: 0
     - name: Build OpenPMIx
       run: |
         cd openpmix/master
+        git checkout 08e41ed5
         ./autogen.pl
         ./configure --prefix=$RUNNER_TEMP/pmixinstall
         make -j
