@@ -43,7 +43,7 @@ AM_LDFLAGS = $(prte_hwloc_LDFLAGS) $(prte_libevent_LDFLAGS) $(prte_pmix_LDFLAGS)
 #Applied binary prefix to the names
 bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte_info
 
-prte_info_SOURCES = \
+@PRTE_BINARY_PREFIX@prte_info_SOURCES = \
         pinfo.h \
         prte_info.c \
         output.c \
@@ -51,7 +51,7 @@ prte_info_SOURCES = \
         components.c \
         version.c
 
-prte_info_LDADD = \
+@PRTE_BINARY_PREFIX@prte_info_LDADD = \
     $(prte_libevent_LIBS) \
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \

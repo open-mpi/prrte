@@ -42,12 +42,12 @@ AM_CFLAGS = \
 #Apply binary prefix to the names
 bin_PROGRAMS = @PRTE_BINARY_PREFIX@prun
 
-prun_SOURCES = \
+@PRTE_BINARY_PREFIX@prun_SOURCES = \
         main.c \
         prun.c \
         prun.h
 
-prun_LDADD = \
+@PRTE_BINARY_PREFIX@prun_LDADD = \
     $(prte_libevent_LIBS) \
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \
