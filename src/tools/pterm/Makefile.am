@@ -24,7 +24,8 @@
 
 AM_LDFLAGS = $(prte_hwloc_LDFLAGS) $(prte_libevent_LDFLAGS) $(prte_pmix_LDFLAGS)
 
-bin_PROGRAMS = pterm
+#Apply binary prefix to the names
+bin_PROGRAMS = @PRTE_BINARY_PREFIX@pterm
 
 pterm_SOURCES = \
         pterm.c
@@ -33,4 +34,4 @@ pterm_LDADD = \
     $(prte_libevent_LIBS) \
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \
-	$(top_builddir)/src/libprrte.la
+	$(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la

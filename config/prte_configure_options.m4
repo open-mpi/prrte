@@ -383,6 +383,8 @@ AC_MSG_CHECKING([if want custom PRTE binary prefix])
 AC_ARG_WITH([prte-binary-prefix],
     [AS_HELP_STRING([--with-prte-binary-prefix=STRING],
                     ["Optionally add a prefix to all PRTE binary names (executables and libraries) names"])])
+#Set default prefix to "ompi-"
+AS_IF([with_prte_binary_prefix=ompi-])
 
 AS_IF([test "$with_prte_binary_prefix" = "no" || \
            test "$with_prte_binary_prefix" = "yes" || \

@@ -46,9 +46,9 @@ bin_PROGRAMS = @PRTE_BINARY_PREFIX@prted
 #  nothing to -all-static in the Makefile.in
 #  nice for systems that don't have all the shared
 #  libraries on the computes
-@PRTE_BINARY_PREFIX@prted_LDFLAGS =
-@PRTE_BINARY_PREFIX@prted_LDADD = \
+prted_LDFLAGS =
+prted_LDADD = \
     $(prte_libevent_LIBS) \
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \
-	$(top_builddir)/src/libprrte.la
+	$(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
