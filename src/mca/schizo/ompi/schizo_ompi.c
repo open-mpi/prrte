@@ -19,7 +19,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018-2022 IBM Corporation.  All rights reserved.
  * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
- * Copyright (c) 2022-2024 Triad National Security, LLC. All rights
+ * Copyright (c) 2022-2025 Triad National Security, LLC. All rights
  *                         reserved.
  * $COPYRIGHT$
  *
@@ -194,6 +194,7 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_DISABLE_RECOVERY, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_CONTINUOUS, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("with-ft", PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE("disable-gpu-support", PMIX_ARG_NONE),
 
     /* mpiexec mandated form launch key parameters - MPI 4.0 */
     PMIX_OPTION_DEFINE("initial-errhandler", PMIX_ARG_REQD),
@@ -1605,6 +1606,15 @@ static int parse_env(char **srcenv, char ***dstenv,
 
     if (NULL != (opt = pmix_cmd_line_get_param(results, "memory-alloc-kinds"))) {
         rc = check_cache(&cache, &cachevals, "mpi_memory_alloc_kinds", opt->values[0]);
+        if (PRTE_SUCCESS != rc) {
+            PMIX_ARGV_FREE_COMPAT(cache);
+            PMIX_ARGV_FREE_COMPAT(cachevals);
+            return rc;
+        }
+    }
+
+   if (NULL != (opt = pmix_cmd_line_get_param(results, "disable-gpu-support"))) {
+        rc = check_cache(&cache, &cachevals, "disable_gpu_support", "true");
         if (PRTE_SUCCESS != rc) {
             PMIX_ARGV_FREE_COMPAT(cache);
             PMIX_ARGV_FREE_COMPAT(cachevals);

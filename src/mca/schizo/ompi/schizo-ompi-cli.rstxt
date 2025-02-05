@@ -163,6 +163,8 @@ MPI Options
   attached to predefined communicators during the first MPI call.
 * ``--memory-alloc-kinds``: Value is a comma separated list of
    memory allocation kinds.
+* ``--disable-gpu-support``: Specify to disable any accelerator support
+  built in to the Open MPI installation at run time.
 * ``--display-comm``: Display table of communication methods between
   MPI_COMM_WORLD ranks during MPI_Init
 * ``--display-comm-finalize``: Display table of communication methods
