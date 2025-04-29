@@ -66,6 +66,17 @@ else
         PRTE_VERSION="$PRTE_MAJOR_VERSION.$PRTE_MINOR_VERSION.$PRTE_RELEASE_VERSION"
         PRTE_VERSION="${PRTE_VERSION}${PRTE_GREEK_VERSION}"
 
+        # This particular version is meant for OMPI 5.x stable branch and should only
+        # be build internally by OMPI. Add the related OMPI version to the reported
+        # version to clarify this link.
+        if test -r ../../VERSION; then
+          # We are in an OMPI tree
+          if test -x ../../config/opal_get_version.sh; then
+            ompi_version=`../../config/opal_get_version.sh ../../VERSION`
+            PRTE_VERSION="${PRTE_VERSION}-${ompi_version}"
+          fi
+        fi
+
         if test "$PRTE_TARBALL_VERSION" = ""; then
             PRTE_TARBALL_VERSION=$PRTE_VERSION
         fi

@@ -1,3 +1,13 @@
+# This is an Open MPI fork of the PRRTE v3.0 branch
+
+This fork is meant to be used in the OMPI v5.0.x branch; it's a
+mechanism to pull upstream PRRTE commits and also maintain any Open
+MPI-specific patches on top of that.
+
+Specifically: this branch is expected to be regularly updated to bring
+support from the upstream PRRTE to match the needs of the Open MPI
+v5.0.x branch.
+
 # PMIx Reference RunTime Environment (PRRTE)
 
 PRRTE is [the PMIx Reference RunTime

@@ -1,3 +1,18 @@
+Open MPI's fork of the PMIx Runtime Environment (PRRTE) |prte_ver|
+==================================================================
+
+.. important:: This copy of the PRRTE software is not the official
+               upstream community version, but instead is a fork used
+               internally by the Open MPI project for its v5.0.x
+               stable series.  If there are any questions or concerns,
+               or to report bugs and issues, please contact the Open
+               MPI community.  More information available at
+               https://github.com/open-mpi/prrte
+
+The remainder of this documentation mirrors the official PRRTE
+documentation.
+
+
 PMIx Reference Runtime Environment (PRRTE) |prte_ver|
 =====================================================
 

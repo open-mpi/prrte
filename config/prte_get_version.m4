@@ -62,6 +62,17 @@ m4_define([PRTE_GET_VERSION],[
         $2_VERSION="$$2_MAJOR_VERSION.$$2_MINOR_VERSION.$$2_RELEASE_VERSION"
         $2_VERSION="${$2_VERSION}${$2_GREEK_VERSION}"
 
+        # This particular version is meant for OMPI 5.x stable branch and should only
+        # be build internally by OMPI. Add the related OMPI version to the reported
+        # version to clarify this link.
+        if test -r ../../VERSION; then
+          # We are in an OMPI tree
+          if test -x ../../config/opal_get_version.sh; then
+            ompi_version=`../../config/opal_get_version.sh ../../VERSION`
+            $2_VERSION="${$2_VERSION}-${ompi_version}"
+          fi
+        fi
+
         if test "$$2_TARBALL_VERSION" = ""; then
             $2_TARBALL_VERSION=$$2_VERSION
         fi

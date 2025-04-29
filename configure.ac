@@ -15,7 +15,7 @@
 # Copyright (c) 2006-2017 Los Alamos National Security, LLC.  All rights
 #                         reserved.
 # Copyright (c) 2009      Oak Ridge National Labs.  All rights reserved.
-# Copyright (c) 2011-2013 NVIDIA Corporation.  All rights reserved.
+# Copyright (c) 2011-2025 NVIDIA Corporation.  All rights reserved.
 # Copyright (c) 2012      Oracle and/or its affiliates.  All rights reserved.
 # Copyright (c) 2013      Mellanox Technologies, Inc.
 #                         All rights reserved.
@@ -36,6 +36,15 @@
 #
 
 ############################################################################
+# BEWARE: This is not the official openpmix/prrte software. This is a
+# fork of the upstream PRRTE v3.0 branch, specifically for internal
+# use in the Open MPI v5.0.x series.  It is intended solely to be
+# distributed as part of Open MPI v5.0.x; it is not meant to be
+# distributed or built separately.  The Open MPI community only
+# supports an internal build of this software package.
+############################################################################
+
+############################################################################
 # Initialization, version number, and other random setup/init stuff
 ############################################################################
 
@@ -50,7 +59,7 @@ m4_include([config/autogen_found_items.m4])
 
 AC_INIT([prte],
         [m4_normalize(esyscmd([config/prte_get_version.sh VERSION --tarball]))],
-        [https://github.com/openpmix/prrte/], [prrte])
+        [https://github.com/open-mpi/prrte], [prrte])
 
 AC_PREREQ(2.69)
 AC_CONFIG_AUX_DIR(config)
