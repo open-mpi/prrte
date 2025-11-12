@@ -317,6 +317,23 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                     prte_set_attribute(&jdata->attributes, PRTE_JOB_GPU_SUPPORT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
                 }
             }
+            /* if not already assigned, inherit the parent's output directives */
+            if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT, NULL, PMIX_BOOL)) {
+                if (prte_get_attribute(&parent->attributes, PRTE_JOB_TAG_OUTPUT, (void **) &fptr, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
+                }
+            }
+            if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_TIMESTAMP_OUTPUT, NULL, PMIX_BOOL)) {
+                if (prte_get_attribute(&parent->attributes, PRTE_JOB_TIMESTAMP_OUTPUT, (void **) &fptr, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_TIMESTAMP_OUTPUT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
+                }
+            }
+            if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_MERGE_STDERR_STDOUT, NULL, PMIX_BOOL)) {
+                if (prte_get_attribute(&parent->attributes, PRTE_JOB_MERGE_STDERR_STDOUT, (void **) &fptr, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_MERGE_STDERR_STDOUT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
+                }
+            }
+
             // copy over any env directives, but do not overwrite anything already specified
             inherit_env_directives(jdata, parent, nptr);
         } else {
@@ -504,6 +521,13 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             options.nprocs += app->num_procs;
             continue;
         }
+
+        if (PRTE_MAPPING_SEQ == PRTE_GET_MAPPING_POLICY(jdata->map->mapping) ||
+            PRTE_MAPPING_BYUSER == PRTE_GET_MAPPING_POLICY(jdata->map->mapping)) {
+            // these mappers compute their #procs as they go
+            continue;
+        }
+
         if (1 < jdata->num_apps && 0 == app->num_procs) {
             pmix_show_help("help-prte-rmaps-base.txt",
                            "multi-apps-and-zero-np", true,
@@ -562,6 +586,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                                                                               HWLOC_OBJ_PU);
                 }
             }
+
         } else {
            if (NULL != options.cpuset) {
                 ck = PMIX_ARGV_SPLIT_COMPAT(options.cpuset, ',');

@@ -359,14 +359,13 @@ int prun_common(pmix_cli_result_t *results,
     }
 
     /** setup callbacks for signals we should forward */
-    PMIX_CONSTRUCT(&prte_ess_base_signals, pmix_list_t);
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_FWD_SIGNALS);
     if (NULL != opt) {
         param = opt->values[0];
     } else {
         param = NULL;
     }
-    if (PRTE_SUCCESS != (rc = prte_ess_base_setup_signals(param))) {
+    if (PMIX_SUCCESS != (rc = prte_ess_base_setup_signals(param))) {
         return rc;
     }
     PMIX_LIST_FOREACH(sig, &prte_ess_base_signals, prte_ess_base_signal_t)
@@ -830,6 +829,7 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
 
     /* mark if recovery was enabled on the cmd line */
     if (pmix_cmd_line_is_taken(results, PRTE_CLI_ENABLE_RECOVERY)) {
+        flag = true;
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_RECOVERABLE, &flag, PMIX_BOOL);
     }
     /* record the max restarts */
