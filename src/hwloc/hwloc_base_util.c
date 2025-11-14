@@ -125,15 +125,18 @@ hwloc_obj_t prte_hwloc_base_get_pu(hwloc_topology_t topo, bool use_hwthread_cpus
 
 hwloc_cpuset_t prte_hwloc_base_generate_cpuset(hwloc_topology_t topo,
                                                bool use_hwthread_cpus,
-                                               char *cpulist)
+                                               char **cpulist)
 {
     hwloc_cpuset_t avail = NULL, pucpus, res;
     char **ranges = NULL, **range = NULL;
     int idx, cpu, start, end;
     hwloc_obj_t pu;
+    bool physical = false;
+    char **cache = NULL;
+    char tmp[256];
 
     /* find the specified logical cpus */
-    ranges = PMIX_ARGV_SPLIT_COMPAT(cpulist, ',');
+    ranges = PMIX_ARGV_SPLIT_COMPAT(*cpulist, ',');
     avail = hwloc_bitmap_alloc();
     hwloc_bitmap_zero(avail);
     res = hwloc_bitmap_alloc();
@@ -144,22 +147,49 @@ hwloc_cpuset_t prte_hwloc_base_generate_cpuset(hwloc_topology_t topo,
         case 1:
             /* only one cpu given - get that object */
             cpu = strtoul(range[0], NULL, 10);
-            if (NULL != (pu = prte_hwloc_base_get_pu(topo, use_hwthread_cpus, cpu))) {
-                hwloc_bitmap_and(pucpus, pu->cpuset, hwloc_topology_get_allowed_cpuset(topo));
-                hwloc_bitmap_or(res, avail, pucpus);
-                hwloc_bitmap_copy(avail, res);
+            pu = prte_hwloc_base_get_pu(topo, use_hwthread_cpus, cpu);
+            if (NULL == pu) {
+                pmix_show_help("help-prte-hwloc-base.txt", "unfound-cpu", true,
+                               *cpulist, cpu, physical ? "physical" : "logical",
+                               use_hwthread_cpus ? "hwthread" : "core");
+                PMIX_ARGV_FREE_COMPAT(ranges);
+                PMIX_ARGV_FREE_COMPAT(range);
+                PMIX_ARGV_FREE_COMPAT(cache);
+                hwloc_bitmap_free(avail);
+                hwloc_bitmap_free(res);
+                hwloc_bitmap_free(pucpus);
+                return NULL;
             }
+            hwloc_bitmap_and(pucpus, pu->cpuset, hwloc_topology_get_allowed_cpuset(topo));
+            hwloc_bitmap_or(res, avail, pucpus);
+            hwloc_bitmap_copy(avail, res);
+            // cache the cpu
+            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&cache, range[0]);
             break;
         case 2:
             /* range given */
             start = strtoul(range[0], NULL, 10);
             end = strtoul(range[1], NULL, 10);
             for (cpu = start; cpu <= end; cpu++) {
-                if (NULL != (pu = prte_hwloc_base_get_pu(topo, use_hwthread_cpus, cpu))) {
-                    hwloc_bitmap_and(pucpus, pu->cpuset, hwloc_topology_get_allowed_cpuset(topo));
-                    hwloc_bitmap_or(res, avail, pucpus);
-                    hwloc_bitmap_copy(avail, res);
+                pu = prte_hwloc_base_get_pu(topo, use_hwthread_cpus, cpu);
+                if (NULL == pu) {
+                    pmix_show_help("help-prte-hwloc-base.txt", "unfound-cpu", true,
+                                   cpulist, cpu, physical ? "physical" : "logical",
+                                   use_hwthread_cpus ? "hwthread" : "core");
+                    PMIX_ARGV_FREE_COMPAT(ranges);
+                    PMIX_ARGV_FREE_COMPAT(range);
+                    PMIX_ARGV_FREE_COMPAT(cache);
+                    hwloc_bitmap_free(avail);
+                    hwloc_bitmap_free(res);
+                    hwloc_bitmap_free(pucpus);
+                    return NULL;
                 }
+                hwloc_bitmap_and(pucpus, pu->cpuset, hwloc_topology_get_allowed_cpuset(topo));
+                hwloc_bitmap_or(res, avail, pucpus);
+                hwloc_bitmap_copy(avail, res);
+                // cache the cpu
+                snprintf(tmp, 256, "%d", cpu);
+                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&cache, tmp);
             }
             break;
         default:
@@ -172,6 +202,10 @@ hwloc_cpuset_t prte_hwloc_base_generate_cpuset(hwloc_topology_t topo,
     }
     hwloc_bitmap_free(res);
     hwloc_bitmap_free(pucpus);
+    // update the cpulist in case it was expanded
+    free(*cpulist);
+    *cpulist = PMIX_ARGV_JOIN_COMPAT(cache, ',');
+    PMIX_ARGV_FREE_COMPAT(cache);
 
     return avail;
 }
@@ -284,7 +318,7 @@ hwloc_cpuset_t prte_hwloc_base_filter_cpus(hwloc_topology_t topo)
     } else {
         PMIX_OUTPUT_VERBOSE((5, prte_hwloc_base_output, "hwloc:base: filtering cpuset"));
         avail = prte_hwloc_base_generate_cpuset(topo, prte_hwloc_default_use_hwthread_cpus,
-                                                prte_hwloc_default_cpu_list);
+                                                &prte_hwloc_default_cpu_list);
     }
 
     return avail;
@@ -1566,6 +1600,8 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
     }
 
     for (n = 0; n < npkgs; n++) {
+        memset(tmp, 0, sizeof(tmp));
+        memset(ans, 0, sizeof(ans));
         pkg = prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_PACKAGE, n);
         /* see if we have any here */
         hwloc_bitmap_and(avail, cpuset, pkg->cpuset);
@@ -1602,19 +1638,19 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
 
 char *prte_hwloc_base_get_topo_signature(hwloc_topology_t topo)
 {
-    int nnuma, npackage, nl3, nl2, nl1, ncore, nhwt;
-    char *sig = NULL, *arch = NULL, *endian, *pus, *cpus;
+    char *sig = NULL, *arch = NULL, *endian;
     hwloc_obj_t obj;
     unsigned i;
-    hwloc_bitmap_t complete, allowed;
+    char buffer[4096];
+    int rc;
 
-    nnuma = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_NUMANODE);
-    npackage = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PACKAGE);
-    nl3 = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_L3CACHE);
-    nl2 = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_L2CACHE);
-    nl1 = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_L1CACHE);
-    ncore = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_CORE);
-    nhwt = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PU);
+    obj = hwloc_get_root_obj(topo);
+    rc = hwloc_topology_export_synthetic(topo, buffer, 4096,
+                                         HWLOC_TOPOLOGY_EXPORT_SYNTHETIC_FLAG_NO_ATTRS);
+    if (-1 == rc) {
+        snprintf(buffer, 4096, "NON-SYMMETRIC[%u]", prte_process_info.myproc.rank);
+    }
+
 
     /* get the root object so we can add the processor architecture */
     obj = hwloc_get_root_obj(topo);
@@ -1638,33 +1674,8 @@ char *prte_hwloc_base_get_topo_signature(hwloc_topology_t topo)
     endian = "unknown";
 #endif
 
-    /* print the cpu bitmap itself so we can detect mismatches in the available
-     * cores across the nodes - we send the complete set along with the available
-     * one in cases where the two differ */
-    complete = (hwloc_bitmap_t) hwloc_topology_get_complete_cpuset(topo);
-    allowed = (hwloc_bitmap_t) hwloc_topology_get_allowed_cpuset(topo);
-    pus = NULL;
-    if (0 >= hwloc_bitmap_list_asprintf(&pus, allowed)) {
-        if (NULL != pus) {
-            free(pus);
-        }
-        pus = strdup("unknown");
-    }
-    if (hwloc_bitmap_isequal(complete, allowed)) {
-        cpus = strdup("");
-    } else {
-        cpus = NULL;
-        if (0 >= hwloc_bitmap_list_asprintf(&cpus, complete)) {
-            if (NULL != cpus) {
-                free(cpus);
-            }
-            cpus = strdup("unknown");
-        }
-    }
-    pmix_asprintf(&sig, "%dN:%dS:%dL3:%dL2:%dL1:%dC:%dH:%s:%s:%s:%s", nnuma, npackage, nl3, nl2,
-                  nl1, ncore, nhwt, pus, cpus, arch, endian);
-    free(pus);
-    free(cpus);
+    // form the final signature
+    pmix_asprintf(&sig, "%s:%s:%s", buffer, arch, endian);
     return sig;
 }
 
