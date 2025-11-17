@@ -52,13 +52,3 @@ bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte-submit
 	$(prte_hwloc_LIBS) \
 	$(prte_pmix_LIBS) \
 	$(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
-
-if PRTE_WANT_LEGACY_TOOLS
-
-install-exec-hook:
-	(cd $(DESTDIR)$(bindir); rm -f prun$(EXEEXT); $(LN_S) @PRTE_BINARY_PREFIX@prte-submit$(EXEEXT) prun$(EXEEXT))
-
-uninstall-local:
-	rm -f $(DESTDIR)$(bindir)/@PRTE_BINARY_PREFIX@prun$(EXEEXT)
-
-endif

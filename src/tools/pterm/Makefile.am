@@ -36,12 +36,3 @@ bin_PROGRAMS = @PRTE_BINARY_PREFIX@prte-term
     $(prte_pmix_LIBS) \
 	$(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
-if PRTE_WANT_LEGACY_TOOLS
-
-install-exec-hook:
-	(cd $(DESTDIR)$(bindir); rm -f pterm$(EXEEXT); $(LN_S) @PRTE_BINARY_PREFIX@prte-term$(EXEEXT) pterm$(EXEEXT))
-
-uninstall-local:
-	rm -f $(DESTDIR)$(bindir)/@PRTE_BINARY_PREFIX@pterm$(EXEEXT)
-
-endif
