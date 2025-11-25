@@ -18,7 +18,7 @@
  *                         All rights reserved.
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023      Triad National Security, LLC. All rights reserved.
  * $COPYRIGHT$
  *
@@ -65,9 +65,11 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/grpcomm/grpcomm.h"
+#include "src/mca/ras/base/ras_private.h"
+#include "src/mca/state/state.h"
 #include "src/rml/rml_contact.h"
 #include "src/rml/rml.h"
-#include "src/runtime/prte_data_server.h"
+#include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/prte_globals.h"
 #include "src/threads/pmix_threads.h"
 #include "src/util/name_fns.h"
@@ -96,7 +98,6 @@ pmix_server_globals_t prte_pmix_server_globals = {0};
 static pmix_topology_t mytopology = {0};
 
 static pmix_server_module_t pmix_server = {
-    .client_connected = pmix_server_client_connected_fn,
     .client_finalized = pmix_server_client_finalized_fn,
     .abort = pmix_server_abort_fn,
     .fence_nb = pmix_server_fencenb_fn,
@@ -118,9 +119,7 @@ static pmix_server_module_t pmix_server = {
     .push_stdin = pmix_server_stdin_fn,
     .group = pmix_server_group_fn,
     .allocate = pmix_server_alloc_fn,
-#if PMIX_NUMERIC_VERSION >= 0x00050000
-    .session_control = pmix_server_session_ctrl_fn
-#endif
+    .client_connected2 = pmix_server_client_connected2_fn,
 };
 
 typedef struct {
@@ -373,6 +372,8 @@ static void send_error(int status, pmix_proc_t *idreq, pmix_proc_t *remote, int 
 static void _mdxresp(int sd, short args, void *cbdata);
 static void modex_resp(pmix_status_t status, char *data, size_t sz, void *cbdata);
 
+static bool remote_connections_specified = false;
+static char *remote_cncts = NULL;
 static char *generate_dist = "fabric,gpu,network";
 void pmix_server_register_params(void)
 {
@@ -398,6 +399,46 @@ void pmix_server_register_params(void)
                                    PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                    &prte_pmix_server_globals.wait_for_server);
 
+    /* whether or not to support tool connections */
+    prte_pmix_server_globals.tool_support = true;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "tool_support",
+                                      "Whether or not to support tool connections",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_pmix_server_globals.tool_support);
+
+    /* whether or not to support remote connections */
+    prte_pmix_server_globals.remote_connections = false;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "remote_connections",
+                                      "Whether or not to support remote connections",
+                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                      &remote_cncts);
+     if (NULL != remote_cncts) {
+          if (0 == strcasecmp(remote_cncts, "false") ||
+              0 == strcasecmp(remote_cncts, "f") ||
+              0 == strcmp(remote_cncts, "0")) {
+               prte_pmix_server_globals.remote_connections = false;
+          } else if (0 == strcasecmp(remote_cncts, "true") ||
+                     0 == strcasecmp(remote_cncts, "t") ||
+                     0 == strcmp(remote_cncts, "1")) {
+               prte_pmix_server_globals.remote_connections = true;
+          }
+          remote_connections_specified = true;
+     }
+
+    /* whether or not to require client pid to match */
+    prte_pmix_server_globals.require_pid_match = false;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "require_pid_match",
+                                      "Whether or not to require client pid to match",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_pmix_server_globals.require_pid_match);
+
+    /* whether or not to allow multiple clients with same ID to connect */
+    prte_pmix_server_globals.allow_client_clones = false;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "allow_client_clones",
+                                      "Whether or not to allow client clones",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_pmix_server_globals.allow_client_clones);
+
     /* whether or not to drop a session-level tool rendezvous point */
     prte_pmix_server_globals.session_server = false;
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "session_server",
@@ -412,7 +453,15 @@ void pmix_server_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.system_server);
 
-    /* whether or not to drop a system-level tool rendezvous point */
+    /* whether or not to accept connection from foreign tools*/
+    prte_pmix_server_globals.no_foreign_tools = true;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "no_foreign_tools",
+                                      "Whether or not to reject tool connection requests "
+                                      "from other users",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_pmix_server_globals.no_foreign_tools);
+
+    /* whether or not to generate device distances */
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "generate_distances",
                                       "Device types whose distances are to be provided (default=none, options=fabric,gpu,network",
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
@@ -516,32 +565,58 @@ void prte_pmix_server_clear(pmix_proc_t *pname)
 
 /* provide a callback function for lost connections to allow us
  * to cleanup after any tools once they depart */
+static void _lost_conn(int sd, short args, void *cbdata)
+{
+     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t*)cbdata;
+     prte_job_t *jdata;
+     PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+     // check the source to see if it is a client or tool
+     jdata = prte_get_job_data_object(cd->proc.nspace);
+     if (NULL == jdata) {
+        // we don't know this job
+        goto complete;
+     }
+
+     if (!PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+        // client - do nothing, the ODLS will see it go away
+        goto complete;
+     }
+
+     // tool - since the tool isn't a child of ours, we cannot
+     // see a waitpid fire, so this is the only notice we will
+     // receive that the tool is no longer connected to us
+     PRTE_ACTIVATE_PROC_STATE(&cd->proc, PRTE_PROC_STATE_TERMINATED);
+
+complete:
+    // progress the PMIx event notification chain
+    if (NULL != cd->evcbfunc) {
+        cd->evcbfunc(PMIX_EVENT_ACTION_COMPLETE, NULL, 0, NULL, NULL, cd->cbdata);
+    }
+    PMIX_RELEASE(cd);
+}
+
 static void lost_connection_hdlr(size_t evhdlr_registration_id, pmix_status_t status,
                                  const pmix_proc_t *source, pmix_info_t info[], size_t ninfo,
                                  pmix_info_t *results, size_t nresults,
                                  pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
 {
-    prte_pmix_tool_t *tl;
-    PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id, status,
-                            info, ninfo, results, nresults);
+     prte_pmix_server_op_caddy_t *cd;
+     PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id);
 
-    /* scan the list of attached tools to see if this one is there */
-    PMIX_LIST_FOREACH(tl, &prte_pmix_server_globals.tools, prte_pmix_tool_t)
-    {
-        if (PMIX_CHECK_PROCID(&tl->name, source)) {
-            /* take this tool off the list */
-            pmix_list_remove_item(&prte_pmix_server_globals.tools, &tl->super);
-            /* release it */
-            PMIX_RELEASE(tl);
-            break;
-        }
-    }
-
-    /* we _always_ have to execute the evhandler callback or
-     * else the event progress engine will hang */
-    if (NULL != cbfunc) {
-        cbfunc(PMIX_EVENT_ACTION_COMPLETE, NULL, 0, NULL, NULL, cbdata);
-    }
+     // need to threadshift this into our own progress thread
+     cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+     cd->status = status;
+     memcpy(&cd->proc, source, sizeof(pmix_proc_t));
+     cd->info = info;
+     cd->ninfo = ninfo;
+     cd->directives = results;
+     cd->ndirs = nresults;
+     cd->evcbfunc = cbfunc;
+     cd->cbdata = cbdata;
+     prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _lost_conn, cd);
+     PMIX_POST_OBJECT(cd);
+     prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 }
 
 static void regcbfunc(pmix_status_t status, size_t ref, void *cbdata)
@@ -578,7 +653,6 @@ int pmix_server_init(void)
     /* setup the server's state variables */
     PMIX_CONSTRUCT(&prte_pmix_server_globals.psets, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.groups, pmix_list_t);
-    PMIX_CONSTRUCT(&prte_pmix_server_globals.tools, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.local_reqs, pmix_pointer_array_t);
     pmix_pointer_array_init(&prte_pmix_server_globals.local_reqs, 128, INT_MAX, 2);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.remote_reqs, pmix_pointer_array_t);
@@ -649,32 +723,80 @@ int pmix_server_init(void)
         rc = prte_pmix_convert_status(prc);
         return rc;
     }
-    /* if requested, tell the server to drop a session-level
-     * PMIx connection point */
-    if (prte_pmix_server_globals.session_server) {
-        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_TOOL_SUPPORT,
-                           NULL, PMIX_BOOL);
+
+      /* tell the server whether or not to enable tool connections */
+    PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_TOOL_SUPPORT,
+                       (void*)&prte_pmix_server_globals.tool_support, PMIX_BOOL);
+    if (PMIX_SUCCESS != prc) {
+        PMIX_INFO_LIST_RELEASE(ilist);
+        rc = prte_pmix_convert_status(prc);
+        return rc;
+    }
+
+    /* tell the server whether or not to drop a session-level PMIx connection point */
+   PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SESSION_SUPPORT,
+                      &prte_pmix_server_globals.session_server, PMIX_BOOL);
+   if (PMIX_SUCCESS != prc) {
+       PMIX_INFO_LIST_RELEASE(ilist);
+       rc = prte_pmix_convert_status(prc);
+       return rc;
+   }
+
+    if (PRTE_PROC_IS_MASTER) {
+        // mark ourselves as a gateway server
+        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_GATEWAY, NULL, PMIX_BOOL);
         if (PMIX_SUCCESS != prc) {
             PMIX_INFO_LIST_RELEASE(ilist);
             rc = prte_pmix_convert_status(prc);
             return rc;
         }
-    }
-
-    if (PRTE_PROC_IS_MASTER) {
-        /* if requested, tell the server to drop a system-level
-         * PMIx connection point - only do this for the HNP as, in
-         * at least one case, a daemon can be colocated with the
-         * HNP and would overwrite the server rendezvous file */
-        if (prte_pmix_server_globals.system_server) {
-            PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SYSTEM_SUPPORT,
-                               NULL, PMIX_BOOL);
+        /* if we have a parent or we are in persistent mode, then we
+         * don't write out ourselves */
+        if (NULL != getenv("PMIX_LAUNCHER_RNDZ_URI") || prte_persistent) {
+            flag = false;
+        } else {
+            flag = true;
+        }
+        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_IOF_LOCAL_OUTPUT, &flag, PMIX_BOOL);
+        if (PMIX_SUCCESS != prc) {
+            PMIX_INFO_LIST_RELEASE(ilist);
+            rc = prte_pmix_convert_status(prc);
+            return rc;
+        }
+        /* tell the IOF system to format our output in XML, if requested */
+        if (prte_xml_output) {
+            flag = true;
+            PMIX_INFO_LIST_ADD(prc, ilist, PMIX_IOF_XML_OUTPUT, &flag, PMIX_BOOL);
             if (PMIX_SUCCESS != prc) {
                 PMIX_INFO_LIST_RELEASE(ilist);
                 rc = prte_pmix_convert_status(prc);
                 return rc;
             }
         }
+        /* tell the server whether or not to drop a system-level
+         * PMIx connection point - only do this for the HNP as, in
+         * at least one case, a daemon can be colocated with the
+         * HNP and would overwrite the server rendezvous file */
+       PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SYSTEM_SUPPORT,
+                          (void*)&prte_pmix_server_globals.system_server, PMIX_BOOL);
+       if (PMIX_SUCCESS != prc) {
+           PMIX_INFO_LIST_RELEASE(ilist);
+           rc = prte_pmix_convert_status(prc);
+           return rc;
+       }
+
+#ifdef PMIX_SERVER_ALLOW_FOREIGN_TOOLS
+        // tell if they want to allow tools from other users
+       flag = !prte_pmix_server_globals.no_foreign_tools;
+       PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_ALLOW_FOREIGN_TOOLS,
+                          (void*)&flag, PMIX_BOOL);
+       if (PMIX_SUCCESS != prc) {
+           PMIX_INFO_LIST_RELEASE(ilist);
+           rc = prte_pmix_convert_status(prc);
+           return rc;
+       }
+#endif
+
 #ifdef PMIX_SERVER_SYS_CONTROLLER
         /* if requested, tell the server that we are the system
          * controller */
@@ -688,6 +810,15 @@ int pmix_server_init(void)
             }
         }
 #endif
+    } else {
+        /* prted's never locally output */
+        flag = false;
+        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_IOF_LOCAL_OUTPUT, &flag, PMIX_BOOL);
+        if (PMIX_SUCCESS != prc) {
+            PMIX_INFO_LIST_RELEASE(ilist);
+            rc = prte_pmix_convert_status(prc);
+            return rc;
+        }
     }
 
     /* if requested, tell the server library to output our PMIx URI */
@@ -716,62 +847,29 @@ int pmix_server_init(void)
         PMIX_INFO_LIST_ADD(prc, ilist, PMIX_BIND_PROGRESS_THREAD,
                            prte_progress_thread_cpus, PMIX_STRING);
         PMIX_INFO_LIST_ADD(prc, ilist, PMIX_BIND_REQUIRED,
-                           &prte_bind_progress_thread_reqd, PMIX_BOOL);
+                           (void*)&prte_bind_progress_thread_reqd, PMIX_BOOL);
     }
 
-    /* if we are the MASTER, then we are the gateway */
-    if (PRTE_PROC_IS_MASTER) {
-        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_GATEWAY, NULL, PMIX_BOOL);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_INFO_LIST_RELEASE(ilist);
-            rc = prte_pmix_convert_status(prc);
-            return rc;
-        }
-        /* if we are also persistent, then we do not output IOF ourselves */
-        if (prte_persistent) {
-            flag = false;
-#ifdef PMIX_SERVER_CONTROLLER
-            // declare ourselves the system controller
-            PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_SYS_CONTROLLER, NULL, PMIX_BOOL);
-            if (PMIX_SUCCESS != prc) {
-                PMIX_INFO_LIST_RELEASE(ilist);
-                rc = prte_pmix_convert_status(prc);
-                return rc;
-            }
-#endif
-        } else {
-            /* if we have a parent or we are in persistent mode, then we
-             * don't write out ourselves */
-            if (NULL != getenv("PMIX_LAUNCHER_RNDZ_URI") || prte_persistent) {
-                flag = false;
-            } else {
-                flag = true;
-            }
-        }
-        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_IOF_LOCAL_OUTPUT, &flag, PMIX_BOOL);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_INFO_LIST_RELEASE(ilist);
-            rc = prte_pmix_convert_status(prc);
-            return rc;
-        }
-    } else {
-        /* prted's never locally output */
-        flag = false;
-        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_IOF_LOCAL_OUTPUT, &flag, PMIX_BOOL);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_INFO_LIST_RELEASE(ilist);
-            rc = prte_pmix_convert_status(prc);
-            return rc;
-        }
+    /* tell if we allow remote tool connections */
+    if (remote_connections_specified) {
+         PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_REMOTE_CONNECTIONS,
+                           (void*)&prte_pmix_server_globals.remote_connections, PMIX_BOOL);
+         if (PMIX_SUCCESS != prc) {
+             PMIX_INFO_LIST_RELEASE(ilist);
+             rc = prte_pmix_convert_status(prc);
+             return rc;
+         }
     }
 
-    /* PRTE always allows remote tool connections */
-    PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_REMOTE_CONNECTIONS, &flag, PMIX_BOOL);
+#ifdef PMIX_ALLOW_CLIENT_CLONES
+    PMIX_INFO_LIST_ADD(prc, ilist, PMIX_ALLOW_CLIENT_CLONES,
+                      (void*)&prte_pmix_server_globals.allow_client_clones, PMIX_BOOL);
     if (PMIX_SUCCESS != prc) {
         PMIX_INFO_LIST_RELEASE(ilist);
         rc = prte_pmix_convert_status(prc);
         return rc;
     }
+#endif
 
     /* if we were launched by a debugger, then we need to have
      * notification of our termination sent */
@@ -891,10 +989,14 @@ int pmix_server_init(void)
     /* register the "lost-connection" event handler */
     PRTE_PMIX_CONSTRUCT_LOCK(&lock);
     prc = PMIX_ERR_LOST_CONNECTION;
-    PMIx_Register_event_handler(&prc, 1, NULL, 0, lost_connection_hdlr, regcbfunc, &lock);
+    ninfo = 1;
+    PMIX_INFO_CREATE(info, ninfo);
+    PMIX_INFO_LOAD(&info[0], PMIX_EVENT_HDLR_NAME, "LOST-CONNECTION", PMIX_STRING);
+    PMIx_Register_event_handler(&prc, 1,info, ninfo, lost_connection_hdlr, regcbfunc, &lock);
     PRTE_PMIX_WAIT_THREAD(&lock);
     prc = lock.status;
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
+    PMIX_INFO_FREE(info, ninfo);
     rc = prte_pmix_convert_status(prc);
 
     return rc;
@@ -926,8 +1028,8 @@ void pmix_server_start(void)
                   PRTE_RML_PERSISTENT, pmix_server_notify, NULL);
 
     /* setup recv for jobid return */
-    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_JOBID_RESP,
-                  PRTE_RML_PERSISTENT, pmix_server_jobid_return, NULL);
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TCONN_RESP,
+                  PRTE_RML_PERSISTENT, pmix_server_tconn_return, NULL);
 
     if (PRTE_PROC_IS_MASTER) {
         /* setup recv for logging requests */
@@ -955,6 +1057,7 @@ void pmix_server_finalize(void)
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LAUNCH_RESP);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DATA_CLIENT);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_NOTIFICATION);
+    PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TCONN_RESP);
     if (PRTE_PROC_IS_MASTER) {
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED);
@@ -1452,6 +1555,7 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
         }
         req->inprogress = false;
         pmix_pointer_array_set_item(&prte_pmix_server_globals.remote_reqs, req->local_index, NULL);
+        rc = prte_pmix_convert_status(prc);
         send_error(rc, &pproc, sender, index);
         return;
     }
@@ -1743,7 +1847,7 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
                               pmix_data_buffer_t *buffer,
                               prte_rml_tag_t tg, void *cbdata)
 {
-    pmix_status_t rc;
+    pmix_status_t rc = PMIX_SUCCESS;
     uint8_t cmd;
     int32_t cnt;
     size_t ninfo;
@@ -1751,7 +1855,7 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
     uint32_t sessionID;
     pmix_info_t *info = NULL;
     pmix_proc_t source;
-    pmix_server_req_t *req;
+    pmix_server_req_t *req = NULL;
     int refid;
     PRTE_HIDE_UNUSED_PARAMS(status, sender, tg, cbdata);
 
@@ -1909,6 +2013,7 @@ static void opcon(prte_pmix_server_op_caddy_t *p)
     p->infocbfunc = NULL;
     p->toolcbfunc = NULL;
     p->spcbfunc = NULL;
+    p->evcbfunc = NULL;
     p->cbdata = NULL;
     p->server_object = NULL;
 }
@@ -2004,6 +2109,7 @@ PMIX_CLASS_INSTANCE(prte_pmix_mdx_caddy_t,
 static void pscon(pmix_server_pset_t *p)
 {
     p->name = NULL;
+    p->jdata = NULL;
     p->members = NULL;
     p->num_members = 0;
 }
@@ -2012,6 +2118,9 @@ static void psdes(pmix_server_pset_t *p)
     if (NULL != p->name) {
         free(p->name);
     }
+    if (NULL != p->jdata) {
+     PMIX_RELEASE(p->jdata);
+    }
     if (NULL != p->members) {
         free(p->members);
     }
@@ -2019,7 +2128,3 @@ static void psdes(pmix_server_pset_t *p)
 PMIX_CLASS_INSTANCE(pmix_server_pset_t,
                     pmix_list_item_t,
                     pscon, psdes);
-
-PMIX_CLASS_INSTANCE(prte_pmix_tool_t,
-                    pmix_list_item_t,
-                    NULL, NULL);

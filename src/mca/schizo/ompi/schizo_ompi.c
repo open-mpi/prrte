@@ -18,8 +18,8 @@
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018-2022 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
- * Copyright (c) 2022      Triad National Security, LLC. All rights
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2022-2024 Triad National Security, LLC. All rights
  *                         reserved.
  * $COPYRIGHT$
  *
@@ -57,6 +57,7 @@
 #include "src/mca/base/pmix_mca_base_vari.h"
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/base/base.h"
+#include "src/mca/pmdl/base/base.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/state/base/base.h"
 #include "src/runtime/prte_globals.h"
@@ -120,6 +121,7 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_SIGNALS, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_CHILD_SEP, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_HETERO_NODES, PMIX_ARG_NONE),
 
     /* debug options */
     PMIX_OPTION_DEFINE(PRTE_CLI_XTERM, PMIX_ARG_REQD),
@@ -157,6 +159,18 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_PRELOAD_FILES, PMIX_ARG_REQD),
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_PRELOAD_BIN, PMIX_ARG_NONE, 's'),
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_FWD_ENVAR, PMIX_ARG_REQD, 'x'),
+#ifdef PMIX_CLI_SET_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_SET_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_PREPEND_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_PREPEND_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_APPEND_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_APPEND_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_UNSET_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_UNSET_ENVAR, PMIX_ARG_REQD),
+#endif
     PMIX_OPTION_DEFINE(PRTE_CLI_WDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("wd", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PATH, PMIX_ARG_REQD),
@@ -167,6 +181,10 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_DEFAULT_HOSTFILE, PMIX_ARG_REQD),
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_HOST, PMIX_ARG_REQD, 'H'),
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_ENVIRON, PMIX_ARG_OPTIONAL),
+    PMIX_OPTION_DEFINE(PRTE_CLI_MEM_ALLOC_KIND, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_GPU_SUPPORT, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_APP_PREFIX, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_NO_APP_PREFIX, PMIX_ARG_NONE),
 
     /* placement options */
     /* Mapping options */
@@ -194,8 +212,12 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_CONTINUOUS, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("with-ft", PMIX_ARG_REQD),
 
-    /* mpiexec mandated form launch key parameters */
+    /* mpiexec mandated form launch key parameters - MPI 4.0 */
     PMIX_OPTION_DEFINE("initial-errhandler", PMIX_ARG_REQD),
+    /* mpiexec mandated form launch key parameters  - MPI 4.1*/
+    PMIX_OPTION_DEFINE(PRTE_CLI_MEM_ALLOC_KIND, PMIX_ARG_REQD),
+    /* GPU support - on/off */
+    PMIX_OPTION_DEFINE(PRTE_CLI_GPU_SUPPORT, PMIX_ARG_REQD),
 
     /* Display Commumication Protocol : MPI_Init */
     PMIX_OPTION_DEFINE("display-comm", PMIX_ARG_NONE),
@@ -260,7 +282,7 @@ static void set_classpath_jar_file(prte_pmix_app_t *app, int index, char *jarfil
         char *fmt = ':' == app->app.argv[index][strlen(app->app.argv[index]-1)]
                     ? "%s%s/%s" : "%s:%s/%s";
         char *str;
-        asprintf(&str, fmt, app->app.argv[index], ompi_install_dirs_libdir, jarfile);
+        pmix_asprintf(&str, fmt, app->app.argv[index], ompi_install_dirs_libdir, jarfile);
         free(app->app.argv[index]);
         app->app.argv[index] = str;
     }
@@ -310,9 +332,9 @@ static int setup_app(prte_pmix_app_t *app)
             if (NULL == strstr(app->app.argv[i], ompi_install_dirs_libdir)) {
                 /* doesn't appear to - add it to be safe */
                 if (':' == app->app.argv[i][strlen(app->app.argv[i]-1)]) {
-                    asprintf(&value, "-Djava.library.path=%s%s", dptr, ompi_install_dirs_libdir);
+                    pmix_asprintf(&value, "-Djava.library.path=%s%s", dptr, ompi_install_dirs_libdir);
                 } else {
-                    asprintf(&value, "-Djava.library.path=%s:%s", dptr, ompi_install_dirs_libdir);
+                    pmix_asprintf(&value, "-Djava.library.path=%s:%s", dptr, ompi_install_dirs_libdir);
                 }
                 free(app->app.argv[i]);
                 app->app.argv[i] = value;
@@ -323,7 +345,7 @@ static int setup_app(prte_pmix_app_t *app)
 
     if (!found) {
         /* need to add it right after the java command */
-        asprintf(&value, "-Djava.library.path=%s", ompi_install_dirs_libdir);
+        pmix_asprintf(&value, "-Djava.library.path=%s", ompi_install_dirs_libdir);
         pmix_argv_insert_element(&app->app.argv, 1, value);
         free(value);
     }
@@ -345,7 +367,7 @@ static int setup_app(prte_pmix_app_t *app)
             }
             free(value);
             /* always add the local directory */
-            asprintf(&value, "%s:%s", app->app.cwd, app->app.argv[i+1]);
+            pmix_asprintf(&value, "%s:%s", app->app.cwd, app->app.argv[i+1]);
             free(app->app.argv[i+1]);
             app->app.argv[i+1] = value;
             break;
@@ -367,7 +389,7 @@ static int setup_app(prte_pmix_app_t *app)
                 }
                 free(value);
                 /* always add the local directory */
-                (void)asprintf(&value, "%s:%s", app->app.cwd, app->app.argv[1]);
+                pmix_asprintf(&value, "%s:%s", app->app.cwd, app->app.argv[1]);
                 free(app->app.argv[1]);
                 app->app.argv[1] = value;
                 pmix_argv_insert_element(&app->app.argv, 1, "-cp");
@@ -387,7 +409,7 @@ static int setup_app(prte_pmix_app_t *app)
             /* check for mpi.jar */
             value = pmix_os_path(false, ompi_install_dirs_libdir, "mpi.jar", NULL);
             if (access(value, F_OK ) != -1) {
-                (void)asprintf(&str2, "%s:%s", str, value);
+                pmix_asprintf(&str2, "%s:%s", str, value);
                 free(str);
                 str = str2;
             }
@@ -422,7 +444,7 @@ static bool mcaoption(char *s)
 static int parse_cli(char **argv, pmix_cli_result_t *results,
                      bool silent)
 {
-    int rc, m, n;
+    int rc, n;
     pmix_cli_item_t *opt;
     char *p1, *p2;
     char **pargv;
@@ -475,7 +497,7 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
         /* check for single-dash errors */
         if ('-' != pargv[n][1] && 2 < strlen(pargv[n])) {
             /* we know this is incorrect */
-            char *p2 = pargv[n];
+            p2 = pargv[n];
             pmix_asprintf(&pargv[n], "-%s", p2);
             if(warn) {
                 caught_single_dashes[cur_caught_pos] = strdup(p2);
@@ -494,6 +516,9 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
         pmix_tool_basename = tool_name;
         pmix_tool_org      = "Open MPI";
         pmix_tool_msg      = "Report bugs to https://www.open-mpi.org/community/help/";
+    }
+    if (NULL == prte_process_info.sessdir_prefix) {
+        prte_process_info.sessdir_prefix = strdup("ompi");
     }
 
     rc = pmix_cmd_line_parse(pargv, ompishorts, ompioptions, NULL,
@@ -599,6 +624,8 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
         }
     }
 
+    // check for the --stream-buffering option
+
     if (NULL != results->tail) {
         /* search for the leader of the tail */
         for (n=0; NULL != argv[n]; n++) {
@@ -620,7 +647,7 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
 {
     char *option, *p1, *p2, *tmp, *tmp2, *output;
     int rc = PRTE_SUCCESS;
-    pmix_cli_item_t *opt, *nxt;
+    pmix_cli_item_t *opt, *nxt, *opt2;
     bool warn;
 
     if (silent) {
@@ -859,6 +886,30 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             free(p2);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
+        /* --stop-in-init  ->  --runtime-options stop-in-init */
+        else if (0 == strcmp(option, PRTE_CLI_STOP_IN_INIT)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_STOP_IN_INIT,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
+        /* --stop-in-app  ->  --runtime-options stop-in-app */
+        else if (0 == strcmp(option, PRTE_CLI_STOP_IN_APP)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_STOP_IN_APP,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
+        /* --stop-on-exec  ->  --runtime-options stop-on-exec */
+        else if (0 == strcmp(option, PRTE_CLI_STOP_ON_EXEC)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_STOP_ON_EXEC,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
         /* --display-map  ->  --display map */
         else if (0 == strcmp(option, "display-map")) {
             rc = prte_schizo_base_add_directive(results, option,
@@ -926,6 +977,31 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                 free(p1);
                 free(opt->values[0]);
                 opt->values[0] = tmp;
+            } else if (0 == strncasecmp(opt->values[0], "ppr", strlen("ppr"))) {
+                // see if they specified "socket" as the resource
+                p1 = strdup(opt->values[0]);
+                p2 = strrchr(p1, ':');
+                ++p2;
+                if (0 == strncasecmp(p2, "socket", strlen("socket")) ||
+                    0 == strncasecmp(p2, "skt", strlen("skt"))) {
+                    *p2 = '\0';
+                    pmix_asprintf(&p2, "%spackage", p1);
+                    if (warn) {
+                        pmix_asprintf(&tmp, "%s %s", option, opt->values[0]);
+                        pmix_asprintf(&tmp2, "%s %s", option, p2);
+                        /* can't just call show_help as we want every instance to be reported */
+                        output = pmix_show_help_string("help-schizo-base.txt",
+                                                       "deprecated-converted", true,
+                                                       tmp, tmp2);
+                        fprintf(stderr, "%s\n", output);
+                        free(output);
+                        free(tmp);
+                        free(tmp2);
+                    }
+                    free(opt->values[0]);
+                    opt->values[0] = p2;
+                }
+                free(p1);
             }
         }
         /* --rank-by socket ->  --rank-by package */
@@ -1012,6 +1088,32 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                 }
             }
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        } else if (0 == strcmp(option, "stream-buffering")) {
+            uint16_t u16;
+
+            u16 = strtol(opt->values[0], NULL, 10);
+            // if the value is 0, then we need to direct the output to be ":raw"
+            if (0 == u16) {
+                opt2 = pmix_cmd_line_get_param(results, PRTE_CLI_OUTPUT);
+                if (NULL == opt2) {
+                    // add the output directive
+                    opt2 = PMIX_NEW(pmix_cli_item_t);
+                    opt2->key = strdup(PRTE_CLI_OUTPUT);
+                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&opt2->values, ":raw");
+                    pmix_list_append(&results->instances, &opt2->super);
+                } else {
+                    // see if the "raw" modifier is already present
+                    p1 = strstr(opt2->values[0], "raw");
+                    if (NULL == p1) {
+                        /* it isn't - need to add it. Since qualifiers are separated
+                         * from the directive by a ':' as well as from each other,
+                         * we can just append ":raw" to the string */
+                        pmix_asprintf(&p2, "%s:raw", opt2->values[0]);
+                        free(opt2->values[0]);
+                        opt2->values[0] = p2;
+                    }
+                }
+            }
         }
     }
 
@@ -1575,6 +1677,15 @@ static int parse_env(char **srcenv, char ***dstenv,
         }
     }
 
+    if (NULL != (opt = pmix_cmd_line_get_param(results, PRTE_CLI_MEM_ALLOC_KIND))) {
+        rc = check_cache(&cache, &cachevals, "mpi_memory_alloc_kinds", opt->values[0]);
+        if (PRTE_SUCCESS != rc) {
+            PMIX_ARGV_FREE_COMPAT(cache);
+            PMIX_ARGV_FREE_COMPAT(cachevals);
+            return rc;
+        }
+    }
+
     if (pmix_cmd_line_is_taken(results, "display-comm") &&
         pmix_cmd_line_is_taken(results, "display-comm-finalize")) {
         PMIX_SETENV_COMPAT("OMPI_MCA_ompi_display_comm", "mpi_init,mpi_finalize", true, dstenv);
@@ -1742,36 +1853,6 @@ static int parse_env(char **srcenv, char ***dstenv,
     }
     PMIX_ARGV_FREE_COMPAT(envlist);
 
-    /* now look for -x options - not allowed to conflict with a -mca option */
-    if (NULL != (opt = pmix_cmd_line_get_param(results, "x"))) {
-        for (i = 0; NULL != opt->values[i]; ++i) {
-            /* the value is the envar */
-            p1 = opt->values[i];
-            /* if there is an '=' in it, then they are setting a value */
-            if (NULL != (p2 = strchr(p1, '='))) {
-                *p2 = '\0';
-                ++p2;
-            } else {
-                p2 = getenv(p1);
-                if (NULL == p2) {
-                    continue;
-                }
-            }
-            /* not allowed to duplicate anything from an MCA param on the cmd line */
-            rc = check_cache_noadd(&cache, &cachevals, p1, p2);
-            if (PRTE_SUCCESS != rc) {
-                PMIX_ARGV_FREE_COMPAT(cache);
-                PMIX_ARGV_FREE_COMPAT(cachevals);
-                PMIX_ARGV_FREE_COMPAT(xparams);
-                PMIX_ARGV_FREE_COMPAT(xvals);
-                return rc;
-            }
-            /* cache this for later inclusion */
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&xparams, p1);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&xvals, p2);
-        }
-    }
-
     /* process the resulting cache into the dstenv */
     if (NULL != cache) {
         for (i = 0; NULL != cache[i]; i++) {
@@ -1809,6 +1890,11 @@ static int parse_env(char **srcenv, char ***dstenv,
 
     return PRTE_SUCCESS;
 }
+
+// NOTE: This code is fundamentally the same (module PMIX <-> OPAL)
+//      as the translate_params() routine in the OMPI repo's
+//      opal/mca/pmix/base/pmix_base_fns.c file.  If there are
+//      changes here, there are likely to be changes there.
 
 static bool check_prte_overlap(char *var, char *value)
 {
@@ -1871,7 +1957,6 @@ static bool check_prte_overlap(char *var, char *value)
     return false;
 }
 
-
 static bool check_pmix_overlap(char *var, char *value)
 {
     char *tmp;
@@ -1909,10 +1994,6 @@ static bool check_pmix_overlap(char *var, char *value)
     return false;
 }
 
-// NOTE: This code is fundamentally the same (module PMIX <-> OPAL)
-//      as the translate_params() routine in the OMPI repo's
-//      opal/mca/pmix/base/pmix_base_fns.c file.  If there are
-//      changes here, there are likely to be changes there.
 static int translate_params(void)
 {
     char *evar, *tmp, *e2;
@@ -1953,7 +2034,7 @@ static int translate_params(void)
             if (check_prte_overlap(&e2[len], evar)) {
                 // check for pmix overlap
                 check_pmix_overlap(&e2[len], evar);
-            } else if (prte_schizo_base_check_prte_param(&e2[len])) {
+            } else if (pmix_pmdl_base_check_prte_param(&e2[len])) {
                     pmix_asprintf(&tmp, "PRTE_MCA_%s", &e2[len]);
                     // set it, but don't overwrite if they already
                     // have a value in our environment
@@ -1961,7 +2042,7 @@ static int translate_params(void)
                     free(tmp);
                     // check for pmix overlap
                     check_pmix_overlap(&e2[len], evar);
-            } else if (prte_schizo_base_check_pmix_param(&e2[len])) {
+            } else if (pmix_pmdl_base_check_pmix_param(&e2[len])) {
                 pmix_asprintf(&tmp, "PMIX_MCA_%s", &e2[len]);
                 // set it, but don't overwrite if they already
                 // have a value in our environment
@@ -1986,7 +2067,7 @@ static int translate_params(void)
             // see if this param relates to PRRTE
             if (check_prte_overlap(fv->mbvfv_var, fv->mbvfv_value)) {
                 check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value);
-            } else if (prte_schizo_base_check_prte_param(fv->mbvfv_var)) {
+            } else if (pmix_pmdl_base_check_prte_param(fv->mbvfv_var)) {
                 pmix_asprintf(&tmp, "PRTE_MCA_%s", fv->mbvfv_var);
                 // set it, but don't overwrite if they already
                 // have a value in our environment
@@ -1996,7 +2077,7 @@ static int translate_params(void)
                 // REACHABLE frameworks, then we also need to set
                 // the equivalent PMIx value
                 check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value);
-            } else if (prte_schizo_base_check_pmix_param(fv->mbvfv_var)) {
+            } else if (pmix_pmdl_base_check_pmix_param(fv->mbvfv_var)) {
                 pmix_asprintf(&tmp, "PMIX_MCA_%s", fv->mbvfv_var);
                 // set it, but don't overwrite if they already
                 // have a value in our environment
@@ -2015,10 +2096,12 @@ static int translate_params(void)
         pmix_mca_base_parse_paramfile(file, &params);
         free(file);
         PMIX_LIST_FOREACH (fv, &params, pmix_mca_base_var_file_value_t) {
-            // see if this param relates to PRRTE
-            if (check_prte_overlap(fv->mbvfv_var, fv->mbvfv_value)) {
-                check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value);
-            } else if (prte_schizo_base_check_prte_param(fv->mbvfv_var)) {
+            // see if this param overlaps with PRRTE
+            check_prte_overlap(fv->mbvfv_var, fv->mbvfv_value);
+            // see if it overlaps with PMIx
+            check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value);
+            // see if it relates to PRRTE
+            if (pmix_pmdl_base_check_prte_param(fv->mbvfv_var)) {
                 pmix_asprintf(&tmp, "PRTE_MCA_%s", fv->mbvfv_var);
                 // set it, but don't overwrite if they already
                 // have a value in our environment
@@ -2028,6 +2111,14 @@ static int translate_params(void)
                 // REACHABLE frameworks, then we also need to set
                 // the equivalent PMIx value
                 check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value);
+            }
+            // see if it relates to PMIx
+            if (pmix_pmdl_base_check_pmix_param(fv->mbvfv_var)) {
+                pmix_asprintf(&tmp, "PMIX_MCA_%s", fv->mbvfv_var);
+                // set it, but don't overwrite if they already
+                // have a value in our environment
+                setenv(tmp, fv->mbvfv_value, false);
+                free(tmp);
             }
         }
         PMIX_LIST_DESTRUCT(&params);
@@ -2059,7 +2150,7 @@ static int detect_proxy(char *personalities)
     /* if we were told the proxy, then use it */
     if (NULL != (evar = getenv("PRTE_MCA_schizo_proxy"))) {
         if (0 == strcmp(evar, "ompi")) {
-            return translate_params();
+            return 100;
         } else {
             return 0;
         }

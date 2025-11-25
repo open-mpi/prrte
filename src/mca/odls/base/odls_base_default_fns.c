@@ -19,7 +19,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2017      Mellanox Technologies Ltd. All rights reserved.
  * Copyright (c) 2017-2020 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -345,7 +345,7 @@ int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *buffer, pmix_n
      * the ability for transport specifications */
     PMIX_INFO_LIST_START(mlist);
 
-    asprintf(&tmp, "%s.net", jdata->nspace);
+    pmix_asprintf(&tmp, "%s.net", jdata->nspace);
     PMIX_INFO_LIST_ADD(ret, mlist, PMIX_ALLOC_NETWORK_ID, tmp, PMIX_STRING);
     free(tmp);
     PMIX_INFO_LIST_ADD(ret, mlist, PMIX_ALLOC_NETWORK_SEC_KEY, NULL, PMIX_BOOL);
@@ -652,8 +652,8 @@ next:
         /* add any cache'd values to the front of the job attributes  */
         for (m = 0; m < ninfo; m++) {
             if (0 == strcmp(info[m].key, PMIX_SET_ENVAR)) {
-                envt.envar = strdup(info[m].value.data.envar.envar);
-                envt.value = strdup(info[m].value.data.envar.value);
+                envt.envar = info[m].value.data.envar.envar;
+                envt.value = info[m].value.data.envar.value;
                 envt.separator = info[m].value.data.envar.separator;
                 prte_prepend_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR, PRTE_ATTR_GLOBAL,
                                        &envt, PMIX_ENVAR);
@@ -756,8 +756,8 @@ next:
 
     /* reset the mapped flags */
     for (n = 0; n < jdata->map->nodes->size; n++) {
-        if (NULL
-            != (node = (prte_node_t *) pmix_pointer_array_get_item(jdata->map->nodes, n))) {
+        node = (prte_node_t *) pmix_pointer_array_get_item(jdata->map->nodes, n);
+        if (NULL != node) {
             PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_MAPPED);
         }
     }
@@ -773,9 +773,9 @@ next:
      * have to do so AFTER we register the nspace so the PMIx server
      * has the nspace info it needs */
     if (0 < ninfo) {
-        if (PMIX_SUCCESS
-            != (ret = PMIx_server_setup_local_support(jdata->nspace, info, ninfo, ls_cbunc,
-                                                      &lock))) {
+        ret = PMIx_server_setup_local_support(jdata->nspace, info, ninfo,
+                                              ls_cbunc, &lock);
+        if (PMIX_SUCCESS != ret) {
             PMIX_ERROR_LOG(ret);
             rc = PRTE_ERROR;
             goto REPORT_ERROR;
@@ -821,7 +821,7 @@ REPORT_ERROR:
 static int setup_path(prte_app_context_t *app, char **wdir)
 {
     int rc = PRTE_SUCCESS;
-    char dir[MAXPATHLEN];
+    char dir[PRTE_PATH_MAX];
     char *session_dir;
     bool usercwd = false;
     prte_job_t *job;
@@ -935,7 +935,8 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
     prte_job_t *jobdat = cd->jdata;
     prte_app_context_t *app = cd->app;
     prte_proc_t *child = cd->child;
-    int rc, i;
+    int rc = PRTE_SUCCESS;
+    int i;
     bool found;
     prte_proc_state_t state;
     pmix_proc_t pproc;
@@ -947,29 +948,6 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
 
     PMIX_ACQUIRE_OBJECT(cd);
 
-    /* thread-protect common values */
-    cd->env = PMIX_ARGV_COPY_COMPAT(prte_launch_environ);
-    if (NULL != app->env) {
-        for (i = 0; NULL != app->env[i]; i++) {
-            /* find the '=' sign.
-             * strdup the env string to a tmp variable,
-             * since it is shared among apps.
-             */
-            char *tmp = strdup(app->env[i]);
-            ptr = strchr(tmp, '=');
-            if (NULL == ptr) {
-                PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-                rc = PRTE_ERR_BAD_PARAM;
-                state = PRTE_PROC_STATE_FAILED_TO_LAUNCH;
-                free(tmp);
-                goto errorout;
-            }
-            *ptr = '\0';
-            ++ptr;
-            PMIX_SETENV_COMPAT(tmp, ptr, true, &cd->env);
-            free(tmp);
-        }
-    }
 
     /* ensure we clear any prior info regarding state or exit status in
      * case this is a restart
@@ -978,6 +956,7 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
     PRTE_FLAG_UNSET(child, PRTE_PROC_FLAG_WAITPID);
 
     /* setup the pmix environment */
+    cd->env = PMIX_ARGV_COPY_COMPAT(app->env);
     PMIX_LOAD_PROCID(&pproc, child->name.nspace, child->name.rank);
     if (PMIX_SUCCESS != (ret = PMIx_server_setup_fork(&pproc, &cd->env))) {
         PMIX_ERROR_LOG(ret);
@@ -1118,12 +1097,160 @@ errorout:
     PMIX_RELEASE(cd);
 }
 
+static void process_envars(prte_job_t *jdata,
+                           prte_app_context_t *app)
+{
+    prte_attribute_t *attr;
+    pmix_value_t *val;
+    pmix_envar_t *envar;
+    char *ptr, *tmp, *p2;
+    size_t n;
+    bool found;
+
+    PMIX_LIST_FOREACH(attr, &jdata->attributes, prte_attribute_t) {
+        if (PMIX_ENVAR != attr->data.type) {
+            continue;
+        }
+        val = &attr->data;
+        envar = &val->data.envar;
+        if (attr->key == PRTE_JOB_SET_ENVAR) {
+            PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+
+        } else if (attr->key == PRTE_JOB_ADD_ENVAR) {
+            PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+
+        } else if (attr->key == PRTE_JOB_UNSET_ENVAR) {
+            // need to support the wildcard here
+            if (NULL != strchr(envar->envar, '*')) {
+                ptr = strdup(envar->envar);
+                ptr[strlen(ptr)-1] = '\0';  // trim off the '*'
+                for (n=0; NULL != app->env[n]; n++) {
+                    if (0 == strncmp(app->env[n], ptr, strlen(ptr))) {
+                        // find the '=' sign
+                        tmp = strdup(app->env[n]);
+                        p2 = strchr(tmp, '=');
+                        *p2 = '\0';
+                        pmix_unsetenv(tmp, &app->env);
+                        free(tmp);
+                    }
+                }
+                free(ptr);
+            } else {
+                pmix_unsetenv(envar->envar, &app->env);
+            }
+
+        } else if (attr->key == PRTE_JOB_PREPEND_ENVAR) {
+            // see if this envar exists
+            ptr = NULL;
+            found = false;
+            for (n=0; NULL != app->env[n]; n++) {
+                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
+                    // find the value - this is a copied env, so we can modify
+                    ptr = strchr(app->env[n], '=');
+                    ++ptr; // step over the '='
+                    pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, envar->value, envar->separator, ptr);
+                    free(app->env[n]);
+                    app->env[n] = tmp;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // didn't find it
+                PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+            }
+
+        } else if (attr->key == PRTE_JOB_APPEND_ENVAR) {
+            // see if this envar exists
+            ptr = NULL;
+            found = false;
+            for (n=0; NULL != app->env[n]; n++) {
+                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
+                    // find the value - this is a copied env, so we can modify
+                    ptr = strchr(app->env[n], '=');
+                    ++ptr; // step over the '='
+                    pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, ptr, envar->separator, envar->value);
+                    free(app->env[n]);
+                    app->env[n] = tmp;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // didn't find it
+                PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+            }
+        }
+    }
+
+    // app trumps job, so do it after the job
+    PMIX_LIST_FOREACH(attr, &app->attributes, prte_attribute_t) {
+        if (PMIX_ENVAR != attr->data.type) {
+            continue;
+        }
+        val = &attr->data;
+        envar = &val->data.envar;
+        if (attr->key == PRTE_APP_SET_ENVAR) {
+            PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+
+        } else if (attr->key == PRTE_APP_ADD_ENVAR) {
+            PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+
+        } else if (attr->key == PRTE_APP_UNSET_ENVAR) {
+            pmix_unsetenv(envar->envar, &app->env);
+
+        } else if (attr->key == PRTE_APP_PREPEND_ENVAR) {
+            // see if this envar exists
+            ptr = NULL;
+            found = false;
+            for (n=0; NULL != app->env[n]; n++) {
+                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
+                    // find the value - this is a copied env, so we can modify
+                    ptr = strchr(app->env[n], '=');
+                    ++ptr; // step over the '='
+                    pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, envar->value, envar->separator, ptr);
+                    free(app->env[n]);
+                    app->env[n] = tmp;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // didn't find it
+                PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+            }
+
+        } else if (attr->key == PRTE_APP_APPEND_ENVAR) {
+            // see if this envar exists
+            ptr = NULL;
+            found = false;
+            for (n=0; NULL != app->env[n]; n++) {
+                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
+                    // find the value - this is a copied env, so we can modify
+                    ptr = strchr(app->env[n], '=');
+                    ++ptr; // step over the '='
+                    pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, ptr, envar->separator, envar->value);
+                    free(app->env[n]);
+                    app->env[n] = tmp;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // didn't find it
+                PMIX_SETENV_COMPAT(envar->envar, envar->value, true, &app->env);
+            }
+        }
+    }
+}
+
+
 void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
 {
     prte_app_context_t *app;
     prte_proc_t *child = NULL;
     int rc = PRTE_SUCCESS;
-    char basedir[MAXPATHLEN];
+    char basedir[PRTE_PATH_MAX];
     int j, idx;
     int total_num_local_procs = 0;
     prte_odls_launch_local_t *caddy = (prte_odls_launch_local_t *) cbdata;
@@ -1131,11 +1258,10 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
     pmix_nspace_t job;
     prte_odls_base_fork_local_proc_fn_t fork_local = caddy->fork_local;
     bool index_argv;
-    char *msg;
+    char *msg, **xfer;
     prte_odls_spawn_caddy_t *cd;
     prte_event_base_t *evb;
     prte_schizo_base_module_t *schizo;
-
     PRTE_HIDE_UNUSED_PARAMS(fd, sd);
 
     PMIX_ACQUIRE_OBJECT(caddy);
@@ -1262,6 +1388,18 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
         }
 
         /* setup the environment for this app */
+        if (NULL == app->env) {
+            app->env = PMIX_ARGV_COPY_COMPAT(prte_launch_environ);
+        } else {
+            xfer = pmix_environ_merge(prte_launch_environ, app->env);
+            PMIX_ARGV_FREE_COMPAT(app->env);
+            app->env = xfer;
+        }
+
+        // process any provided env directives
+        process_envars(jobdat, app);
+
+
         if (PRTE_SUCCESS != (rc = schizo->setup_fork(jobdat, app))) {
 
             PMIX_OUTPUT_VERBOSE((10, prte_odls_base_framework.framework_output,
@@ -1978,7 +2116,7 @@ int prte_odls_base_default_restart_proc(prte_proc_t *child,
     int rc;
     prte_app_context_t *app;
     prte_job_t *jobdat;
-    char basedir[MAXPATHLEN];
+    char basedir[PRTE_PATH_MAX];
     char *wdir = NULL;
     prte_odls_spawn_caddy_t *cd;
     prte_event_base_t *evb;

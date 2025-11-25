@@ -18,7 +18,7 @@ dnl                         reserved.
 dnl Copyright (c) 2009      Oak Ridge National Labs.  All rights reserved.
 dnl
 dnl Copyright (c) 2016-2020 Intel, Inc.  All rights reserved.
-dnl Copyright (c) 2021-2023 Nanook Consulting  All rights reserved.
+dnl Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
 dnl Copyright (c) 2022      Amazon.com, Inc. or its affiliates.
 dnl                         All Rights reserved.
 dnl $COPYRIGHT$
@@ -31,6 +31,17 @@ dnl
 
 AC_DEFUN([PRTE_CONFIGURE_OPTIONS],[
 prte_show_subtitle "PRTE Configuration options"
+
+# A hint to tell us if we are working with a build from Git or a tarball.
+# Helpful when preparing diagnostic output.
+if test -e $PRTE_TOP_SRCDIR/.git; then
+    AC_DEFINE_UNQUOTED([PRTE_GIT_REPO_BUILD], ["1"],
+                       [If built from a git repo])
+    prte_git_repo_build=yes
+else
+    prte_git_repo_build=no
+fi
+
 
 #
 # Do we want prte's --prefix behavior to be enabled by default?
@@ -49,54 +60,6 @@ fi
 AC_DEFINE_UNQUOTED([PRTE_WANT_PRTE_PREFIX_BY_DEFAULT],
                    [$prte_want_prte_prefix_by_default],
                    [Whether we want prte to effect "--prefix $prefix" by default])
-
-#
-# Is this a developer copy?
-#
-
-if test -d .git; then
-    PRTE_DEVEL=1
-else
-    PRTE_DEVEL=0
-fi
-
-#
-# Developer picky compiler options
-#
-
-AC_MSG_CHECKING([if want developer-level compiler pickyness])
-AC_ARG_ENABLE(devel-check,
-    AS_HELP_STRING([--enable-devel-check],
-                   [enable developer-level compiler pickyness when building Open MPI (default: disabled)]))
-if test "$enable_devel_check" = "yes"; then
-    AC_MSG_RESULT([yes])
-    WANT_PICKY_COMPILER=1
-else
-    AC_MSG_RESULT([no])
-    WANT_PICKY_COMPILER=0
-fi
-
-AC_DEFINE_UNQUOTED(PRTE_PICKY_COMPILERS, $WANT_PICKY_COMPILER,
-                   [Whether or not we are using picky compiler settings])
-
-AC_MSG_CHECKING([if want memory sanitizers])
-AC_ARG_ENABLE(memory-sanitizers,
-    AS_HELP_STRING([--memory-sanitizers],
-                   [enable developer-level memory sanitizers when building PMIx (default: disabled)]))
-if test "$enable_memory_sanitizers" = "yes"; then
-    AC_MSG_RESULT([yes])
-    WANT_MEMORY_SANITIZERS=1
-    AC_MSG_WARN([******************************************************])
-    AC_MSG_WARN([**** Memory sanitizers may require that you LD_PRELOAD])
-    AC_MSG_WARN([**** libasan in order to run an executable.])
-    AC_MSG_WARN([******************************************************])
-else
-    AC_MSG_RESULT([no])
-    WANT_MEMORY_SANITIZERS=0
-fi
-
-AC_DEFINE_UNQUOTED(PRTE_MEMORY_SANITIZERS, $WANT_MEMORY_SANITIZERS,
-                   [Whether or not we are using memory sanitizers])
 
 #
 # Developer debugging
@@ -124,6 +87,50 @@ AC_DEFINE_UNQUOTED(PRTE_ENABLE_DEBUG, $WANT_DEBUG,
 AC_ARG_ENABLE(debug-symbols,
     AS_HELP_STRING([--disable-debug-symbols],
         [Disable adding compiler flags to enable debugging symbols if --enable-debug is specified.  For non-debugging builds, this flag has no effect.]))
+
+#
+# Developer picky compiler options
+#
+
+AC_MSG_CHECKING([if want developer-level compiler pickyness])
+AC_ARG_ENABLE(devel-check,
+    AS_HELP_STRING([--enable-devel-check],
+                   [enable developer-level compiler pickyness when building PRRTE (default: disabled)]))
+if test "$enable_devel_check" = "yes"; then
+    AC_MSG_RESULT([yes])
+    WANT_PICKY_COMPILER=1
+elif test "$enable_devel_check" = "no"; then
+    AC_MSG_RESULT([no])
+    WANT_PICKY_COMPILER=0
+elif test "$prte_git_repo_build" = "yes" && test "$WANT_DEBUG" = "1"; then
+    AC_MSG_RESULT([yes])
+    WANT_PICKY_COMPILER=1
+else
+    AC_MSG_RESULT([no])
+    WANT_PICKY_COMPILER=0
+fi
+
+AC_DEFINE_UNQUOTED(PRTE_PICKY_COMPILERS, $WANT_PICKY_COMPILER,
+                   [Whether or not we are using picky compiler settings])
+
+AC_MSG_CHECKING([if want memory sanitizers])
+AC_ARG_ENABLE(memory-sanitizers,
+    AS_HELP_STRING([--memory-sanitizers],
+                   [enable developer-level memory sanitizers when building PRRTE (default: disabled)]))
+if test "$enable_memory_sanitizers" = "yes"; then
+    AC_MSG_RESULT([yes])
+    WANT_MEMORY_SANITIZERS=1
+    AC_MSG_WARN([******************************************************])
+    AC_MSG_WARN([**** Memory sanitizers may require that you LD_PRELOAD])
+    AC_MSG_WARN([**** libasan in order to run an executable.])
+    AC_MSG_WARN([******************************************************])
+else
+    AC_MSG_RESULT([no])
+    WANT_MEMORY_SANITIZERS=0
+fi
+
+AC_DEFINE_UNQUOTED(PRTE_MEMORY_SANITIZERS, $WANT_MEMORY_SANITIZERS,
+                   [Whether or not we are using memory sanitizers])
 
 #
 # Do we want to install the internal devel headers?
@@ -376,5 +383,24 @@ else
 fi
 AC_DEFINE_UNQUOTED([PRTE_ENABLE_GETPWUID], [$prte_want_getpwuid],
                    [Disable getpwuid support (default: enabled)])
+
+# use header "shims" for 3rd-party libraries to test-build
+# the PLM launchers
+AC_MSG_CHECKING([if want to test-build PLM launchers that require 3rd-party headers/libraries])
+AC_ARG_ENABLE([testbuild-launchers],
+    [AS_HELP_STRING([--enable-testbuild-launchers],
+        [Test-build PLM launchers that require 3rd-party headers/libraries (default: disabled)])])
+if test "$enable_testbuild_launchers" = "yes"; then
+    AC_MSG_RESULT([yes])
+    prte_testbuild_launchers=1
+    prte_testbuild_launchers_msg=yes
+else
+    AC_MSG_RESULT([no])
+    prte_testbuild_launchers=0
+    prte_testbuild_launchers_msg=no
+fi
+AC_DEFINE_UNQUOTED([PRTE_TESTBUILD_LAUNCHERS], [$prte_testbuild_launchers],
+                   [Enable testbuild PLM launchers (default: disabled)])
+PRTE_SUMMARY_ADD([Miscellaneous], [Testbuild launchers], [], [$prte_testbuild_launchers_msg])
 
 ])dnl

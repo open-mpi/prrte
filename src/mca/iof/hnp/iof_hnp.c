@@ -292,10 +292,15 @@ static int hnp_pull(const pmix_proc_t *dst_name, prte_iof_tag_t src_tag, int fd)
      */
     if ((flags = fcntl(fd, F_GETFL, 0)) < 0) {
         pmix_output(prte_iof_base_framework.framework_output,
-                    "[%s:%d]: fcntl(F_GETFL) failed with errno=%d\n", __FILE__, __LINE__, errno);
+                    "[%s:%d]: fcntl(F_GETFL) failed with errno=%d\n",
+                    __FILE__, __LINE__, errno);
     } else {
         flags |= O_NONBLOCK;
-        fcntl(fd, F_SETFL, flags);
+        if (fcntl(fd, F_SETFL, flags) < 0) {
+            pmix_output(prte_iof_base_framework.framework_output,
+                        "[%s:%d]: fcntl(F_SETFL) failed with errno=%d\n",
+                        __FILE__, __LINE__, errno);
+        }
     }
 
     /* do we already have this process in our list? */
@@ -456,8 +461,9 @@ static void stdin_write_handler(int fd, short event, void *cbdata)
             PMIX_OUTPUT_VERBOSE((1, prte_iof_base_framework.framework_output,
                                  "%s hnp:stdin:write:handler incomplete write %d - adjusting data",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), num_written));
-            /* incomplete write - adjust data to avoid duplicate output */
-            memmove(output->data, &output->data[num_written], output->numbytes - num_written);
+            /* incomplete write - adjust data and count to avoid duplicate output */
+            output->numbytes -= num_written;
+            memmove(output->data, &output->data[num_written], output->numbytes);
             /* push this item back on the front of the list */
             pmix_list_prepend(&wev->outputs, item);
             /* leave the write event running so it will call us again

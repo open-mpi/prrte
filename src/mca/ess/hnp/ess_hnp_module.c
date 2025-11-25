@@ -100,7 +100,6 @@ static int rte_init(int argc, char **argv)
 {
     int ret;
     char *error = NULL;
-    char *contact_path;
     char *tmp;
     prte_job_t *jdata = NULL;
     prte_node_t *node;
@@ -223,8 +222,6 @@ static int rte_init(int argc, char **argv)
     node->daemon = proc;
     PRTE_FLAG_SET(node, PRTE_NODE_FLAG_DAEMON_LAUNCHED);
     node->state = PRTE_NODE_STATE_UP;
-    /* get our aliases - will include all the interface aliases captured in prte_init */
-    node->aliases = PMIX_ARGV_COPY_COMPAT(prte_process_info.aliases);
     /* record that the daemon job is running */
     jdata->num_procs = 1;
     jdata->state = PRTE_JOB_STATE_RUNNING;
@@ -253,6 +250,20 @@ static int rte_init(int argc, char **argv)
         error = "pmix_server_init";
         goto error;
     }
+
+    /* add network aliases to our list of alias hostnames - must
+     * wait until after we init PMIx before getting them */
+    pmix_ifgetaliases(&prte_process_info.aliases);
+
+    /* get our aliases - will include all the interface aliases captured in prte_init */
+    node->aliases = PMIX_ARGV_COPY_COMPAT(prte_process_info.aliases);
+
+    /* if we are using xml for output, put a start tag */
+    if (prte_xml_output) {
+        fprintf(stdout, "<%s>\n", prte_tool_basename);
+        fflush(stdout);
+    }
+
     /* Setup the communication infrastructure */
     if (PRTE_SUCCESS
         != (ret = pmix_mca_base_framework_open(&prte_prtereachable_base_framework,
@@ -468,9 +479,6 @@ error:
 
 static int rte_finalize(void)
 {
-    char *contact_path;
-    prte_job_t *jdata;
-
     /* first stage shutdown of the errmgr, deregister the handler but keep
      * the required facilities until the rml and oob are offline */
     prte_errmgr.finalize();
@@ -493,6 +501,11 @@ static int rte_finalize(void)
     (void) pmix_mca_base_framework_close(&prte_state_base_framework);
 
     free(prte_topo_signature);
+
+    if (prte_xml_output) {
+        fprintf(stdout, "</%s>\n", prte_tool_basename);
+        fflush(stdout);
+    }
 
     /* shutdown the pmix server */
     pmix_server_finalize();

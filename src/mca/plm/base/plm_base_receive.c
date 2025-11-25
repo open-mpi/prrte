@@ -17,7 +17,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -84,6 +84,8 @@ int prte_plm_base_comm_start(void)
                       PRTE_RML_PERSISTENT, prte_plm_base_daemon_failed, NULL);
         PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TOPOLOGY_REPORT,
                       PRTE_RML_PERSISTENT, prte_plm_base_daemon_topology, NULL);
+        PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_STACK_TRACE,
+                      PRTE_RML_PERSISTENT, prte_plm_base_stack_trace_recv, NULL);
     }
     recv_issued = true;
 
@@ -104,6 +106,7 @@ int prte_plm_base_comm_stop(void)
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_PRTED_CALLBACK);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_REPORT_REMOTE_LAUNCH);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TOPOLOGY_REPORT);
+        PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_STACK_TRACE);
     }
     recv_issued = false;
 
@@ -118,10 +121,11 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
     prte_plm_cmd_flag_t command;
     int32_t count;
     pmix_nspace_t job;
-    prte_job_t *jdata, *parent, jb;
+    prte_job_t *jdata, *parent;
     pmix_data_buffer_t *answer;
     pmix_rank_t vpid;
     prte_proc_t *proc;
+    prte_node_t *node;
     prte_proc_state_t state;
     prte_exit_code_t exit_code;
     int32_t rc = PRTE_SUCCESS, ret;
@@ -130,14 +134,13 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
     pid_t pid;
     bool debugging, found;
     int i, room, *rmptr = &room;
-    char **env;
-    char *prefix_dir, *tmp;
-    pmix_rank_t tgt, *tptr;
+    char **env, *tmp;
     pmix_value_t pidval = PMIX_VALUE_STATIC_INIT;
     PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
 
     PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                         "%s plm:base:receive processing msg", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                         "%s plm:base:receive processing msg",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
     count = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &command, &count, PMIX_UINT8);
@@ -147,9 +150,9 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
     }
 
     switch (command) {
-    case PRTE_PLM_ALLOC_JOBID_CMD:
+    case PRTE_PLM_TOOL_ATTACHED_CMD:
         /* set default return value */
-        PMIX_LOAD_NSPACE(job, NULL);
+        ret = PMIX_SUCCESS;
 
         /* unpack the room number of the request so we can return it to them */
         count = 1;
@@ -158,24 +161,100 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             PMIX_ERROR_LOG(rc);
             goto CLEANUP;
         }
-        /* the new nspace is our base nspace with an "@N" extension */
-        pmix_asprintf(&tmp, "%s@%u", prte_plm_globals.base_nspace, prte_plm_globals.next_jobid);
-        PMIX_LOAD_NSPACE(job, tmp);
-        free(tmp);
-        prte_plm_globals.next_jobid++;
-        PMIX_CONSTRUCT(&jb, prte_job_t);
+        // see if they need a new jobid assigned
+        count = 1;
+        rc = PMIx_Data_unpack(NULL, buffer, &found, &count, PMIX_BOOL);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            goto CLEANUP;
+        }
+        // if so, then get the rank of the tool
+        if (found) {
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &name.rank, &count, PMIX_PROC_RANK);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                goto CLEANUP;
+            }
+            /* the new nspace is our base nspace with an "@N" extension */
+            pmix_asprintf(&tmp, "%s@%u", prte_plm_globals.base_nspace, prte_plm_globals.next_jobid);
+            PMIX_LOAD_NSPACE(name.nspace, tmp);
+            free(tmp);
+            prte_plm_globals.next_jobid++;
 
+        } else {
+            // get the full procID of the tool
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &name, &count, PMIX_PROC);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                goto CLEANUP;
+            }
+        }
+        // see if we already have this job
+        jdata = prte_get_job_data_object(name.nspace);
+        if (NULL != jdata) {
+            // we do - check if we already have this proc
+            proc = (prte_proc_t*)pmix_pointer_array_get_item(jdata->procs, name.rank);
+            if (NULL == proc) {
+                // new rank for this tool - add it
+                proc = PMIX_NEW(prte_proc_t);
+                memcpy(&proc->name, &name, sizeof(pmix_proc_t));
+                proc->state = PRTE_PROC_STATE_RUNNING;
+                pmix_pointer_array_set_item(jdata->procs, name.rank, proc);
+                jdata->num_procs++;
+            } else {
+                ret = PMIX_ERR_VALUE_OUT_OF_BOUNDS;
+            }
+        } else {
+            // unpack the cmd line
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &tmp, &count, PMIX_STRING);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                goto CLEANUP;
+            }
+            // and the pid
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &pid, &count, PMIX_PID);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                free(tmp);
+                goto CLEANUP;
+            }
+
+            // need to add the tool job
+            jdata = PMIX_NEW(prte_job_t);
+            PMIX_LOAD_NSPACE(jdata->nspace, name.nspace);
+            PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
+            rc = prte_set_job_data_object(jdata);
+            app = PMIX_NEW(prte_app_context_t);
+            if (NULL != tmp) {
+                app->argv = PMIx_Argv_split(tmp, ' ');
+                free(tmp);
+                app->app = strdup(app->argv[0]);
+            } else {
+                app->app = strdup("unknown");
+                PMIx_Argv_append_nosize(&app->argv, "unknown");
+            }
+            pmix_pointer_array_set_item(jdata->apps, 0, app);
+            jdata->num_apps++;
+            proc = PMIX_NEW(prte_proc_t);
+            memcpy(&proc->name, &name, sizeof(pmix_proc_t));
+            proc->pid = pid;
+            proc->state = PRTE_PROC_STATE_RUNNING;
+            pmix_pointer_array_set_item(jdata->procs, name.rank, proc);
+            // find the node it is on
+            node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, sender->rank);
+            PMIX_RETAIN(node);
+            proc->node = node;
+            jdata->num_procs = 1;
+        }
         /* setup the response */
         PMIX_DATA_BUFFER_CREATE(answer);
 
         /* pack the status to be returned */
-        rc = PMIx_Data_pack(NULL, answer, &rc, 1, PMIX_INT32);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-        }
-
-        /* pack the jobid */
-        rc = PMIx_Data_pack(NULL, answer, &job, 1, PMIX_PROC_NSPACE);
+        rc = PMIx_Data_pack(NULL, answer, &ret, 1, PMIX_INT32);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
         }
@@ -186,8 +265,17 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             PMIX_ERROR_LOG(rc);
         }
 
+        if (PRTE_SUCCESS == ret) {
+            // pack the namespace of the tool - we may have provided the namespace,
+            // or it may be just the one they sent us
+            rc = PMIx_Data_pack(NULL, answer, name.nspace, 1, PMIX_PROC_NSPACE);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+            }
+        }
+
         /* send the response back to the sender */
-        PRTE_RML_SEND(ret, sender->rank, answer, PRTE_RML_TAG_JOBID_RESP);
+        PRTE_RML_SEND(ret, sender->rank, answer, PRTE_RML_TAG_TCONN_RESP);
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             PMIX_DATA_BUFFER_RELEASE(answer);
@@ -247,24 +335,19 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             }
             /* if the prefix was set in the parent's job, we need to transfer
              * that prefix to the child's app_context so any further launch of
-             * orteds can find the correct binary. There always has to be at
+             * procs can find the correct library. There always has to be at
              * least one app_context in both parent and child, so we don't
              * need to check that here. However, be sure not to overwrite
              * the prefix if the user already provided it!
              */
             app = (prte_app_context_t *) pmix_pointer_array_get_item(parent->apps, 0);
             child_app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
-            if (NULL != app && NULL != child_app) {
-                prefix_dir = NULL;
-                if (prte_get_attribute(&app->attributes, PRTE_APP_PREFIX_DIR,
-                                       (void **) &prefix_dir, PMIX_STRING)
-                    && !prte_get_attribute(&child_app->attributes, PRTE_APP_PREFIX_DIR, NULL,
-                                           PMIX_STRING)) {
-                    prte_set_attribute(&child_app->attributes, PRTE_APP_PREFIX_DIR,
-                                       PRTE_ATTR_GLOBAL, prefix_dir, PMIX_STRING);
-                }
-                if (NULL != prefix_dir) {
-                    free(prefix_dir);
+            if (NULL != app && NULL != app->env && NULL != child_app) {
+                for (i=0; NULL != app->env[i]; i++) {
+                    if (0 == strncmp(app->env[i], "PMIX_PREFIX", strlen("PMIX_PREFIX"))) {
+                        PMIx_Argv_append_unique_nosize(&child_app->env, app->env[i]);
+                        break;
+                    }
                 }
             }
         }
@@ -295,7 +378,8 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             goto ANSWER_LAUNCH;
         }
 
-        if (NULL != parent && !PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL)) {
+        if (NULL != parent && !PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL) &&
+            !PMIX_CHECK_NSPACE(parent->nspace, PRTE_PROC_MY_NAME->nspace)) {
             if (NULL == parent->bookmark) {
                 /* find the sender's node in the job map */
                 proc = (prte_proc_t *) pmix_pointer_array_get_item(parent->procs, sender->rank);
@@ -493,7 +577,6 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
                  * the state cbfunc update it as it may need to compare this
                  * state against the prior proc state */
                 proc->pid = pid;
-                tptr = &tgt;
                 if (debugging) {
                     jdata->num_ready_for_debug++;
                 }

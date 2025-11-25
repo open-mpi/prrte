@@ -17,7 +17,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2016-2020 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023      Advanced Micro Devices, Inc. All rights reserved.
  * $COPYRIGHT$
  *
@@ -128,8 +128,8 @@ void prte_plm_base_daemons_reported(int fd, short args, void *cbdata)
 
     /* if we are not launching, then we just assume that all
      * daemons share our topology */
-    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)
-        && PMIX_CHECK_NSPACE(caddy->jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
+    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL) &&
+        PMIX_CHECK_NSPACE(caddy->jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
         node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
         t = node->topology;
         for (i = 1; i < prte_node_pool->size; i++) {
@@ -328,8 +328,9 @@ static void spawn_timeout_cb(int fd, short event, void *cbdata)
     }
 }
 
-static void stack_trace_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
-                             prte_rml_tag_t tag, void *cbdata)
+void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
+                                    pmix_data_buffer_t *buffer,
+                                    prte_rml_tag_t tag, void *cbdata)
 {
     pmix_byte_object_t pbo;
     pmix_data_buffer_t blob;
@@ -345,7 +346,7 @@ static void stack_trace_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t
     int rc;
     pmix_byte_object_t bo;
 
-    PMIX_DATA_BUFFER_CONSTRUCT(&blob);    
+    PMIX_DATA_BUFFER_CONSTRUCT(&blob);
     PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
 
     pmix_output_verbose(5, prte_plm_base_framework.framework_output,
@@ -479,13 +480,108 @@ static void stack_trace_timeout(int sd, short args, void *cbdata)
     PMIX_DESTRUCT(&parray);
 }
 
+static void dump_job(prte_job_t *jdata)
+{
+    pmix_proc_t pc;
+    prte_proc_t *proc;
+    pmix_byte_object_t bo;
+    char *st;
+    int i;
+
+    PMIX_LOAD_PROCID(&pc, jdata->nspace, PMIX_RANK_WILDCARD);
+    pmix_asprintf(&st, "DATA FOR JOB: %s\n", PRTE_JOBID_PRINT(jdata->nspace));
+    bo.bytes = st;
+    bo.size = strlen(st);
+    PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+    free(st);
+    pmix_asprintf(&st, "\tNum apps: %d\tNum procs: %d\tJobState: %s\tAbort: %s\n",
+                  (int) jdata->num_apps, (int) jdata->num_procs, prte_job_state_to_str(jdata->state),
+                  (PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) ? "True" : "False");
+    bo.bytes = st;
+    bo.size = strlen(st);
+    PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+    free(st);
+    pmix_asprintf(&st, "\tNum launched: %ld\tNum reported: %ld\tNum terminated: %ld\n\n\tProcs:\n",
+                  (long) jdata->num_launched, (long) jdata->num_reported,
+                  (long) jdata->num_terminated);
+    bo.bytes = st;
+    bo.size = strlen(st);
+    PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+    free(st);
+    for (i = 0; i < jdata->procs->size; i++) {
+        if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, i))) {
+            pmix_asprintf(&st, "\t\tRank: %s\tNode: %s\tPID: %u\tState: %s\tExitCode %d\n",
+                          PRTE_VPID_PRINT(proc->name.rank),
+                          (NULL == proc->node) ? "UNKNOWN" : proc->node->name,
+                          (unsigned int) proc->pid, prte_proc_state_to_str(proc->state),
+                          proc->exit_code);
+            bo.bytes = st;
+            bo.size = strlen(st);
+            PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+            free(st);
+        }
+    }
+    st = "\n";
+    bo.bytes = st;
+    bo.size = strlen(st);
+    PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+}
+
+static int get_traces(prte_job_t *jdata)
+{
+    prte_daemon_cmd_flag_t command = PRTE_DAEMON_GET_STACK_TRACES;
+    pmix_data_buffer_t buffer;
+    pmix_byte_object_t bo;
+    pmix_proc_t pc;
+    pmix_status_t rc;
+    prte_grpcomm_signature_t *sig;
+
+    PMIX_LOAD_PROCID(&pc, jdata->nspace, PMIX_RANK_WILDCARD);
+    bo.bytes = "Waiting for stack traces (this may take a few moments)...\n";
+    bo.size = strlen(bo.bytes);
+    PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+
+
+    /* setup the buffer */
+    PMIX_DATA_BUFFER_CONSTRUCT(&buffer);
+    /* pack the command */
+    rc = PMIx_Data_pack(NULL, &buffer, &command, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_DESTRUCT(&buffer);
+        return PRTE_ERROR;
+    }
+    /* pack the jobid */
+    rc = PMIx_Data_pack(NULL, &buffer, &jdata->nspace, 1, PMIX_PROC_NSPACE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_DESTRUCT(&buffer);
+        return PRTE_ERROR;
+    }
+    /* goes to all daemons */
+    sig = PMIX_NEW(prte_grpcomm_signature_t);
+    sig->signature = (pmix_proc_t *) malloc(sizeof(pmix_proc_t));
+    PMIX_LOAD_PROCID(&sig->signature[0], PRTE_PROC_MY_NAME->nspace, PMIX_RANK_WILDCARD);
+    sig->sz = 1;
+    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(sig, PRTE_RML_TAG_DAEMON, &buffer))) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_RELEASE(sig);
+        PMIX_DATA_BUFFER_DESTRUCT(&buffer);
+        return PRTE_ERROR;
+    }
+    PMIX_DATA_BUFFER_DESTRUCT(&buffer);
+    PMIX_RELEASE(sig);
+    return PRTE_SUCCESS;
+}
+
 static void job_timeout_cb(int fd, short event, void *cbdata)
 {
     prte_job_t *jdata = (prte_job_t *) cbdata;
     prte_timer_t *timer = NULL;
-    prte_proc_t *proc, prc;
+    prte_proc_t *prc;
+    prte_job_t *child;
     pmix_proc_t pc;
-    int i, rc, timeout, *tp;
+    int rc, timeout, *tp, i;
     pmix_pointer_array_t parray;
     pmix_byte_object_t bo;
     char *st;
@@ -519,90 +615,30 @@ static void job_timeout_cb(int fd, short event, void *cbdata)
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_STATE, NULL, PMIX_BOOL)) {
         /* output the results - note that the output might need to go to a
          * tool instead of just to stderr, so we use the PMIx IOF deliver
-         * function to ensure it gets where it needs to go */
-        pmix_asprintf(&st, "DATA FOR JOB: %s\n", PRTE_JOBID_PRINT(jdata->nspace));
-        bo.bytes = st;
-        bo.size = strlen(st);
-        PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
-        free(st);
-        pmix_asprintf(&st, "\tNum apps: %d\tNum procs: %d\tJobState: %s\tAbort: %s\n",
-                      (int) jdata->num_apps, (int) jdata->num_procs, prte_job_state_to_str(jdata->state),
-                      (PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ABORTED)) ? "True" : "False");
-        bo.bytes = st;
-        bo.size = strlen(st);
-        PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
-        free(st);
-        pmix_asprintf(&st, "\tNum launched: %ld\tNum reported: %ld\tNum terminated: %ld\n\n\tProcs:\n",
-                      (long) jdata->num_launched, (long) jdata->num_reported,
-                      (long) jdata->num_terminated);
-        bo.bytes = st;
-        bo.size = strlen(st);
-        PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
-        free(st);
-        for (i = 0; i < jdata->procs->size; i++) {
-            if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, i))) {
-                pmix_asprintf(&st, "\t\tRank: %s\tNode: %s\tPID: %u\tState: %s\tExitCode %d\n",
-                              PRTE_VPID_PRINT(proc->name.rank),
-                              (NULL == proc->node) ? "UNKNOWN" : proc->node->name,
-                              (unsigned int) proc->pid, prte_proc_state_to_str(proc->state),
-                              proc->exit_code);
-                bo.bytes = st;
-                bo.size = strlen(st);
-                PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
-                free(st);
-            }
-        }
-        st = "\n";
-        bo.bytes = st;
-        bo.size = strlen(st);
-        PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+         * function to ensure it gets where it needs to go. */
+        dump_job(jdata);
+    }
+
+    /* Do this for all its child jobs, if any */
+    PMIX_LIST_FOREACH(child, &jdata->children, prte_job_t) {
+        dump_job(child);
     }
 
     /* see if they want stacktraces */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_STACKTRACES, NULL, PMIX_BOOL)) {
         /* if they asked for stack_traces, attempt to get them, but timeout
          * if we cannot do so */
-        prte_daemon_cmd_flag_t command = PRTE_DAEMON_GET_STACK_TRACES;
-        pmix_data_buffer_t buffer;
-        prte_grpcomm_signature_t *sig;
-
-        bo.bytes = "Waiting for stack traces (this may take a few moments)...\n";
-        bo.size = strlen(bo.bytes);
-        PMIx_server_IOF_deliver(&pc, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
-
-        /* set the recv */
-        PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_STACK_TRACE,
-                      PRTE_RML_PERSISTENT, stack_trace_recv, NULL);
-
-        /* setup the buffer */
-        PMIX_DATA_BUFFER_CONSTRUCT(&buffer);
-        /* pack the command */
-        rc = PMIx_Data_pack(NULL, &buffer, &command, 1, PMIX_UINT8);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_DESTRUCT(&buffer);
+        rc = get_traces(jdata);
+        if (PRTE_SUCCESS != rc) {
             goto giveup;
         }
-        /* pack the jobid */
-        rc = PMIx_Data_pack(NULL, &buffer, &jdata->nspace, 1, PMIX_PROC_NSPACE);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_DESTRUCT(&buffer);
-            goto giveup;
+        // get traces for child jobs too
+        PMIX_LIST_FOREACH(child, &jdata->children, prte_job_t) {
+            rc = get_traces(child);
+            if (PRTE_SUCCESS != rc) {
+                goto giveup;
+            }
         }
-        /* goes to all daemons */
-        sig = PMIX_NEW(prte_grpcomm_signature_t);
-        sig->signature = (pmix_proc_t *) malloc(sizeof(pmix_proc_t));
-        PMIX_LOAD_PROCID(&sig->signature[0], PRTE_PROC_MY_NAME->nspace, PMIX_RANK_WILDCARD);
-        sig->sz = 1;
-        if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(sig, PRTE_RML_TAG_DAEMON, &buffer))) {
-            PRTE_ERROR_LOG(rc);
-            PMIX_DATA_BUFFER_DESTRUCT(&buffer);
-            goto giveup;
-        }
-        PMIX_DATA_BUFFER_DESTRUCT(&buffer);
-        /* maintain accounting */
-        PMIX_RELEASE(sig);
         /* we will terminate after we get the stack_traces, but set a timeout
          * just in case we never hear back from everyone */
         if (prte_stack_trace_wait_timeout > 0) {
@@ -621,10 +657,29 @@ static void job_timeout_cb(int fd, short event, void *cbdata)
 giveup:
     /* abort the job */
     PMIX_CONSTRUCT(&parray, pmix_pointer_array_t);
-    PMIX_LOAD_PROCID(&prc.name, jdata->nspace, PMIX_RANK_WILDCARD);
-    pmix_pointer_array_add(&parray, &prc);
+    pmix_pointer_array_init(&parray,
+                            PRTE_GLOBAL_ARRAY_BLOCK_SIZE,
+                            PRTE_GLOBAL_ARRAY_MAX_SIZE,
+                            PRTE_GLOBAL_ARRAY_BLOCK_SIZE);
+
+    prc = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&prc->name, jdata->nspace, PMIX_RANK_WILDCARD);
+    pmix_pointer_array_add(&parray, prc);
+    PMIX_LIST_FOREACH(child, &jdata->children, prte_job_t) {
+        prc = PMIX_NEW(prte_proc_t);
+        PMIX_LOAD_PROCID(&prc->name, child->nspace, PMIX_RANK_WILDCARD);
+        pmix_pointer_array_add(&parray, prc);
+    }
     if (PRTE_SUCCESS != (rc = prte_plm.terminate_procs(&parray))) {
         PRTE_ERROR_LOG(rc);
+    }
+    for (i=0; i < parray.size; i++) {
+        prc = (prte_proc_t *) pmix_pointer_array_get_item(&parray, i);
+        if (NULL == prc) {
+            continue;
+        }
+        pmix_pointer_array_set_item(&parray, i, NULL);
+        PMIX_RELEASE(prc);
     }
     PMIX_DESTRUCT(&parray);
 }
@@ -640,7 +695,8 @@ void prte_plm_base_setup_job(int fd, short args, void *cbdata)
 
     PMIX_ACQUIRE_OBJECT(caddy);
 
-    PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output, "%s plm:base:setup_job",
+    PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                         "%s plm:base:setup_job",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
     if (PRTE_JOB_STATE_INIT != caddy->job_state) {
@@ -687,6 +743,17 @@ void prte_plm_base_setup_job(int fd, short args, void *cbdata)
         prte_set_attribute(&caddy->jdata->attributes, PRTE_JOB_TIMEOUT_EVENT, PRTE_ATTR_LOCAL, timer, PMIX_POINTER);
         PMIX_POST_OBJECT(timer);
         prte_event_evtimer_add(timer->ev, &timer->tv);
+    }
+
+    // if we are not going to launch this job, then ensure we output something - otherwise,
+    // we will simply silently exit
+    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL) &&
+        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_MAP, NULL, PMIX_BOOL) &&
+        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, NULL, PMIX_BOOL)) {
+        pmix_output(0, "SETTING");
+        // default to the devel map
+        prte_set_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, PRTE_ATTR_GLOBAL,
+                           NULL, PMIX_BOOL);
     }
 
     /* set the job state to the next position */
@@ -1101,6 +1168,73 @@ void prte_plm_base_registered(int fd, short args, void *cbdata)
 static bool prted_failed_launch;
 static prte_job_t *jdatorted = NULL;
 
+typedef struct {
+    pmix_list_item_t super;
+    pmix_rank_t rank;
+    prte_proc_t *daemon;
+    char *sig;
+    prte_topology_t *t;
+} dcaddy_t;
+static void dcon(dcaddy_t *p)
+{
+    p->daemon = NULL;
+    p->sig = NULL;
+    p->t = NULL;
+}
+static void ddes(dcaddy_t *p)
+{
+    if (NULL != p->sig) {
+        free(p->sig);
+    }
+}
+static PMIX_CLASS_INSTANCE(dcaddy_t,
+                           pmix_list_item_t,
+                           dcon, ddes);
+
+static void progress_daemons(prte_job_t *daemons,
+                             bool show_progress)
+{
+    int i;
+    prte_job_t *jdata;
+
+    if (prted_failed_launch) {
+        PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_FAILED_TO_START);
+        return;
+    } else {
+        if (show_progress &&
+            (0 == daemons->num_reported % 100 ||
+             daemons->num_reported == prte_process_info.num_daemons)) {
+            PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_REPORT_PROGRESS);
+        }
+        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                             "%s plm:base:progress_daemons recvd %d of %d reported daemons",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), daemons->num_reported,
+                             daemons->num_procs));
+
+        if (daemons->num_procs == daemons->num_reported) {
+            bool oneactivated = false;
+            daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
+            /* activate the daemons_reported state for all jobs
+             * whose daemons were launched
+             */
+            for (i = 1; i < prte_job_data->size; i++) {
+                jdata = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, i);
+                if (NULL == jdata) {
+                    continue;
+                }
+                if (PRTE_JOB_STATE_DAEMONS_LAUNCHED == jdata->state) {
+                    oneactivated = true;
+                    PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_REPORTED);
+                }
+            }
+            if (!oneactivated) {
+                /* must be launching a DVM - activate the state */
+                PRTE_ACTIVATE_JOB_STATE(daemons, PRTE_JOB_STATE_DAEMONS_REPORTED);
+            }
+        }
+    }
+}
+
 /* callback for topology reports */
 void prte_plm_base_daemon_topology(int status, pmix_proc_t *sender,
                                    pmix_data_buffer_t *buffer,
@@ -1109,30 +1243,24 @@ void prte_plm_base_daemon_topology(int status, pmix_proc_t *sender,
     hwloc_topology_t topo;
     int rc, idx;
     char *sig;
-    prte_proc_t *daemon = NULL, *dptr, *dnxt;
-    prte_topology_t *t, *t2;
-    int i;
-    prte_job_t *jdata;
+    bool show_progress;
     uint8_t flag;
     pmix_data_buffer_t datbuf, *data;
     pmix_byte_object_t bo, pbo;
     pmix_topology_t ptopo;
+    dcaddy_t *dc, *dcnext;
     PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
 
-    PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                         "%s plm:base:daemon_topology recvd for daemon %s",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender)));
+    pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                        "%s plm:base:daemon_topology recvd from daemon %u",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), sender->rank);
 
     /* get the daemon job, if necessary */
     if (NULL == jdatorted) {
         jdatorted = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
     }
-    daemon = (prte_proc_t *) pmix_pointer_array_get_item(jdatorted->procs, sender->rank);
-    if (NULL == daemon) {
-        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        prted_failed_launch = true;
-        goto CLEANUP;
-    }
+    show_progress = prte_get_attribute(&jdatorted->attributes, PRTE_JOB_SHOW_PROGRESS, NULL, PMIX_BOOL);
+
     PMIX_DATA_BUFFER_CONSTRUCT(&datbuf);
     /* unpack the flag to see if this payload is compressed */
     idx = 1;
@@ -1181,28 +1309,6 @@ void prte_plm_base_daemon_topology(int status, pmix_proc_t *sender,
         goto CLEANUP;
     }
 
-    /* find it in the array */
-    t = NULL;
-    for (i = 0; i < prte_node_topologies->size; i++) {
-        t2 = (prte_topology_t *) pmix_pointer_array_get_item(prte_node_topologies, i);
-        if (NULL == t2) {
-            continue;
-        }
-        /* just check the signature */
-        if (0 == strcmp(sig, t2->sig)) {
-            t = t2;
-            break;
-        }
-    }
-    free(sig);
-    if (NULL == t) {
-        /* should never happen */
-        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        prted_failed_launch = true;
-        PMIX_DATA_BUFFER_DESTRUCT(data);
-        goto CLEANUP;
-    }
-
     /* unpack the topology */
     idx = 1;
     rc = PMIx_Data_unpack(NULL, data, &ptopo, &idx, PMIX_TOPO);
@@ -1216,66 +1322,39 @@ void prte_plm_base_daemon_topology(int status, pmix_proc_t *sender,
     ptopo.topology = NULL;
     PMIX_TOPOLOGY_DESTRUCT(&ptopo);
     PMIX_DATA_BUFFER_DESTRUCT(data);
-    /* record the final topology */
-    t->topo = topo;
-    /* update the node's available processors */
-    if (NULL != daemon->node->available) {
-        hwloc_bitmap_free(daemon->node->available);
-    }
-    /* Apply any CPU filters (not preserved by the XML) */
-    daemon->node->available = prte_hwloc_base_filter_cpus(topo);
 
-    /* process any cached daemons that match this signature */
-    PMIX_LIST_FOREACH_SAFE(dptr, dnxt, &prte_plm_globals.daemon_cache, prte_proc_t) {
-        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                             "%s plm:base:report_topo processing cached daemon %s",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                             PRTE_NAME_PRINT(&dptr->name)));
-        if (0 == strcmp(dptr->node->topology->sig, t->sig)) {
-            dptr->node->topology = t;
-            dptr->node->available = prte_hwloc_base_filter_cpus(topo);
+    // search the cache for matching signatures
+    PMIX_LIST_FOREACH_SAFE(dc, dcnext, &prte_plm_globals.daemon_cache, dcaddy_t) {
+        if (0 == strcmp(sig, dc->sig)) {
+            dc->t->topo = topo;
+            dc->daemon->node->topology = dc->t;
+            /* update the node's available processors */
+            if (NULL != dc->daemon->node->available) {
+                hwloc_bitmap_free(dc->daemon->node->available);
+            }
+            /* Apply any CPU filters (not preserved by the XML) */
+            if (NULL == dc->daemon->node->available) {
+                dc->daemon->node->available = prte_hwloc_base_filter_cpus(topo);
+            }
+            pmix_list_remove_item(&prte_plm_globals.daemon_cache, &dc->super);
+            PMIX_RELEASE(dc);
+            // track that his daemon is now complete
             jdatorted->num_reported++;
-            pmix_list_remove_item(&prte_plm_globals.daemon_cache, &dptr->super);
+            jdatorted->num_daemons_reported++;
         }
     }
+
+    // setup the topology's summary
+    prte_hwloc_base_setup_summary(topo);
+
 
 CLEANUP:
     PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                         "%s plm:base:orted:report_topo launch %s for daemon %s",
+                         "%s plm:base:daemon_topology launch %s for daemon %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                         prted_failed_launch ? "failed" : "completed", PRTE_NAME_PRINT(sender)));
-
-    if (prted_failed_launch) {
-        PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_FAILED_TO_START);
-        return;
-    } else {
-        jdatorted->num_reported++;
-        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                             "%s plm:base:orted_report_launch recvd %d of %d reported daemons",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), jdatorted->num_reported,
-                             jdatorted->num_procs));
-        if (jdatorted->num_procs == jdatorted->num_reported) {
-            bool dvm = true;
-            jdatorted->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
-            /* activate the daemons_reported state for all jobs
-             * whose daemons were launched
-             */
-            for (i = 1; i < prte_job_data->size; i++) {
-                jdata = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, i);
-                if (NULL == jdata) {
-                    continue;
-                }
-                dvm = false;
-                if (PRTE_JOB_STATE_DAEMONS_LAUNCHED == jdata->state) {
-                    PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_REPORTED);
-                }
-            }
-            if (dvm) {
-                /* must be launching a DVM - activate the state */
-                PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_DAEMONS_REPORTED);
-            }
-        }
-    }
+                         prted_failed_launch ? "failed" : "completed",
+                         PRTE_NAME_PRINT(sender)));
+    progress_daemons(jdatorted, show_progress);
 }
 
 static void opcbfunc(pmix_status_t status, void *cbdata)
@@ -1292,14 +1371,13 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
     int idx;
     pmix_status_t ret;
     prte_proc_t *daemon = NULL, *dptr;
-    prte_job_t *jdata;
     pmix_proc_t dname;
     pmix_data_buffer_t *relay;
     char *sig;
     prte_topology_t *t, *mytopo;
     hwloc_topology_t topo;
     int i;
-    bool found;
+    bool found, show_progress;
     prte_daemon_cmd_flag_t cmd;
     char *alias;
     uint8_t naliases, ni;
@@ -1313,7 +1391,8 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
     pmix_data_buffer_t datbuf, *data;
     pmix_topology_t ptopo;
     pmix_value_t cnctinfo;
-    pmix_list_t cachelist;
+    char *myendian;
+    dcaddy_t *dc, *dcnext;
 
     PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
 
@@ -1321,22 +1400,26 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
     if (NULL == jdatorted) {
         jdatorted = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
     }
+    show_progress = prte_get_attribute(&jdatorted->attributes, PRTE_JOB_SHOW_PROGRESS, NULL, PMIX_BOOL);
 
     /* get my topology */
     mytopo = (prte_topology_t *) pmix_pointer_array_get_item(prte_node_topologies, 0);
     if (NULL == mytopo) {
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        prted_failed_launch = true;
-        goto CLEANUP;
+        PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_FAILED_TO_START);
+        return;
     }
+    myendian = strrchr(mytopo->sig, ':');
+    ++myendian;
 
     /* multiple daemons could be in this buffer, so unpack until we exhaust the data */
     idx = 1;
-    while (PMIX_SUCCESS == (ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC))) {
+    ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
+    while (PMIX_SUCCESS == ret) {
 
         pmix_output_verbose(5, prte_plm_base_framework.framework_output,
-                             "%s plm:base:orted_report_launch from daemon %s",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&dname));
+                            "%s plm:base:prted_report_launch from daemon %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&dname));
 
         /* update state and record for this daemon contact info */
         daemon = (prte_proc_t *) pmix_pointer_array_get_item(jdatorted->procs, dname.rank);
@@ -1387,7 +1470,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
         }
 
         PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                             "%s plm:base:orted_report_launch from daemon %s on node %s",
+                             "%s plm:base:prted_report_launch from daemon %s on node %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&daemon->name),
                              nodename));
 
@@ -1446,26 +1529,30 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             prted_failed_launch = true;
             goto CLEANUP;
         }
-        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                             "%s RECEIVED TOPOLOGY SIG %s FROM NODE %s",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), sig, nodename));
+        pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                            "%s RECEIVED TOPOLOGY SIG %s FROM NODE %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), sig, nodename);
 
-        if (NULL == prte_base_compute_node_sig) {
-            prte_base_compute_node_sig = strdup(sig);
-            if (prte_hnp_is_allocated && 0 != strcmp(sig, mytopo->sig)) {
-                prte_hetero_nodes = true;
+        // if we have different endianess, then error out
+        ptr = strrchr(sig, ':');
+        ++ptr;
+        if (0 != strcmp(ptr, myendian)) {
+            // we don't support multi-endian operations
+            pmix_show_help("help-plm-base.txt", "multi-endian", true,
+                           nodename, ptr, myendian);
+            prted_failed_launch = true;
+            if (NULL != sig) {
+                free(sig);
             }
-        } else if (!prte_hetero_nodes) {
-            if (0 != strcmp(sig, prte_base_compute_node_sig) ||
-                (prte_hnp_is_allocated && 0 != strcmp(sig, mytopo->sig))) {
-                prte_hetero_nodes = true;
-            }
+            goto CLEANUP;
         }
 
-        /* rank=1 always sends its topology back */
+        /* we always get a topology from rank=1, and if prte_hetero_nodes is set */
         topo = NULL;
-        if (1 == dname.rank) {
-            prte_plm_globals.daemon1_has_reported = true;
+        if (1 == dname.rank || prte_hetero_nodes) {
+            if (1 == dname.rank) {
+                prte_plm_globals.daemon1_has_reported = true;
+            }
             PMIX_DATA_BUFFER_CONSTRUCT(&datbuf);
             /* unpack the flag to see if this payload is compressed */
             idx = 1;
@@ -1483,58 +1570,52 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                 prted_failed_launch = true;
                 goto CLEANUP;
             }
-            /* only need to process it if our signatures differ */
-            if (0 == strcmp(sig, mytopo->sig)) {
-                PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-                topo = mytopo->topo;
-            } else {
-                if (compressed) {
-                    /* decompress the data */
-                    if (PMIx_Data_decompress((uint8_t *) pbo.bytes, pbo.size,
-                                             (uint8_t **) &bo.bytes, &bo.size)) {
-                        /* the data has been uncompressed */
-                        ret = PMIx_Data_load(&datbuf, &bo);
-                        PMIX_BYTE_OBJECT_DESTRUCT(&bo);
-                        if (PMIX_SUCCESS != ret) {
-                            PMIX_ERROR_LOG(ret);
-                            prted_failed_launch = true;
-                            PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-                            goto CLEANUP;
-                        }
-                    } else {
-                        pmix_show_help("help-prte-runtime.txt", "failed-to-uncompress",
-                                       true, prte_process_info.nodename);
-                        prted_failed_launch = true;
-                        PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-                        PMIX_BYTE_OBJECT_DESTRUCT(&bo);
-                        goto CLEANUP;
-                    }
-                } else {
-                    ret = PMIx_Data_load(&datbuf, &pbo);
+            if (compressed) {
+                /* decompress the data */
+                if (PMIx_Data_decompress((uint8_t *) pbo.bytes, pbo.size,
+                                         (uint8_t **) &bo.bytes, &bo.size)) {
+                    /* the data has been uncompressed */
+                    ret = PMIx_Data_load(&datbuf, &bo);
+                    PMIX_BYTE_OBJECT_DESTRUCT(&bo);
                     if (PMIX_SUCCESS != ret) {
                         PMIX_ERROR_LOG(ret);
                         prted_failed_launch = true;
                         PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
                         goto CLEANUP;
                     }
+                } else {
+                    pmix_show_help("help-prte-runtime.txt", "failed-to-uncompress",
+                                   true, prte_process_info.nodename);
+                    prted_failed_launch = true;
+                    PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
+                    PMIX_BYTE_OBJECT_DESTRUCT(&bo);
+                    goto CLEANUP;
                 }
-                PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-                data = &datbuf;
-
-                /* unpack the available topology information */
-                idx = 1;
-                ret = PMIx_Data_unpack(NULL, data, &ptopo, &idx, PMIX_TOPO);
+            } else {
+                ret = PMIx_Data_load(&datbuf, &pbo);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
                     prted_failed_launch = true;
+                    PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
                     goto CLEANUP;
                 }
-                topo = ptopo.topology;
-                ptopo.topology = NULL;
-                PMIX_TOPOLOGY_DESTRUCT(&ptopo);
-                /* cleanup */
-                PMIX_DATA_BUFFER_DESTRUCT(data);
             }
+            PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
+            data = &datbuf;
+
+            /* unpack the available topology information */
+            idx = 1;
+            ret = PMIx_Data_unpack(NULL, data, &ptopo, &idx, PMIX_TOPO);
+            if (PMIX_SUCCESS != ret) {
+                PMIX_ERROR_LOG(ret);
+                prted_failed_launch = true;
+                goto CLEANUP;
+            }
+            topo = ptopo.topology;
+            ptopo.topology = NULL;
+            PMIX_TOPOLOGY_DESTRUCT(&ptopo);
+            /* cleanup */
+            PMIX_DATA_BUFFER_DESTRUCT(data);
         }
 
         /* see if they provided their inventory */
@@ -1596,6 +1677,45 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             }
         }
 
+        // if this is not rank=1 or prte_hetero_nodes, then we need
+        // to cache this daemon until rank=1 has arrived
+        if (!prte_plm_globals.daemon1_has_reported && !prte_hetero_nodes) {
+            // if daemon=1 has not arrived, then we must wait
+            dc = PMIX_NEW(dcaddy_t);
+            dc->rank = daemon->name.rank;
+            dc->sig = sig;
+            dc->daemon = daemon;
+            pmix_list_append(&prte_plm_globals.daemon_cache, &dc->super);
+            free(nodename);
+            nodename = NULL;
+            idx = 1;
+            ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
+            if (PMIX_SUCCESS != ret) {
+                break;
+            }
+            continue;
+        }
+
+        if (prte_hetero_nodes) {
+            // always record the topology
+            t = PMIX_NEW(prte_topology_t);
+            t->sig = sig;
+            t->topo = topo;
+            t->index = pmix_pointer_array_add(prte_node_topologies, t);
+            daemon->node->topology = t;
+            daemon->node->available = prte_hwloc_base_filter_cpus(t->topo);
+            prte_hwloc_base_setup_summary(t->topo);
+            // cannot have cached daemons
+            free(nodename);
+            nodename = NULL;
+            idx = 1;
+            ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
+            if (PMIX_SUCCESS != ret) {
+                break;
+            }
+            continue;
+        }
+
         /* do we already have this topology from some other node? */
         found = false;
         for (i = 0; i < prte_node_topologies->size; i++) {
@@ -1605,21 +1725,16 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             }
             /* just check the signature */
             if (0 == strcmp(sig, t->sig)) {
-                PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                     "%s TOPOLOGY SIGNATURE ALREADY RECORDED IN POSN %d",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), i));
+                pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                                    "%s TOPOLOGY SIGNATURE ALREADY RECORDED IN POSN %d",
+                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), i);
                 daemon->node->topology = t;
                 found = true;
                 /* the topology in this struct can be NULL in the case
                  * where an earlier daemon other than daemon1 reported the
                  * signature but did not include its topology */
-                if (NULL == t->topo) {
-                    if (1 == dname.rank) {
-                        /* we will have received its topology */
-                        t->topo = topo;
-                    } else {
-                        break;
-                    }
+                if (NULL == t->topo && NULL != topo) {
+                    t->topo = topo;
                 }
                 /* update the node's available processors */
                 if (NULL != daemon->node->available) {
@@ -1632,119 +1747,64 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
         }
 
         if (1 == dname.rank) {
-            /* process any cached daemons */
-            PMIX_CONSTRUCT(&cachelist, pmix_list_t);
-            while (NULL != (dptr = (prte_proc_t*)pmix_list_remove_first(&prte_plm_globals.daemon_cache))) {
-                PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                     "%s plm:base:prted_daemon_cback processing cached daemon %s",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                     PRTE_NAME_PRINT(&dptr->name)));
-                if (0 == strcmp(dptr->node->topology->sig, sig)) {
-                    dptr->node->topology = t;
-                    dptr->node->available = prte_hwloc_base_filter_cpus(topo);
-                    jdatorted->num_reported++;
-                } else {
-                    /* see if this topology has already been requested */
-                    compressed = false;
-                    if (NULL != prte_plm_globals.cache) {
-                        for (i=0; NULL != prte_plm_globals.cache[i]; i++) {
-                            if (0 == strcmp(prte_plm_globals.cache[i], dptr->node->topology->sig)) {
-                                /* already requested - cache it */
-                                pmix_list_append(&cachelist, &dptr->super);
-                                compressed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (compressed) {
-                        continue;
-                    }
-                    /* we need to request this topology */
-                    PMIX_DATA_BUFFER_CREATE(relay);
-                    cmd = PRTE_DAEMON_REPORT_TOPOLOGY_CMD;
-                    ret = PMIx_Data_pack(NULL, relay, &cmd, 1, PMIX_UINT8);
-                    if (PMIX_SUCCESS != ret) {
-                        PMIX_ERROR_LOG(ret);
-                        PMIX_DATA_BUFFER_RELEASE(relay);
-                        prted_failed_launch = true;
-                        goto CLEANUP;
-                    }
-                    /* send it */
-                    PRTE_RML_SEND(ret, dptr->name.rank, relay, PRTE_RML_TAG_DAEMON);
-                    if (PRTE_SUCCESS != ret) {
-                        PRTE_ERROR_LOG(ret);
-                        PMIX_DATA_BUFFER_RELEASE(relay);
-                        prted_failed_launch = true;
-                        goto CLEANUP;
-                    }
-                    /* track that we requested it */
-                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_plm_globals.cache, dptr->node->topology->sig);
-                }
-            }
-            /* transfer back any cached items */
-            while (NULL != (dptr = (prte_proc_t*)pmix_list_remove_first(&cachelist))) {
-                pmix_list_append(&prte_plm_globals.daemon_cache, &dptr->super);
-            }
-            PMIX_DESTRUCT(&cachelist);
-        }
-
-        if (!found) {
-            /* signature not found - record it */
-            PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                 "%s NEW TOPOLOGY - ADDING SIGNATURE",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            t = PMIX_NEW(prte_topology_t);
-            t->sig = sig;
-            t->index = pmix_pointer_array_add(prte_node_topologies, t);
-            daemon->node->topology = t;
-            if (NULL != topo) {
+            // if the signature wasn't found, then add it
+            if (!found) {
+                t = PMIX_NEW(prte_topology_t);
+                t->sig = sig;
                 t->topo = topo;
-                /* update the node's available processors */
-                if (NULL != daemon->node->available) {
-                    hwloc_bitmap_free(daemon->node->available);
-                }
+                t->index = pmix_pointer_array_add(prte_node_topologies, t);
+                daemon->node->topology = t;
                 daemon->node->available = prte_hwloc_base_filter_cpus(t->topo);
             }
-        }
-        if (!prte_plm_globals.daemon1_has_reported) {
-            if (NULL == daemon->node->topology->topo) {
-                /* if daemon1 has not reported and the topology is
-                 * different than the one for DVM controller, then cache this daemon
-                 * for later processing */
-                PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                     "%s CACHING DAEMON %s",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                    PRTE_NAME_PRINT(&dname)));
-                pmix_list_append(&prte_plm_globals.daemon_cache, &daemon->super);
-                /* we will count this node as completed
-                 * when we get the full topology back */
-                if (NULL != nodename) {
-                    free(nodename);
-                    nodename = NULL;
-                }
-                idx = 1;
-                continue;
-            }
-        } else if (1 != dname.rank && NULL == daemon->node->topology->topo) {
-            /* see if we already have requested a topology for this signature */
-            compressed = false;
-            if (NULL != prte_plm_globals.cache) {
-                for (i=0; NULL != prte_plm_globals.cache[i]; i++) {
-                    if (0 == strcmp(prte_plm_globals.cache[i], daemon->node->topology->sig)) {
-                        /* already requested - cache it */
-                        compressed = true;
+            // mark as completed
+            jdatorted->num_reported++;
+            jdatorted->num_daemons_reported++;
+            /* process any cached daemons */
+            PMIX_LIST_FOREACH_SAFE(dc, dcnext, &prte_plm_globals.daemon_cache, dcaddy_t) {
+                pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                                    "%s plm:base:prted_daemon_cback processing cached daemon %u",
+                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                    dc->rank);
+                // search for a matching signature
+                found = false;
+                for (i = 0; i < prte_node_topologies->size; i++) {
+                    t = (prte_topology_t *) pmix_pointer_array_get_item(prte_node_topologies, i);
+                    if (NULL == t) {
+                        continue;
+                    }
+                    /* just check the signature */
+                    if (0 == strcmp(dc->sig, t->sig)) {
+                        // have a match
+                        dptr = (prte_proc_t *) pmix_pointer_array_get_item(jdatorted->procs, dc->rank);
+                        if (NULL == dptr) {
+                            PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                            prted_failed_launch = true;
+                            goto CLEANUP;
+                        }
+                        dptr->node->topology = t;
+                        if (NULL == dptr->node->available) {
+                            dptr->node->available = prte_hwloc_base_filter_cpus(t->topo);
+                            prte_hwloc_base_setup_summary(t->topo);
+                        }
+                        found = true;
                         break;
                     }
                 }
-            }
-            if (!compressed) {
-                /* request the complete topology from that node */
-                PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                     "%s REQUESTING TOPOLOGY FROM %s FOR SIG %s",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                     PRTE_NAME_PRINT(&dname),
-                                     daemon->node->topology->sig));
-                /* construct the request */
+                if (found) {
+                    pmix_list_remove_item(&prte_plm_globals.daemon_cache, &dc->super);
+                    PMIX_RELEASE(dc);
+                    // track that this daemon is now complete
+                    jdatorted->num_reported++;
+                    jdatorted->num_daemons_reported++;
+                    continue;
+                }
+                // not found, so add the signature to the topology array
+                t = PMIX_NEW(prte_topology_t);
+                t->sig = strdup(dc->sig);
+                t->index = pmix_pointer_array_add(prte_node_topologies, t);
+                dc->t = t;
+
+                /* we need to request this topology */
                 PMIX_DATA_BUFFER_CREATE(relay);
                 cmd = PRTE_DAEMON_REPORT_TOPOLOGY_CMD;
                 ret = PMIx_Data_pack(NULL, relay, &cmd, 1, PMIX_UINT8);
@@ -1755,84 +1815,109 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                     goto CLEANUP;
                 }
                 /* send it */
-                PRTE_RML_SEND(ret, dname.rank, relay, PRTE_RML_TAG_DAEMON);
+                PRTE_RML_SEND(ret, dc->rank, relay, PRTE_RML_TAG_DAEMON);
                 if (PRTE_SUCCESS != ret) {
                     PRTE_ERROR_LOG(ret);
                     PMIX_DATA_BUFFER_RELEASE(relay);
                     prted_failed_launch = true;
                     goto CLEANUP;
                 }
-                /* record that it was sent */
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&prte_plm_globals.cache, daemon->node->topology->sig);
-            }
-            /* we will count this node as completed
-             * when we get the full topology back */
-            if (NULL != nodename) {
-                free(nodename);
-                nodename = NULL;
+                /* we will count this node as completed
+                 * when we get the full topology back */
+                if (NULL != nodename) {
+                    free(nodename);
+                    nodename = NULL;
+                }
             }
             idx = 1;
+            ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
+            if (PMIX_SUCCESS != ret) {
+                break;
+            }
             continue;
+
+        } else {  // not daemon rank=1
+            if (!found) {
+                /* signature not found - record it */
+                pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                                    "%s NEW TOPOLOGY - ADDING SIGNATURE",
+                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+                t = PMIX_NEW(prte_topology_t);
+                t->sig = sig;
+                t->index = pmix_pointer_array_add(prte_node_topologies, t);
+                daemon->node->topology = t;
+                if (NULL != topo) {
+                    t->topo = topo;
+                    /* update the node's available processors */
+                    if (NULL != daemon->node->available) {
+                        hwloc_bitmap_free(daemon->node->available);
+                    }
+                    daemon->node->available = prte_hwloc_base_filter_cpus(t->topo);
+                    prte_hwloc_base_setup_summary(t->topo);
+                } else {
+                    // add this daemon to our cache
+                    dc = PMIX_NEW(dcaddy_t);
+                    dc->rank = daemon->name.rank;
+                    dc->sig = strdup(sig);
+                    dc->t = t;
+                    dc->daemon = daemon;
+                    pmix_list_append(&prte_plm_globals.daemon_cache, &dc->super);
+                    /* request this topology */
+                    PMIX_DATA_BUFFER_CREATE(relay);
+                    cmd = PRTE_DAEMON_REPORT_TOPOLOGY_CMD;
+                    ret = PMIx_Data_pack(NULL, relay, &cmd, 1, PMIX_UINT8);
+                    if (PMIX_SUCCESS != ret) {
+                        PMIX_ERROR_LOG(ret);
+                        PMIX_DATA_BUFFER_RELEASE(relay);
+                        prted_failed_launch = true;
+                        goto CLEANUP;
+                    }
+                    /* send it */
+                    PRTE_RML_SEND(ret, dc->rank, relay, PRTE_RML_TAG_DAEMON);
+                    if (PRTE_SUCCESS != ret) {
+                        PRTE_ERROR_LOG(ret);
+                        PMIX_DATA_BUFFER_RELEASE(relay);
+                        prted_failed_launch = true;
+                        goto CLEANUP;
+                    }
+                }
+                /* we will count this node as completed
+                 * when we get the full topology back */
+                if (NULL != nodename) {
+                    free(nodename);
+                    nodename = NULL;
+                }
+                idx = 1;
+                ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
+                continue;
+            }
+            // Signature already found, we can mark this node as completed now
+            jdatorted->num_reported++;
+            jdatorted->num_daemons_reported++;
         }
 
     CLEANUP:
-        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                             "%s plm:base:orted_report_launch %s for daemon %s at contact %s",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                             prted_failed_launch ? "failed" : "completed", PRTE_NAME_PRINT(&dname),
-                             (NULL == daemon) ? "UNKNOWN" : daemon->rml_uri));
+        pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                            "%s plm:base:prted_daemon_cback %s for daemon %s at contact %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            prted_failed_launch ? "failed" : "completed", PRTE_NAME_PRINT(&dname),
+                            (NULL == daemon) ? "UNKNOWN" : daemon->rml_uri);
 
         if (NULL != nodename) {
             free(nodename);
             nodename = NULL;
         }
 
-        if (prted_failed_launch) {
-            PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_FAILED_TO_START);
-            return;
-        } else {
-            jdatorted->num_reported++;
-            jdatorted->num_daemons_reported++;
-            PMIX_OUTPUT_VERBOSE(
-                (5, prte_plm_base_framework.framework_output,
-                 "%s plm:base:orted_report_launch job %s recvd %d of %d reported daemons",
-                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdatorted->nspace),
-                 jdatorted->num_reported, jdatorted->num_procs));
-            found = prte_get_attribute(&jdatorted->attributes, PRTE_JOB_SHOW_PROGRESS, NULL, PMIX_BOOL);
-            if (found &&
-                (0 == jdatorted->num_reported % 100 ||
-                 jdatorted->num_reported == prte_process_info.num_daemons)) {
-                PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_REPORT_PROGRESS);
-            }
-            if (jdatorted->num_procs == jdatorted->num_reported) {
-                bool dvm = true;
-                jdatorted->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
-                /* activate the daemons_reported state for all jobs
-                 * whose daemons were launched
-                 */
-                for (i = 1; i < prte_job_data->size; i++) {
-                    jdata = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, i);
-                    if (NULL == jdata) {
-                        continue;
-                    }
-                    dvm = false;
-                    if (PRTE_JOB_STATE_DAEMONS_LAUNCHED == jdata->state) {
-                        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_REPORTED);
-                    }
-                }
-                if (dvm) {
-                    /* must be launching a DVM - activate the state */
-                    PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_DAEMONS_REPORTED);
-                }
-            }
-        }
         idx = 1;
+        ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
     }
 
     if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER != ret) {
         PMIX_ERROR_LOG(ret);
         PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_FAILED_TO_START);
+        return;
     }
+    progress_daemons(jdatorted, show_progress);
 }
 
 void prte_plm_base_daemon_failed(int st, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
@@ -1934,6 +2019,9 @@ int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, in
     }
     if (prte_allow_run_as_root) {
         pmix_argv_append(argc, argv, "--allow-run-as-root");
+    }
+    if (prte_hetero_nodes) {
+        pmix_argv_append(argc, argv, "--hetero-nodes");
     }
 
     /* the following is not an mca param */

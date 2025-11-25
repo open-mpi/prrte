@@ -18,7 +18,7 @@
  * Copyright (c) 2014-2016 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  *
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -37,6 +37,9 @@
 #endif
 #ifdef HAVE_SYS_STAT_H
 #    include <sys/stat.h>
+#endif
+#ifdef HAVE_STRING_H
+#include <string.h>
 #endif
 
 #include "src/util/error.h"
@@ -57,6 +60,7 @@
 #include "src/hwloc/hwloc-internal.h"
 #include "src/prted/pmix/pmix_server.h"
 #include "src/threads/pmix_threads.h"
+#include "src/include/prte_frameworks.h"
 
 #include "src/mca/base/pmix_base.h"
 #include "src/mca/base/pmix_mca_base_var.h"
@@ -110,11 +114,6 @@ pmix_nspace_t prte_nspace_wildcard = {0};
 static bool util_initialized = false;
 static bool min_initialized = false;
 
-#if PRTE_CC_USE_PRAGMA_IDENT
-#    pragma ident PRTE_IDENT_STRING
-#elif PRTE_CC_USE_IDENT
-#    ident PRTE_IDENT_STRING
-#endif
 const char prte_version_string[] = PRTE_IDENT_STRING;
 
 static bool check_exist(char *path)
@@ -127,18 +126,88 @@ static bool check_exist(char *path)
     return false;
 }
 
+static void print_error(unsigned major,
+                        unsigned minor,
+                        unsigned release)
+{
+    fprintf(stderr, "************************************************\n");
+    fprintf(stderr, "We have detected that the runtime version\n");
+    fprintf(stderr, "of the PMIx library we were given is binary\n");
+    fprintf(stderr, "incompatible with the version we were built against:\n\n");
+    fprintf(stderr, "    Runtime: 0x%x%02x%02x\n", major, minor, release);
+    fprintf(stderr, "    Build:   0x%0x\n\n", PMIX_NUMERIC_VERSION);
+    fprintf(stderr, "Please update your LD_LIBRARY_PATH to point\n");
+    fprintf(stderr, "us to the same PMIx version used to build PRRTE.\n");
+    fprintf(stderr, "************************************************\n");
+}
+
 int prte_init_minimum(void)
 {
-    int ret;
+    int ret, n;
     char *path = NULL;
+    char *evar, **prefixes;
+    const char *rvers;
+    char token[100];
+    unsigned int major, minor, release;
 
     if (min_initialized) {
         return PRTE_SUCCESS;
     }
     min_initialized = true;
 
+    /* check to see if the version of PMIx we were given in the
+     * library path matches the version we were built against.
+     * Because we are using PMIx internals, we cannot support
+     * cross version operations from inside of PRRTE.
+     */
+    rvers = PMIx_Get_version();
+    ret = sscanf(rvers, "%s %u.%u.%u", token, &major, &minor, &release);
+
+    /* check the version triplet - we know that version
+     * 5 and above are not runtime compatible with version
+     * 4 and below. Since PRRTE has a minimum PMIx requirement
+     * in the v4.x series, we only need to check v4 vs 5
+     * and above */
+    if ((PMIX_VERSION_MAJOR > 4 && 4 == major) ||
+        (PMIX_VERSION_MAJOR == 4 && 5 <= major) ||
+        6 <= major) {
+        print_error(major, minor, release);
+        return PRTE_ERR_SILENT;
+    }
+
+    /* Protect against the envar version of the Slurm
+     * custom args MCA param. This is an unfortunate
+     * hack that hopefully will eventually go away.
+     * See both of the following for detailed
+     * explanations and discussion:
+     *
+     * https://github.com/openpmix/prrte/issues/1974
+     * https://github.com/open-mpi/ompi/issues/12471
+     *
+     * Orgs/users wanting to add custom args to the
+     * internal "srun" command used to spawn the
+     * PRRTE daemons must do so via the default MCA
+     * param files (system or user), or via the
+     * prterun (or its proxy) cmd line
+     */
+    unsetenv("PRTE_MCA_plm_slurm_args");
+    unsetenv("OMPI_MCA_plm_slurm_args");
+
     /* carry across the toolname */
     pmix_tool_basename = prte_tool_basename;
+
+    // publish MCA prefixes
+    prefixes = NULL;
+    for (n=0; NULL != prte_framework_names[n]; n++) {
+        if (0 == strcmp("common", prte_framework_names[n])) {
+            continue;
+        }
+        PMIx_Argv_append_nosize(&prefixes, prte_framework_names[n]);
+    }
+    evar = PMIx_Argv_join(prefixes, ',');
+    pmix_setenv("PRTE_MCA_PREFIXES", evar, true, &environ);
+    free(evar);
+    PMIx_Argv_free(prefixes);
 
     /* initialize install dirs code */
     ret = pmix_mca_base_framework_open(&prte_prteinstalldirs_base_framework,
@@ -183,7 +252,6 @@ int prte_init_util(prte_proc_type_t flags)
 {
     int ret;
     char *error = NULL;
-    char *path = NULL;
 
     if (util_initialized) {
         return PRTE_SUCCESS;
@@ -352,8 +420,6 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
         error = "prte_ess_init";
         goto error;
     }
-    /* add network aliases to our list of alias hostnames */
-    pmix_ifgetaliases(&prte_process_info.aliases);
 
     /* initialize the cache */
     prte_cache = PMIX_NEW(pmix_pointer_array_t);
@@ -464,7 +530,13 @@ void prte_preload_default_mca_params(void)
      * user already has the param in our environment as their
      * environment settings override all defaults */
     PMIX_LIST_FOREACH(fv, &pfinal, pmix_mca_base_var_file_value_t) {
-        if (pmix_pmdl_base_check_prte_param(fv->mbvfv_var)) {
+        if (pmix_pmdl_base_check_pmix_param(fv->mbvfv_var)) {
+            pmix_asprintf(&tmp, "PMIX_MCA_%s", fv->mbvfv_var);
+            // set it, but don't overwrite if they already
+            // have a value in our environment
+            setenv(tmp, fv->mbvfv_value, false);
+            free(tmp);
+        } else {
             pmix_asprintf(&tmp, "PRTE_MCA_%s", fv->mbvfv_var);
             // set it, but don't overwrite if they already
             // have a value in our environment
@@ -474,12 +546,6 @@ void prte_preload_default_mca_params(void)
             // or mca frameworks, then we also need to set
             // the equivalent PMIx value
             check_pmix_overlap(fv->mbvfv_var, fv->mbvfv_value);
-        } else if (pmix_pmdl_base_check_pmix_param(fv->mbvfv_var)) {
-            pmix_asprintf(&tmp, "PMIX_MCA_%s", fv->mbvfv_var);
-            // set it, but don't overwrite if they already
-            // have a value in our environment
-            setenv(tmp, fv->mbvfv_value, false);
-            free(tmp);
         }
     }
 

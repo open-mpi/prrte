@@ -1,6 +1,6 @@
 #
-# Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
-# Copyright (c) 2023      Nanook Consulting.  All rights reserved.
+# Copyright (c) 2023-2025 Jeffrey M. Squyres.  All rights reserved.
+# Copyright (c) 2023-2025 Nanook Consulting  All rights reserved.
 #
 # $COPYRIGHT$
 #
@@ -20,6 +20,8 @@
 rstdir = $(prtedatadir)/rst/prrte-rst-content
 dist_rst_DATA = \
     cli-allow-run-as-root.rst \
+    cli-app-prefix.rst \
+    cli-append-env.rst \
     cli-bind-to.rst \
     cli-dash-host.rst \
     cli-debug-daemons-file.rst \
@@ -28,6 +30,8 @@ dist_rst_DATA = \
     cli-dvm-hostfile.rst \
     cli-dvm.rst \
     cli-forward-signals.rst \
+    cli-general.rst \
+    cli-hetero-nodes.rst \
     cli-launcher-hostfile.rst \
     cli-leave-session-attached.rst \
     cli-map-by.rst \
@@ -35,12 +39,17 @@ dist_rst_DATA = \
     cli-output.rst \
     cli-personality.rst \
     cli-pmixmca.rst \
+    cli-pmix-prefix.rst \
     cli-prefix.rst \
+    cli-prepend-env.rst \
     cli-prtemca.rst \
+    cli-no-app-prefix.rst \
     cli-rank-by.rst \
     cli-runtime-options.rst \
+    cli-set-env.rst \
     cli-stream-buffering.rst \
     cli-tune.rst \
+    cli-unset-env.rst \
     cli-x.rst \
     definitions-pes.rst \
     definitions-slots.rst \

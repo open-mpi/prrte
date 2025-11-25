@@ -19,7 +19,7 @@
  * Copyright (c) 2013-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2022      Triad National Security, LLC. All rights
  *                         reserved.
  * $COPYRIGHT$
@@ -329,6 +329,11 @@ int main(int argc, char *argv[])
         prte_leave_session_attached = true;
     }
 
+    // check for hetero nodes
+    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_HETERO_NODES)) {
+        prte_hetero_nodes = true;
+    }
+
     /* if prte_daemon_debug is set, let someone know we are alive right
      * away just in case we have a problem along the way
      */
@@ -341,17 +346,22 @@ int main(int argc, char *argv[])
      * otherwise, remain attached so output can get to us
      */
     if (!prte_leave_session_attached && !prte_debug_daemons_flag) {
-        pipe(wait_pipe);
+        if (0 > pipe(wait_pipe)) {
+            return PRTE_ERROR;
+        }
         prte_state_base.parent_fd = wait_pipe[1];
         prte_daemon_init_callback(NULL, wait_dvm);
         close(wait_pipe[0]);
+    } else {
+        // the daemon_init_callback fn already setsid, so don't
+        // do it twice!
+    #if defined(HAVE_SETSID)
+        /* see if we were directed to separate from current session */
+        if (pmix_cmd_line_is_taken(&results, PRTE_CLI_SET_SID)) {
+            setsid();
+        }
+    #endif
     }
-#if defined(HAVE_SETSID)
-    /* see if we were directed to separate from current session */
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_SET_SID)) {
-        setsid();
-    }
-#endif
 
     /* ensure we silence any compression warnings */
     PMIX_SETENV_COMPAT("PMIX_MCA_compress_base_silence_warning", "1", true, &environ);
@@ -522,9 +532,9 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* send the information to the orted report-back point - this function
+    /* send the information to the prted report-back point - this function
      * will process the data, but also counts the number of
-     * orteds that reported back so the launch procedure can continue.
+     * prteds that reported back so the launch procedure can continue.
      * We need to do this at the last possible second as the HNP
      * can turn right around and begin issuing orders to us
      */
@@ -563,9 +573,9 @@ int main(int argc, char *argv[])
 
     /* include any non-loopback aliases for this node */
     for (n = 0; NULL != prte_process_info.aliases[n]; n++) {
-        if (0 != strcmp(prte_process_info.aliases[n], "localhost")
-            && 0 != strcmp(prte_process_info.aliases[n], "127.0.0.1")
-            && 0 != strcmp(prte_process_info.aliases[n], prte_process_info.nodename)) {
+        if (0 != strcmp(prte_process_info.aliases[n], "localhost") &&
+            0 != strcmp(prte_process_info.aliases[n], "127.0.0.1") &&
+            0 != strcmp(prte_process_info.aliases[n], prte_process_info.nodename)) {
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&nonlocal, prte_process_info.aliases[n]);
         }
     }
@@ -595,9 +605,9 @@ int main(int argc, char *argv[])
         goto DONE;
     }
 
-    /* if we are rank=1, then send our topology back - otherwise, prte
-     * will request it if necessary */
-    if (1 == PRTE_PROC_MY_NAME->rank) {
+    /* if we are rank=1 or designated as having hetero node, then send our
+     * topology back - otherwise, prte will request it if necessary */
+    if (1 == PRTE_PROC_MY_NAME->rank || prte_hetero_nodes) {
         pmix_data_buffer_t data;
         pmix_topology_t ptopo;
         bool compressed;

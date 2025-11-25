@@ -5,7 +5,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -40,7 +40,6 @@
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/prted/pmix/pmix_server_internal.h"
-#include "src/runtime/prte_data_server.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_wait.h"
 #include "src/threads/pmix_threads.h"
@@ -64,13 +63,12 @@ int prte_state_base_set_default_rto(prte_job_t *jdata,
  * PMIX_RUNTIME_OPTIONS info struct */
 int prte_state_base_set_runtime_options(prte_job_t *jdata, char *spec)
 {
-    char **options, **tmp, *ptr;
+    char **options, *ptr;
     int n;
     bool flag, *fptr = &flag;
     int32_t i32;
     prte_job_t *djob;
     prte_app_context_t *app;
-    pmix_rank_t rank;
     pmix_info_t info;
     pmix_value_t value;
 

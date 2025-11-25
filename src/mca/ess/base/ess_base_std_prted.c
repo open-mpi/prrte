@@ -43,6 +43,7 @@
 #include "src/event/event-internal.h"
 #include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
+#include "src/util/pmix_if.h"
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_environ.h"
 
@@ -97,17 +98,17 @@ int prte_ess_base_prted_setup(void)
 {
     int ret = PRTE_ERROR;
     int fd;
-    char log_file[PATH_MAX];
+    char log_file[PRTE_PATH_MAX];
     char *error = NULL;
     char *uri = NULL;
-    char *tmp;
-    prte_job_t *jdata;
+    char *tmp = NULL;
+    prte_job_t *jdata = NULL;
     prte_proc_t *proc;
-    prte_app_context_t *app;
+    prte_app_context_t *app = NULL;
     hwloc_obj_t obj;
     unsigned i, j;
-    prte_topology_t *t;
-    prte_ess_base_signal_t *sig;
+    prte_topology_t *t = NULL;
+    prte_ess_base_signal_t *sig = NULL;
     int idx;
     pmix_value_t val;
 
@@ -273,7 +274,7 @@ int prte_ess_base_prted_setup(void)
          */
 
         /* define a log file name in the session directory */
-        snprintf(log_file, PATH_MAX, "output-prted-%s-%s.log",
+        snprintf(log_file, PRTE_PATH_MAX, "output-prted-%s-%s.log",
                  prte_process_info.myproc.nspace,
                  prte_process_info.nodename);
         log_path = pmix_os_path(false, prte_process_info.top_session_dir, log_file, NULL);
@@ -302,6 +303,10 @@ int prte_ess_base_prted_setup(void)
         error = "pmix_server_init";
         goto error;
     }
+
+    /* add network aliases to our list of alias hostnames - must
+     * wait until after we init PMIx before getting them */
+    pmix_ifgetaliases(&prte_process_info.aliases);
 
     /* Setup the communication infrastructure */
     if (PRTE_SUCCESS

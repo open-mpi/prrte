@@ -17,7 +17,7 @@
 # Copyright (c) 2014-2019 Research Organization for Information Science
 #                         and Technology (RIST).  All rights reserved.
 # Copyright (c) 2016      IBM Corporation.  All rights reserved.
-# Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
 # Copyright (c) 2021-2022 Amazon.com, Inc. or its affiliates.
 #                         All Rights reserved.
 # Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
@@ -32,12 +32,7 @@ dnl $1 is the base cap name (i.e., what comes after "PMIX_CAP_")
 dnl $2 is the action if happy
 dnl $3 is the action if not happy
 AC_DEFUN([PRTE_CHECK_PMIX_CAP],[
-    PRTE_VAR_SCOPE_PUSH([prte_cpp_save])
 
-    AC_MSG_CHECKING([for PMIX_CAP_$1])
-
-    prte_cpp_save=$CPP
-    CPP="$PMIXCC_PATH -E"
     AC_PREPROC_IFELSE(
         [AC_LANG_PROGRAM([#include <pmix_version.h>],
                          [#if !defined(PMIX_CAPABILITIES)
@@ -57,9 +52,6 @@ AC_DEFUN([PRTE_CHECK_PMIX_CAP],[
         [AC_MSG_RESULT([not found])
          $3])
 
-    CPP=$prte_cpp_save
-
-    PRTE_VAR_SCOPE_POP
 ])
 
 AC_DEFUN([PRTE_CHECK_PMIX],[
@@ -88,7 +80,7 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
     fi
 
     AS_IF([test "$with_pmix_extra_libs" = "yes" -o "$with_pmix_extra_libs" = "no"],
-	  [AC_MSG_ERROR([--with-pmix-extra-libs requires an argument other than yes or no])])
+      [AC_MSG_ERROR([--with-pmix-extra-libs requires an argument other than yes or no])])
 
     AS_IF([test "$enable_pmix_lib_checks" != "no"],
           [dnl Need to explicitly enable wrapper compiler to get the dependent libraries
@@ -128,6 +120,22 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
                        AC_MSG_WARN([PRRTE requires PMIx v$prte_pmix_min_num_version or above.])
                        AC_MSG_ERROR([Please select a supported version and configure again])])
 
+    # NOTE: We have already read PRRTE's VERSION file, so we can use
+    # $pmix_max_version.
+    prte_pmix_max_num_version=PRTE_PMIX_NUMERIC_MAX_VERSION
+    prte_pmix_max_version=PRTE_PMIX_MAX_VERSION
+    AC_MSG_CHECKING([version below v$prte_pmix_max_version])
+    AC_PREPROC_IFELSE([AC_LANG_PROGRAM([
+                                        #include <pmix_version.h>
+                                        #if !(PMIX_NUMERIC_VERSION < $prte_pmix_max_num_version)
+                                        #error "not below version $prte_pmix_max_num_version"
+                                        #endif
+                                       ], [])],
+                      [AC_MSG_RESULT([yes])],
+                      [AC_MSG_RESULT(no)
+                       AC_MSG_WARN([PRRTE requires PMIx be below v$prte_pmix_max_num_version.])
+                       AC_MSG_ERROR([Please select a supported version and configure again])])
+
     AC_CHECK_HEADER([src/util/pmix_argv.h], [],
                     [AC_MSG_ERROR([Could not find PMIx devel headers.  Can not continue.])])
 
@@ -158,22 +166,35 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
     #
     # Note: if the PMIx we found does not define capability flags,
     # then it definitely does not have the capability flags we're
-    # looking for.
+    # looking for. Specifically, we cannot use PMIx versions that
+    # support LTO compatibility as their pmix_framework.h definition
+    # is incompatible with our infrastructure
 
-    # For now, we just check for the "base" capability to exercise
-    # this feature - essentially retaining this as an example for
-    # future times when we actually need to check capabilities
-    PRTE_CHECK_PMIX_CAP([BASE],
-                        [PRTE_PMIX_BASE_CAPABILITY=1],
-                        [AC_MSG_WARN([Your PMIx version is either does not])
-                         AC_MSG_WARN([the capabilities feature or does not])
-                         AC_MSG_WARN([include the PMIX_CAP_BASE capability flag])
-                         AC_MSG_WARN([Ignoring this for now])
-                         PRTE_PMIX_BASE_CAPABILITY=0])
+    prte_external_pmix_save_CPPFLAGS=$CPPFLAGS
+    prte_external_pmix_save_LDFLAGS=$LDFLAGS
+    prte_external_pmix_save_LIBS=$LIBS
 
-    AC_DEFINE_UNQUOTED([PRTE_PMIX_BASE_CAPABILITY],
-                       [$PRTE_PMIX_BASE_CAPABILITY],
-                       [Whether or not PMIx has the BASE capability flag set])
+    PRTE_FLAGS_APPEND_UNIQ(CPPFLAGS, $PRTE_FINAL_CPPFLAGS)
+    PRTE_FLAGS_APPEND_UNIQ(LDFLAGS, $PRTE_FINAL_LDFLAGS)
+    PRTE_FLAGS_APPEND_UNIQ(LIBS, $PRTE_FINAL_LIBS)
+
+    AC_MSG_CHECKING([for LTO compatibility])
+    PRTE_CHECK_PMIX_CAP([LTO],
+                        [AC_MSG_RESULT([yes])
+                         AC_MSG_WARN([Your PMIx version includes the PMIX_CAP_LTO])
+                         AC_MSG_WARN([capability flag. The infrastructure defined])
+                         AC_MSG_WARN([within it is not compatible with this version])
+                         AC_MSG_WARN([of PRRTE. Please point us at an earlier PMIx])
+                         AC_MSG_ERROR([Cannot proceed.])],
+                        [AC_MSG_RESULT([no])
+                         AC_MSG_WARN([This build will not be compatible with the])
+                         AC_MSG_WARN([LTO optimizer. All LTO-related flags will])
+                         AC_MSG_WARN([be removed from the build])])
+
+    # restore the global flags
+    CPPFLAGS=$prte_external_pmix_save_CPPFLAGS
+    LDFLAGS=$prte_external_pmix_save_LDFLAGS
+    LIBS=$prte_external_pmix_save_LIBS
 
     PRTE_SUMMARY_ADD([Required Packages], [PMIx], [], [$prte_pmix_SUMMARY])
 

@@ -134,6 +134,8 @@ examples/legacy
 examples/colocate
 examples/pset
 examples/nodeid
+examples/client-threaded
+examples/abort
 
 src/sys/powerpc/atomic-32.s
 src/sys/powerpc/atomic-64.s
@@ -185,6 +187,10 @@ test/filegen
 test/iostress
 test/spawn_multiple
 test/clichk
+test/chkfs
+test/chkfs
+test/spawn_timeout
+test/mpi/spawn_multiple
 
 docs/_build
 docs/_static

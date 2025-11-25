@@ -17,7 +17,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2019      UT-Battelle, LLC. All rights reserved.
  *
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2022      IBM Corporation.  All rights reserved.
  * $COPYRIGHT$
  *
@@ -56,6 +56,10 @@ static int map_colocate(prte_job_t *jdata,
                         uint16_t procs_per_target,
                         prte_rmaps_options_t *options);
 
+static void inherit_env_directives(prte_job_t *jdata,
+                                   prte_job_t *parent,
+                                   pmix_proc_t *proxy);
+
 void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
@@ -64,12 +68,12 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     pmix_proc_t *pptr;
     int rc = PRTE_SUCCESS;
     int n;
-    bool did_map, pernode = false, ppr_node = false, ppr_socket = false;
+    bool did_map, pernode = false;
     prte_rmaps_base_selected_module_t *mod;
     prte_job_t *parent = NULL;
     prte_app_context_t *app;
     bool inherit = false;
-    pmix_proc_t *nptr, *target_proc;
+    pmix_proc_t *nptr = NULL, *target_proc;
     char *tmp, **ck;
     uint16_t u16 = 0, procs_per_target = 0;
     uint16_t *u16ptr = &u16;
@@ -80,6 +84,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     pmix_data_array_t *darray = NULL;
     pmix_list_t nodes;
     int slots, len;
+    bool flag, *fptr;
 
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
@@ -99,6 +104,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     memset(&options, 0, sizeof(prte_rmaps_options_t));
     options.stream = prte_rmaps_base_framework.framework_output;
     options.verbosity = 5;  // usual value for base-level functions
+    fptr = &flag;
 
     /* check and set some general options */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
@@ -219,6 +225,11 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     /* if this is a dynamic job launch and they didn't explicitly
      * request inheritance, then don't inherit the launch directives */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY, (void **) &nptr, PMIX_PROC)) {
+        if (NULL == nptr) {
+            PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
+            goto cleanup;
+        }
         /* if the launch proxy is me, then this is the initial launch from
          * a proxy scenario, so we don't really have a parent */
         if (PMIX_CHECK_NSPACE(PRTE_PROC_MY_NAME->nspace, nptr->nspace)) {
@@ -226,11 +237,23 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             /* we do allow inheritance of the defaults */
             inherit = true;
         } else if (NULL != (parent = prte_get_job_data_object(nptr->nspace))) {
-            if (prte_get_attribute(&jdata->attributes, PRTE_JOB_INHERIT, NULL, PMIX_BOOL)) {
-                inherit = true;
-            } else if (prte_get_attribute(&jdata->attributes, PRTE_JOB_NOINHERIT, NULL, PMIX_BOOL)) {
+            if (PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL)) {
+                // we don't inherit anything from tools as they were not
+                // mapped by us
                 inherit = false;
                 parent = NULL;
+
+            } else if (prte_get_attribute(&parent->attributes, PRTE_JOB_INHERIT, NULL, PMIX_BOOL)) {
+                inherit = true;
+                // if they didn't specifically direct it not inherit, then pass this on to the child
+                if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_NOINHERIT, NULL, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_ATTR_GLOBAL, PRTE_JOB_INHERIT, NULL, PMIX_BOOL);
+                }
+
+            } else if (prte_get_attribute(&parent->attributes, PRTE_JOB_NOINHERIT, NULL, PMIX_BOOL)) {
+                inherit = false;
+                parent = NULL;
+
             } else {
                 inherit = prte_rmaps_base.inherit;
             }
@@ -241,7 +264,6 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
         } else {
             inherit = true;
         }
-        PMIX_PROC_RELEASE(nptr);
     } else {
         /* initial launch always takes on default MCA params for non-specified policies */
         inherit = true;
@@ -281,6 +303,31 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                     }
                 }
             }
+            /* if not already assigned, inherit the parent's GPU support directive */
+            if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_GPU_SUPPORT, NULL, PMIX_BOOL)) {
+                if (prte_get_attribute(&parent->attributes, PRTE_JOB_GPU_SUPPORT, (void **) &fptr, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_GPU_SUPPORT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
+                }
+            }
+            /* if not already assigned, inherit the parent's output directives */
+            if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT, NULL, PMIX_BOOL)) {
+                if (prte_get_attribute(&parent->attributes, PRTE_JOB_TAG_OUTPUT, (void **) &fptr, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
+                }
+            }
+            if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_TIMESTAMP_OUTPUT, NULL, PMIX_BOOL)) {
+                if (prte_get_attribute(&parent->attributes, PRTE_JOB_TIMESTAMP_OUTPUT, (void **) &fptr, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_TIMESTAMP_OUTPUT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
+                }
+            }
+            if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_MERGE_STDERR_STDOUT, NULL, PMIX_BOOL)) {
+                if (prte_get_attribute(&parent->attributes, PRTE_JOB_MERGE_STDERR_STDOUT, (void **) &fptr, PMIX_BOOL)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_MERGE_STDERR_STDOUT, PRTE_ATTR_GLOBAL, fptr, PMIX_BOOL);
+                }
+            }
+
+            // copy over any env directives, but do not overwrite anything already specified
+            inherit_env_directives(jdata, parent, nptr);
         } else {
             if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_HWT_CPUS, NULL, PMIX_BOOL) &&
                 !prte_get_attribute(&jdata->attributes, PRTE_JOB_CORE_CPUS, NULL, PMIX_BOOL)) {
@@ -292,6 +339,9 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                 }
             }
         }
+    }
+    if (NULL != nptr) {
+        PMIX_PROC_RELEASE(nptr);
     }
 
     /* we always inherit a parent's oversubscribe flag unless the job assigned it */
@@ -388,7 +438,8 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             options.maptype = HWLOC_OBJ_CORE;
             options.mapdepth = PRTE_BIND_TO_CORE;
         } else if (0 == strncasecmp(ck[1], "package", len) ||
-                   0 == strncasecmp(ck[1], "skt", len)) {
+                   0 == strncasecmp(ck[1], "skt", len) ||
+                   0 == strncasecmp(ck[1], "socket", len)) {
             options.maptype = HWLOC_OBJ_PACKAGE;
             options.mapdepth = PRTE_BIND_TO_PACKAGE;
         } else if (0 == strncasecmp(ck[1], "numa", len) ||
@@ -428,6 +479,22 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             options.nprocs += app->num_procs;
             continue;
         }
+
+        if (PRTE_MAPPING_SEQ == PRTE_GET_MAPPING_POLICY(jdata->map->mapping) ||
+            PRTE_MAPPING_BYUSER == PRTE_GET_MAPPING_POLICY(jdata->map->mapping)) {
+            // these mappers compute their #procs as they go
+            continue;
+        }
+
+        if (1 < jdata->num_apps && 0 == app->num_procs) {
+            pmix_show_help("help-prte-rmaps-base.txt",
+                           "multi-apps-and-zero-np", true,
+                           jdata->num_apps, NULL);
+            jdata->exit_code = PRTE_ERR_BAD_PARAM;
+            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
+            goto cleanup;
+        }
+
         /*
          * get the target nodes for this app - the base function
          * will take any host or hostfile directive into account
@@ -435,7 +502,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
         PMIX_CONSTRUCT(&nodes, pmix_list_t);
         rc = prte_rmaps_base_get_target_nodes(&nodes, &slots,
                                               jdata, app, jdata->map->mapping,
-                                              true, true);
+                                              true, true, false);
         if (PRTE_SUCCESS != rc) {
             PMIX_LIST_DESTRUCT(&nodes);
             jdata->exit_code = rc;
@@ -467,7 +534,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
 #else
             } else if (HWLOC_OBJ_L1CACHE == options.maptype ||
                        HWLOC_OBJ_L2CACHE == options.maptype ||
-                       HWLOC_OBJ_L1CACHE == options.maptype) {
+                       HWLOC_OBJ_L3CACHE == options.maptype) {
                 /* add in #cache for each node */
                 PMIX_LIST_FOREACH (node, &nodes, prte_node_t) {
                     app->num_procs += options.pprn * prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
@@ -487,21 +554,34 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                                                                                         HWLOC_OBJ_PU, 0);
                 }
             }
+
         } else {
            if (NULL != options.cpuset) {
                 ck = PMIX_ARGV_SPLIT_COMPAT(options.cpuset, ',');
                 app->num_procs = PMIX_ARGV_COUNT_COMPAT(ck);
                 PMIX_ARGV_FREE_COMPAT(ck);
             } else {
-                /* set the num_procs to equal the number of slots on these
-                 * mapped nodes, taking into account the number of cpus/rank
-                 */
-                app->num_procs = slots / options.cpus_per_rank;
-                /* sometimes, we have only one "slot" assigned, but may
-                 * want more than one cpu/rank - so ensure we always wind
-                 * up with at least one proc */
-                if (0 == app->num_procs) {
-                    app->num_procs = 1;
+                if (1 < options.cpus_per_rank) {
+                    // compute the number of cpus on each node
+                    len = 0;
+                    PMIX_LIST_FOREACH (node, &nodes, prte_node_t) {
+                        if (options.use_hwthreads) {
+                            len += prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                                      HWLOC_OBJ_PU, 0) / options.cpus_per_rank;
+                        } else {
+                            len += prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                                      HWLOC_OBJ_CORE, 0) / options.cpus_per_rank;
+                        }
+                    }
+                    app->num_procs = len;
+                    // ensure we always wind up with at least one proc
+                    if (0 == app->num_procs) {
+                        app->num_procs = 1;
+                    } else if (slots < app->num_procs) {
+                        app->num_procs = slots;
+                    }
+                } else {
+                    app->num_procs = slots;
                 }
             }
         }
@@ -1059,45 +1139,75 @@ static int map_colocate(prte_job_t *jdata,
             PMIX_RETAIN(node);
             pmix_list_append(&targets, &node->super);
         }
-   }
+    }
+
+    // clear the flags
+    PMIX_LIST_FOREACH(nptr, &targets, prte_node_t) {
+        PRTE_FLAG_UNSET(nptr, PRTE_NODE_FLAG_MAPPED);
+    }
+
 
     if (pernode) {
         /* cycle across the target nodes and place the specified
          * number of procs on each one */
         PMIX_LIST_FOREACH_SAFE(nptr, n2, &targets, prte_node_t) {
-            // Map the node to this job - note we already set the "mapped" flag
-            PMIX_RETAIN(nptr);
-            pmix_pointer_array_add(map->nodes, nptr);
-            map->num_nodes += 1;
-            // Assign N procs per node for each app_context
+            // setup the mapping options
+            options->ncpus = prte_rmaps_base_get_ncpus(nptr, NULL, options);
+            /* the available cpus are in the scratch location */
+            options->target = hwloc_bitmap_dup(prte_rmaps_base.available);
+            options->nprocs = procs_per_target;
+           // Assign N procs per node for each app_context
             for (i=0; i < jdata->apps->size; i++) {
                 app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, i);
                 if (NULL == app) {
                     continue;
                 }
                 // is there room on this node? daemons don't count
-                if (!daemons && !prte_rmaps_base_check_avail(jdata, app, nptr, &targets, NULL, options)) {
-                    if (PRTE_MAPPING_NO_OVERSUBSCRIBE & PRTE_GET_MAPPING_DIRECTIVE(map->mapping)) {
-                        pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
-                                       app->num_procs, app->app, prte_process_info.nodename);
-                        PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
-                        ret = PRTE_ERR_SILENT;
+                if (!daemons) {
+                    cnt = nptr->slots_inuse + procs_per_target;
+                    // first check the absolute limit
+                    if (0 != nptr->slots_max && nptr->slots_max < cnt) {
+                        // violates the max limit
+                        ret = PRTE_ERR_OUT_OF_RESOURCE;
                         goto done;
                     }
-                    PRTE_FLAG_SET(nptr, PRTE_NODE_FLAG_OVERSUBSCRIBED);
-                    PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_OVERSUBSCRIBED);
+                    if (nptr->slots < cnt) {
+                        // oversubscribed - we can still fit if they allow oversubscription
+                        if (PRTE_MAPPING_NO_OVERSUBSCRIBE & PRTE_GET_MAPPING_DIRECTIVE(map->mapping)) {
+                            pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
+                                           app->num_procs, app->app, prte_process_info.nodename);
+                            PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
+                            ret = PRTE_ERR_SILENT;
+                            goto done;
+                        }
+                        // we can use it oversubscribed - so mark it
+                        PRTE_FLAG_SET(nptr, PRTE_NODE_FLAG_OVERSUBSCRIBED);
+                        PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_OVERSUBSCRIBED);
+                    }
                 }
+                // Map the node to this job
+                if (!PRTE_FLAG_TEST(nptr, PRTE_NODE_FLAG_MAPPED)) {
+                    PRTE_FLAG_SET(nptr, PRTE_NODE_FLAG_MAPPED);
+                    PMIX_RETAIN(nptr);
+                    pmix_pointer_array_add(map->nodes, nptr);
+                    map->num_nodes += 1;
+                    options->nnodes++;
+                }
+                // map the procs
                 for (j = 0; j < procs_per_target; ++j) {
-                    if (NULL == (proc = prte_rmaps_base_setup_proc(jdata, app->idx, nptr, NULL, options))) {
+                    proc = prte_rmaps_base_setup_proc(jdata, app->idx, nptr, NULL, options);
+                    if (NULL == proc) {
+                        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
                         ret = PRTE_ERR_OUT_OF_RESOURCE;
                         goto done;
                     }
                     jdata->num_procs += 1;
                     app->num_procs += 1;
-                    PMIX_RELEASE(proc); 
+                    PMIX_RELEASE(proc);
                 }
             }
         }
+
         /* calculate the ranks for this job */
         ret = prte_rmaps_base_compute_vpids(jdata, options);
         if (PRTE_SUCCESS != ret) {
@@ -1109,6 +1219,10 @@ static int map_colocate(prte_job_t *jdata,
 
     /* handle the case of colocate by process */
     PMIX_LIST_FOREACH_SAFE(nptr, n2, &targets, prte_node_t) {
+        // setup the mapping options
+        options->ncpus = prte_rmaps_base_get_ncpus(nptr, NULL, options);
+        /* the available cpus are in the scratch location */
+        options->target = hwloc_bitmap_dup(prte_rmaps_base.available);
         // count the number of target procs on this node
         cnt = 0;
         for (i=0; i < nptr->procs->size; i++) {
@@ -1127,28 +1241,51 @@ static int map_colocate(prte_job_t *jdata,
             // should not happen
             continue;
         }
-        // Map the node to this job - note we already set the "mapped" flag
-        PMIX_RETAIN(nptr);
-        pmix_pointer_array_add(map->nodes, nptr);
-        map->num_nodes += 1;
-        cnt = cnt * procs_per_target; // total number of procs to place on this node
-        // Assign cnt procs for each app_context
+        // assign the number of procs to be placed on this node
+        options->nprocs = cnt * procs_per_target; // total number of procs to place on this node;
+        // Assign procs for each app_context
         for (i=0; i < jdata->apps->size; i++) {
             app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, i);
+            if (NULL == app) {
+                continue;
+            }
             // is there room on this node? daemons don't count
-            if (!daemons && !prte_rmaps_base_check_avail(jdata, app, nptr, &targets, NULL, options)) {
-                if (PRTE_MAPPING_NO_OVERSUBSCRIBE & PRTE_GET_MAPPING_DIRECTIVE(map->mapping)) {
-                    pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
-                                   app->num_procs, app->app, prte_process_info.nodename);
-                    PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
-                    ret = PRTE_ERR_SILENT;
+            if (!daemons) {
+                cnt = nptr->slots_inuse + options->nprocs;
+                // first check the absolute limit
+                if (0 != nptr->slots_max && nptr->slots_max < cnt) {
+                    // violates the max limit
+                    ret = PRTE_ERR_OUT_OF_RESOURCE;
                     goto done;
                 }
-                PRTE_FLAG_SET(nptr, PRTE_NODE_FLAG_OVERSUBSCRIBED);
-                PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_OVERSUBSCRIBED);
+                // check oversubscribed
+                if (nptr->slots < cnt) {
+                    // oversubscribed - we can still fit if they allow oversubscription
+                    if (PRTE_MAPPING_NO_OVERSUBSCRIBE & PRTE_GET_MAPPING_DIRECTIVE(map->mapping)) {
+                        pmix_show_help("help-prte-rmaps-base.txt", "prte-rmaps-base:alloc-error", true,
+                                       app->num_procs, app->app, prte_process_info.nodename);
+                        PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
+                        ret = PRTE_ERR_SILENT;
+                        goto done;
+                    }
+                    // we can use it oversubscribed - so mark it
+                    PRTE_FLAG_SET(nptr, PRTE_NODE_FLAG_OVERSUBSCRIBED);
+                    PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_OVERSUBSCRIBED);
+                }
             }
-            for (j = 0; j < cnt; ++j) {
-                if (NULL == (proc = prte_rmaps_base_setup_proc(jdata, i, nptr, NULL, options))) {
+            // Map the node to this job
+            if (!PRTE_FLAG_TEST(nptr, PRTE_NODE_FLAG_MAPPED)) {
+                PRTE_FLAG_SET(nptr, PRTE_NODE_FLAG_MAPPED);
+                PMIX_RETAIN(nptr);
+                pmix_pointer_array_add(map->nodes, nptr);
+                map->num_nodes += 1;
+                options->nnodes++;
+            }
+            // map the procs
+            for (j = 0; j < options->nprocs; ++j) {
+                proc = prte_rmaps_base_setup_proc(jdata, i, nptr, NULL, options);
+                if (NULL == proc) {
+                    PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
                     ret = PRTE_ERR_OUT_OF_RESOURCE;
                     goto done;
                 }
@@ -1174,4 +1311,109 @@ done:
     }
     PMIX_LIST_DESTRUCT(&targets);
     return ret;
+}
+
+static void inherit_env_directives(prte_job_t *jdata,
+                                   prte_job_t *parent,
+                                   pmix_proc_t *proxy)
+{
+    prte_app_context_t *app, *app2;
+    prte_proc_t *p;
+    prte_attribute_t *attr, *attr2;
+    pmix_value_t *val, *val2;
+    pmix_envar_t *envar, *envar2;
+    int n;
+    bool exists;
+
+    // deal with job-level attributes first
+    PMIX_LIST_FOREACH(attr, &parent->attributes, prte_attribute_t) {
+        if (PMIX_ENVAR != attr->data.type) {
+            continue;
+        }
+        val = &attr->data;
+        envar = &val->data.envar;
+
+        // do we have a matching attribute in the new job?
+        exists = false;
+        PMIX_LIST_FOREACH(attr2, &jdata->attributes, prte_attribute_t) {
+            if (PMIX_ENVAR != attr->data.type) {
+                continue;
+            }
+            val2 = &attr2->data;
+            envar2 = &val2->data.envar;
+
+            if (attr->key == attr2->key) {
+                // operation is same - check if the target envars match
+                if (0 == strcmp(envar->envar, envar2->envar)) {
+                    // these match, so don't overwrite it
+                    exists = true;
+                    break;
+                }
+            }
+        }
+
+        if (exists) {
+            // leave this alone
+            continue;
+        }
+
+        // if it doesn't exist, then inherit it
+        prte_set_attribute(&jdata->attributes, attr->key, PRTE_ATTR_GLOBAL,
+                           envar, PMIX_ENVAR);
+    }
+
+    /* There is no one-to-one correlation between the apps, but we can
+     * inherit the directives from the proc that called spawn, so do that
+     * much here */
+    p = prte_get_proc_object(proxy);
+    if (NULL == p) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        return;
+    }
+    app = (prte_app_context_t*)pmix_pointer_array_get_item(parent->apps, p->app_idx);
+    if (NULL == app) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        return;
+    }
+    for (n=0; n < jdata->apps->size; n++) {
+        app2 = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, n);
+        if (NULL == app2) {
+            continue;
+        }
+        PMIX_LIST_FOREACH(attr, &app->attributes, prte_attribute_t) {
+            if (PMIX_ENVAR != attr->data.type) {
+                continue;
+            }
+            val = &attr->data;
+            envar = &val->data.envar;
+
+            exists = false;
+            PMIX_LIST_FOREACH(attr2, &app2->attributes, prte_attribute_t) {
+                if (PMIX_ENVAR != attr->data.type) {
+                    continue;
+                }
+                val2 = &attr2->data;
+                envar2 = &val2->data.envar;
+
+                if (attr->key == attr2->key) {
+                    // operation is same - check if the target envars match
+                    if (0 == strcmp(envar->envar, envar2->envar)) {
+                        // these match, so don't overwrite it
+                        exists = true;
+                        break;
+                    }
+                }
+            }
+
+            if (exists) {
+                // leave this alone
+                continue;
+            }
+
+            // if it doesn't exist, then inherit it
+            prte_set_attribute(&app2->attributes, attr->key, PRTE_ATTR_GLOBAL,
+                               envar, PMIX_ENVAR);
+        }
+    }
+
 }

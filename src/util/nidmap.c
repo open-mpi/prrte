@@ -5,7 +5,7 @@
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
  * Copyright (c) 2020      Triad National Security, LLC. All rights
  *                         reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -86,11 +86,19 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
         if (NULL == (nptr = (prte_node_t *) pmix_pointer_array_get_item(pool, n))) {
             continue;
         }
+        if (NULL == nptr->daemon) {
+            continue;
+        }
         /* add the hostname to the argv */
         PMIX_ARGV_APPEND_NOSIZE_COMPAT(&names, nptr->name);
         als = NULL;
         if (NULL != nptr->aliases) {
             for (m=0; NULL != nptr->aliases[m]; m++) {
+                // skip any localhost entries
+                if (0 == strcmp(nptr->aliases[m], "localhost") ||
+                    0 == strcmp(nptr->aliases[m], "127.0.0.1")) {
+                    continue;
+                }
                 PMIX_ARGV_APPEND_NOSIZE_COMPAT(&als, nptr->aliases[m]);
             }
             raw = PMIX_ARGV_JOIN_COMPAT(als, ',');
@@ -101,11 +109,7 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&aliases, "PRTENONE");
         }
         /* store the vpid */
-        if (NULL == nptr->daemon) {
-            vpids[ndaemons] = PMIX_RANK_INVALID;
-        } else {
-            vpids[ndaemons] = nptr->daemon->name.rank;
-        }
+        vpids[ndaemons] = nptr->daemon->name.rank;
         ++ndaemons;
     }
 
@@ -398,22 +402,20 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
         /* set the topology - always default to homogeneous
          * as that is the most common scenario */
         nd->topology = t;
-        /* see if it has a daemon on it */
-        if (PMIX_RANK_INVALID != vpid[n]) {
-            proc = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, vpid[n]);
-            if (NULL == proc) {
-                proc = PMIX_NEW(prte_proc_t);
-                PMIX_LOAD_PROCID(&proc->name, PRTE_PROC_MY_NAME->nspace, vpid[n]);
-                proc->state = PRTE_PROC_STATE_RUNNING;
-                PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_ALIVE);
-                daemons->num_procs++;
-                pmix_pointer_array_set_item(daemons->procs, proc->name.rank, proc);
-            }
-            PMIX_RETAIN(nd);
-            proc->node = nd;
-            PMIX_RETAIN(proc);
-            nd->daemon = proc;
+        /* record the daemon on it */
+        proc = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, vpid[n]);
+        if (NULL == proc) {
+            proc = PMIX_NEW(prte_proc_t);
+            PMIX_LOAD_PROCID(&proc->name, PRTE_PROC_MY_NAME->nspace, vpid[n]);
+            proc->state = PRTE_PROC_STATE_RUNNING;
+            PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_ALIVE);
+            daemons->num_procs++;
+            pmix_pointer_array_set_item(daemons->procs, proc->name.rank, proc);
         }
+        PMIX_RETAIN(nd);
+        proc->node = nd;
+        PMIX_RETAIN(proc);
+        nd->daemon = proc;
     }
 
     /* update num procs */
