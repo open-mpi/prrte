@@ -15,7 +15,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2017-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -54,7 +54,6 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
     int rc;
     pmix_mca_base_component_t *c = &prte_mca_rmaps_round_robin_component;
     bool initial_map = true;
-    char **tmp;
 
     /* this mapper can only handle initial launch
      * when rr mapping is desired - allow
@@ -110,7 +109,7 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
          * option
          */
         rc = prte_rmaps_base_get_target_nodes(&node_list, &num_slots, jdata, app,
-                                              jdata->map->mapping, initial_map, false);
+                                              jdata->map->mapping, initial_map, false, false);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
             goto error;

@@ -19,7 +19,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Geoffroy Vallee. All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      Amazon.com, Inc. or its affiliates.  All Rights
  *                         reserved.
  * $COPYRIGHT$
@@ -106,17 +106,10 @@ static pmix_nspace_t spawnednspace;
 
 static size_t evid = INT_MAX;
 static pmix_proc_t myproc;
-static bool forcibly_die = false;
-static prte_event_t term_handler;
-static int term_pipe[2];
-static pmix_mutex_t prun_abort_inprogress_lock = PMIX_MUTEX_STATIC_INIT;
 static bool verbose = false;
 static pmix_list_t forwarded_signals;
 
-static void abort_signal_callback(int signal);
-static void clean_abort(int fd, short flags, void *arg);
 static void signal_forward_callback(int signal);
-static void epipe_signal_callback(int signal);
 
 static void regcbfunc(pmix_status_t status, size_t ref, void *cbdata)
 {
@@ -314,7 +307,7 @@ int prun_common(pmix_cli_result_t *results,
                 prte_schizo_base_module_t *schizo,
                 int pargc, char **pargv)
 {
-    int rc = 1, i;
+    int rc = 1;
     char *param, *ptr;
     prte_pmix_lock_t lock, rellock;
     pmix_list_t apps;
@@ -350,7 +343,9 @@ int prun_common(pmix_cli_result_t *results,
      * otherwise, remain attached so output can get to us
      */
     if (pmix_cmd_line_is_taken(results, PRTE_CLI_DAEMONIZE)) {
-        pipe(wait_pipe);
+        if (0 > pipe(wait_pipe)) {
+            return PRTE_ERROR;
+        }
         prte_state_base.parent_fd = wait_pipe[1];
         prte_daemon_init_callback(NULL, wait_dvm);
         close(wait_pipe[0]);
@@ -364,14 +359,13 @@ int prun_common(pmix_cli_result_t *results,
     }
 
     /** setup callbacks for signals we should forward */
-    PMIX_CONSTRUCT(&prte_ess_base_signals, pmix_list_t);
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_FWD_SIGNALS);
     if (NULL != opt) {
         param = opt->values[0];
     } else {
         param = NULL;
     }
-    if (PRTE_SUCCESS != (rc = prte_ess_base_setup_signals(param))) {
+    if (PMIX_SUCCESS != (rc = prte_ess_base_setup_signals(param))) {
         return rc;
     }
     PMIX_LIST_FOREACH(sig, &prte_ess_base_signals, prte_ess_base_signal_t)
@@ -382,7 +376,7 @@ int prun_common(pmix_cli_result_t *results,
     /* setup the job data global table */
     prte_job_data = PMIX_NEW(pmix_pointer_array_t);
     ret = pmix_pointer_array_init(prte_job_data, PRTE_GLOBAL_ARRAY_BLOCK_SIZE,
-                                          PRTE_GLOBAL_ARRAY_MAX_SIZE,
+                                  PRTE_GLOBAL_ARRAY_MAX_SIZE,
                                   PRTE_GLOBAL_ARRAY_BLOCK_SIZE);
     if (PRTE_SUCCESS != ret) {
         PRTE_ERROR_LOG(ret);
@@ -549,128 +543,6 @@ int prun_common(pmix_cli_result_t *results,
     /* we want to be notified upon job completion */
     PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_NOTIFY_COMPLETION, &flag, PMIX_BOOL);
 
-    /* pass the personality */
-    PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_PERSONALITY, schizo->name, PMIX_STRING);
-
-    /* get display options */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_DISPLAY);
-    if (NULL != opt) {
-        ret = prte_schizo_base_parse_display(opt, jinfo);
-        if (PRTE_SUCCESS != ret) {
-            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
-            goto DONE;
-        }
-    }
-
-    /* check for output options */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_OUTPUT);
-    if (NULL != opt) {
-        ret = prte_schizo_base_parse_output(opt, jinfo);
-        if (PRTE_SUCCESS != ret) {
-            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
-            goto DONE;
-        }
-    }
-
-    /* check for runtime options */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_RTOS);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_RUNTIME_OPTIONS, opt->values[0], PMIX_STRING);
-    }
-
-    /* check what user wants us to do with stdin */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_STDIN);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_STDIN_TGT, opt->values[0], PMIX_STRING);
-    }
-
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_MAPBY);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_MAPBY, opt->values[0], PMIX_STRING);
-    }
-
-    /* if the user specified a ranking policy, then set it */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_RANKBY);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_RANKBY, opt->values[0], PMIX_STRING);
-    }
-
-    /* if the user specified a binding policy, then set it */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_BINDTO);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_BINDTO, opt->values[0], PMIX_STRING);
-    }
-
-    /* check for an exec agent */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_EXEC_AGENT);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_EXEC_AGENT, opt->values[0], PMIX_STRING);
-    }
-
-    /* mark if recovery was enabled on the cmd line */
-    if (pmix_cmd_line_is_taken(results, PRTE_CLI_ENABLE_RECOVERY)) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_RECOVERABLE, &flag, PMIX_BOOL);
-    }
-    /* record the max restarts */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_MAX_RESTARTS);
-    if (NULL != opt) {
-        ui32 = strtol(opt->values[0], NULL, 10);
-        PMIX_LIST_FOREACH(app, &apps, prte_pmix_app_t)
-        {
-            PMIX_INFO_LIST_ADD(ret, app->info, PMIX_MAX_RESTARTS, &ui32, PMIX_UINT32);
-        }
-    }
-    /* if continuous operation was specified */
-    if (pmix_cmd_line_is_taken(results, PRTE_CLI_CONTINUOUS)) {
-        /* mark this job as continuously operating */
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_CONTINUOUS, &flag, PMIX_BOOL);
-    }
-#ifdef PMIX_ABORT_NONZERO_EXIT
-    /* if ignore non-zero exit was specified */
-    if (pmix_cmd_line_is_taken(results, PRTE_CLI_TERM_NONZERO)) {
-        /* mark this job to not terminate if a proc exits with non-zero status */
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_ABORT_NONZERO_EXIT, NULL, PMIX_BOOL);
-    }
-#endif
-    /* if stop-on-exec was specified */
-    if (pmix_cmd_line_is_taken(results, PRTE_CLI_STOP_ON_EXEC)) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_DEBUG_STOP_ON_EXEC, NULL, PMIX_BOOL);
-    }
-
-    /* check for a job timeout specification, to be provided in seconds
-     * as that is what MPICH used
-     */
-    i = 0;
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_TIMEOUT);
-    if (NULL != opt) {
-        i = strtol(opt->values[0], NULL, 10);
-    } else if (NULL != (param = getenv("MPIEXEC_TIMEOUT"))) {
-        i = strtol(param, NULL, 10);
-    }
-    if (0 != i) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_TIMEOUT, &i, PMIX_INT);
-    }
-
-    if (pmix_cmd_line_is_taken(results, PRTE_CLI_STACK_TRACES)) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_TIMEOUT_STACKTRACES, &flag, PMIX_BOOL);
-    }
-    if (pmix_cmd_line_is_taken(results, PRTE_CLI_REPORT_STATE)) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_TIMEOUT_REPORT_STATE, &flag, PMIX_BOOL);
-    }
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_SPAWN_TIMEOUT);
-    if (NULL != opt) {
-        i = strtol(opt->values[0], NULL, 10);
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_SPAWN_TIMEOUT, &i, PMIX_INT);
-    }
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_DO_NOT_AGG_HELP);
-    if (NULL != opt) {
-        flag = false;
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_LOG_AGG, &flag, PMIX_BOOL);
-    }
-
-    /* give the schizo components a chance to add to the job info */
-    schizo->job_info(results, jinfo);
-
     /* pickup any relevant envars */
     ninfo = 4;
     PMIX_INFO_CREATE(iptr, ninfo);
@@ -714,7 +586,8 @@ int prun_common(pmix_cli_result_t *results,
     /* they want to run an application, so let's parse
      * the cmd line to get it */
 
-    if (PRTE_SUCCESS != (rc = prte_parse_locals(schizo, &apps, pargv, NULL, NULL))) {
+    rc = prte_parse_locals(schizo, &apps, pargv, NULL, NULL, NULL);
+    if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PMIX_LIST_DESTRUCT(&apps);
         goto DONE;
@@ -723,6 +596,11 @@ int prun_common(pmix_cli_result_t *results,
     /* bozo check */
     if (0 == pmix_list_get_size(&apps)) {
         pmix_output(0, "No application specified!");
+        goto DONE;
+    }
+
+    ret = prte_prun_parse_common_cli(jinfo, results, schizo, &apps);
+    if (PRTE_SUCCESS != ret) {
         goto DONE;
     }
 
@@ -786,7 +664,7 @@ int prun_common(pmix_cli_result_t *results,
         } else if (0 == strcmp(opt->values[0], "none")) {
             pname.rank = PMIX_RANK_INVALID;
         } else {
-            pname.rank = 0;
+            pname.rank = strtoul(opt->values[0], NULL, 10);
         }
     } else {
         pname.rank = 0;
@@ -880,81 +758,160 @@ DONE:
     return rc;
 }
 
-static void clean_abort(int fd, short flags, void *arg)
+int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
+                               prte_schizo_base_module_t *schizo,
+                               pmix_list_t *apps)
 {
-    pmix_proc_t target;
-    pmix_info_t directive;
-    pmix_status_t rc;
-    PRTE_HIDE_UNUSED_PARAMS(fd, flags, arg);
+    pmix_cli_item_t *opt;
+    int ret, i;
+    uint32_t ui32;
+    bool flag;
+    prte_pmix_app_t *app;
+    char *param;
 
-    /* if we have already ordered this once, don't keep
-     * doing it to avoid race conditions
+    /* pass the personality */
+    PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_PERSONALITY, schizo->name, PMIX_STRING);
+
+    /* get display options */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_DISPLAY);
+    if (NULL != opt) {
+        ret = prte_schizo_base_parse_display(opt, jinfo);
+        if (PRTE_SUCCESS != ret) {
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return ret;
+        }
+    }
+
+    /* check for output options */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_OUTPUT);
+    if (NULL != opt) {
+        ret = prte_schizo_base_parse_output(opt, jinfo);
+        if (PRTE_SUCCESS != ret) {
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return ret;
+        }
+    }
+
+    /* check for runtime options */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_RTOS);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_RUNTIME_OPTIONS, opt->values[0], PMIX_STRING);
+    }
+
+    /* check what user wants us to do with stdin */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_STDIN);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_STDIN_TGT, opt->values[0], PMIX_STRING);
+    }
+
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_MAPBY);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_MAPBY, opt->values[0], PMIX_STRING);
+    }
+
+    /* if the user specified a ranking policy, then set it */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_RANKBY);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_RANKBY, opt->values[0], PMIX_STRING);
+    }
+
+    /* if the user specified a binding policy, then set it */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_BINDTO);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_BINDTO, opt->values[0], PMIX_STRING);
+    }
+
+    /* check for an exec agent */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_EXEC_AGENT);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_EXEC_AGENT, opt->values[0], PMIX_STRING);
+    }
+
+    /* mark if recovery was enabled on the cmd line */
+    if (pmix_cmd_line_is_taken(results, PRTE_CLI_ENABLE_RECOVERY)) {
+        flag = true;
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_RECOVERABLE, &flag, PMIX_BOOL);
+    }
+    /* record the max restarts */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_MAX_RESTARTS);
+    if (NULL != opt) {
+        ui32 = strtol(opt->values[0], NULL, 10);
+        PMIX_LIST_FOREACH(app, apps, prte_pmix_app_t)
+        {
+            PMIX_INFO_LIST_ADD(ret, app->info, PMIX_MAX_RESTARTS, &ui32, PMIX_UINT32);
+        }
+    }
+    /* if continuous operation was specified */
+    if (pmix_cmd_line_is_taken(results, PRTE_CLI_CONTINUOUS)) {
+        /* mark this job as continuously operating */
+        flag = true;
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_CONTINUOUS, &flag, PMIX_BOOL);
+    }
+#ifdef PMIX_ABORT_NONZERO_EXIT
+    /* if ignore non-zero exit was specified */
+    if (pmix_cmd_line_is_taken(results, PRTE_CLI_TERM_NONZERO)) {
+        /* mark this job to not terminate if a proc exits with non-zero status */
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_ABORT_NONZERO_EXIT, NULL, PMIX_BOOL);
+    }
+#endif
+    /* if stop-on-exec was specified */
+    if (pmix_cmd_line_is_taken(results, PRTE_CLI_STOP_ON_EXEC)) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_DEBUG_STOP_ON_EXEC, NULL, PMIX_BOOL);
+    }
+
+    /* check for a job timeout specification, to be provided in seconds
+     * as that is what MPICH used
      */
-    if (pmix_mutex_trylock(&prun_abort_inprogress_lock)) { /* returns 1 if already locked */
-        if (forcibly_die) {
-            PMIx_tool_finalize();
-            /* exit with a non-zero status */
-            exit(1);
-        }
-        fprintf(stderr,
-                "prun: abort is already in progress...hit ctrl-c again to forcibly terminate\n\n");
-        forcibly_die = true;
-        /* reset the event */
-        prte_event_add(&term_handler, NULL);
-        return;
+    i = 0;
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_TIMEOUT);
+    if (NULL != opt) {
+        i = strtol(opt->values[0], NULL, 10);
+    } else if (NULL != (param = getenv("MPIEXEC_TIMEOUT"))) {
+        i = strtol(param, NULL, 10);
+    }
+    if (0 != i) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_JOB_TIMEOUT, &i, PMIX_INT);
     }
 
-    /* tell PRTE to terminate our job */
-    PMIX_LOAD_PROCID(&target, spawnednspace, PMIX_RANK_WILDCARD);
-    PMIX_INFO_LOAD(&directive, PMIX_JOB_CTRL_KILL, NULL, PMIX_BOOL);
-    rc = PMIx_Job_control_nb(&target, 1, &directive, 1, NULL, NULL);
-    if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
-        PMIx_tool_finalize();
-        /* exit with a non-zero status */
-        exit(1);
+    if (pmix_cmd_line_is_taken(results, PRTE_CLI_STACK_TRACES)) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_TIMEOUT_STACKTRACES, &flag, PMIX_BOOL);
     }
-}
-
-static struct timeval current, last = {0, 0};
-static bool first = true;
-
-/*
- * Attempt to terminate the job and wait for callback indicating
- * the job has been aborted.
- */
-static void abort_signal_callback(int fd)
-{
-    uint8_t foo = 1;
-    char *msg
-        = "Abort is in progress...hit ctrl-c again within 5 seconds to forcibly terminate\n\n";
-    PRTE_HIDE_UNUSED_PARAMS(fd);
-
-    /* if this is the first time thru, just get
-     * the current time
-     */
-    if (first) {
-        first = false;
-        gettimeofday(&current, NULL);
-    } else {
-        /* get the current time */
-        gettimeofday(&current, NULL);
-        /* if this is within 5 seconds of the
-         * last time we were called, then just
-         * exit - we are probably stuck
-         */
-        if ((current.tv_sec - last.tv_sec) < 5) {
-            exit(1);
-        }
-        if (-1 == write(1, (void *) msg, strlen(msg))) {
-            exit(1);
-        }
+    if (pmix_cmd_line_is_taken(results, PRTE_CLI_REPORT_STATE)) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_TIMEOUT_REPORT_STATE, &flag, PMIX_BOOL);
     }
-    /* save the time */
-    last.tv_sec = current.tv_sec;
-    /* tell the event lib to attempt to abnormally terminate */
-    if (-1 == write(term_pipe[1], &foo, 1)) {
-        exit(1);
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_SPAWN_TIMEOUT);
+    if (NULL != opt) {
+        i = strtol(opt->values[0], NULL, 10);
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_SPAWN_TIMEOUT, &i, PMIX_INT);
     }
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_DO_NOT_AGG_HELP);
+    if (NULL != opt) {
+        flag = false;
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_LOG_AGG, &flag, PMIX_BOOL);
+    }
+
+#ifdef PMIX_MEM_ALLOC_KIND
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_MEM_ALLOC_KIND);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_MEM_ALLOC_KIND, opt->values[0], PMIX_STRING);
+    }
+#endif
+#ifdef PMIX_GPU_SUPPORT
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_GPU_SUPPORT);
+    if (NULL != opt) {
+        pmix_info_t info;
+        // they could be enabling or disabling it
+        info.value.type = PMIX_STRING;
+        info.value.data.string = opt->values[0];
+        flag = PMIX_INFO_TRUE(&info);
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_GPU_SUPPORT, &flag, PMIX_BOOL);
+    }
+#endif
+
+    /* give the schizo components a chance to add to the job info */
+    schizo->job_info(results, jinfo);
+
+    return PRTE_SUCCESS;
 }
 
 static void signal_forward_callback(int signum)
@@ -975,22 +932,4 @@ static void signal_forward_callback(int signum)
         fprintf(stderr, "Signal %d could not be sent to job %s (returned %s)", signum,
                 spawnednspace, PMIx_Error_string(rc));
     }
-}
-
-/**
- * Deal with sigpipe errors
- */
-static int sigpipe_error_count = 0;
-static void epipe_signal_callback(int signal)
-{
-    sigpipe_error_count++;
-    PRTE_HIDE_UNUSED_PARAMS(signal);
-
-    if (10 < sigpipe_error_count) {
-        /* time to abort */
-        pmix_output(0, "%s: SIGPIPE detected - aborting", prte_tool_basename);
-        clean_abort(0, 0, NULL);
-    }
-
-    return;
 }

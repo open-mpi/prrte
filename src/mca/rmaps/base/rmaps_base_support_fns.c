@@ -106,7 +106,7 @@ int prte_rmaps_base_get_target_nodes(pmix_list_t *allocated_nodes,
                                      int32_t *total_num_slots,
                                      prte_job_t *jdata, prte_app_context_t *app,
                                      prte_mapping_policy_t policy,
-                                     bool initial_map, bool silent)
+                                     bool initial_map, bool silent, bool keepall)
 {
     pmix_list_item_t *item;
     prte_node_t *node, *nd, *nptr, *next;
@@ -431,7 +431,7 @@ complete:
                 }
             }
             /** check to see if this node is fully used - remove if so */
-            if (0 != node->slots_max && node->slots_inuse >= node->slots_max) {
+            if (!keepall && 0 != node->slots_max && node->slots_inuse >= node->slots_max) {
                 PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
                                      "%s Removing node %s: max %d inuse %d",
                                      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name,
@@ -440,7 +440,7 @@ complete:
                 PMIX_RELEASE(node); /* "un-retain" it */
                 continue;
             }
-            if (node->slots <= node->slots_inuse &&
+            if (!keepall && node->slots <= node->slots_inuse &&
                 (PRTE_MAPPING_NO_OVERSUBSCRIBE & PRTE_GET_MAPPING_DIRECTIVE(policy))) {
                 /* remove the node as fully used */
                 PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
@@ -480,7 +480,7 @@ complete:
                                      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
                 /* cache the available CPUs for later */
                 hwloc_bitmap_copy(node->jobcache, node->available);
-            } else {
+            } else if (!keepall) {
                 PMIX_OUTPUT_VERBOSE((5, prte_rmaps_base_framework.framework_output,
                                      "%s node %s is fully used and not available for oversubscription: SLOTS %d INUSE %d",
                                      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name,
@@ -635,27 +635,18 @@ int prte_rmaps_base_get_ncpus(prte_node_t *node,
 {
     int ncpus;
 
+    if (NULL == options->job_cpuset) {
+        hwloc_bitmap_copy(prte_rmaps_base.available, node->available);
+    } else {
+        hwloc_bitmap_and(prte_rmaps_base.available, node->available, options->job_cpuset);
+    }
+    if (NULL != obj) {
 #if HWLOC_API_VERSION < 0x20000
-    hwloc_obj_t root;
-    root = hwloc_get_root_obj(node->topology->topo);
-    if (NULL == options->job_cpuset) {
-        hwloc_bitmap_copy(prte_rmaps_base.available, root->allowed_cpuset);
-    } else {
-        hwloc_bitmap_and(prte_rmaps_base.available, root->allowed_cpuset, options->job_cpuset);
-    }
-    if (NULL != obj) {
         hwloc_bitmap_and(prte_rmaps_base.available, prte_rmaps_base.available, obj->allowed_cpuset);
-    }
 #else
-    if (NULL == options->job_cpuset) {
-        hwloc_bitmap_copy(prte_rmaps_base.available, hwloc_topology_get_allowed_cpuset(node->topology->topo));
-    } else {
-        hwloc_bitmap_and(prte_rmaps_base.available, hwloc_topology_get_allowed_cpuset(node->topology->topo), options->job_cpuset);
-    }
-    if (NULL != obj) {
         hwloc_bitmap_and(prte_rmaps_base.available, prte_rmaps_base.available, obj->cpuset);
-    }
 #endif
+    }
     if (options->use_hwthreads) {
         ncpus = hwloc_bitmap_weight(prte_rmaps_base.available);
     } else {
@@ -668,6 +659,7 @@ int prte_rmaps_base_get_ncpus(prte_node_t *node,
          */
         ncpus = hwloc_get_nbobjs_inside_cpuset_by_type(node->topology->topo, prte_rmaps_base.available, HWLOC_OBJ_CORE);
     }
+
     return ncpus;
 }
 

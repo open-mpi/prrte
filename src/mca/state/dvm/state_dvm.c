@@ -4,7 +4,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -24,11 +24,13 @@
 #include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
 #include "src/util/pmix_argv.h"
+#include "src/util/pmix_fd.h"
 #include "src/util/nidmap.h"
 #include "src/util/pmix_os_dirpath.h"
 #include "src/util/pmix_output.h"
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
+#include "src/util/pmix_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/filem/filem.h"
@@ -39,7 +41,7 @@
 #include "src/mca/ras/base/base.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/rml/rml.h"
-#include "src/runtime/prte_data_server.h"
+#include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/prte_quit.h"
 #include "src/runtime/prte_wait.h"
 #include "src/threads/pmix_threads.h"
@@ -344,7 +346,7 @@ static void vm_ready(int fd, short args, void *cbdata)
             }
         } else {
             char ok = 'K';
-            write(prte_state_base.parent_fd, &ok, 1);
+            pmix_fd_write(prte_state_base.parent_fd, 1, &ok);
             close(prte_state_base.parent_fd);
             prte_state_base.parent_fd = -1;
         }
@@ -505,7 +507,7 @@ static void check_complete(int fd, short args, void *cbdata)
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     prte_job_t *jdata, *jptr;
     prte_proc_t *proc;
-    int i, rc;
+    int i, rc, nprocs;
     prte_node_t *node;
     prte_job_map_t *map;
     int32_t index;
@@ -514,13 +516,13 @@ static void check_complete(int fd, short args, void *cbdata)
     uint8_t command = PRTE_PMIX_PURGE_PROC_CMD;
     pmix_data_buffer_t *buf;
     pmix_pointer_array_t procs;
-    char *tmp;
     prte_timer_t *timer;
     prte_app_context_t *app;
     hwloc_obj_t obj;
     hwloc_obj_type_t type;
     hwloc_cpuset_t boundcpus, tgt;
-    bool takeall;
+    bool takeall, sep, *sepptr = &sep;
+    pmix_server_pset_t *pst, *pst2;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(caddy);
@@ -810,27 +812,46 @@ release:
         PMIX_RELEASE(map);
         jdata->map = NULL;
     }
+    // if this job has apps that named a pset, then remove them
+    PMIX_LIST_FOREACH_SAFE(pst, pst2, &prte_pmix_server_globals.psets, pmix_server_pset_t) {
+        if (pst->jdata == jdata) {
+            pmix_list_remove_item(&prte_pmix_server_globals.psets, &pst->super);
+            PMIX_RELEASE(pst);
+        }
+    }
 
     /* if requested, check fd status for leaks */
     if (prte_state_base.run_fdcheck) {
         prte_state_base_check_fds(jdata);
     }
 
-    /* if this job was a launcher, then we need to abort all of its
-     * child jobs that might still be running */
+    /* if this job started child jobs, then we need to abort all of its
+     * child jobs that might still be running unless designated to
+     * run independently of their parent */
     if (0 < pmix_list_get_size(&jdata->children)) {
         PMIX_CONSTRUCT(&procs, pmix_pointer_array_t);
         pmix_pointer_array_init(&procs, 1, INT_MAX, 1);
+        nprocs = 0;
         PMIX_LIST_FOREACH(jptr, &jdata->children, prte_job_t)
         {
-            proc = PMIX_NEW(prte_proc_t);
-            PMIX_LOAD_PROCID(&proc->name, jptr->nspace, PMIX_RANK_WILDCARD);
-            pmix_pointer_array_add(&procs, proc);
+            if (prte_get_attribute(&jptr->attributes, PRTE_JOB_CHILD_SEP, (void**)&sepptr, PMIX_BOOL) && !sep) {
+                proc = PMIX_NEW(prte_proc_t);
+                PMIX_LOAD_PROCID(&proc->name, jptr->nspace, PMIX_RANK_WILDCARD);
+                pmix_pointer_array_add(&procs, proc);
+                ++nprocs;
+                if (1 == nprocs) {
+                    // output a warning message that at least one child is being terminated
+                    pmix_show_help("help-state-base.txt", "child-term", true,
+                                   jdata->nspace, jptr->nspace);
+                }
+            }
         }
-        prte_plm.terminate_procs(&procs);
-        for (i = 0; i < procs.size; i++) {
-            if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(&procs, i))) {
-                PMIX_RELEASE(proc);
+        if (0 < nprocs) {
+            prte_plm.terminate_procs(&procs);
+            for (i = 0; i < procs.size; i++) {
+                if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(&procs, i))) {
+                    PMIX_RELEASE(proc);
+                }
             }
         }
         PMIX_DESTRUCT(&procs);
@@ -851,6 +872,8 @@ release:
 
 static void cleanup_job(int sd, short args, void *cbdata)
 {
+    pmix_proc_t *nptr;
+    prte_job_t *parent;
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
@@ -861,6 +884,16 @@ static void cleanup_job(int sd, short args, void *cbdata)
         prte_plm.terminate_orteds();
     }
     if (NULL != caddy->jdata) {
+        /* if the job had a spawn parent remove it from the parents child list */
+        if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_LAUNCH_PROXY, (void **) &nptr, PMIX_PROC)) {
+            if(NULL != (parent = prte_get_job_data_object(nptr->nspace)) &&
+            !PMIX_CHECK_NSPACE(parent->nspace, PRTE_PROC_MY_NAME->nspace)){
+                pmix_list_remove_item(&parent->children, &caddy->jdata->super);
+                /* We retained the jdata before adding it to the list - maintain ref count */
+                PMIX_RELEASE(caddy->jdata);
+            }
+            PMIX_PROC_RELEASE(nptr);
+        }
         PMIX_RELEASE(caddy->jdata);
     }
     PMIX_RELEASE(caddy);

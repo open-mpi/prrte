@@ -15,7 +15,7 @@
  * Copyright (c) 2017-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -66,7 +66,6 @@ typedef struct {
     size_t node_regex_threshold;
     pmix_list_t daemon_cache;
     bool daemon1_has_reported;
-    char **cache;
 } prte_plm_globals_t;
 /**
  * Global instance of PLM framework data
@@ -90,6 +89,9 @@ PRTE_EXPORT void prte_plm_base_daemon_failed(int status, pmix_proc_t *sender,
 PRTE_EXPORT void prte_plm_base_daemon_topology(int status, pmix_proc_t *sender,
                                                pmix_data_buffer_t *buffer, prte_rml_tag_t tag,
                                                void *cbdata);
+PRTE_EXPORT void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
+                                                pmix_data_buffer_t *buffer,
+                                                prte_rml_tag_t tag, void *cbdata);
 
 PRTE_EXPORT int prte_plm_base_create_jobid(prte_job_t *jdata);
 PRTE_EXPORT int prte_plm_base_set_hnp_name(void);

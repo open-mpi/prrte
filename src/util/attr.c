@@ -3,7 +3,7 @@
  * Copyright (c) 2014-2017 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018-2020 Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
@@ -257,8 +257,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "APP-NODES-MANDATORY";
         case PRTE_APP_MAX_PPN:
             return "APP-MAX-PPN";
-        case PRTE_APP_PREFIX_DIR:
-            return "APP-PREFIX-DIR";
+        case PRTE_APP_PMIX_PREFIX:
+            return "APP-PMIX-PREFIX";
         case PRTE_APP_NO_CACHEDIR:
             return "PRTE_APP_NO_CACHEDIR";
         case PRTE_APP_SET_ENVAR:
@@ -499,6 +499,14 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "DISPLAY PARSEABLE OUTPUT";
         case PRTE_JOB_EXTEND_DVM:
             return "EXTEND DVM";
+        case PRTE_JOB_CHILD_SEP:
+            return "CHILD SEP";
+        case PRTE_JOB_GPU_SUPPORT:
+            return "GPU SUPPORT";
+        case PRTE_JOB_PREFIX:
+            return "PRTE-JOB-PREFIX";
+        case PRTE_JOB_PMIX_PREFIX:
+            return "PRTE-JOB-PMIX-PREFIX";
 
         case PRTE_PROC_NOBARRIER:
             return "PROC-NOBARRIER";
@@ -585,6 +593,17 @@ int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type)
                 free(kv->data.data.string);
             } else if (PMIX_BYTE_OBJECT == type && NULL != kv->data.data.bo.bytes) {
                 free(kv->data.data.bo.bytes);
+            } else if (PMIX_PROC_NSPACE == type && NULL != kv->data.data.proc) {
+                PMIX_PROC_FREE(kv->data.data.proc, 1);
+            } else if (PMIX_PROC == type && NULL != kv->data.data.proc) {
+                PMIX_PROC_FREE(kv->data.data.proc, 1);
+            } else if (PMIX_ENVAR == type) {
+                if (NULL != kv->data.data.envar.envar) {
+                    free(kv->data.data.envar.envar);
+                }
+                if (NULL != kv->data.data.envar.value) {
+                    free(kv->data.data.envar.value);
+                }
             }
             /* just set the fields to zero */
             memset(&kv->data.data, 0, sizeof(kv->data.data));
@@ -603,7 +622,11 @@ int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type)
         if (NULL != kv->data.data.string) {
             free(kv->data.data.string);
         }
-        kv->data.data.string = strdup((const char *) data);
+        if (NULL != data) {
+            kv->data.data.string = strdup((const char *) data);
+        } else {
+            kv->data.data.string = NULL;
+        }
         break;
     case PMIX_SIZE:
         kv->data.data.size = *(size_t *) (data);
@@ -678,25 +701,34 @@ int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type)
         break;
 
     case PMIX_PROC_NSPACE:
-        PMIX_PROC_CREATE(kv->data.data.proc, 1);
         if (NULL == kv->data.data.proc) {
-            return PRTE_ERR_OUT_OF_RESOURCE;
+            PMIX_PROC_CREATE(kv->data.data.proc, 1);
+            if (NULL == kv->data.data.proc) {
+                return PRTE_ERR_OUT_OF_RESOURCE;
+            }
         }
         PMIX_LOAD_NSPACE(kv->data.data.proc->nspace, (char *) data);
         break;
 
     case PMIX_PROC:
-        PMIX_PROC_CREATE(kv->data.data.proc, 1);
         if (NULL == kv->data.data.proc) {
-            return PRTE_ERR_OUT_OF_RESOURCE;
+            PMIX_PROC_CREATE(kv->data.data.proc, 1);
+            if (NULL == kv->data.data.proc) {
+                return PRTE_ERR_OUT_OF_RESOURCE;
+            }
         }
         PMIX_XFER_PROCID(kv->data.data.proc, (pmix_proc_t *) data);
         break;
 
     case PMIX_ENVAR:
-        PMIX_ENVAR_CONSTRUCT(&kv->data.data.envar);
         envar = (pmix_envar_t *) data;
         if (NULL != envar) {
+            if (NULL != kv->data.data.envar.envar) {
+                free(kv->data.data.envar.envar);
+            }
+            if (NULL != kv->data.data.envar.value) {
+                free(kv->data.data.envar.value);
+            }
             if (NULL != envar->envar) {
                 kv->data.data.envar.envar = strdup(envar->envar);
             }

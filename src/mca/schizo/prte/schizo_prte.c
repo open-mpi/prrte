@@ -18,7 +18,7 @@
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018-2022 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -109,10 +109,12 @@ static struct option prteoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_LEAVE_SESSION_ATTACHED, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_TMPDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PREFIX, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_PMIX_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_NOPREFIX, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_SIGNALS, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DO_NOT_AGG_HELP, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_HETERO_NODES, PMIX_ARG_NONE),
 
     // Launch options
     PMIX_OPTION_DEFINE(PRTE_CLI_TIMEOUT, PMIX_ARG_REQD),
@@ -151,6 +153,7 @@ static struct option prterunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_SET_SID, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_PID, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_URI, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_SYSTEM_SERVER, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DEFAULT_HOSTFILE, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_KEEPALIVE, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_LAUNCH_AGENT, PMIX_ARG_REQD),
@@ -161,12 +164,14 @@ static struct option prterunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_LEAVE_SESSION_ATTACHED, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_TMPDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PREFIX, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_PMIX_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_NOPREFIX, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_SIGNALS, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PERSONALITY, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_CHILD_SEP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DVM, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_HETERO_NODES, PMIX_ARG_NONE),
 
     // Launch options
     PMIX_OPTION_DEFINE(PRTE_CLI_TIMEOUT, PMIX_ARG_REQD),
@@ -182,6 +187,18 @@ static struct option prterunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_STOP_IN_INIT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_STOP_IN_APP, PMIX_ARG_NONE),
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_FWD_ENVAR, PMIX_ARG_REQD, 'x'),
+#ifdef PMIX_CLI_SET_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_SET_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_PREPEND_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_PREPEND_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_APPEND_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_APPEND_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_UNSET_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_UNSET_ENVAR, PMIX_ARG_REQD),
+#endif
     PMIX_OPTION_DEFINE(PRTE_CLI_WDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("wd", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_SET_CWD_SESSION, PMIX_ARG_NONE),
@@ -196,6 +213,10 @@ static struct option prterunoptions[] = {
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_PRELOAD_BIN, PMIX_ARG_NONE, 's'),
     PMIX_OPTION_DEFINE(PRTE_CLI_DO_NOT_AGG_HELP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_ENVIRON, PMIX_ARG_OPTIONAL),
+    PMIX_OPTION_DEFINE(PRTE_CLI_MEM_ALLOC_KIND, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_GPU_SUPPORT, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_APP_PREFIX, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_NO_APP_PREFIX, PMIX_ARG_NONE),
 
     // output options
     PMIX_OPTION_DEFINE(PRTE_CLI_OUTPUT, PMIX_ARG_REQD),
@@ -255,7 +276,7 @@ static struct option prterunoptions[] = {
 
     PMIX_OPTION_END
 };
-static char *prterunshorts = "h::vVpn:c:N:sH:x:";
+static char *prterunshorts = "h::vVn:c:N:sH:x:";
 
 static struct option prunoptions[] = {
     /* basic options */
@@ -296,6 +317,18 @@ static struct option prunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_STOP_IN_INIT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_STOP_IN_APP, PMIX_ARG_NONE),
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_FWD_ENVAR, PMIX_ARG_REQD, 'x'),
+#ifdef PMIX_CLI_SET_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_SET_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_PREPEND_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_PREPEND_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_APPEND_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_APPEND_ENVAR, PMIX_ARG_REQD),
+#endif
+#ifdef PMIX_CLI_UNSET_ENVAR
+    PMIX_OPTION_DEFINE(PMIX_CLI_UNSET_ENVAR, PMIX_ARG_REQD),
+#endif
     PMIX_OPTION_DEFINE(PRTE_CLI_WDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("wd", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_SET_CWD_SESSION, PMIX_ARG_NONE),
@@ -310,6 +343,10 @@ static struct option prunoptions[] = {
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_PRELOAD_BIN, PMIX_ARG_NONE, 's'),
     PMIX_OPTION_DEFINE(PRTE_CLI_DO_NOT_AGG_HELP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_ENVIRON, PMIX_ARG_OPTIONAL),
+    PMIX_OPTION_DEFINE(PRTE_CLI_MEM_ALLOC_KIND, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_GPU_SUPPORT, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_APP_PREFIX, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_NO_APP_PREFIX, PMIX_ARG_NONE),
 
     // output options
     PMIX_OPTION_DEFINE(PRTE_CLI_OUTPUT, PMIX_ARG_REQD),
@@ -401,6 +438,7 @@ static struct option prtedoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_LEAVE_SESSION_ATTACHED, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_BOOTSTRAP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_HETERO_NODES, PMIX_ARG_NONE),
 
     PMIX_OPTION_END
 };
@@ -452,40 +490,50 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
 static int parse_cli(char **argv, pmix_cli_result_t *results,
                      bool silent)
 {
-    char *shorts, *helpfile;
-    struct option *myoptions;
+    char *shorts = NULL, *helpfile = NULL;
+    struct option *myoptions = NULL;
     int rc, n;
-    pmix_cli_item_t *opt;
+    pmix_cli_item_t *opt = NULL;
+    char *sdprefix = "prte";
 
     if (0 == strcmp(prte_tool_actual, "prte")) {
         myoptions = prteoptions;
         shorts = prteshorts;
         helpfile = "help-prte.txt";
+        sdprefix = "prte";
     } else if (0 == strcmp(prte_tool_actual, "prterun")) {
         myoptions = prterunoptions;
         shorts = prterunshorts;
         helpfile = "help-prterun.txt";
+        sdprefix = "prtrn";
     } else if (0 == strcmp(prte_tool_actual, "prted")) {
         myoptions = prtedoptions;
         shorts = prtedshorts;
         helpfile = "help-prted.txt";
+        sdprefix = "prted";
     } else if (0 == strcmp(prte_tool_actual, "prun")) {
         myoptions = prunoptions;
         shorts = prunshorts;
         helpfile = "help-prun.txt";
+        sdprefix = "prun";
     } else if (0 == strcmp(prte_tool_actual, "pterm")) {
         myoptions = ptermoptions;
         shorts = ptermshorts;
         helpfile = "help-pterm.txt";
+        sdprefix = "prte";
     } else if (0 == strcmp(prte_tool_actual, "prte_info")) {
         myoptions = pinfooptions;
         shorts = pinfoshorts;
         helpfile = "help-prte-info.txt";
+        sdprefix = "prte";
     }
     pmix_tool_msg = "Report bugs to: https://github.com/openpmix/prrte";
     pmix_tool_org = "PRRTE";
     pmix_tool_version = prte_util_make_version_string("all", PRTE_MAJOR_VERSION, PRTE_MINOR_VERSION,
                                                       PRTE_RELEASE_VERSION, PRTE_GREEK_VERSION, NULL);
+    if (NULL == prte_process_info.sessdir_prefix) {
+        prte_process_info.sessdir_prefix = strdup(sdprefix);
+    }
 
     rc = pmix_cmd_line_parse(argv, shorts, myoptions, NULL,
                              results, helpfile);
@@ -746,6 +794,29 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             free(p2);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
+        /* --stop-in-init  ->  --runtime-options stop-in-init */
+        else if (0 == strcmp(option, PRTE_CLI_STOP_IN_INIT)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_STOP_IN_INIT,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
+        /* --stop-in-app  ->  --runtime-options stop-in-app */
+        else if (0 == strcmp(option, PRTE_CLI_STOP_IN_APP)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_STOP_IN_APP,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
+        /* --stop-on-exec  ->  --runtime-options stop-on-exec */
+        else if (0 == strcmp(option, PRTE_CLI_STOP_ON_EXEC)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_STOP_ON_EXEC,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
         /* --display-map  ->  --display map */
         else if (0 == strcmp(option, "display-map")) {
             rc = prte_schizo_base_add_directive(results, option,
@@ -819,6 +890,31 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                 free(p1);
                 free(opt->values[0]);
                 opt->values[0] = tmp;
+            } else if (0 == strncasecmp(opt->values[0], "ppr", strlen("ppr"))) {
+                // see if they specified "socket" as the resource
+                p1 = strdup(opt->values[0]);
+                p2 = strrchr(p1, ':');
+                ++p2;
+                if (0 == strncasecmp(p2, "socket", strlen("socket")) ||
+                    0 == strncasecmp(p2, "skt", strlen("skt"))) {
+                    *p2 = '\0';
+                    pmix_asprintf(&p2, "%spackage", p1);
+                    if (warn) {
+                        pmix_asprintf(&tmp, "%s %s", option, opt->values[0]);
+                        pmix_asprintf(&tmp2, "%s %s", option, p2);
+                        /* can't just call show_help as we want every instance to be reported */
+                        output = pmix_show_help_string("help-schizo-base.txt",
+                                                       "deprecated-converted", true,
+                                                       tmp, tmp2);
+                        fprintf(stderr, "%s\n", output);
+                        free(output);
+                        free(tmp);
+                        free(tmp2);
+                    }
+                    free(opt->values[0]);
+                    opt->values[0] = p2;
+                }
+                free(p1);
             }
         }
         /* --rank-by */
@@ -896,92 +992,11 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
 static int parse_env(char **srcenv, char ***dstenv,
                      pmix_cli_result_t *cli)
 {
-    int i, j, n;
-    char *p1, *p2;
-    char **env;
-    char **xparams = NULL, **xvals = NULL;
-    char *param, *value;
-    pmix_cli_item_t *opt;
-    PRTE_HIDE_UNUSED_PARAMS(srcenv);
+    PRTE_HIDE_UNUSED_PARAMS(srcenv, dstenv, cli);
 
     pmix_output_verbose(1, prte_schizo_base_framework.framework_output,
                         "%s schizo:prte: parse_env",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-
-    if (NULL == cli) {
-        return PRTE_SUCCESS;
-    }
-
-    env = *dstenv;
-
-    /* look for -x options - not allowed to conflict with a -mca option */
-    opt = pmix_cmd_line_get_param(cli, PRTE_CLI_FWD_ENVAR);
-    if (NULL != opt) {
-        for (j=0; NULL != opt->values[j]; j++) {
-            /* the value is the envar */
-            p1 = opt->values[j];
-            /* if there is an '=' in it, then they are setting a value */
-            if (NULL != (p2 = strchr(p1, '='))) {
-                *p2 = '\0';
-                ++p2;
-            } else {
-                p2 = getenv(p1);
-                if (NULL == p2) {
-                    pmix_show_help("help-schizo-base.txt", "missing-envar-param", true, p1);
-                    continue;
-                }
-            }
-
-            /* check if it is already present in the environment */
-            for (n = 0; NULL != env && NULL != env[n]; n++) {
-                param = strdup(env[n]);
-                value = strchr(param, '=');
-                *value = '\0';
-                value++;
-                /* check if parameter is already present */
-                if (0 == strcmp(param, p1)) {
-                    /* we do have it - check for same value */
-                    if (0 != strcmp(value, p2)) {
-                        /* this is an error - different values */
-                        pmix_show_help("help-schizo-base.txt", "duplicate-mca-value", true, p1, p2,
-                                       value);
-                        free(param);
-                        PMIX_ARGV_FREE_COMPAT(xparams);
-                        PMIX_ARGV_FREE_COMPAT(xvals);
-                        return PRTE_ERR_BAD_PARAM;
-                    }
-                }
-                free(param);
-            }
-
-            /* check if we already processed a conflicting -x version with MCA prefix */
-            if (NULL != xparams) {
-                for (i = 0; NULL != xparams[i]; i++) {
-                    if (0 == strncmp("PRTE_MCA_", p1, strlen("PRTE_MCA_"))) {
-                        /* this is an error - different values */
-                        pmix_show_help("help-schizo-base.txt", "duplicate-mca-value", true, p1, p2,
-                                       xvals[i]);
-                        PMIX_ARGV_FREE_COMPAT(xparams);
-                        PMIX_ARGV_FREE_COMPAT(xvals);
-                        return PRTE_ERR_BAD_PARAM;
-                    }
-                }
-            }
-
-            /* cache this for later inclusion - do not modify dstenv in this loop */
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&xparams, p1);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&xvals, p2);
-        }
-    }
-
-    /* add the -x values */
-    if (NULL != xparams) {
-        for (i = 0; NULL != xparams[i]; i++) {
-            PMIX_SETENV_COMPAT(xparams[i], xvals[i], true, dstenv);
-        }
-        PMIX_ARGV_FREE_COMPAT(xparams);
-        PMIX_ARGV_FREE_COMPAT(xvals);
-    }
 
     return PRTE_SUCCESS;
 }

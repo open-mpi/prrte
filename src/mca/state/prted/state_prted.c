@@ -4,7 +4,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020-2021 IBM Corporation.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -28,7 +28,7 @@
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/prted/pmix/pmix_server_internal.h"
-#include "src/runtime/prte_data_server.h"
+#include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/prte_quit.h"
 #include "src/threads/pmix_threads.h"
 #include "src/util/pmix_output.h"
@@ -315,7 +315,6 @@ static void track_procs(int fd, short argc, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     pmix_proc_t *proc;
-    pmix_rank_t tgt, *tptr;
     prte_proc_state_t state;
     prte_job_t *jdata;
     prte_proc_t *pdata, *pptr;

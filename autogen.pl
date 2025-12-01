@@ -8,7 +8,7 @@
 # Copyright (c) 2015      Research Organization for Information Science
 #                         and Technology (RIST). All rights reserved.
 # Copyright (c) 2015      IBM Corporation.  All rights reserved.
-# Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
 # Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
 #
 # $COPYRIGHT$
@@ -76,12 +76,6 @@ my $full_hostname;
 
 # Patch program
 my $patch_prog = "patch";
-# Solaris "patch" doesn't understand unified diffs, and will cause
-# autogen.pl to hang with a "File to patch:" prompt. Default to Linux
-# "patch", but use "gpatch" on Solaris.
-if ($^O eq "solaris") {
-    $patch_prog = "gpatch";
-}
 
 $username = getpwuid($>);
 $full_hostname = `hostname`;
@@ -727,6 +721,15 @@ sub export_version {
     $m4 .= "m4_define([PRTE_${name}_NUMERIC_MIN_VERSION], [$hex])\n";
 }
 
+sub export_max_version {
+    my ($name,$version) = @_;
+    $version =~ s/[^a-zA-Z0-9,.]//g;
+    my @version_splits = split(/\./,$version);
+    my $hex = sprintf("0x%04x%02x%02x", $version_splits[0], $version_splits[1], $version_splits[2]);
+    $m4 .= "m4_define([PRTE_${name}_MAX_VERSION], [$version])\n";
+    $m4 .= "m4_define([PRTE_${name}_NUMERIC_MAX_VERSION], [$hex])\n";
+}
+
 sub get_and_define_min_versions() {
 
     open(IN, "VERSION") || my_die "Can't open VERSION";
@@ -751,6 +754,11 @@ sub get_and_define_min_versions() {
           elsif($fields[0] eq "pmix_min_version") {
               if ($fields[1] ne "\n") {
                   export_version("PMIX", $fields[1]);
+              }
+          }
+          elsif($fields[0] eq "pmix_max_version") {
+              if ($fields[1] ne "\n") {
+                  export_max_version("PMIX", $fields[1]);
               }
           }
           elsif($fields[0] eq "hwloc_min_version") {

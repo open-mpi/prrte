@@ -564,7 +564,8 @@ static int create_link(char *my_dir, char *path, char *link_pt)
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), link_pt, mypath, fullname));
         /* create any required path to the link location */
         basedir = pmix_dirname(fullname);
-        if (PMIX_SUCCESS != (rc = pmix_os_dirpath_create(basedir, S_IRWXU))) {
+        rc = pmix_os_dirpath_create(basedir, S_IRWXU);
+        if (PMIX_SUCCESS != rc && PMIX_ERR_EXISTS != rc) {
             PMIX_ERROR_LOG(rc);
             pmix_output(0, "%s Failed to symlink %s to %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         mypath, fullname);
@@ -847,7 +848,7 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
 {
     FILE *fp;
     char *cmd;
-    char path[MAXPATHLEN];
+    char path[PRTE_PATH_MAX];
 
     PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                          "%s filem:raw: identifying links for archive %s",
@@ -999,7 +1000,8 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), incoming->fullpath));
         /* create the path to the target, if not already existing */
         tmp = pmix_dirname(incoming->fullpath);
-        if (PMIX_SUCCESS != (rc = pmix_os_dirpath_create(tmp, S_IRWXU))) {
+        rc = pmix_os_dirpath_create(tmp, S_IRWXU);
+        if (PMIX_SUCCESS != rc && PMIX_ERR_EXISTS != rc) {
             PMIX_ERROR_LOG(rc);
             send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
             free(file);
@@ -1064,7 +1066,7 @@ static void write_handler(int fd, short event, void *cbdata)
     prte_filem_raw_output_t *output;
     int num_written;
     char *dirname, *cmd;
-    char homedir[MAXPATHLEN];
+    char homedir[PRTE_PATH_MAX];
     int rc;
     PRTE_HIDE_UNUSED_PARAMS(fd, event);
 

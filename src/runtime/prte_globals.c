@@ -17,7 +17,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2017-2020 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -77,6 +77,7 @@ bool prte_allow_run_as_root = false;
 bool prte_fwd_environment = false;
 bool prte_show_launch_progress = false;
 bool prte_bootstrap_setup = false;
+bool prte_xml_output = false;
 
 /* PRTE OOB port flags */
 bool prte_static_ports = false;
@@ -513,7 +514,6 @@ static void prte_job_destruct(prte_job_t *job)
     prte_app_context_t *app;
     int n;
     prte_timer_t *evtimer;
-    prte_job_t *child_jdata = NULL;
     pmix_list_t *cache = NULL;
 
     if (NULL == job) {
@@ -579,12 +579,7 @@ static void prte_job_destruct(prte_job_t *job)
 
     PMIX_DATA_BUFFER_DESTRUCT(&job->launch_msg);
 
-    /* Clear the child list before destroying the list */
-    PMIX_LIST_FOREACH(child_jdata, &job->children, prte_job_t)
-    {
-        pmix_list_remove_item(&job->children, &child_jdata->super);
-    }
-
+    /* Release the child list - we retained the child jobs before adding them to the list*/
     PMIX_LIST_DESTRUCT(&job->children);
 
     if (NULL != job->session_dir) {
@@ -783,7 +778,13 @@ static void tcon(prte_topology_t *t)
 }
 static void tdes(prte_topology_t *t)
 {
+    hwloc_obj_t root;
+
     if (NULL != t->topo) {
+        root = hwloc_get_root_obj(t->topo);
+        if (NULL != root->userdata) {
+            PMIX_RELEASE(root->userdata);
+        }
         hwloc_topology_destroy(t->topo);
     }
     if (NULL != t->sig) {

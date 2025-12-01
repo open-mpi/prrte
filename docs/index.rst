@@ -34,9 +34,9 @@ Table of contents
    how-things-work/index
    hosts/index
    placement/index
+   launching-apps/index
    notifications
    session-directory
-   resilience
    developers/index
    contributing
    license

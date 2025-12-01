@@ -25,7 +25,7 @@
 # Copyright (c) 2016-2017 IBM Corporation.  All rights reserved.
 # Copyright (c) 2018-2022 Amazon.com, Inc. or its affiliates.
 #                         All Rights reserved.
-# Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
 # Copyright (c) 2021      FUJITSU LIMITED.  All rights reserved.
 # Copyright (c) 2023-2024 Jeffrey M. Squyres.  All rights reserved.
 # $COPYRIGHT$
@@ -135,7 +135,7 @@ PRTE_VAR_SCOPE_POP
 # Init automake
 #
 
-AM_INIT_AUTOMAKE([foreign dist-bzip2 subdir-objects no-define 1.12.2])
+AM_INIT_AUTOMAKE([foreign dist-bzip2 subdir-objects no-define 1.13.4 tar-pax])
 
 # SILENT_RULES is new in AM 1.11, but we require 1.11 or higher via
 # autogen.  Limited testing shows that calling SILENT_RULES directly
@@ -268,7 +268,7 @@ AC_SUBST(PRTE_TOP_BUILDDIR)
 # Configuration options
 ############################################################################
 
-PRTE_CHECK_OS_FLAVORS
+OAC_CHECK_OS_FLAVORS
 PRTE_CONFIGURE_OPTIONS
 
 if test "$enable_binaries" = "no" && test "$enable_dist" = "yes"; then
@@ -323,6 +323,17 @@ prte_show_title "Compiler and preprocessor tests"
 ##################################
 
 PRTE_SETUP_CC
+# We do not currently support the "lto" optimizer as it
+# aggregates all the headers from our plugins, resulting
+# in a configuration that generates warnings/errors when
+# passed through their optimizer phase. We therefore check
+# for the flag, and if found, output a message explaining
+# the situation and aborting configure
+_PRTE_CHECK_LTO_FLAG($CPPFLAGS, CPPFLAGS)
+_PRTE_CHECK_LTO_FLAG($CFLAGS, CFLAGS)
+_PRTE_CHECK_LTO_FLAG($LDFLAGS, LDFLAGS)
+_PRTE_CHECK_LTO_FLAG($LIBS, LIBS)
+
 
 # Does the compiler support "ident"-like constructs?
 
@@ -551,9 +562,6 @@ PRTE_SEARCH_LIBS_CORE([gethostbyname], [nsl])
 
 PRTE_SEARCH_LIBS_CORE([socket], [socket])
 
-# Solaris has sched_yield in -lrt, usually in libc
-PRTE_SEARCH_LIBS_CORE([sched_yield], [rt])
-
 # Darwin doesn't need -lm, as it's a symlink to libSystem.dylib
 PRTE_SEARCH_LIBS_CORE([ceil], [m])
 
@@ -607,10 +615,6 @@ AC_C_BIGENDIAN
 
 PRTE_CONFIG_THREADS
 
-CFLAGS="$CFLAGS $THREAD_CFLAGS"
-LDFLAGS="$LDFLAGS $THREAD_LDFLAGS"
-LIBS="$LIBS $THREAD_LIBS"
-
 #
 # What is the local equivalent of "ln -s"
 #
@@ -618,9 +622,6 @@ LIBS="$LIBS $THREAD_LIBS"
 AC_PROG_LN_S
 AC_PROG_GREP
 AC_PROG_EGREP
-
-# This check must come after PRTE_CONFIG_THREADS
-AC_CHECK_FUNCS([pthread_setaffinity_np])
 
 #
 # We need as and lex
@@ -647,7 +648,7 @@ if test "x$LEX" != xflex && test ! -e $PRTE_TOP_SRCDIR/src/util/hostfile/hostfil
 fi
 
 #
-# Do we have RLIMIT_NPROC in <sys/resources.h>? (e.g., Solaris does not)
+# Do we have RLIMIT_NPROC in <sys/resources.h>?
 #
 
 AC_CHECK_DECLS([RLIMIT_NPROC], [], [], [
@@ -657,7 +658,7 @@ AC_INCLUDES_DEFAULT
 #endif])
 
 #
-# Do we have RLIMIT_MEMLOCK in <sys/resources.h>? (e.g., Solaris does not)
+# Do we have RLIMIT_MEMLOCK in <sys/resources.h>?
 #
 
 AC_CHECK_DECLS([RLIMIT_MEMLOCK], [], [], [
@@ -667,7 +668,7 @@ AC_INCLUDES_DEFAULT
 #endif])
 
 #
-# Do we have RLIMIT_NOFILE in <sys/resources.h>? (e.g., Solaris does not)
+# Do we have RLIMIT_NOFILE in <sys/resources.h>?
 #
 
 AC_CHECK_DECLS([RLIMIT_NOFILE], [], [], [
@@ -677,7 +678,7 @@ AC_INCLUDES_DEFAULT
 #endif])
 
 #
-# Do we have RLIMIT_MEMLOCK in <sys/resources.h>? (e.g., Solaris does not)
+# Do we have RLIMIT_MEMLOCK in <sys/resources.h>?
 #
 
 AC_CHECK_DECLS([RLIMIT_FSIZE], [], [], [
@@ -687,7 +688,7 @@ AC_INCLUDES_DEFAULT
 #endif])
 
 #
-# Do we have RLIMIT_CORE in <sys/resources.h>? (e.g., Solaris does not)
+# Do we have RLIMIT_CORE in <sys/resources.h>?
 #
 
 AC_CHECK_DECLS([RLIMIT_CORE], [], [], [
@@ -697,7 +698,7 @@ AC_INCLUDES_DEFAULT
 #endif])
 
 #
-# Do we have RLIMIT_STACK in <sys/resources.h>? (e.g., Solaris does not)
+# Do we have RLIMIT_STACK in <sys/resources.h>?
 #
 
 AC_CHECK_DECLS([RLIMIT_STACK], [], [], [
@@ -707,7 +708,7 @@ AC_INCLUDES_DEFAULT
 #endif])
 
 #
-# Do we have RLIMIT_AS in <sys/resources.h>? (e.g., Solaris does not)
+# Do we have RLIMIT_AS in <sys/resources.h>?
 #
 
 AC_CHECK_DECLS([RLIMIT_AS], [], [], [
@@ -850,12 +851,6 @@ prte_show_title "Final top-level PRTE configuration"
 ############################################################################
 prte_show_subtitle "Libtool configuration"
 
-# Use the undocumented solaris_use_stlport4 libtool variable to turn off any
-# Cstd/stlport4 linkage. This allows PRTE to be C++ STL agnostic.
-if test "x$prte_cv_c_compiler_vendor" = "xsun"; then
-    solaris_use_stlport4="yes"
-fi
-
 LT_INIT()
 LT_LANG([C])
 
@@ -930,6 +925,7 @@ CPP_INCLUDES="$(echo $cpp_includes | $SED 's/[[^ \]]* */'"$prte_cc_iquote"'&/g')
 CPPFLAGS="$CPP_INCLUDES $CPPFLAGS $PRTE_FINAL_CPPFLAGS"
 LDFLAGS="$LDFLAGS $PRTE_FINAL_LDFLAGS"
 LIBS="$LIBS $PRTE_FINAL_LIBS"
+
 
 # restore any user-provided Werror flags
 AS_IF([test ! -z "$PRTE_CFLAGS_cache"], [CFLAGS="$CFLAGS $PRTE_CFLAGS_cache"])
@@ -1006,7 +1002,6 @@ AC_CONFIG_FILES([
     include/prte_version.h
     docs/Makefile
     src/docs/Makefile
-    src/docs/show-help-files/Makefile
     src/docs/prrte-rst-content/Makefile
 ])
 

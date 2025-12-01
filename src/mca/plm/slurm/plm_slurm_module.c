@@ -15,7 +15,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -54,6 +54,7 @@
 
 #include "src/mca/base/pmix_base.h"
 #include "src/mca/prteinstalldirs/prteinstalldirs.h"
+#include "src/mca/pinstalldirs/pinstalldirs_types.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_basename.h"
 #include "src/util/pmix_output.h"
@@ -89,7 +90,8 @@ static int plm_slurm_terminate_prteds(void);
 static int plm_slurm_signal_job(pmix_nspace_t jobid, int32_t signal);
 static int plm_slurm_finalize(void);
 
-static int plm_slurm_start_proc(int argc, char **argv, char *prefix);
+static int plm_slurm_start_proc(int argc, char **argv,
+                                char *prefix, char *pmix_prefix);
 
 /*
  * Global variable
@@ -170,7 +172,6 @@ static int plm_slurm_launch_job(prte_job_t *jdata)
 
 static void launch_daemons(int fd, short args, void *cbdata)
 {
-    prte_app_context_t *app;
     prte_node_t *node;
     int32_t n;
     prte_job_map_t *map;
@@ -185,6 +186,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     char **custom_strings;
     int num_args, i;
     char *cur_prefix = NULL;
+    char *pmix_prefix = NULL;
     int proc_vpid_index;
     bool failed_launch = true;
     prte_job_t *daemons;
@@ -253,6 +255,11 @@ static void launch_daemons(int fd, short args, void *cbdata)
     /* add the srun command */
     pmix_argv_append(&argc, &argv, "srun");
 
+    // add the external launcher flag if necessary
+    if (!prte_mca_plm_slurm_component.early) {
+        pmix_argv_append(&argc, &argv, "--external-launcher");
+    }
+
     /* start one orted on each node */
     pmix_argv_append(&argc, &argv, "--ntasks-per-node=1");
 
@@ -280,18 +287,6 @@ static void launch_daemons(int fd, short args, void *cbdata)
     if (NULL != getenv("PMIX_LAUNCHER_RENDEZVOUS_FILE")) {
         unsetenv("PMIX_LAUNCHER_RENDEZVOUS_FILE");
     }
-
-#if SLURM_CRAY_ENV
-    /*
-     * If in a SLURM/Cray env. make sure that Cray PMI is not pulled in,
-     * neither as a constructor run when orteds start, nor selected
-     * when pmix components are registered
-     */
-
-    setenv("PMI_NO_PREINITIALIZE", "1", false);
-    setenv("PMI_NO_FORK", "1", false);
-    setenv("OMPI_NO_USE_CRAY_PMI", "1", false);
-#endif
 
     /* Append user defined arguments to srun */
     if (NULL != prte_mca_plm_slurm_component.custom_args) {
@@ -376,47 +371,18 @@ static void launch_daemons(int fd, short args, void *cbdata)
     argv[proc_vpid_index] = strdup(name_string);
     free(name_string);
 
-    /* Copy the prefix-directory specified in the
-       corresponding app_context.  If there are multiple,
-       different prefix's in the app context, complain (i.e., only
-       allow one --prefix option for the entire slurm run -- we
-       don't support different --prefix'es for different nodes in
-       the SLURM plm) */
-    cur_prefix = NULL;
-    for (n = 0; n < state->jdata->apps->size; n++) {
-        char *app_prefix_dir;
-        app = (prte_app_context_t *) pmix_pointer_array_get_item(state->jdata->apps, n);
-        if (NULL == app) {
-            continue;
-        }
-        app_prefix_dir = NULL;
-        prte_get_attribute(&app->attributes, PRTE_APP_PREFIX_DIR, (void **) &app_prefix_dir, PMIX_STRING);
-        /* Check for already set cur_prefix_dir -- if different,
-           complain */
-        if (NULL != app_prefix_dir) {
-            if (NULL != cur_prefix && 0 != strcmp(cur_prefix, app_prefix_dir)) {
-                pmix_show_help("help-plm-slurm.txt", "multiple-prefixes", true, cur_prefix,
-                               app_prefix_dir);
-                goto cleanup;
-            }
-
-            /* If not yet set, copy it; iff set, then it's the
-             * same anyway
-             */
-            if (NULL == cur_prefix) {
-                cur_prefix = strdup(app_prefix_dir);
-                PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
-                                     "%s plm:slurm: Set prefix:%s",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), cur_prefix));
-            }
-            free(app_prefix_dir);
-        }
+    /*
+     * Any prefix was installed in the DAEMON job object, so
+     * we only need to look there to find it. This covers any
+     * prefix by default, PRTE_PREFIX given in the environment,
+     * and '--prefix' from the cmd line
+     */
+    if (!prte_get_attribute(&daemons->attributes, PRTE_JOB_PREFIX, (void **) &cur_prefix, PMIX_STRING)) {
+        cur_prefix = NULL;
     }
-    if (NULL == cur_prefix) {
-        // see if it is in the environment
-        if (NULL != (param = getenv("PRTE_PREFIX"))) {
-            cur_prefix = strdup(param);
-        }
+    /* Similarly, we have to check for any PMIx prefix that was specified */
+    if (!prte_get_attribute(&daemons->attributes, PRTE_JOB_PMIX_PREFIX, (void **) &pmix_prefix, PMIX_STRING)) {
+        pmix_prefix = NULL;
     }
 
     /* protect the args in case someone has a script wrapper around srun */
@@ -432,7 +398,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     }
 
     /* exec the daemon(s) */
-    if (PRTE_SUCCESS != (rc = plm_slurm_start_proc(argc, argv, cur_prefix))) {
+    if (PRTE_SUCCESS != (rc = plm_slurm_start_proc(argc, argv, cur_prefix, pmix_prefix))) {
         PRTE_ERROR_LOG(rc);
         goto cleanup;
     }
@@ -450,6 +416,9 @@ cleanup:
     }
     if (NULL != cur_prefix) {
         free(cur_prefix);
+    }
+    if (NULL != pmix_prefix) {
+        free(pmix_prefix);
     }
     /* check for failed launch - if so, force terminate */
     if (failed_launch) {
@@ -522,50 +491,19 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
     prte_wait_tracker_t *t2 = (prte_wait_tracker_t *) cbdata;
     prte_proc_t *proc = t2->child;
     prte_job_t *jdata;
-    FILE *fp;
-    char version[1024], *cptr;
-    int major=0, minor=0;
     PRTE_HIDE_UNUSED_PARAMS(sd, fd);
 
     jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
 
     /* need to check that we are at least version 17.11 */
-    fp = popen("sinfo -V", "r");
-    if (NULL == fp) {
-        /* default to printing the error advice */
-        pmix_show_help("help-plm-slurm.txt", "ancient-version", true, major, minor);
+    if (prte_mca_plm_slurm_component.ancient) {
+        pmix_show_help("help-plm-slurm.txt", "ancient-version", true,
+                       prte_mca_plm_slurm_component.major,
+                       prte_mca_plm_slurm_component.minor);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
         PMIX_RELEASE(t2);
         return;
     }
-    memset(version, 0, sizeof(version));
-    while (NULL != fgets(version, sizeof(version), fp)) {
-        /* if the line doesn't start with "slurm", then ignore it */
-        if (0 != strncasecmp(version, "slurm", strlen("slurm"))) {
-            continue;
-        }
-        cptr = &version[strlen("slurm")+1];
-        major = strtoul(cptr, &cptr, 10);
-        ++cptr;
-        minor = strtoul(cptr, NULL, 10);
-        if (major < 17) {
-            pclose(fp);
-            pmix_show_help("help-plm-slurm.txt", "ancient-version", true, major, minor);
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
-            PMIX_RELEASE(t2);
-            return;
-        }
-        if (17 == major && minor < 11) {
-            pclose(fp);
-            pmix_show_help("help-plm-slurm.txt", "ancient-version", true, major, minor);
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
-            PMIX_RELEASE(t2);
-            return;
-        }
-        /* version was not the issue */
-        break;
-    }
-    pclose(fp);
 
     /* According to the SLURM folks, srun always returns the highest exit
      code of our remote processes. Thus, a non-zero exit status doesn't
@@ -595,10 +533,8 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
         /* an orted must have died unexpectedly - report
          * that the daemon has failed so we exit
          */
-        PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
-                             "%s plm:slurm: srun returned non-zero exit status (%d) from launching "
-                             "the per-node daemon",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), proc->exit_code));
+        pmix_show_help("help-plm-slurm.txt", "srun-failed", true,
+                       proc->exit_code);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
     } else {
         /* otherwise, check to see if this is the primary pid */
@@ -619,7 +555,8 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
     PMIX_RELEASE(t2);
 }
 
-static int plm_slurm_start_proc(int argc, char **argv, char *prefix)
+static int plm_slurm_start_proc(int argc, char **argv,
+                                char *prefix, char *pmix_prefix)
 {
     int fd;
     int srun_pid;
@@ -627,6 +564,7 @@ static int plm_slurm_start_proc(int argc, char **argv, char *prefix)
     char **tmp = NULL, *p;
     char *exec_argv = pmix_path_findv(argv[0], 0, environ, NULL);
     prte_proc_t *dummy;
+    char *oldenv, *newenv;
     PRTE_HIDE_UNUSED_PARAMS(argc);
 
     if (NULL == exec_argv) {
@@ -690,7 +628,6 @@ static int plm_slurm_start_proc(int argc, char **argv, char *prefix)
         /* If we have a prefix, then modify the PATH and
            LD_LIBRARY_PATH environment variables.  */
         if (NULL != prefix) {
-            char *oldenv, *newenv;
 
             /* Reset PATH */
             oldenv = getenv("PATH");
@@ -699,7 +636,7 @@ static int plm_slurm_start_proc(int argc, char **argv, char *prefix)
             } else {
                 pmix_asprintf(&newenv, "%s/%s", prefix, bin_base);
             }
-            setenv("PATH", newenv, true);
+            PMIX_SETENV_COMPAT("PATH", newenv, true, &environ);
             PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                                  "%s plm:slurm: reset PATH: %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  newenv));
@@ -712,12 +649,37 @@ static int plm_slurm_start_proc(int argc, char **argv, char *prefix)
             } else {
                 pmix_asprintf(&newenv, "%s/%s", prefix, lib_base);
             }
-            setenv("LD_LIBRARY_PATH", newenv, true);
+            PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", newenv, true, &environ);
             PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
                                  "%s plm:slurm: reset LD_LIBRARY_PATH: %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), newenv));
             free(newenv);
+
+            // need to export it as well so srun will propagate it
+            PMIX_SETENV_COMPAT("PRTE_PREFIX", prefix, true, &environ);
         }
+
+        /* for pmix_prefix, we only have to modify the library path.
+         * NOTE: obviously, we cannot know the lib_base used for the
+         * PMIx library. All we can do is hope they used the same one
+         * for PMIx as they did for the one they linked to PRRTE */
+        if (NULL != pmix_prefix) {
+            oldenv = getenv("LD_LIBRARY_PATH");
+            p = pmix_basename(pmix_pinstall_dirs.libdir);
+            if (NULL != oldenv) {
+                pmix_asprintf(&newenv, "%s/%s:%s", pmix_prefix, p, oldenv);
+            } else {
+                pmix_asprintf(&newenv, "%s/%s", pmix_prefix, p);
+            }
+            free(p);
+            PMIX_SETENV_COMPAT("LD_LIBRARY_PATH", newenv, true, &environ);
+            PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
+                                 "%s plm:slurm: reset LD_LIBRARY_PATH: %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), newenv));
+            free(newenv);
+             // need to export it as well so srun will propagate it
+            PMIX_SETENV_COMPAT("PMIX_PREFIX", pmix_prefix, true, &environ);
+       }
 
         fd = open("/dev/null", O_CREAT | O_RDWR | O_TRUNC, 0666);
         if (fd >= 0) {

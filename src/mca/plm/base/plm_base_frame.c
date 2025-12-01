@@ -59,8 +59,8 @@ prte_plm_globals_t prte_plm_globals = {
     .tree_spawn_cmd = PMIX_DATA_BUFFER_STATIC_INIT,
     .daemon_nodes_assigned_at_launch = true,
     .node_regex_threshold = 0,
-    .daemon1_has_reported = false,
-    .cache = NULL
+    .daemon_cache = PMIX_LIST_STATIC_INIT,
+    .daemon1_has_reported = false
 };
 
 /*
@@ -137,8 +137,7 @@ static int prte_plm_base_close(void)
     if (NULL != prte_plm_globals.base_nspace) {
         free(prte_plm_globals.base_nspace);
     }
-    while (NULL != pmix_list_remove_first(&prte_plm_globals.daemon_cache)); // do not release list items!
-    PMIX_DESTRUCT(&prte_plm_globals.daemon_cache);
+    PMIX_LIST_DESTRUCT(&prte_plm_globals.daemon_cache);
 
     return pmix_mca_base_framework_components_close(&prte_plm_base_framework, NULL);
 }
@@ -215,10 +214,11 @@ static int term_orteds(void)
 static void launch_daemons(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *state = (prte_state_caddy_t *) cbdata;
-    prte_job_t *daemons;
+    prte_job_t *daemons = NULL;
     int rc;
     prte_job_map_t *map = NULL;
-    prte_node_t *node;
+    prte_node_t *node = NULL;
+    PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     /* setup the virtual machine */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);

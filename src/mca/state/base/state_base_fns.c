@@ -5,7 +5,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -39,7 +39,7 @@
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/prted/pmix/pmix_server_internal.h"
-#include "src/runtime/prte_data_server.h"
+#include "src/runtime/data_server/prte_data_server.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_wait.h"
 #include "src/threads/pmix_threads.h"
@@ -427,13 +427,11 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     pmix_proc_t *proc;
-    pmix_rank_t tgt, *tptr;
     prte_proc_state_t state;
     prte_job_t *jdata;
     prte_proc_t *pdata;
     int i;
     pmix_proc_t target;
-    prte_pmix_lock_t lock;
     pmix_rank_t threshold;
     PRTE_HIDE_UNUSED_PARAMS(fd, argc);
 
@@ -540,10 +538,7 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
             pdata->state = state;
         }
         if (PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_LOCAL)) {
-            PRTE_PMIX_CONSTRUCT_LOCK(&lock);
-            PMIx_server_deregister_client(proc, opcbfunc, &lock);
-            PRTE_PMIX_WAIT_THREAD(&lock);
-            PRTE_PMIX_DESTRUCT_LOCK(&lock);
+            PMIx_server_deregister_client(proc, NULL, NULL);
         }
         /* if we are trying to terminate and our routes are
          * gone, then terminate ourselves IF no local procs
@@ -602,6 +597,7 @@ void prte_state_base_check_all_complete(int fd, short args, void *cbdata)
     int32_t i32, *i32ptr;
     prte_pmix_lock_t lock;
     prte_app_context_t *app;
+    pmix_server_pset_t *pst, *pst2;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(caddy);
@@ -753,6 +749,13 @@ CHECK_DAEMONS:
         }
         PMIX_RELEASE(map);
         jdata->map = NULL;
+    }
+    // if this job has apps that named a pset, then remove them
+    PMIX_LIST_FOREACH_SAFE(pst, pst2, &prte_pmix_server_globals.psets, pmix_server_pset_t) {
+        if (pst->jdata == jdata) {
+            pmix_list_remove_item(&prte_pmix_server_globals.psets, &pst->super);
+            PMIX_RELEASE(pst);
+        }
     }
 
 CHECK_ALIVE:

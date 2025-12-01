@@ -20,7 +20,7 @@
  *                         All rights reserved.
  * Copyright (c) 2018      Amazon.com, Inc. or its affiliates.  All Rights reserved.
  * Copyright (c) 2019-2020 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023      Advanced Micro Devices, Inc. All rights reserved.
  * $COPYRIGHT$
  *
@@ -516,6 +516,7 @@ static hwloc_obj_t df_search(hwloc_topology_t topo, hwloc_obj_t start, hwloc_obj
                              unsigned cache_level, unsigned int nobj, unsigned int *num_objs)
 {
     int search_depth;
+    PRTE_HIDE_UNUSED_PARAMS(start);
 
     search_depth = hwloc_get_type_depth(topo, target);
     if (HWLOC_TYPE_DEPTH_MULTIPLE == search_depth) {
@@ -1257,7 +1258,7 @@ static int bitmap_list_snprintf_exp(char *__hwloc_restrict buf, size_t buflen,
 #if HWLOC_API_VERSION >= 0x20000
     int prev = -1;
     ssize_t size = buflen;
-    int res;
+    int res = -1;
 
     /* mark the end in case we do nothing later */
     if (buflen > 0) {
@@ -1304,6 +1305,7 @@ static int bitmap_list_snprintf_exp(char *__hwloc_restrict buf, size_t buflen,
         }
     }
 #else
+    PRTE_HIDE_UNUSED_PARAMS(set, type);
     if (buflen > 0) {
         tmp[0] = '\0';
     }
@@ -1326,7 +1328,7 @@ void prte_hwloc_get_binding_info(hwloc_const_cpuset_t cpuset,
 
     /* if the cpuset is all zero, then something is wrong */
     if (hwloc_bitmap_iszero(cpuset)) {
-        snprintf(cores, sz, "\n%*c<NOT MAPPED/>\n", 20, ' ');
+        snprintf(cores, sz, "\n%*c<EMPTY CPUSET/>\n", 20, ' ');
     }
 
     /* if the cpuset includes all available cpus, and
@@ -1399,7 +1401,7 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
 
     /* if the cpuset is all zero, then something is wrong */
     if (hwloc_bitmap_iszero(cpuset)) {
-        return strdup("NOT MAPPED");
+        return strdup("EMPTY CPUSET");
     }
 
     /* if the cpuset includes all available cpus, and
@@ -1465,19 +1467,18 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
 
 char *prte_hwloc_base_get_topo_signature(hwloc_topology_t topo)
 {
-    int nnuma, npackage, nl3, nl2, nl1, ncore, nhwt;
-    char *sig = NULL, *arch = NULL, *endian, *pus, *cpus;
+    char *sig = NULL, *arch = NULL, *endian;
     hwloc_obj_t obj;
     unsigned i;
-    hwloc_bitmap_t complete, allowed;
+    char buffer[4096];
+    int rc;
 
-    nnuma = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_NUMANODE, 0);
-    npackage = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PACKAGE, 0);
-    nl3 = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_L3CACHE, 3);
-    nl2 = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_L2CACHE, 2);
-    nl1 = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_L1CACHE, 1);
-    ncore = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_CORE, 0);
-    nhwt = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PU, 0);
+    obj = hwloc_get_root_obj(topo);
+    rc = hwloc_topology_export_synthetic(topo, buffer, 4096,
+                                         HWLOC_TOPOLOGY_EXPORT_SYNTHETIC_FLAG_NO_ATTRS);
+    if (-1 == rc) {
+        snprintf(buffer, 4096, "NON-SYMMETRIC[%u]", prte_process_info.myproc.rank);
+    }
 
     /* get the root object so we can add the processor architecture */
     obj = hwloc_get_root_obj(topo);
@@ -1501,33 +1502,8 @@ char *prte_hwloc_base_get_topo_signature(hwloc_topology_t topo)
     endian = "unknown";
 #endif
 
-    /* print the cpu bitmap itself so we can detect mismatches in the available
-     * cores across the nodes - we send the complete set along with the available
-     * one in cases where the two differ */
-    complete = (hwloc_bitmap_t) hwloc_topology_get_complete_cpuset(topo);
-    allowed = (hwloc_bitmap_t) hwloc_topology_get_allowed_cpuset(topo);
-    pus = NULL;
-    if (0 >= hwloc_bitmap_list_asprintf(&pus, allowed)) {
-        if (NULL != pus) {
-            free(pus);
-        }
-        pus = strdup("unknown");
-    }
-    if (hwloc_bitmap_isequal(complete, allowed)) {
-        cpus = strdup("");
-    } else {
-        cpus = NULL;
-        if (0 >= hwloc_bitmap_list_asprintf(&cpus, complete)) {
-            if (NULL != cpus) {
-                free(cpus);
-            }
-            cpus = strdup("unknown");
-        }
-    }
-    pmix_asprintf(&sig, "%dN:%dS:%dL3:%dL2:%dL1:%dC:%dH:%s:%s:%s:%s", nnuma, npackage, nl3, nl2,
-                  nl1, ncore, nhwt, pus, cpus, arch, endian);
-    free(pus);
-    free(cpus);
+    // form the final signature
+    pmix_asprintf(&sig, "%s:%s:%s", buffer, arch, endian);
     return sig;
 }
 
@@ -1876,10 +1852,12 @@ int prte_hwloc_base_topology_set_flags(hwloc_topology_t topology, unsigned long 
     // Blacklist the "gl" component due to potential conflicts.
     // See "https://github.com/open-mpi/ompi/issues/10025" for
     // an explanation
+#ifdef HWLOC_VERSION_MAJOR
 #if HWLOC_VERSION_MAJOR > 2
     hwloc_topology_set_components(topology, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, "gl");
 #elif HWLOC_VERSION_MAJOR == 2 && HWLOC_VERSION_MINOR >= 1
     hwloc_topology_set_components(topology, HWLOC_TOPOLOGY_COMPONENTS_FLAG_BLACKLIST, "gl");
+#endif
 #endif
     return hwloc_topology_set_flags(topology, flags);
 }

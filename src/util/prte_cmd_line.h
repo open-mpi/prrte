@@ -15,7 +15,7 @@
  * Copyright (c) 2016-2017 Los Alamos National Security, LLC. All rights
  *                         reserved.
  * Copyright (c) 2017-2022 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -82,11 +82,15 @@ BEGIN_C_DECLS
 #define PRTE_CLI_LEAVE_SESSION_ATTACHED "leave-session-attached"    // none
 #define PRTE_CLI_TMPDIR                 "tmpdir"                    // required
 #define PRTE_CLI_PREFIX                 "prefix"                    // required
+#define PRTE_CLI_PMIX_PREFIX			"pmix-prefix"				// required
+#define PRTE_CLI_APP_PREFIX				"app-pmix-prefix"			// required
 #define PRTE_CLI_NOPREFIX               "noprefix"                  // none
+#define PRTE_CLI_NO_APP_PREFIX   	    "no-app-prefix"             // none
 #define PRTE_CLI_FWD_SIGNALS            "forward-signals"           // required
 #define PRTE_CLI_RUN_AS_ROOT            "allow-run-as-root"         // none
 #define PRTE_CLI_STREAM_BUF             "stream-buffering"          // required
 #define PRTE_CLI_BOOTSTRAP              "bootstrap"                 // none
+#define PRTE_CLI_HETERO_NODES           "hetero-nodes"              // none
 
 // Application options
 #define PRTE_CLI_NP                     "np"                        // required
@@ -108,6 +112,8 @@ BEGIN_C_DECLS
 #define PRTE_CLI_SET_CWD_SESSION        "set-cwd-to-session-dir"    // none
 #define PRTE_CLI_ENABLE_RECOVERY        "enable-recovery"           // none
 #define PRTE_CLI_DISABLE_RECOVERY       "disable-recovery"          // none
+#define PRTE_CLI_MEM_ALLOC_KIND			"memory-alloc-kinds"        // required
+#define PRTE_CLI_GPU_SUPPORT			"gpu-support"				// required
 
 // Placement options
 #define PRTE_CLI_MAPBY                  "map-by"                    // required

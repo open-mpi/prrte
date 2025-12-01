@@ -19,7 +19,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * Copyright (c) 2024      Triad National Security, LLC. All rights
  *                         reserved.
  * $COPYRIGHT$
@@ -80,7 +80,7 @@ static void _query(int sd, short args, void *cbdata)
     prte_node_t *node, *ndptr;
     int j, k, rc;
     size_t m, n, p;
-    uint32_t key, nodeid, sessionid = UINT32_MAX;
+    uint32_t key, nodeid;
     char **nspaces, *hostname, *uri;
     char *cmdline;
     char **ans, *tmp;
@@ -88,7 +88,6 @@ static void _query(int sd, short args, void *cbdata)
     prte_app_context_t *app;
     int matched;
     pmix_proc_info_t *procinfo;
-    pmix_info_t *info;
     pmix_data_array_t dry;
     prte_proc_t *proct;
     pmix_proc_t *proc;
@@ -122,6 +121,13 @@ static void _query(int sd, short args, void *cbdata)
                                          : "(not a string)"));
 
                 if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_NSPACE)) {
+                    // the nspace could be NULL, indicating that this is a
+                    // wildcard request - if so, then ignore it here
+                    if (NULL == q->qualifiers[n].value.data.string ||
+                        0 == strlen(q->qualifiers[n].value.data.string)) {
+                        PMIX_LOAD_NSPACE(jobid, NULL);
+                        continue;
+                    }
                     /* Never trust the namespace string that is provided.
                      * First check to see if we know about this namespace. If
                      * not then return an error. If so then continue on.
@@ -146,7 +152,7 @@ static void _query(int sd, short args, void *cbdata)
                         goto done;
                     }
 
-                    PMIX_LOAD_NSPACE(jobid, q->qualifiers[n].value.data.string);
+                    PMIX_LOAD_NSPACE(jobid, jdata->nspace);
                     if (PMIX_NSPACE_INVALID(jobid)) {
                         ret = PMIX_ERR_BAD_PARAM;
                         goto done;
@@ -189,10 +195,6 @@ static void _query(int sd, short args, void *cbdata)
 
                 } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_PSET_NAME)) {
                     psetname = q->qualifiers[n].value.data.string;
-
-                } else if (PMIX_CHECK_KEY(&q->qualifiers[n], PMIX_SESSION_ID)) {
-                    PMIX_VALUE_GET_NUMBER(rc, &q->qualifiers[n].value, sessionid, uint32_t);
-
                 }
 
             }
@@ -233,90 +235,90 @@ static void _query(int sd, short args, void *cbdata)
                     if (NULL == jdata) {
                         continue;
                     }
-                    /* don't show the requestor's job */
-                    if (!PMIX_CHECK_NSPACE(PRTE_PROC_MY_NAME->nspace, jdata->nspace)) {
-                        PMIX_INFO_LIST_START(stack);
-                        /* add the nspace name */
-                        PMIX_INFO_LIST_ADD(rc, stack, PMIX_NSPACE, jdata->nspace, PMIX_STRING);
-                        if (PMIX_SUCCESS != rc) {
-                            PMIX_ERROR_LOG(rc);
-                            PMIX_INFO_LIST_RELEASE(stack);
-                            goto done;
-                        }
-                        /* add the cmd line */
-                        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
-                        if (NULL == app) {
-                            ret = PMIX_ERR_NOT_FOUND;
-                            goto done;
-                        }
-                        cmdline = PMIX_ARGV_JOIN_COMPAT(app->argv, ' ');
-                        PMIX_INFO_LIST_ADD(rc, stack, PMIX_CMD_LINE, cmdline, PMIX_STRING);
-                        free(cmdline);
-                        /* add the job size */
-                        PMIX_INFO_LIST_ADD(rc, stack, PMIX_JOB_SIZE, &jdata->num_procs, PMIX_UINT32);
-                        if (PMIX_SUCCESS != rc) {
-                            PMIX_ERROR_LOG(rc);
-                            PMIX_INFO_LIST_RELEASE(stack);
-                            goto done;
-                        }
-                        /* construct info on each process in the job */
-                        for (j=0; j < jdata->procs->size; j++) {
-                            proct = (prte_proc_t*)pmix_pointer_array_get_item(jdata->procs, j);
-                            if (NULL == proct) {
-                                continue;
-                            }
-                            PMIX_INFO_LIST_START(plist);
-                            /* add the proc's rank */
-                            PMIX_INFO_LIST_ADD(rc, plist, PMIX_RANK, &proct->name.rank, PMIX_PROC_RANK);
-                            if (PMIX_SUCCESS != rc) {
-                                PMIX_ERROR_LOG(rc);
-                                PMIX_INFO_LIST_RELEASE(stack);
-                                PMIX_INFO_LIST_RELEASE(plist);
-                                goto done;
-                            }
-                            /* add the proc's hostname */
-                            PMIX_INFO_LIST_ADD(rc, plist, PMIX_HOSTNAME, proct->node->name, PMIX_STRING);
-                            if (PMIX_SUCCESS != rc) {
-                                PMIX_ERROR_LOG(rc);
-                                PMIX_INFO_LIST_RELEASE(stack);
-                                PMIX_INFO_LIST_RELEASE(plist);
-                                goto done;
-                            }
-                            /* add the proc's local rank */
-                            PMIX_INFO_LIST_ADD(rc, plist, PMIX_LOCAL_RANK, &proct->local_rank, PMIX_UINT16);
-                            if (PMIX_SUCCESS != rc) {
-                                PMIX_ERROR_LOG(rc);
-                                PMIX_INFO_LIST_RELEASE(stack);
-                                PMIX_INFO_LIST_RELEASE(plist);
-                                goto done;
-                            }
-                            /* add to the stack */
-                            PMIX_INFO_LIST_CONVERT(rc, plist, &dry);
-                            if (PMIX_SUCCESS != rc) {
-                                PMIX_ERROR_LOG(rc);
-                                PMIX_INFO_LIST_RELEASE(stack);
-                                PMIX_INFO_LIST_RELEASE(plist);
-                                goto done;
-                            }
-                            PMIX_INFO_LIST_RELEASE(plist);
-                            PMIX_INFO_LIST_ADD(rc, stack, PMIX_PROC_INFO_ARRAY, &dry, PMIX_DATA_ARRAY);
-                            PMIX_DATA_ARRAY_DESTRUCT(&dry);
-                        }
-                        /* add the result to our cache */
-                        PMIX_INFO_LIST_CONVERT(rc, stack, &dry);
-                        if (PMIX_SUCCESS != rc) {
-                            PMIX_ERROR_LOG(rc);
-                            PMIX_INFO_LIST_RELEASE(stack);
-                            goto done;
-                        }
+                    PMIX_INFO_LIST_START(stack);
+                    /* add the nspace name */
+                    PMIX_INFO_LIST_ADD(rc, stack, PMIX_NSPACE, jdata->nspace, PMIX_STRING);
+                    if (PMIX_SUCCESS != rc) {
+                        PMIX_ERROR_LOG(rc);
                         PMIX_INFO_LIST_RELEASE(stack);
-                        PMIX_INFO_LIST_ADD(rc, cache, PMIX_JOB_INFO_ARRAY, &dry, PMIX_DATA_ARRAY);
+                        goto done;
+                    }
+                    /* add the cmd line */
+                    app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
+                    if (NULL == app) {
+                        ret = PMIX_ERR_NOT_FOUND;
+                        goto done;
+                    }
+                    cmdline = PMIX_ARGV_JOIN_COMPAT(app->argv, ' ');
+                    PMIX_INFO_LIST_ADD(rc, stack, PMIX_CMD_LINE, cmdline, PMIX_STRING);
+                    free(cmdline);
+                    /* add the job size */
+                    PMIX_INFO_LIST_ADD(rc, stack, PMIX_JOB_SIZE, &jdata->num_procs, PMIX_UINT32);
+                    if (PMIX_SUCCESS != rc) {
+                        PMIX_ERROR_LOG(rc);
+                        PMIX_INFO_LIST_RELEASE(stack);
+                        goto done;
+                    }
+                    /* construct info on each process in the job */
+                    for (j=0; j < jdata->procs->size; j++) {
+                        proct = (prte_proc_t*)pmix_pointer_array_get_item(jdata->procs, j);
+                        if (NULL == proct) {
+                            continue;
+                        }
+                        PMIX_INFO_LIST_START(plist);
+                        /* add the proc's rank */
+                        PMIX_INFO_LIST_ADD(rc, plist, PMIX_RANK, &proct->name.rank, PMIX_PROC_RANK);
+                        if (PMIX_SUCCESS != rc) {
+                            PMIX_ERROR_LOG(rc);
+                            PMIX_INFO_LIST_RELEASE(stack);
+                            PMIX_INFO_LIST_RELEASE(plist);
+                            goto done;
+                        }
+                        /* add the proc's hostname */
+                        PMIX_INFO_LIST_ADD(rc, plist, PMIX_HOSTNAME, proct->node->name, PMIX_STRING);
+                        if (PMIX_SUCCESS != rc) {
+                            PMIX_ERROR_LOG(rc);
+                            PMIX_INFO_LIST_RELEASE(stack);
+                            PMIX_INFO_LIST_RELEASE(plist);
+                            goto done;
+                        }
+                        /* add the proc's local rank */
+                        PMIX_INFO_LIST_ADD(rc, plist, PMIX_LOCAL_RANK, &proct->local_rank, PMIX_UINT16);
+                        if (PMIX_SUCCESS != rc) {
+                            PMIX_ERROR_LOG(rc);
+                            PMIX_INFO_LIST_RELEASE(stack);
+                            PMIX_INFO_LIST_RELEASE(plist);
+                            goto done;
+                        }
+                        /* add to the stack */
+                        PMIX_INFO_LIST_CONVERT(rc, plist, &dry);
+                        if (PMIX_SUCCESS != rc) {
+                            PMIX_ERROR_LOG(rc);
+                            PMIX_INFO_LIST_RELEASE(stack);
+                            PMIX_INFO_LIST_RELEASE(plist);
+                            goto done;
+                        }
+                        PMIX_INFO_LIST_RELEASE(plist);
+                        PMIX_INFO_LIST_ADD(rc, stack, PMIX_PROC_INFO_ARRAY, &dry, PMIX_DATA_ARRAY);
                         PMIX_DATA_ARRAY_DESTRUCT(&dry);
                     }
+                    /* add the result to our cache */
+                    PMIX_INFO_LIST_CONVERT(rc, stack, &dry);
+                    if (PMIX_SUCCESS != rc) {
+                        PMIX_ERROR_LOG(rc);
+                        PMIX_INFO_LIST_RELEASE(stack);
+                        goto done;
+                    }
+                    PMIX_INFO_LIST_RELEASE(stack);
+                    PMIX_INFO_LIST_ADD(rc, cache, PMIX_JOB_INFO_ARRAY, &dry, PMIX_DATA_ARRAY);
+                    PMIX_DATA_ARRAY_DESTRUCT(&dry);
                 }
                 /* add our findings to the results */
                 PMIX_INFO_LIST_CONVERT(rc, cache, &dry);
-                if (PMIX_SUCCESS != rc) {
+                if (PMIX_SUCCESS != rc && PMIX_ERR_EMPTY != rc) {
+                    // if the array is empty, then there is nothing wrong - we
+                    // simply didn't find any runnning jobs
+                    // otherwise, report the error and abort
                     PMIX_ERROR_LOG(rc);
                     PMIX_INFO_LIST_RELEASE(cache);
                     goto done;
@@ -395,7 +397,7 @@ static void _query(int sd, short args, void *cbdata)
                 }
 
             } else if (0 == strcmp(q->keys[n], PMIX_HWLOC_XML_V2)) {
-                /* we cannot provide it if we are using v1.x */
+               /* we cannot provide it if we are using v1.x */
 #if HWLOC_API_VERSION >= 0x20000
                 if (NULL != prte_hwloc_topology) {
                     char *xmlbuffer = NULL;
@@ -595,18 +597,19 @@ static void _query(int sd, short args, void *cbdata)
                     PMIX_ARGV_APPEND_NOSIZE_COMPAT(&ans, ps->name);
                 }
                 if (NULL == ans) {
-                    ret = PMIX_ERR_NOT_FOUND;
-                    goto done;
+                    tmp = NULL;;
                 } else {
                     tmp = PMIX_ARGV_JOIN_COMPAT(ans, ',');
                     PMIX_ARGV_FREE_COMPAT(ans);
                     ans = NULL;
-                    PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_PSET_NAMES, tmp, PMIX_STRING);
+                }
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_PSET_NAMES, tmp, PMIX_STRING);
+                if (NULL != tmp) {
                     free(tmp);
-                    if (PMIX_SUCCESS != rc) {
-                        PMIX_ERROR_LOG(rc);
-                        goto done;
-                    }
+                }
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
                 }
 
             } else if (0 == strcmp(q->keys[n], PMIX_QUERY_PSET_MEMBERSHIP)) {
@@ -703,9 +706,7 @@ static void _query(int sd, short args, void *cbdata)
                 /* cycle thru the job and create an entry for each proc */
                 PMIX_DATA_ARRAY_CONSTRUCT(&dry, grp->num_members, PMIX_PROC);
                 proc = (pmix_proc_t *) dry.array;
-                for (k = 0; k < grp->num_members; k++) {
-                    PMIX_LOAD_PROCID(&proc[k], grp->members[k].nspace, grp->members[k].rank);
-                }
+                memcpy(proc, grp->members, grp->num_members * sizeof(pmix_proc_t));
                 PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_GROUP_MEMBERSHIP, &dry, PMIX_DATA_ARRAY);
                 PMIX_DATA_ARRAY_DESTRUCT(&dry);
                 if (PMIX_SUCCESS != rc) {
@@ -764,8 +765,8 @@ static void _query(int sd, short args, void *cbdata)
                     if (0 != hwloc_topology_export_xmlbuffer(topo->topo, &str, &len, 0)) {
                         continue;
                     }
-                    PMIX_INFO_LIST_ADD(rc, nodelist, PMIX_HWLOC_XML_V2, str, PMIX_STRING);
 #endif
+                    PMIX_INFO_LIST_ADD(rc, nodelist, PMIX_HWLOC_XML_V2, str, PMIX_STRING);
                     free(str);
                 }
                 /* convert list to array */
@@ -822,8 +823,155 @@ static void _query(int sd, short args, void *cbdata)
                 }
 #endif
 
+#ifdef PMIX_MEM_ALLOC_KIND
+            } else if (0 == strcmp(q->keys[n], PMIX_MEM_ALLOC_KIND)) {
+                pmix_proc_t pproc;
+                pmix_info_t info;
+                pmix_value_t *value;
+                jdata = prte_get_job_data_object(jobid);
+                if (NULL == jdata) {
+                    ret = PMIX_ERR_NOT_FOUND;
+                    goto done;
+                }
+                PMIX_LOAD_PROCID(&pproc, jobid, PMIX_RANK_WILDCARD);
+                PMIX_INFO_LOAD(&info, PMIX_IMMEDIATE, NULL, PMIX_BOOL);
+                ret = PMIx_Get(&pproc, PMIX_MEM_ALLOC_KIND, &info, 1, &value);
+                if (PMIX_SUCCESS != ret) {
+                    goto done;
+                }
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_MEM_ALLOC_KIND, value->data.string, PMIX_STRING);
+                PMIX_VALUE_RELEASE(value);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto done;
+                }
+#endif
+
+#ifdef PMIX_QUERY_RESOLVE_PEERS
+            } else if (0 == strcmp(q->keys[n], PMIX_QUERY_RESOLVE_PEERS)) {
+                char *nm;
+                pmix_list_t procs;
+                int idx;
+                prte_proc_t *p2;
+                bool found;
+                // must at least have given us a hostname
+                if (NULL == hostname) {
+                    ret = PMIX_ERR_BAD_PARAM;
+                    goto done;
+                }
+                /* does the name refer to me? */
+                if (prte_check_host_is_local(hostname)) {
+                    nm = prte_process_info.nodename;
+                } else {
+                    nm = hostname;
+                }
+                PMIX_CONSTRUCT(&procs, pmix_list_t);
+                // could ask for info on all jobs, so have to check for that case
+                for (k = 1; k < prte_job_data->size; k++) {
+                    jdata = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, k);
+                    if (NULL == jdata) {
+                        continue;
+                    }
+                    if (NULL == jdata->map) {
+                        continue;
+                    }
+                    if (!PMIX_NSPACE_INVALID(jobid) &&
+                        !PMIX_CHECK_NSPACE(jobid, jdata->nspace)) {
+                        continue;
+                    }
+                    // see if this job has any procs on the indicated node
+                    for (j=0; j < jdata->map->nodes->size; j++) {
+                        node = (prte_node_t *) pmix_pointer_array_get_item(jdata->map->nodes, j);
+                        if (NULL == node) {
+                            continue;
+                        }
+                        if (0 != strcmp(node->name, nm)) {
+                            if (NULL == node->aliases) {
+                                continue;
+                            }
+                            found = false;
+                            for (p = 0; NULL != node->aliases[p]; p++) {
+                                if (0 == strcmp(nm, node->aliases[p])) {
+                                    /* this is the node! */
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                continue;
+                            }
+                        }
+                        // we want the procs from this node
+                        for (idx=0; idx < node->procs->size; idx++) {
+                            proct = (prte_proc_t*)pmix_pointer_array_get_item(node->procs, idx);
+                            if (NULL == proct) {
+                                continue;
+                            }
+                            if (PMIX_CHECK_NSPACE(jdata->nspace, proct->name.nspace)) {
+                                pmix_list_append(&procs, &proct->super);
+                            }
+                        }
+                    }
+                }
+                sz = pmix_list_get_size(&procs);
+                if (0 < sz) {
+                    PMIX_PROC_CREATE(proc, sz);
+                    idx = 0;
+                    PMIX_LIST_FOREACH_SAFE(proct, p2, &procs, prte_proc_t) {
+                        memcpy(&proc[idx], &proct->name, sizeof(pmix_proc_t));
+                        pmix_list_remove_item(&procs, &proct->super);
+                        ++idx;
+                    }
+                } else {
+                    proc = NULL;
+                }
+                dry.type = PMIX_PROC;
+                dry.array = proc;
+                dry.size = sz;
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_RESOLVE_PEERS, &dry, PMIX_DATA_ARRAY);
+                if (NULL != proc) {
+                    free(proc);
+                }
+                PMIX_DESTRUCT(&procs);
+#endif
+
+#ifdef PMIX_QUERY_RESOLVE_NODE
+            } else if (0 == strcmp(q->keys[n], PMIX_QUERY_RESOLVE_NODE)) {
+                char **nodes = NULL, *nodelist;
+                // could ask for info on all jobs, so have to check for that case
+                for (k = 1; k < prte_job_data->size; k++) {
+                    jdata = (prte_job_t *) pmix_pointer_array_get_item(prte_job_data, k);
+                    if (NULL == jdata) {
+                        continue;
+                    }
+                    if (NULL == jdata->map) {
+                        continue;
+                    }
+                    if (!PMIX_NSPACE_INVALID(jobid) &&
+                        !PMIX_CHECK_NSPACE(jobid, jdata->nspace)) {
+                        continue;
+                    }
+                    // assemble the nodes
+                    for (j=0; j < jdata->map->nodes->size; j++) {
+                        node = (prte_node_t *) pmix_pointer_array_get_item(jdata->map->nodes, j);
+                        if (NULL == node) {
+                            continue;
+                        }
+                        PMIx_Argv_append_unique_nosize(&nodes, node->name);
+                    }
+                }
+                nodelist = PMIx_Argv_join(nodes, ',');
+                PMIx_Argv_free(nodes);
+                PMIX_INFO_LIST_ADD(rc, results, PMIX_QUERY_RESOLVE_NODE, nodelist, PMIX_STRING);
+#endif
+
             } else {
-                fprintf(stderr, "Query for unrecognized attribute: %s\n", q->keys[n]);
+                pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                    "%s Query for unrecognized attribute: %s",
+                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                    PMIx_Get_attribute_name(q->keys[n]));
+                ret = PMIX_ERR_NOT_SUPPORTED;
+                goto done;
             }
         } // for
     }     // for
@@ -836,16 +984,18 @@ done:
         ret = rc;
     }
     PMIX_INFO_LIST_RELEASE(results);
-    if (PMIX_ERR_EMPTY == rc) {
-        ret = PMIX_ERR_NOT_FOUND;
-    } else if (PMIX_SUCCESS == ret) {
-        if (0 == dry.size) {
+    if (PMIX_ERR_NOT_SUPPORTED != ret) {
+        if (PMIX_ERR_EMPTY == rc) {
             ret = PMIX_ERR_NOT_FOUND;
-        } else {
-            if (dry.size < cd->ninfo) {
-                ret = PMIX_QUERY_PARTIAL_SUCCESS;
+        } else if (PMIX_SUCCESS == ret) {
+            if (0 == dry.size) {
+                ret = PMIX_ERR_NOT_FOUND;
             } else {
-                ret = PMIX_SUCCESS;
+                if (dry.size < cd->ninfo) {
+                    ret = PMIX_QUERY_PARTIAL_SUCCESS;
+                } else {
+                    ret = PMIX_SUCCESS;
+                }
             }
         }
     }

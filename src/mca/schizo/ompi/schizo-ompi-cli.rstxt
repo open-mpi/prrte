@@ -1,9 +1,11 @@
 .. -*- rst -*-
 
-   Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+   Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
    Copyright (c) 2022      Cisco Systems, Inc.  All rights reserved.
    Copyright (c) 2022      IBM Corporation.  All rights reserved.
    Copyright (c) 2023      Jeffrey M. Squyres.  All rights reserved.
+   Copyright (c) 2024      Triad National Security, LLC. All rights reserved.
+
    $COPYRIGHT$
 
    Additional copyrights may follow
@@ -79,8 +81,28 @@ Launch options
 
 * ``--wdir <dir>``: Set the working directory of the started processes.
 
-* ``-x <var>``: Export a environment variable, optionally specifying a value.
+* ``-x <var>``: Export an environment variable, optionally specifying a value.
   :ref:`See below for details <label-schizo-ompi-x>`.
+
+* ``--set-env <var>=<val>``: Set an environment variable.
+  :ref:`See below for details <label-schizo-ompi-set-env>`.
+
+* ``--unset-env <var>``: Unset an environment variable.
+  :ref:`See below for details <label-schizo-ompi-unset-env>`.
+
+* ``--prepend-env <var[c]> <val>``: Prepend a value to an environment variable
+  :ref:`See below for details <label-schizo-ompi-prepend-env>`.
+
+* ``--append-env <var[c]> <val>``: Prepend a value to an environment variable
+  :ref:`See below for details <label-schizo-ompi-append-env>`.
+
+* ``--gpu-support <val>``: Direct application to either enable (true) or
+  disable (false) its internal library's GPU support
+
+* ``--app-pmix-prefix <val>``: Prefix to be used by an app to look for its
+  PMIx installation on remote nodes.
+
+* ``--no-app-prefix``: Do not provide a prefix directive to this application.
 
 Mapping, ranking, and binding options
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -143,6 +165,9 @@ Specific options
 
 * ``--prefix <prefix>``: Prefix to be used to look for RTE executables.
 
+* ``--pmix-prefix <prefix>``: Prefix to be used by a PRRTE executable
+  to look for its PMIx installation on remote nodes.
+
 * ``--set-sid``: Direct the DVM daemons to separate from the current
   session.
 
@@ -154,11 +179,16 @@ Specific options
   operations.
   :ref:`See below for details <label-schizo-ompi-tune>`.
 
+* ``--hetero-nodes``: Allocated nodes should be treated as having different
+  topologies
+
 MPI Options
 ^^^^^^^^^^^
 
 * ``--initial-errhandler``: Specify the initial error handler that is
   attached to predefined communicators during the first MPI call.
+* ``--memory-alloc-kinds``: Value is a comma separated list of
+   memory allocation kinds.
 * ``--display-comm``: Display table of communication methods between
   MPI_COMM_WORLD ranks during MPI_Init
 * ``--display-comm-finalize``: Display table of communication methods
@@ -252,7 +282,26 @@ above.
 The ``--allow-run-as-root`` option
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. include:: /prrte-rst-content/cli-allow-run-as-root.rst
+Allow execution as root **(STRONGLY DISCOURAGED)**.
+
+Running as root exposes the user to potentially catastrophic file
+system corruption and damage |mdash| e.g., if the user accidentally
+points the root of the session directory to a system required point,
+this directory and all underlying elements will be deleted upon job
+completion, thereby rendering the system inoperable.
+
+It is recognized that some environments (e.g., containers) may require
+operation as root, and that the user accepts the risks in those
+scenarios. Accordingly, one can override PRRTE's run-as-root
+protection by providing one of the following:
+
+* The ``--allow-run-as-root`` command line directive
+* Adding **BOTH** of the following environmental parameters:
+
+    * ``OMPI_ALLOW_RUN_AS_ROOT=1``
+    * ``OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1``
+
+Again, we recommend this only be done if absolutely necessary.
 
 .. _label-schizo-ompi-bind-to:
 
@@ -338,6 +387,27 @@ The ``--prefix`` option
 
 .. include:: /prrte-rst-content/cli-prefix.rst
 
+.. _label-schizo-ompi-pmix-prefix:
+
+The ``--pmix-prefix`` option
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. include:: /prrte-rst-content/cli-pmix-prefix.rst
+
+.. _label-schizo-ompi-app-prefix:
+
+The ``--app-prefix`` option
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. include:: /prrte-rst-content/cli-app-prefix.rst
+
+.. _label-schizo-ompi-no-app-prefix:
+
+The ``--no-app-prefix`` option
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. include:: /prrte-rst-content/cli-no-app-prefix.rst
+
 .. _label-schizo-ompi-prtemca:
 
 The ``--prtemca`` option
@@ -386,6 +456,31 @@ The ``-x`` option
 ~~~~~~~~~~~~~~~~~
 
 .. include:: /prrte-rst-content/cli-x.rst
+
+.. _label-schizo-ompi-set-env:
+
+The ``--set-env`` option
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. include:: /prrte-rst-content/cli-set-env.rst
+
+.. _label-schizo-ompi-unset-env:
+
+The ``--unset-env`` option
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. include:: /prrte-rst-content/cli-unset-env.rst
+
+.. _label-schizo-ompi-prepend-env:
+
+The ``--prepend-env`` option
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. include:: /prrte-rst-content/cli-prepend-env.rst
+
+
+.. _label-schizo-ompi-append-env:
+
+The ``--append-env`` option
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. include:: /prrte-rst-content/cli-append-env.rst
 
 
 Deprecated command line options

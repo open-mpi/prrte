@@ -19,7 +19,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2016-2022 IBM Corporation.  All rights reserved.
  *
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -42,6 +42,7 @@
 #include "src/class/pmix_pointer_array.h"
 #include "src/hwloc/hwloc-internal.h"
 #include "src/util/pmix_argv.h"
+#include "src/util/pmix_fd.h"
 #include "src/util/pmix_if.h"
 #include "src/util/pmix_net.h"
 #include "src/util/proc_info.h"
@@ -71,7 +72,7 @@ static int prte_rmaps_rf_process_lsf_affinity_hostfile(prte_job_t *jdata, prte_r
 
 char *prte_rmaps_rank_file_slot_list = NULL;
 
-#if PMIX_NUMERIC_VERSION < 0x00040208
+#if PMIX_NUMERIC_VERSION < 0x00040205
 static char *pmix_getline(FILE *fp)
 {
     char *ret, *buff;
@@ -100,7 +101,6 @@ static int num_ranks = 0;
 static int prte_rmaps_rf_map(prte_job_t *jdata,
                              prte_rmaps_options_t *options)
 {
-    prte_job_map_t *map;
     prte_app_context_t *app = NULL;
     int32_t i, k;
     pmix_list_t node_list;
@@ -115,7 +115,6 @@ static int prte_rmaps_rf_map(prte_job_t *jdata,
     char *slots = NULL;
     bool initial_map = true;
     char *rankfile = NULL;
-    hwloc_obj_t obj = NULL;
     char *affinity_file = NULL;
     hwloc_cpuset_t proc_bitmap, bitmap;
     char *cpu_bitmap;
@@ -179,9 +178,6 @@ static int prte_rmaps_rf_map(prte_job_t *jdata,
     }
     jdata->map->last_mapper = strdup(c->pmix_mca_component_name);
 
-    /* convenience def */
-    map = jdata->map;
-
     /* setup the node list */
     PMIX_CONSTRUCT(&node_list, pmix_list_t);
 
@@ -230,7 +226,7 @@ static int prte_rmaps_rf_map(prte_job_t *jdata,
          * option
          */
         rc = prte_rmaps_base_get_target_nodes(&node_list, &num_slots, jdata, app,
-                                              options->map, initial_map, false);
+                                              options->map, initial_map, false, true);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
             goto error;
@@ -582,7 +578,7 @@ static int prte_rmaps_rank_file_parse(const char *rankfile)
             case PRTE_RANKFILE_INT:
             case PRTE_RANKFILE_RELATIVE:
                 if (PRTE_RANKFILE_INT == token) {
-                    sprintf(buff, "%d", prte_rmaps_rank_file_value.ival);
+                    snprintf(buff,RMAPS_RANK_FILE_MAX_SLOTS,  "%d", prte_rmaps_rank_file_value.ival);
                     value = buff;
                 } else {
                     value = prte_rmaps_rank_file_value.sval;
@@ -647,7 +643,7 @@ static int prte_rmaps_rank_file_parse(const char *rankfile)
                 goto unlock;
             } else {
                 /* prepare rank assignment string for the help message in case of a bad-assign */
-                sprintf(tmp_rank_assignment, "%s slot=%s", node_name, value);
+                snprintf(tmp_rank_assignment, RMAPS_RANK_FILE_MAX_SLOTS, "%s slot=%s", node_name, value);
                 pmix_pointer_array_set_item(assigned_ranks_array, 0, tmp_rank_assignment);
             }
 
@@ -691,7 +687,7 @@ static char *prte_rmaps_rank_file_parse_string_or_int(void)
     case PRTE_RANKFILE_STRING:
         return strdup(prte_rmaps_rank_file_value.sval);
     case PRTE_RANKFILE_INT:
-        sprintf(tmp_str, "%d", prte_rmaps_rank_file_value.ival);
+        snprintf(tmp_str, RMAPS_RANK_FILE_MAX_SLOTS, "%d", prte_rmaps_rank_file_value.ival);
         return strdup(tmp_str);
     default:
         return NULL;
@@ -765,18 +761,40 @@ static int prte_rmaps_rf_process_lsf_affinity_hostfile(prte_job_t *jdata,
     return PRTE_SUCCESS;
 }
 
+static bool quickmatch(prte_node_t *nd, char *name)
+{
+    int n;
+
+    if (0 == strcmp(nd->name, name)) {
+        return true;
+    }
+    if (0 == strcmp(nd->name, prte_process_info.nodename) &&
+        (0 == strcmp(name, "localhost") ||
+         0 == strcmp(name, "127.0.0.1"))) {
+        return true;
+    }
+    if (NULL != nd->aliases) {
+        for (n=0; NULL != nd->aliases[n]; n++) {
+            if (0 == strcmp(nd->aliases[n], name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static int prte_rmaps_rf_lsf_convert_affinity_to_rankfile(char *affinity_file, char **aff_rankfile)
 {
     FILE *fp;
     int fp_rank, cur_rank = 0;
     char *hstname = NULL;
     char *sep, *eptr, *membind_opt;
-    char *tmp_str = NULL, *tmp_rid = NULL;
+    char *tmp_str = NULL;
     size_t len;
     char **cpus;
-    int i;
+    int i, j;
     hwloc_obj_t obj;
-    prte_topology_t *my_topo = NULL;
+    prte_node_t *node, *nptr;
 
     if( NULL != *aff_rankfile) {
         free(*aff_rankfile);
@@ -785,7 +803,7 @@ static int prte_rmaps_rf_lsf_convert_affinity_to_rankfile(char *affinity_file, c
     // session dir + / (1) + lsf_rf. (7) + XXXXXX (6) + \0 (1)
     len = strlen(prte_process_info.top_session_dir) + 1 + 7 + 6 + 1;
     (*aff_rankfile) = (char*) malloc(sizeof(char) * len);
-    sprintf(*aff_rankfile, "%s/lsf_rf.XXXXXX", prte_process_info.top_session_dir);
+    snprintf(*aff_rankfile, len, "%s/lsf_rf.XXXXXX", prte_process_info.top_session_dir);
 
     /* open the file */
     fp = fopen(affinity_file, "r");
@@ -844,16 +862,43 @@ static int prte_rmaps_rf_lsf_convert_affinity_to_rankfile(char *affinity_file, c
         // Convert the Physical CPU set from LSF to a Hwloc logical CPU set
         pmix_output_verbose(20, prte_rmaps_base_framework.framework_output,
                             "mca:rmaps:rf: (lsf) Convert Physical CPUSET from <%s>", sep);
-        my_topo = (prte_topology_t *) pmix_pointer_array_get_item(prte_node_topologies, 0);
+
+        // find the named host
+        nptr = NULL;
+        for (j = 0; j < prte_node_pool->size; j++) {
+            node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, j);
+            if (NULL == node) {
+                continue;
+            }
+            if (quickmatch(node, hstname)) {
+                nptr = node;
+                break;
+            }
+        }
+        if (NULL == nptr) {
+            /* wasn't found - that is an error */
+            pmix_show_help("help-rmaps_rank_file.txt",
+                           "resource-not-found", true,
+                           hstname);
+            fclose(fp);
+            close(fp_rank);
+            return PRTE_ERROR;
+        }
+
         cpus = PMIX_ARGV_SPLIT_COMPAT(sep, ',');
         for(i = 0; NULL != cpus[i]; ++i) {
-            // assume HNP has the same topology as other nodes
-            obj = hwloc_get_pu_obj_by_os_index(my_topo->topo, strtol(cpus[i], NULL, 10)) ;
-
+            // get the specified object
+            obj = hwloc_get_pu_obj_by_os_index(nptr->topology->topo, strtol(cpus[i], NULL, 10)) ;
+            if (NULL == obj) {
+                PMIX_ARGV_FREE_COMPAT(cpus);
+                fclose(fp);
+                close(fp_rank);
+                return PRTE_ERROR;
+            }
             free(cpus[i]);
             // 10 max number of digits in an int
             cpus[i] = (char*)malloc(sizeof(char) * 10);
-            sprintf(cpus[i], "%d", obj->logical_index);
+            snprintf(cpus[i], 10, "%d", obj->logical_index);
         }
         sep = PMIX_ARGV_JOIN_COMPAT(cpus, ',');
         PMIX_ARGV_FREE_COMPAT(cpus);
@@ -864,8 +909,8 @@ static int prte_rmaps_rf_lsf_convert_affinity_to_rankfile(char *affinity_file, c
         // "rank " (5) + id (max 10) + = (1) + host (?) + " slot=" (6) + ids (?) + '\0' (1)
         len = 5 + 10 + 1 + strlen(hstname) + 6 + strlen(sep) + 1;
         tmp_str = (char *)malloc(sizeof(char) * len);
-        sprintf(tmp_str, "rank %d=%s slot=%s\n", cur_rank, hstname, sep);
-        write(fp_rank, tmp_str, strlen(tmp_str));
+        snprintf(tmp_str, len, "rank %d=%s slot=%s\n", cur_rank, hstname, sep);
+        pmix_fd_write(fp_rank, strlen(tmp_str), tmp_str);
         free(tmp_str);
         ++cur_rank;
     }

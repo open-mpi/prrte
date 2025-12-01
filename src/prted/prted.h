@@ -11,7 +11,7 @@
  *                         All rights reserved.
  * Copyright (c) 2019      Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -47,12 +47,16 @@ PRTE_EXPORT int prte_daemon_process_commands(pmix_proc_t *sender, pmix_data_buff
                                              prte_rml_tag_t tag);
 
 PRTE_EXPORT int prte_parse_locals(prte_schizo_base_module_t *schizo, pmix_list_t *jdata,
-                                  char **argv, char ***hostfiles, char ***hosts);
+                                  char **argv, char ***hostfiles, char ***hosts,
+                                  pmix_list_t *jobdata);
 
 PRTE_EXPORT int prun_common(pmix_cli_result_t *cli,
                             prte_schizo_base_module_t *schizo,
                             int argc, char **argv);
 
+PRTE_EXPORT int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
+                                           prte_schizo_base_module_t *schizo,
+                                           pmix_list_t *apps);
 END_C_DECLS
 
 #endif /* PRTED_H */

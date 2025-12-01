@@ -17,7 +17,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2015-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -305,11 +305,25 @@ static void ssh_wait_daemon(int sd, short flags, void *cbdata)
             daemon->state = PRTE_PROC_STATE_FAILED_TO_START;
         } else {
             jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+            pmix_output(prte_clean_output,
+                        "------------------------------------------------------------\n"
+                        "A daemon failed to report back after being spawned. This could\n"
+                        "be due to several factors, including inability to find the\n"
+                        "daemon executable, or the executable was unable to find its\n"
+                        "required supporting libraries. In some cases, the daemon was\n"
+                        "able to execute, but was unable to complete a TCP connection\n"
+                        "back to %s:\n\n"
+                        "  Local host:    %s\n"
+                        "  Remote host:   %s\n"
+                        "  Daemon exit status: %d\n\n"
+                        "This may also be caused by a firewall on the remote host. Please\n"
+                        "check that any firewall (e.g., iptables) has been disabled and\n"
+                        "try again.\n"
+                        "------------------------------------------------------------",
+                        prte_tool_basename, prte_process_info.nodename,
+                        (NULL == daemon->node->name) ? "<unknown>" : daemon->node->name,
+                        WEXITSTATUS(daemon->exit_code));
 
-            PMIX_OUTPUT_VERBOSE(
-                (1, prte_plm_base_framework.framework_output, "%s daemon %s failed with status %d",
-                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_VPID_PRINT(daemon->name.rank),
-                 WEXITSTATUS(daemon->exit_code)));
             /* set the exit status */
             PRTE_UPDATE_EXIT_STATUS(WEXITSTATUS(daemon->exit_code));
             /* note that this daemon failed */
@@ -336,7 +350,7 @@ static void ssh_wait_daemon(int sd, short flags, void *cbdata)
 }
 
 static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node_name_index1,
-                        int *proc_vpid_index, char *prefix_dir)
+                        int *proc_vpid_index, char *prefix_dir, char *pmix_prefix)
 {
     int argc;
     char **argv;
@@ -459,37 +473,53 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
         free(tmp);
     }
 
-    if (NULL != prefix_dir) {
+    if (NULL != prefix_dir || NULL != pmix_prefix) {
         value = pmix_basename(prte_install_dirs.libdir);
         value2 = pmix_basename(pmix_pinstall_dirs.libdir);
         if (PRTE_PLM_SSH_SHELL_SH == remote_shell ||
             PRTE_PLM_SSH_SHELL_KSH == remote_shell ||
             PRTE_PLM_SSH_SHELL_ZSH == remote_shell ||
             PRTE_PLM_SSH_SHELL_BASH == remote_shell) {
-            pmix_asprintf(&tmp, "PRTE_PREFIX=%s", prefix_dir);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export PRTE_PREFIX");
-            free(tmp);
-            if (NULL != (param = getenv("PMIX_PREFIX"))) {
-                pmix_asprintf(&tmp, "PMIX_PREFIX=%s", param);
+            if (NULL != prefix_dir) {
+                pmix_asprintf(&tmp, "PRTE_PREFIX=%s", prefix_dir);
+                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export PRTE_PREFIX");
+                free(tmp);
+                if (NULL != pmix_prefix) {
+                    pmix_asprintf(&tmp, "PMIX_PREFIX=%s", pmix_prefix);
+                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export PMIX_PREFIX");
+                    free(tmp);
+                    pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s/%s:%s/%s:$LD_LIBRARY_PATH",
+                                  prefix_dir, value, pmix_prefix, value2);
+                } else {
+                    pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s/%s:%s:$LD_LIBRARY_PATH",
+                                  prefix_dir, value, pmix_pinstall_dirs.libdir);
+                }
+            } else {
+                // pmix_prefix must not be NULL
+                pmix_asprintf(&tmp, "PMIX_PREFIX=%s", pmix_prefix);
                 PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
                 PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export PMIX_PREFIX");
                 free(tmp);
-                pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s/%s:%s/%s:$LD_LIBRARY_PATH",
-                              prefix_dir, value, param, value2);
-            } else {
-                pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s/%s:%s:$LD_LIBRARY_PATH",
-                              prefix_dir, value, pmix_pinstall_dirs.libdir);
+                pmix_asprintf(&tmp, "LD_LIBRARY_PATH=%s/%s:$LD_LIBRARY_PATH",
+                              pmix_prefix, value2);
             }
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export LD_LIBRARY_PATH");
             free(tmp);
-            if (NULL != param) {
-                pmix_asprintf(&tmp, "DYLD_LIBRARY_PATH=%s/%s:%s/%s:$DYLD_LIBRARY_PATH",
-                              prefix_dir, value, param, value2);
+            if (NULL != prefix_dir) {
+                if (NULL != pmix_prefix) {
+                    pmix_asprintf(&tmp, "DYLD_LIBRARY_PATH=%s/%s:%s/%s:$DYLD_LIBRARY_PATH",
+                                  prefix_dir, value, pmix_prefix, value2);
+                } else {
+                    pmix_asprintf(&tmp, "DYLD_LIBRARY_PATH=%s/%s:%s:$DYLD_LIBRARY_PATH",
+                                  prefix_dir, value, pmix_pinstall_dirs.libdir);
+                }
             } else {
-                pmix_asprintf(&tmp, "DYLD_LIBRARY_PATH=%s/%s:%s:$DYLD_LIBRARY_PATH",
-                              prefix_dir, value, pmix_pinstall_dirs.libdir);
+                // pmix_prefix must not be NULL
+                pmix_asprintf(&tmp, "DYLD_LIBRARY_PATH=%s/%s:$DYLD_LIBRARY_PATH",
+                              pmix_prefix, value2);
             }
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "export DYLD_LIBRARY_PATH");
@@ -507,30 +537,49 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
              * assemble the cmd with the orted_cmd at the end. Otherwise,
              * we have to insert the orted_prefix in the right place
              */
-            pmix_asprintf(&tmp, "setenv PRTE_PREFIX %s", prefix_dir);
-            PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
-            free(tmp);
-            if (NULL != (param = getenv("PMIX_PREFIX"))) {
-                pmix_asprintf(&tmp, "setenv PMIX_PREFIX %s", param);
+            if (NULL != prefix_dir) {
+                pmix_asprintf(&tmp, "setenv PRTE_PREFIX %s", prefix_dir);
+                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+                free(tmp);
+                if (NULL != pmix_prefix) {
+                    pmix_asprintf(&tmp, "setenv PMIX_PREFIX %s", pmix_prefix);
+                    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
+                    free(tmp);
+                }
+            } else {
+                // pmix_prefix must not be NULL
+                pmix_asprintf(&tmp, "setenv PMIX_PREFIX %s", pmix_prefix);
                 PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
                 free(tmp);
             }
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, "if ( $?LD_LIBRARY_PATH == 1 ) set PRTE_have_llp");
-            if (NULL != param) {
-                pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s/%s:%s/%s",
-                              prefix_dir, value, param, value2);
+            if (NULL != prefix_dir) {
+                if (NULL != pmix_prefix) {
+                    pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s/%s:%s/%s",
+                                  prefix_dir, value, pmix_prefix, value2);
+                } else {
+                    pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s/%s:%s",
+                                  prefix_dir, value, pmix_pinstall_dirs.libdir);
+                }
             } else {
-                pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s/%s:%s",
-                              prefix_dir, value, pmix_pinstall_dirs.libdir);
+                // pmix_prefix must not be NULL
+                pmix_asprintf(&tmp, "if ( $?LD_LIBRARY_PATH == 0 ) setenv LD_LIBRARY_PATH %s/%s",
+                              pmix_prefix, value2);
             }
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
             free(tmp);
-            if (NULL != param) {
-                pmix_asprintf(&tmp, "if ( $?PRTE_have_llp == 1 ) setenv LD_LIBRARY_PATH %s/%s:%s/%s:$LD_LIBRARY_PATH",
-                              prefix_dir, value, param, value2);
+            if (NULL != prefix_dir) {
+                if (NULL != pmix_prefix) {
+                    pmix_asprintf(&tmp, "if ( $?PRTE_have_llp == 1 ) setenv LD_LIBRARY_PATH %s/%s:%s/%s:$LD_LIBRARY_PATH",
+                                  prefix_dir, value, pmix_prefix, value2);
+                } else {
+                    pmix_asprintf(&tmp, "if ( $?PRTE_have_llp == 1 ) setenv LD_LIBRARY_PATH %s/%s:%s:$LD_LIBRARY_PATH",
+                                  prefix_dir, value, pmix_pinstall_dirs.libdir);
+                }
             } else {
-                pmix_asprintf(&tmp, "if ( $?PRTE_have_llp == 1 ) setenv LD_LIBRARY_PATH %s/%s:%s:$LD_LIBRARY_PATH",
-                              prefix_dir, value, pmix_pinstall_dirs.libdir);
+                // pmix_prefix must not be NULL
+                pmix_asprintf(&tmp, "if ( $?PRTE_have_llp == 1 ) setenv LD_LIBRARY_PATH %s/%s:$LD_LIBRARY_PATH",
+                              pmix_prefix, value2);
             }
             PMIX_ARGV_APPEND_NOSIZE_COMPAT(&final_argv, tmp);
             free(tmp);
@@ -772,6 +821,7 @@ static int remote_spawn(void)
     int proc_vpid_index;
     char **argv = NULL;
     char *prefix, *hostname, *var;
+    char *pmix_prefix = NULL;
     int argc;
     int rc = PRTE_SUCCESS;
     bool failed_launch = true;
@@ -790,10 +840,13 @@ static int remote_spawn(void)
      * this is being done by a singleton, then prun will not be there
      * to put the prefix in the app. So make sure we check to find it */
     if ((bool) PRTE_WANT_PRTE_PREFIX_BY_DEFAULT) {
-        prefix = strdup(prte_install_dirs.prefix);
+        prefix = prte_install_dirs.prefix;
     } else {
-        prefix = NULL;
+        // the prefix will have been put in our environment
+        prefix = getenv("PRTE_PREFIX");
     }
+    // the PMIx prefix will have been put in our environment
+    pmix_prefix = getenv("PMIX_PREFIX");
 
     /* if I have no children, just return */
     if (0 == pmix_list_get_size(&prte_rml_base.children)) {
@@ -807,7 +860,7 @@ static int remote_spawn(void)
 
     /* setup the launch */
     rc = setup_launch(&argc, &argv, prte_process_info.nodename, &node_name_index1,
-                      &proc_vpid_index, prefix);
+                      &proc_vpid_index, prefix, pmix_prefix);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         goto cleanup;
@@ -1004,10 +1057,9 @@ static void launch_daemons(int fd, short args, void *cbdata)
     int node_name_index1;
     int proc_vpid_index;
     char **argv = NULL;
-    char *prefix_dir = NULL, *var;
+    char *prefix_dir = NULL, *pmix_prefix = NULL, *var;
     int argc;
     int rc;
-    prte_app_context_t *app;
     prte_node_t *node, *nd;
     int32_t nnode;
     prte_job_t *daemons;
@@ -1087,41 +1139,19 @@ static void launch_daemons(int fd, short args, void *cbdata)
     }
 
     /*
-     * After a discussion between Ralph & Jeff, we concluded that we
-     * really are handling the prefix dir option incorrectly. It currently
-     * is associated with an app_context, yet it really refers to the
-     * location where PRTE is installed on a NODE. Fixing
-     * this right now would involve significant change to prun as well
-     * as elsewhere, so we will intentionally leave this incorrect at this
-     * point. The error, however, is identical to that seen in all prior
-     * releases of PRTE, so our behavior is no worse than before.
-     *
-     * A note to fix this, along with ideas on how to do so, has been filed
-     * on the project's Trac system under "feature enhancement".
-     *
-     * For now, default to the prefix_dir provided in the first app_context.
-     * Since there always MUST be at least one app_context, we are safe in
-     * doing this.
+     * Any prefix is being installed in the DAEMON job object, so
+     * we only need to look there to find it. This covers any
+     * prefix by default, PRTE_PREFIX given in the environment,
+     * and '--prefix' from the cmd line
      */
-    app = (prte_app_context_t *) pmix_pointer_array_get_item(state->jdata->apps, 0);
-    if (NULL == app) {
-        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        rc = PRTE_ERR_NOT_FOUND;
-        goto cleanup;
+    if (!prte_get_attribute(&daemons->attributes, PRTE_JOB_PREFIX, (void **) &prefix_dir, PMIX_STRING)) {
+        prefix_dir = NULL;
     }
-    if (!prte_get_attribute(&app->attributes, PRTE_APP_PREFIX_DIR, (void **) &prefix_dir, PMIX_STRING)) {
-        /* check to see if enable-prun-prefix-by-default was given - if
-         * this is being done by a singleton, then prun will not be there
-         * to put the prefix in the app. So make sure we check to find it */
-        if ((bool) PRTE_WANT_PRTE_PREFIX_BY_DEFAULT) {
-            prefix_dir = strdup(prte_install_dirs.prefix);
-        } else {
-            // see if it is in the environment
-            if (NULL != (var = getenv("PRTE_PREFIX"))) {
-                prefix_dir = strdup(var);
-            }
-        }
+    // and the PMIx prefix, if given
+    if (!prte_get_attribute(&daemons->attributes, PRTE_JOB_PMIX_PREFIX, (void **) &pmix_prefix, PMIX_STRING)) {
+        pmix_prefix = NULL;
     }
+
     /* we also need at least one node name so we can check what shell is
      * being used, if we have to
      */
@@ -1147,7 +1177,9 @@ static void launch_daemons(int fd, short args, void *cbdata)
     }
 
     /* setup the launch */
-    rc = setup_launch(&argc, &argv, node->name, &node_name_index1, &proc_vpid_index, prefix_dir);
+    rc = setup_launch(&argc, &argv, node->name,
+                      &node_name_index1, &proc_vpid_index,
+                      prefix_dir, pmix_prefix);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         goto cleanup;

@@ -16,7 +16,7 @@
  * Copyright (c) 2015-2017 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018      Inria.  All rights reserved.
- * Copyright (c) 2021-2023 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -56,11 +56,12 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
                         prte_node_t *node, hwloc_obj_t obj,
                         prte_rmaps_options_t *options)
 {
-    hwloc_obj_t trg_obj, tmp_obj;
+    hwloc_obj_t trg_obj = NULL, tmp_obj = NULL;
     unsigned ncpus;
     hwloc_obj_type_t type;
     hwloc_obj_t target;
     hwloc_cpuset_t tgtcpus, tmpcpus;
+    int nobjs, n;
 
     pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
                         "mca:rmaps: bind %s with policy %s",
@@ -82,18 +83,30 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
 #endif
     hwloc_bitmap_and(prte_rmaps_base.baseset, options->target, tgtcpus);
 
-    trg_obj = NULL;
-    /* find the first object of that type in the target that has at least one available CPU */
-    tmp_obj = hwloc_get_next_obj_inside_cpuset_by_type(node->topology->topo,
-                                                       prte_rmaps_base.baseset,
-                                                       options->hwb, NULL);
-    while (NULL != tmp_obj) {
+    nobjs = hwloc_get_nbobjs_by_type(node->topology->topo, options->hwb);
+
+    // check for target object existence
+    if (0 == nobjs) {
+        // if this is not a default binding policy, then error out
+        if (PRTE_BINDING_POLICY_IS_SET(jdata->map->binding)) {
+            pmix_show_help("help-prte-rmaps-base.txt", "rmaps:binding-target-not-found",
+                           true, prte_hwloc_base_print_binding(jdata->map->binding), node->name);
+            return PRTE_ERR_SILENT;
+        }
+        // fallback to not binding
+        return PRTE_SUCCESS;
+    }
+
+    for (n=0; n < nobjs; n++) {
+        tmp_obj = hwloc_get_obj_by_type(node->topology->topo, options->hwb, n);
 #if HWLOC_API_VERSION < 0x20000
         tmpcpus = tmp_obj->allowed_cpuset;
 #else
         tmpcpus = tmp_obj->cpuset;
 #endif
         hwloc_bitmap_and(prte_rmaps_base.available, node->available, tmpcpus);
+        hwloc_bitmap_and(prte_rmaps_base.available, prte_rmaps_base.available, prte_rmaps_base.baseset);
+
         if (options->use_hwthreads) {
             ncpus = hwloc_bitmap_weight(prte_rmaps_base.available);
         } else {
@@ -112,9 +125,6 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
             trg_obj = tmp_obj;
             break;
         }
-        tmp_obj = hwloc_get_next_obj_inside_cpuset_by_type(node->topology->topo,
-                                                           prte_rmaps_base.baseset,
-                                                           options->hwb, tmp_obj);
     }
     if (NULL == trg_obj) {
         /* there aren't any appropriate targets under this object */
@@ -131,6 +141,9 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
 #else
     tgtcpus = trg_obj->cpuset;
 #endif
+    if (NULL == tgtcpus) {
+        return PRTE_ERROR;
+    }
     hwloc_bitmap_list_asprintf(&proc->cpuset, tgtcpus); // bind to the entire target object
     if (4 < pmix_output_get_verbosity(prte_rmaps_base_framework.framework_output)) {
         char *tmp1;
@@ -383,6 +396,12 @@ static int bind_multiple(prte_job_t *jdata, prte_proc_t *proc,
     }
     hwloc_bitmap_list_asprintf(&proc->cpuset, result);
     hwloc_bitmap_free(result);
+    if (NULL == proc->cpuset || 0 == strlen(proc->cpuset)) {
+        pmix_show_help("help-prte-rmaps-base.txt", "not-enough-cpus", true,
+                       options->pprn, hwloc_obj_type_string(options->maptype),
+                       options->cpus_per_rank);
+        return PRTE_ERR_SILENT;
+    }
     return PRTE_SUCCESS;
 }
 
