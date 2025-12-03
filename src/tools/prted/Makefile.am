@@ -53,3 +53,9 @@ bin_PROGRAMS = @PRTE_BINARY_PREFIX@prted
     $(prte_hwloc_LIBS) \
     $(prte_pmix_LIBS) \
 	$(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
+
+install-exec-hook:
+	(cd $(DESTDIR)$(bindir); rm -f prted$(EXEEXT); $(LN_S) @PRTE_BINARY_PREFIX@prted$(EXEEXT) prted$(EXEEXT))
+
+uninstall-local:
+	rm -f $(DESTDIR)$(bindir)/prted$(EXEEXT)
