@@ -222,15 +222,14 @@ static int prte_rmaps_rf_map(prte_job_t *jdata,
         /* flag that all subsequent requests should not reset the node->mapped flag */
         initial_map = false;
 
-        /* we already checked for sanity, so it's okay to just do here */
-        if (0 == app->num_procs) {
-            /* set the number of procs to the number of entries in that rankfile */
+        /* set the number of procs to the number of entries in that rankfile */
+        if (PRTE_FLAG_TEST(app, PRTE_APP_FLAG_COMPUTED)) {
             app->num_procs = num_ranks;
-        }
-        if (0 == app->num_procs) {
-            pmix_show_help("help-rmaps_rank_file.txt", "bad-syntax", true, rankfile);
-            rc = PRTE_ERR_SILENT;
-            goto error;
+            if (0 == app->num_procs) {
+                pmix_show_help("help-rmaps_rank_file.txt", "bad-syntax", true, rankfile);
+                rc = PRTE_ERR_SILENT;
+                goto error;
+            }
         }
         for (k = 0; k < app->num_procs; k++) {
             rank = vpid_start + k;
