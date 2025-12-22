@@ -399,12 +399,39 @@ int prte(int argc, char *argv[])
         return rc;
     }
 
-    /* look for any personality specification */
+    /* look for any personality specification and do a quick sanity check */
     personality = NULL;
+    bool mapby_found = false;
+    bool rankby_found = false;
+    bool bindto_found = false;
     for (i = 0; NULL != argv[i]; i++) {
         if (0 == strcmp(argv[i], "--personality")) {
             personality = argv[i + 1];
-            break;
+            continue;
+        }
+        if (0 == strcmp(argv[i], "--map-by")) {
+            if (mapby_found) {
+                pmix_show_help("help-schizo-base.txt", "multi-instances", true, "map-by");
+                return PRTE_ERR_BAD_PARAM;
+            }
+            mapby_found = true;
+            continue;
+        }
+        if (0 == strcmp(argv[i], "--rank-by")) {
+            if (rankby_found) {
+                pmix_show_help("help-schizo-base.txt", "multi-instances", true, "rank-by");
+                return PRTE_ERR_BAD_PARAM;
+            }
+            rankby_found = true;
+            continue;
+        }
+        if (0 == strcmp(argv[i], "--bind-to")) {
+            if (bindto_found) {
+                pmix_show_help("help-schizo-base.txt", "multi-instances", true, "bind-to");
+                return PRTE_ERR_BAD_PARAM;
+            }
+            bindto_found = true;
+            continue;
         }
     }
 
@@ -1034,7 +1061,8 @@ int prte(int argc, char *argv[])
     PMIX_INFO_LIST_START(jinfo);
 
     /* see if we ourselves were spawned by someone */
-    ret = PMIx_Get(&prte_process_info.myproc, PMIX_PARENT_ID, NULL, 0, &val);
+    PMIX_LOAD_PROCID(&pname, myproc.nspace, PMIX_RANK_WILDCARD);
+    ret = PMIx_Get(&pname, PMIX_PARENT_ID, NULL, 0, &val);
     if (PMIX_SUCCESS == ret) {
         PMIX_LOAD_PROCID(&prte_process_info.my_parent, val->data.proc->nspace, val->data.proc->rank);
         PMIX_VALUE_RELEASE(val);
