@@ -1,4 +1,9 @@
 .. _man1-ompi-prte_info:
+.. We also want a label that is the same as the upstream label so that
+   the OMPI docs can refer to this label and have it work regardless of
+   whether OMPI was built against upstream PRRTE or the internal /
+   embedded PRRTE.
+.. _man1-prte_info:
 
 ompi-prte_info
 ==============
