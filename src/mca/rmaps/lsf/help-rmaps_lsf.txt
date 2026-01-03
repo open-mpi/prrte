@@ -13,40 +13,6 @@
 #
 # This is the US/English general help file for rankle utilities.
 #
-[no-rankfile]
-%s was unable to open the rankfile:
-  Filename: %s
-Check to make sure the path and filename are correct.
-
-usage:  %s --map-by rankfile:file=<path> ./app
-
-Examples of proper syntax include:
-  cat hostfile
-    host1
-    host2
-    host3
-    host4
-  cat rankfile
-    rank 1=host1 slot=1:0,1
-    rank 0=host2 slot=0:*
-    rank 2=host4 slot=1-2
-    rank 3=host3 slot=0:1;1:0-2
-#
-[bad-host]
-The rankfile that was used claimed that a host was either not
-allocated or oversubscribed its slots.  Please review your rank-slot
-assignments and your host allocation to ensure a proper match.  Also,
-some systems may require using full hostnames, such as
-"host1.example.com" (instead of just plain "host1").
-
-  Host: %s
-#
-[bad-index]
-Rankfile claimed host %s by index that is bigger than number of allocated hosts.
-#
-[bad-assign]
-Error, rank %d is already assigned to %s, check %s
-#
 [bad-syntax]
 Error, invalid syntax in the rankfile (%s)
 syntax must be the following
@@ -78,6 +44,13 @@ a non-existent CPU:
 
 Please correct the line and try again.
 #
+[lsf-affinity-file-not-found]
+The affinity file provided in LSB_AFFINITY_HOSTFILE could not be found:
+
+  File:  %s
+
+We cannot continue.
+#
 [rmaps:proc-slots-overloaded]
 A process attempted to bind to resources already allocated on a node
 to a different process.
@@ -90,3 +63,18 @@ to a different process.
 If this is intentional then you must pass the "overload-allowed"
 qualifier to the --bind-to option.
   --bind-to :overload-allowed
+#
+[resource-not-found]
+The specified LSF affinity file contained a node (%s) that is not in your
+allocation. We therefore cannot map a process rank to it. Please
+check your allocation and affinity file to ensure the latter only
+contains allocated nodes.
+#
+[bad-host]
+The rankfile that was used claimed that a host was either not
+allocated or oversubscribed its slots.  Please review your rank-slot
+assignments and your host allocation to ensure a proper match.  Also,
+some systems may require using full hostnames, such as
+"host1.example.com" (instead of just plain "host1").
+
+  Host: %s

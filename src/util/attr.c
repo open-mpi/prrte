@@ -507,6 +507,12 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "PRTE-JOB-PREFIX";
         case PRTE_JOB_PMIX_PREFIX:
             return "PRTE-JOB-PMIX-PREFIX";
+        case PRTE_JOB_FWD_ENVIRONMENT:
+            return "FWD ENVIRONMENT";
+        case PRTE_JOB_REPORT_PHYSICAL_CPUS:
+            return "REPORT PHYSICAL CPUS";
+        case PRTE_JOB_ALLOC_DISPLAYED:
+            return "ALLOCATION DISPLAYED";
 
         case PRTE_PROC_NOBARRIER:
             return "PROC-NOBARRIER";
@@ -1010,6 +1016,33 @@ char* prte_print_node_flags(struct prte_node_t *ptr)
     if (PRTE_FLAG_TEST(p, PRTE_NODE_NON_USABLE)) {
         PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "NONUSABLE");
     }
+    ans = PMIX_ARGV_JOIN_COMPAT(tmp, '|');
+    PMIX_ARGV_FREE_COMPAT(tmp);
+    return ans;
+}
+
+char* prte_print_app_flags(struct prte_app_context_t *ptr)
+{
+    prte_app_context_t *p = (prte_app_context_t*)ptr;
+    char **tmp = NULL;
+    char *ans;
+
+    // start with the app command
+    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, p->app);
+    PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, ": ");
+
+    if (PRTE_FLAG_TEST(p, PRTE_APP_FLAG_USED_ON_NODE)) {
+        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "USED-LOCAL-NODE");
+    }
+
+    if (PRTE_FLAG_TEST(p, PRTE_APP_FLAG_TOOL)) {
+        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "TOOL");
+    }
+
+    if (PRTE_FLAG_TEST(p, PRTE_APP_FLAG_COMPUTED)) {
+        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&tmp, "NPROCS-COMPUTED");
+    }
+
     ans = PMIX_ARGV_JOIN_COMPAT(tmp, '|');
     PMIX_ARGV_FREE_COMPAT(tmp);
     return ans;

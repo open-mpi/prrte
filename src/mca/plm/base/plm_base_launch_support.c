@@ -128,8 +128,7 @@ void prte_plm_base_daemons_reported(int fd, short args, void *cbdata)
 
     /* if we are not launching, then we just assume that all
      * daemons share our topology */
-    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL) &&
-        PMIX_CHECK_NSPACE(caddy->jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
+    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
         node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
         t = node->topology;
         for (i = 1; i < prte_node_pool->size; i++) {
@@ -749,8 +748,8 @@ void prte_plm_base_setup_job(int fd, short args, void *cbdata)
     // we will simply silently exit
     if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL) &&
         !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_MAP, NULL, PMIX_BOOL) &&
-        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, NULL, PMIX_BOOL)) {
-        pmix_output(0, "SETTING");
+        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, NULL, PMIX_BOOL) &&
+        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_REPORT_BINDINGS, NULL, PMIX_BOOL)) {
         // default to the devel map
         prte_set_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, PRTE_ATTR_GLOBAL,
                            NULL, PMIX_BOOL);
@@ -1684,6 +1683,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             dc = PMIX_NEW(dcaddy_t);
             dc->rank = daemon->name.rank;
             dc->sig = sig;
+            sig = NULL;  // protect from release
             dc->daemon = daemon;
             pmix_list_append(&prte_plm_globals.daemon_cache, &dc->super);
             free(nodename);
@@ -1700,6 +1700,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             // always record the topology
             t = PMIX_NEW(prte_topology_t);
             t->sig = sig;
+            sig = NULL;  // protect from release
             t->topo = topo;
             t->index = pmix_pointer_array_add(prte_node_topologies, t);
             daemon->node->topology = t;
@@ -1710,9 +1711,15 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             nodename = NULL;
             idx = 1;
             ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
-            if (PMIX_SUCCESS != ret) {
-                break;
+            if (PMIX_SUCCESS != ret &&
+                PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER != ret) {
+                PMIX_ERROR_LOG(ret);
+                PRTE_ACTIVATE_JOB_STATE(jdatorted, PRTE_JOB_STATE_FAILED_TO_START);
+                return;
             }
+            jdatorted->num_reported++;
+            jdatorted->num_daemons_reported++;
+            progress_daemons(jdatorted, show_progress);
             continue;
         }
 
@@ -1741,7 +1748,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                     hwloc_bitmap_free(daemon->node->available);
                 }
                 daemon->node->available = prte_hwloc_base_filter_cpus(t->topo);
-                free(sig);
+                prte_hwloc_base_setup_summary(t->topo);
                 break;
             }
         }
@@ -1750,7 +1757,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             // if the signature wasn't found, then add it
             if (!found) {
                 t = PMIX_NEW(prte_topology_t);
-                t->sig = sig;
+                t->sig = strdup(sig);
                 t->topo = topo;
                 t->index = pmix_pointer_array_add(prte_node_topologies, t);
                 daemon->node->topology = t;
@@ -1843,7 +1850,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                                     "%s NEW TOPOLOGY - ADDING SIGNATURE",
                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
                 t = PMIX_NEW(prte_topology_t);
-                t->sig = sig;
+                t->sig = strdup(sig);
                 t->index = pmix_pointer_array_add(prte_node_topologies, t);
                 daemon->node->topology = t;
                 if (NULL != topo) {
@@ -1854,6 +1861,9 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                     }
                     daemon->node->available = prte_hwloc_base_filter_cpus(t->topo);
                     prte_hwloc_base_setup_summary(t->topo);
+                    jdatorted->num_reported++;
+                    jdatorted->num_daemons_reported++;
+                    progress_daemons(jdatorted, show_progress);
                 } else {
                     // add this daemon to our cache
                     dc = PMIX_NEW(dcaddy_t);
@@ -1880,12 +1890,16 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                         prted_failed_launch = true;
                         goto CLEANUP;
                     }
+                    /* we will count this node as completed
+                     * when we get the full topology back */
                 }
-                /* we will count this node as completed
-                 * when we get the full topology back */
                 if (NULL != nodename) {
                     free(nodename);
                     nodename = NULL;
+                }
+                if (NULL != sig) {
+                    free(sig);
+                    sig = NULL;
                 }
                 idx = 1;
                 ret = PMIx_Data_unpack(NULL, buffer, &dname, &idx, PMIX_PROC);
@@ -1906,6 +1920,10 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
         if (NULL != nodename) {
             free(nodename);
             nodename = NULL;
+        }
+        if (NULL != sig) {
+            free(sig);
+            sig = NULL;
         }
 
         idx = 1;

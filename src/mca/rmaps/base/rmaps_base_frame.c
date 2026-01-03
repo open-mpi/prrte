@@ -15,7 +15,7 @@
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -61,47 +61,60 @@ prte_rmaps_base_t prte_rmaps_base = {
     .inherit = false,
     .hwthread_cpus = false,
     .file = NULL,
+    .default_pes = 0,
     .available = NULL,
     .baseset = NULL,
-    .default_mapping_policy = NULL
+    .default_mapping_policy = NULL,
+    .default_ranking_policy = NULL,
+    .require_hwtcpus = false
 };
-
-/*
- * Local variables
- */
-static char *rmaps_base_ranking_policy = NULL;
-static bool rmaps_base_inherit = false;
 
 static int prte_rmaps_base_register(pmix_mca_base_register_flag_t flags)
 {
+    int ret;
     PRTE_HIDE_UNUSED_PARAMS(flags);
 
     /* define default mapping policy */
     prte_rmaps_base.default_mapping_policy = NULL;
-    (void) pmix_mca_base_var_register("prte", "rmaps", "default", "mapping_policy",
-                                      "Default mapping Policy [slot | hwthread | core | l1cache | "
+    ret = pmix_mca_base_var_register("prte", NULL, NULL, "mapby",
+                                     "Default mapping Policy [slot | hwthread | core | l1cache | "
                                       "l2cache | l3cache | numa | package | node | seq | dist | ppr | "
                                       "rankfile | pe-list=a,b (comma-delimited ranges of cpus to use for this job)],"
                                       " with supported colon-delimited modifiers: PE=y (for multiple cpus/proc), "
                                       "SPAN, OVERSUBSCRIBE, NOOVERSUBSCRIBE, NOLOCAL, HWTCPUS, CORECPUS, "
                                       "DEVICE=dev (for dist policy), INHERIT, NOINHERIT, ORDERED, FILE=%s (path to file containing sequential "
-                                      "or rankfile entries)",
-                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                      &prte_rmaps_base.default_mapping_policy);
+                                      "or rankfile entries). For more details, see \"prterun --help map-by\". "
+                                      "The full directive need not be provided — "
+                                      "only enough characters are required to uniquely identify the "
+                                      "directive. Directive values are case insensitive",
+                                     PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                     &prte_rmaps_base.default_mapping_policy);
+    (void) pmix_mca_base_var_register_synonym(ret, "prte", NULL, NULL, "map_by",
+                                              PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
+    (void) pmix_mca_base_var_register_synonym(ret, "prte", "rmaps", "default", "mapping_policy",
+                                              PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
 
     /* define default ranking policy */
-    rmaps_base_ranking_policy = NULL;
-    (void) pmix_mca_base_var_register("prte", "rmaps", "default", "ranking_policy",
-                                      "Default ranking Policy [slot | node | span | fill]",
-                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                      &rmaps_base_ranking_policy);
+    prte_rmaps_base.default_ranking_policy = NULL;
+    ret = pmix_mca_base_var_register("prte", NULL, NULL, "rankby",
+                                     "Default ranking Policy [slot | node | span | fill]. "
+                                     "For more details, see \"prterun --help rank-by\". The full "
+                                     "directive need not be provided — only enough characters are "
+                                     "required to uniquely identify the directive. Directive values "
+                                     "are case insensitive",
+                                     PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                     &prte_rmaps_base.default_ranking_policy);
+    (void) pmix_mca_base_var_register_synonym(ret, "prte", NULL, NULL, "rank_by",
+                                              PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
+    (void) pmix_mca_base_var_register_synonym(ret, "prte", "rmaps", "default", "ranking_policy",
+                                              PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
 
-    rmaps_base_inherit = false;
+    prte_rmaps_base.inherit = false;
     (void) pmix_mca_base_var_register("prte", "rmaps", "default", "inherit",
                                       "Whether child jobs shall inherit mapping/ranking/binding "
                                       "directives from their parent by default",
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
-                                      &rmaps_base_inherit);
+                                      &prte_rmaps_base.inherit);
 
     return PRTE_SUCCESS;
 }
@@ -131,11 +144,6 @@ static int prte_rmaps_base_open(pmix_mca_base_open_flag_t flags)
 
     /* init the globals */
     PMIX_CONSTRUCT(&prte_rmaps_base.selected_modules, pmix_list_t);
-    prte_rmaps_base.mapping = 0;
-    prte_rmaps_base.ranking = 0;
-    prte_rmaps_base.inherit = rmaps_base_inherit;
-    prte_rmaps_base.hwthread_cpus = false;
-    prte_rmaps_base.require_hwtcpus = false;
     prte_rmaps_base.available = hwloc_bitmap_alloc();
     prte_rmaps_base.baseset = hwloc_bitmap_alloc();
 
@@ -147,8 +155,8 @@ static int prte_rmaps_base_open(pmix_mca_base_open_flag_t flags)
         }
     }
 
-    if (NULL != rmaps_base_ranking_policy) {
-        rc = prte_rmaps_base_set_ranking_policy(NULL, rmaps_base_ranking_policy);
+    if (NULL != prte_rmaps_base.default_ranking_policy) {
+        rc = prte_rmaps_base_set_ranking_policy(NULL, prte_rmaps_base.default_ranking_policy);
         if (PRTE_SUCCESS != rc) {
             return rc;
         }
@@ -228,11 +236,6 @@ static int check_modifiers(char *ck, prte_job_t *jdata, prte_mapping_policy_t *t
             PRTE_SET_MAPPING_DIRECTIVE(*tmp, PRTE_MAPPING_ORDERED);
 
         } else if (PMIX_CHECK_CLI_OPTION(ck2[i], PRTE_CLI_PE)) {
-            if (NULL == jdata) {
-                pmix_show_help("help-prte-rmaps-base.txt", "unsupported-default-modifier", true,
-                               "mapping policy", ck2[i]);
-                return PRTE_ERR_SILENT;
-            }
             /* Numeric value must immediately follow '=' (PE=2) */
             u16 = strtol(&ck2[i][3], &ptr, 10);
             if ('\0' != *ptr) {
@@ -242,8 +245,12 @@ static int check_modifiers(char *ck, prte_job_t *jdata, prte_mapping_policy_t *t
                 PMIX_ARGV_FREE_COMPAT(ck2);
                 return PRTE_ERR_SILENT;
             }
-            prte_set_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, PRTE_ATTR_GLOBAL,
-                               &u16, PMIX_UINT16);
+            if (NULL == jdata) {
+                prte_rmaps_base.default_pes = u16;
+            } else {
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, PRTE_ATTR_GLOBAL,
+                                   &u16, PMIX_UINT16);
+            }
 
         } else if (PMIX_CHECK_CLI_OPTION(ck2[i], PRTE_CLI_INHERIT)) {
             if (noinherit_given) {
