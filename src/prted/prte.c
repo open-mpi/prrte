@@ -471,6 +471,7 @@ int prte(int argc, char *argv[])
     /* ensure we don't confuse any downstream PRRTE tools on
      * choice of proxy since some environments forward their envars */
     unsetenv("PRTE_MCA_schizo_proxy");
+    unsetenv("PRTE_MCA_personality");
 
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (rc = prte_register_params())) {
@@ -630,7 +631,19 @@ int prte(int argc, char *argv[])
                 return 1;
             }
         }
+
+        // open the ess framework so it can init the signal forwarding
+        // list - we don't actually need the components
+        rc = pmix_mca_base_framework_open(&prte_ess_base_framework,
+                                        PMIX_MCA_BASE_OPEN_DEFAULT);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+            exit(rc);
+        }
         rc = prun_common(&results, schizo, argc, argv);
+
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
         exit(rc);
     }
 
@@ -796,7 +809,7 @@ int prte(int argc, char *argv[])
     /* if we are supporting a singleton, add it to our jobs */
     if (NULL != prte_pmix_server_globals.singleton) {
         rc = prep_singleton(prte_pmix_server_globals.singleton);
-        if (PRTE_SUCCESS != ret) {
+        if (PRTE_SUCCESS != rc) {
             PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
             goto DONE;
         }
