@@ -15,7 +15,7 @@
  * Copyright (c) 2016-2017 Los Alamos National Security, LLC. All rights
  *                         reserved.
  * Copyright (c) 2017-2022 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -116,12 +116,12 @@ BEGIN_C_DECLS
 #define PRTE_CLI_GPU_SUPPORT			"gpu-support"				// required
 
 // Placement options
-#define PRTE_CLI_MAPBY                  "map-by"                    // required
-#define PRTE_CLI_RANKBY                 "rank-by"                   // required
-#define PRTE_CLI_BINDTO                 "bind-to"                   // required
+#define PRTE_CLI_MAPBY                  "mapby"                     // required
+#define PRTE_CLI_RANKBY                 "rankby"                    // required
+#define PRTE_CLI_BINDTO                 "bindto"                    // required
 
 // Runtime options
-#define PRTE_CLI_RTOS                   "runtime-options"           // required
+#define PRTE_CLI_RTOS                   "rtos"           			// required
 
 // Debug options
 #define PRTE_CLI_DO_NOT_LAUNCH          "do-not-launch"             // none
@@ -174,7 +174,6 @@ BEGIN_C_DECLS
 #define PRTE_CLI_NONE       "none"
 #define PRTE_CLI_HWTCPUS    "hwtcpus"
 #define PRTE_CLI_PELIST     "pe-list="
-#define PRTE_CLI_LIKWID     "likwid"
 
 // Ranking directives
 // PRTE_CLI_SLOT, PRTE_CLI_NODE, PRTE_CLI_SPAN reused here
@@ -205,6 +204,7 @@ BEGIN_C_DECLS
 // Runtime directives
 #define PRTE_CLI_ERROR_NZ           "error-nonzero-status"          // optional arg
 #define PRTE_CLI_NOLAUNCH           "donotlaunch"                   // no arg
+#define PRTE_CLI_NOSPAWN            "donotspawn"                    // no arg
 #define PRTE_CLI_SHOW_PROGRESS      "show-progress"                 // optional arg
 #define PRTE_CLI_RECOVERABLE        "recoverable"                   // optional arg
 #define PRTE_CLI_AUTORESTART        "autorestart"                   // optional arg

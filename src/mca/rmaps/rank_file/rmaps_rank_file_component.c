@@ -62,13 +62,10 @@ PMIX_MCA_BASE_COMPONENT_INIT(prte, rmaps, rank_file)
 
 static int prte_rmaps_rank_file_query(pmix_mca_base_module_t **module, int *priority)
 {
-    /*
-     * Set the rankfile priority to the highest:
-     * - If we are in an LSF environment with affinity information (LSB_AFFINITY_HOSTFILE)
-     *   then we need to force this component.
-     * - If the user did not explicitly request this component, then it is skipped.
+    /* Set the rankfile priority to be LESS than the lsf component
+     * so that the LSF component can decide if it needs to run
      */
-    *priority = 100;
+    *priority = 95;
     *module = (pmix_mca_base_module_t *) &prte_rmaps_rank_file_module;
     return PRTE_SUCCESS;
 }

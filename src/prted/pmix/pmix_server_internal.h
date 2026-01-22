@@ -18,7 +18,7 @@
  * Copyright (c) 2014      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -76,6 +76,8 @@ typedef struct {
     bool launcher;
     bool scheduler;
     bool copy;  // info array has been copied and must be released
+    bool moncopy;  // monitor was allocated and must be released
+    bool dircopy;   // directives array has been copied and must be released
     uid_t uid;
     gid_t gid;
     pid_t pid;
@@ -83,8 +85,13 @@ typedef struct {
     uint32_t sessionID;
     pmix_info_t *info;
     size_t ninfo;
+    pmix_info_t *monitor;
+    pmix_info_t *directives;
+    size_t ndirs;
     char *data;
     size_t sz;
+    uint32_t ndaemons;
+    uint32_t nreported;
     pmix_data_range_t range;
     pmix_proc_t proxy;
     pmix_proc_t target;
@@ -100,8 +107,8 @@ typedef struct {
     pmix_info_cbfunc_t infocbfunc;
     void *cbdata;
     void *rlcbdata;
-} pmix_server_req_t;
-PMIX_CLASS_DECLARATION(pmix_server_req_t);
+} prte_pmix_server_req_t;
+PMIX_CLASS_DECLARATION(prte_pmix_server_req_t);
 
 /* object for thread-shifting server operations */
 typedef struct {
@@ -151,8 +158,8 @@ PMIX_CLASS_DECLARATION(prte_pmix_server_op_caddy_t);
 
 #define PRTE_DMX_REQ(p, i, ni, cf, ocf, ocd)                                         \
     do {                                                                             \
-        pmix_server_req_t *_req;                                                     \
-        _req = PMIX_NEW(pmix_server_req_t);                                          \
+        prte_pmix_server_req_t *_req;                                                \
+        _req = PMIX_NEW(prte_pmix_server_req_t);                                     \
         pmix_asprintf(&_req->operation, "DMDX: %s:%d", __FILE__, __LINE__);          \
         memcpy(&_req->tproc, (p), sizeof(pmix_proc_t));                              \
         _req->info = (pmix_info_t *) (i);                                            \
@@ -166,8 +173,8 @@ PMIX_CLASS_DECLARATION(prte_pmix_server_op_caddy_t);
 
 #define PRTE_SPN_REQ(j, cf, ocf, ocd)                                                \
     do {                                                                             \
-        pmix_server_req_t *_req;                                                     \
-        _req = PMIX_NEW(pmix_server_req_t);                                          \
+        prte_pmix_server_req_t *_req;                                                \
+        _req = PMIX_NEW(prte_pmix_server_req_t);                                     \
         pmix_asprintf(&_req->operation, "SPAWN: %s:%d", __FILE__, __LINE__);         \
         _req->jdata = (j);                                                           \
         _req->spcbfunc = (ocf);                                                      \
@@ -192,7 +199,7 @@ PMIX_CLASS_DECLARATION(prte_pmix_server_op_caddy_t);
         prte_event_active(&(_cd->ev), PRTE_EV_WRITE, 1);                           \
     } while (0);
 
-#define PRTE_SERVER_PMIX_THREADSHIFT(p, s, st, m, pl, pn, fn, cf, cb)                     \
+#define PRTE_SERVER_PMIX_THREADSHIFT(p, s, st, m, pl, pn, fn, cf, cb)              \
     do {                                                                           \
         prte_pmix_server_op_caddy_t *_cd;                                          \
         _cd = PMIX_NEW(prte_pmix_server_op_caddy_t);                               \
@@ -281,6 +288,10 @@ PRTE_EXPORT extern pmix_status_t pmix_server_log2_fn(const pmix_proc_t *client, 
                                                      size_t ndirs, pmix_op_cbfunc_t cbfunc, void *cbdata);
 #endif
 
+PRTE_EXPORT extern void pmix_server_logging_resp(int status, pmix_proc_t *sender,
+                                                 pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
+                                                 void *cbdata);
+
 PRTE_EXPORT extern pmix_status_t pmix_server_alloc_fn(const pmix_proc_t *client,
                                                       pmix_alloc_directive_t directive,
                                                       const pmix_info_t data[], size_t ndata,
@@ -290,6 +301,12 @@ PRTE_EXPORT extern pmix_status_t
 pmix_server_job_ctrl_fn(const pmix_proc_t *requestor, const pmix_proc_t targets[], size_t ntargets,
                         const pmix_info_t directives[], size_t ndirs, pmix_info_cbfunc_t cbfunc,
                         void *cbdata);
+
+PRTE_EXPORT extern pmix_status_t
+pmix_server_monitor_fn(const pmix_proc_t *requestor,
+                       const pmix_info_t *monitor, pmix_status_t error,
+                       const pmix_info_t directives[], size_t ndirs,
+                       pmix_info_cbfunc_t cbfunc, void *cbdata);
 
 PRTE_EXPORT extern pmix_status_t pmix_server_iof_pull_fn(const pmix_proc_t procs[], size_t nprocs,
                                                          const pmix_info_t directives[],
@@ -306,6 +323,11 @@ PRTE_EXPORT extern pmix_status_t pmix_server_group_fn(pmix_group_operation_t op,
                                                       const pmix_proc_t procs[], size_t nprocs,
                                                       const pmix_info_t directives[], size_t ndirs,
                                                       pmix_info_cbfunc_t cbfunc, void *cbdata);
+
+PRTE_EXPORT extern pmix_status_t pmix_server_monitor_fn(const pmix_proc_t *requestor,
+                                                        const pmix_info_t *monitor, pmix_status_t error,
+                                                        const pmix_info_t directives[], size_t ndirs,
+                                                        pmix_info_cbfunc_t cbfunc, void *cbdata);
 
 /* declare the RML recv functions for responses */
 PRTE_EXPORT extern void pmix_server_launch_resp(int status, pmix_proc_t *sender,
@@ -324,7 +346,7 @@ PRTE_EXPORT extern void pmix_server_tconn_return(int status, pmix_proc_t *sender
                                                  pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                                                  void *cbdata);
 
-PRTE_EXPORT extern int prte_pmix_server_register_tool(pmix_server_req_t *cd);
+PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd);
 
 PRTE_EXPORT extern int pmix_server_cache_job_info(prte_job_t *jdata, pmix_info_t *info);
 
@@ -340,7 +362,7 @@ PRTE_EXPORT extern void pmix_server_alloc_request_resp(int status, pmix_proc_t *
 
 PRTE_EXPORT extern pmix_status_t prte_pmix_set_scheduler(void);
 
-PRTE_EXPORT extern pmix_status_t prte_server_send_request(uint8_t cmd, pmix_server_req_t *req);
+PRTE_EXPORT extern pmix_status_t prte_server_send_request(uint8_t cmd, prte_pmix_server_req_t *req);
 
 PRTE_EXPORT extern void prte_server_lost_connection(size_t evhdlr_registration_id,
                                                     pmix_status_t status,
@@ -350,6 +372,14 @@ PRTE_EXPORT extern void prte_server_lost_connection(size_t evhdlr_registration_i
                                                     pmix_event_notification_cbfunc_fn_t cbfunc,
                                                     void *cbdata);
 
+
+PRTE_EXPORT extern void pmix_server_monitor_request(int status, pmix_proc_t *sender,
+                                                    pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
+                                                    void *cbdata);
+
+PRTE_EXPORT extern void pmix_server_monitor_resp(int status, pmix_proc_t *sender,
+                                                 pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
+                                                 void *cbdata);
 
 #define PRTE_PMIX_ALLOC_REQ      0
 #define PRTE_PMIX_SESSION_CTRL   1
@@ -372,8 +402,8 @@ typedef struct {
     prte_job_t *jdata;
     pmix_proc_t *members;
     size_t num_members;
-} pmix_server_pset_t;
-PMIX_CLASS_DECLARATION(pmix_server_pset_t);
+} prte_pmix_server_pset_t;
+PMIX_CLASS_DECLARATION(prte_pmix_server_pset_t);
 
 typedef struct {
     bool initialized;
@@ -402,9 +432,9 @@ typedef struct {
     pmix_device_type_t generate_dist;
     pmix_list_t psets;
     pmix_list_t groups;
-} pmix_server_globals_t;
+} prte_pmix_server_globals_t;
 
-extern pmix_server_globals_t prte_pmix_server_globals;
+extern prte_pmix_server_globals_t prte_pmix_server_globals;
 
 END_C_DECLS
 

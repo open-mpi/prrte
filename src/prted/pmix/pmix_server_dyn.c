@@ -59,7 +59,7 @@
 
 void pmix_server_notify_spawn(pmix_nspace_t jobid, int room, pmix_status_t ret)
 {
-    pmix_server_req_t *req;
+    prte_pmix_server_req_t *req;
     prte_job_t *jdata;
 
     jdata = prte_get_job_data_object(jobid);
@@ -70,7 +70,7 @@ void pmix_server_notify_spawn(pmix_nspace_t jobid, int room, pmix_status_t ret)
     }
 
     /* retrieve the request */
-    req = (pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.local_reqs, room);
+    req = (prte_pmix_server_req_t*)pmix_pointer_array_get_item(&prte_pmix_server_globals.local_reqs, room);
     if (NULL == req) {
         /* we are hosed */
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
@@ -137,7 +137,7 @@ void pmix_server_launch_resp(int status, pmix_proc_t *sender,
 
 static void spawn(int sd, short args, void *cbdata)
 {
-    pmix_server_req_t *req = (pmix_server_req_t *) cbdata;
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
     int rc;
     pmix_data_buffer_t *buf;
     prte_plm_cmd_flag_t command;
@@ -315,6 +315,13 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
 
             /***   MAP-BY   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_MAPBY)) {
+            if (PRTE_MAPPING_POLICY_IS_SET(jdata->map->mapping)) {
+                /* not allowed to provide multiple mapping policies */
+                pmix_show_help("help-prte-rmaps-base.txt", "redefining-policy", true, "mapping",
+                               info->value.data.string,
+                               prte_rmaps_base_print_mapping(jdata->map->mapping));
+                return PRTE_ERR_BAD_PARAM;
+            }
             rc = prte_rmaps_base_set_mapping_policy(jdata, info->value.data.string);
             if (PRTE_SUCCESS != rc) {
                 return rc;
@@ -338,6 +345,13 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
 
             /***   RANK-BY   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_RANKBY)) {
+            if (PRTE_RANKING_POLICY_IS_SET(jdata->map->ranking)) {
+                /* not allowed to provide multiple mapping policies */
+                pmix_show_help("help-prte-rmaps-base.txt", "redefining-policy", true, "ranking",
+                               info->value.data.string,
+                               prte_rmaps_base_print_ranking(jdata->map->ranking));
+                return PRTE_ERR_BAD_PARAM;
+            }
             rc = prte_rmaps_base_set_ranking_policy(jdata, info->value.data.string);
             if (PRTE_SUCCESS != rc) {
                 return rc;
@@ -345,6 +359,13 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
 
             /***   BIND-TO   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_BINDTO)) {
+            if (PRTE_BINDING_POLICY_IS_SET(jdata->map->binding)) {
+                /* not allowed to provide multiple mapping policies */
+                pmix_show_help("help-prte-rmaps-base.txt", "redefining-policy", true, "binding",
+                               info->value.data.string,
+                               prte_hwloc_base_print_binding(jdata->map->binding));
+                return PRTE_ERR_BAD_PARAM;
+            }
             rc = prte_hwloc_base_set_binding_policy(jdata, info->value.data.string);
             if (PRTE_SUCCESS != rc) {
                 return rc;
@@ -795,6 +816,75 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                 prte_set_attribute(&app->attributes, PRTE_APP_PRELOAD_BIN, PRTE_ATTR_GLOBAL,
                                    NULL, PMIX_BOOL);
 
+            /***   PPR (PROCS-PER-RESOURCE)   ***/
+            } else if (PMIX_CHECK_KEY(info, PMIX_PPR)) {
+                char **ck, *p;
+                uint16_t ppn, pes;
+                int n;
+                ck = PMIX_ARGV_SPLIT_COMPAT(info->value.data.string, ':');
+                if (3 > PMIX_ARGV_COUNT_COMPAT(ck)) {
+                    PMIX_ARGV_FREE_COMPAT(ck);
+                    return PMIX_ERR_BAD_PARAM;
+                }
+                if (0 == strcasecmp(ck[0], "ppr")) {
+                    ppn =  strtoul(ck[1], NULL, 10);
+                    prte_set_attribute(&app->attributes, PRTE_APP_PPR,
+                                       PRTE_ATTR_GLOBAL, &ppn, PMIX_UINT16);
+                    // ck[2] has the object type
+                    pes = 0;
+                    for (n=2; NULL != ck[n]; n++) {
+                        p = strchr(ck[n], '=');
+                        if (NULL != p && 0 == strncmp(ck[n], "pe", 2)) {
+                            ++p;
+                            pes = strtol(p, NULL, 10);
+                            break;
+                        }
+                    }
+                    if (0 < pes) {
+                        prte_set_attribute(&app->attributes, PRTE_APP_PES_PER_PROC,
+                                           PRTE_ATTR_GLOBAL, &pes, PMIX_UINT16);
+                    }
+                } 
+                PMIX_ARGV_FREE_COMPAT(ck);
+ 
+                /***   MAP-BY   ***/
+            } else if (PMIX_CHECK_KEY(info, PMIX_MAPBY)) {
+                char **ck, *p;
+                uint16_t ppn, pes;
+                int n;
+                ck = PMIX_ARGV_SPLIT_COMPAT(info->value.data.string, ':');
+                for (n=0; NULL != ck[n]; n++) {
+                    if (0 == strcasecmp(ck[n], "ppr")) {
+                        ppn =  strtoul(ck[1], NULL, 10);
+                        prte_set_attribute(&app->attributes, PRTE_APP_PPR,
+                                           PRTE_ATTR_GLOBAL, &ppn, PMIX_UINT16);
+                    } else if (0 == strncmp(ck[n], "pe", 2) &&
+                               0 != strncmp(ck[n], "pe-", 3)) {
+                        p = strchr(ck[n], '=');
+                        if (NULL == p) {
+                            /* missing the value or value is invalid */
+                            pmix_show_help("help-prte-rmaps-base.txt", "invalid-value", true, "mapping policy",
+                                           "PE", ck[n]);
+                            PMIX_ARGV_FREE_COMPAT(ck);
+                            return PRTE_ERR_SILENT;
+                        }
+                        ++p;
+                        if (NULL == p || '\0' == *p) {
+                            /* missing the value or value is invalid */
+                            pmix_show_help("help-prte-rmaps-base.txt", "invalid-value", true, "mapping policy",
+                                           "PE", ck[n]);
+                            PMIX_ARGV_FREE_COMPAT(ck);
+                            return PRTE_ERR_SILENT;
+                        }
+                        pes = strtol(p, NULL, 10);                
+                        if (0 < pes) {
+                            prte_set_attribute(&app->attributes, PRTE_APP_PES_PER_PROC,
+                                               PRTE_ATTR_GLOBAL, &pes, PMIX_UINT16);
+                        }
+                    }
+                }
+                PMIX_ARGV_FREE_COMPAT(ck);
+
                 /***   ENVIRONMENTAL VARIABLE DIRECTIVES   ***/
                 /* there can be multiple of these, so we add them to the attribute list */
             } else if (PMIX_CHECK_KEY(info, PMIX_SET_ENVAR)) {
@@ -1006,7 +1096,7 @@ static void connect_release(pmix_status_t status,
                             void *cbdata,
                             pmix_release_cbfunc_t rel, void *relcbdata)
 {
-    pmix_server_req_t *md = (pmix_server_req_t*)cbdata;
+    prte_pmix_server_req_t *md = (prte_pmix_server_req_t*)cbdata;
     pmix_byte_object_t bo;
     pmix_data_buffer_t pbkt;
     pmix_info_t *info = NULL, infostat;
@@ -1089,7 +1179,7 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
                                      const pmix_info_t info[], size_t ninfo,
                                      pmix_op_cbfunc_t cbfunc, void *cbdata)
 {
-    pmix_server_req_t *cd;
+    prte_pmix_server_req_t *cd;
     size_t n;
     pmix_status_t rc;
 
@@ -1106,7 +1196,7 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
      * nodes, and (b) send along any endpt information posted by the participants
      * for "remote" scope */
 
-    cd = PMIX_NEW(pmix_server_req_t);
+    cd = PMIX_NEW(prte_pmix_server_req_t);
     for (n=0; n < ninfo; n++) {
         if (PMIX_CHECK_KEY(&info[n], PMIX_PROC_DATA) ||
             PMIX_CHECK_KEY(&info[n], PMIX_JOB_INFO_ARRAY)) {

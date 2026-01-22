@@ -14,7 +14,7 @@
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2016      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -43,23 +43,6 @@
 
 #include "dash_host.h"
 
-static bool quickmatch(prte_node_t *nd, char *name)
-{
-    int n;
-
-    if (0 == strcmp(nd->name, name)) {
-        return true;
-    }
-    if (NULL != nd->aliases) {
-        for (n=0; NULL != nd->aliases[n]; n++) {
-            if (0 == strcmp(nd->aliases[n], name)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 int prte_util_dash_host_compute_slots(prte_node_t *node, char *hosts)
 {
     char **specs, *cptr;
@@ -77,7 +60,7 @@ int prte_util_dash_host_compute_slots(prte_node_t *node, char *hosts)
         } else {
             cptr = NULL;
         }
-        if (quickmatch(node, specs[n])) {
+        if (prte_quickmatch(node, specs[n])) {
             if (NULL != cptr) {
                 if ('*' == *cptr || 0 == strcmp(cptr, "auto")) {
                     slots += node->slots - node->slots_inuse;
@@ -270,14 +253,17 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts, bool allocati
         /* check for local name and compute non-fqdn name */
         shortname = NULL;
         rawname = NULL;
+
         if (prte_check_host_is_local(mini_map[i])) {
             ndname = prte_process_info.nodename;
         } else {
             ndname = mini_map[i];
-            /* compute the non-fqdn version */
-            if (!prte_keep_fqdn_hostnames &&
-                !pmix_net_isaddr(ndname)) {
-                cptr = strchr(ndname, '.');
+        }
+
+        if (!prte_keep_fqdn_hostnames) {
+            // Strip off the FQDN if present, ignore IP addresses
+            if (!pmix_net_isaddr(mini_map[i])) {
+                 cptr = strchr(ndname, '.');
                 if (NULL != cptr) {
                     rawname = strdup(ndname);
                     *cptr = '\0';
@@ -286,6 +272,7 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts, bool allocati
                 }
             }
         }
+
         /* see if a node of this name is already on the list */
         node = prte_node_match(&adds, ndname);
         if (NULL == node && NULL != shortname) {
@@ -478,7 +465,7 @@ static int parse_dash_host(char ***mapped_nodes, char *hosts)
                     if (NULL != (cptr = strchr(mini_map[k], ':'))) {
                         /* the colon indicates a specific # are requested */
                         ++cptr;
-                        if (NULL == cptr) {
+                        if ('\0' == *cptr) {
                             // missing number of nodes being requested
                             pmix_show_help("help-dash-host.txt",
                                            "dash-host:invalid-relative-node-syntax", true,
@@ -694,7 +681,7 @@ int prte_util_filter_dash_host_nodes(pmix_list_t *nodes, char *hosts, bool remov
                         test = (lmn == lst) ? 0 : 1;
                     }
                 } else {
-                    test = (quickmatch(node, mapped_nodes[i])) ? 0 : 1;
+                    test = (prte_quickmatch(node, mapped_nodes[i])) ? 0 : 1;
                 }
                 if (0 == test) {
                     if (remove) {

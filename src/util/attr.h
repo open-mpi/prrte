@@ -3,7 +3,7 @@
  * Copyright (c) 2016      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
@@ -36,6 +36,9 @@ typedef uint8_t prte_app_context_flags_t;
 #define PRTE_APP_FLAG_TOOL          0x02    // this app describes daemons to be co-launched
                                             //    with the application procs in the other apps
                                             //    and does not count against allocation
+#define PRTE_APP_FLAG_COMPUTED      0x04    // num procs for this app were computed and not
+                                            //    given by the user
+
 
 /* APP_CONTEXT ATTRIBUTE KEYS */
 #define PRTE_APP_HOSTFILE            1  // string  - hostfile
@@ -61,6 +64,9 @@ typedef uint8_t prte_app_context_flags_t;
 #define PRTE_APP_ADD_ENVAR          21 // prte_envar_t - add envar, do not override pre-existing one
 #define PRTE_APP_PSET_NAME          23 // string - user-assigned name for the process
                                        //          set containing the given process
+#define PRTE_APP_PES_PER_PROC       24 // uint16_t - number of cpus to be assigned to each process
+#define PRTE_APP_PPR                25 // uint16_t - number of procs to place on the resource specified
+                                       //           in the job ppr string
 
 #define PRTE_APP_MAX_KEY 100
 
@@ -236,6 +242,8 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_PMIX_PREFIX                (PRTE_JOB_START_KEY + 119) // string - PMIX_PREFIX for daemons
 #define PRTE_JOB_FWD_ENVIRONMENT            (PRTE_JOB_START_KEY + 120) // bool - forward local environment to procs in this job
 #define PRTE_JOB_REPORT_PHYSICAL_CPUS       (PRTE_JOB_START_KEY + 121) // bool - report using physical (vs logical) cpu IDs
+#define PRTE_JOB_ALLOC_DISPLAYED            (PRTE_JOB_START_KEY + 122) // bool - allocation has been displayed
+#define PRTE_JOB_DO_NOT_SPAWN               (PRTE_JOB_START_KEY + 123) // bool - do not spawn app procs
 
 #define PRTE_JOB_MAX_KEY (PRTE_JOB_START_KEY + 200)
 
@@ -345,8 +353,10 @@ PRTE_EXPORT int prte_attr_register(const char *project, prte_attribute_key_t key
 // forward declarations
 struct prte_proc_t;
 struct prte_node_t;
+struct prte_app_context_t;
 struct prte_job_t;
 
 PRTE_EXPORT char* prte_print_proc_flags(struct prte_proc_t *p);
 PRTE_EXPORT char* prte_print_node_flags(struct prte_node_t *p);
+PRTE_EXPORT char* prte_print_app_flags(struct prte_app_context_t *p);
 PRTE_EXPORT char* prte_print_job_flags(struct prte_job_t *p);

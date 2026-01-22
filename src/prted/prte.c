@@ -19,7 +19,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Geoffroy Vallee. All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      Amazon.com, Inc. or its affiliates.  All Rights
  *                         reserved.
  * Copyright (c) 2022-2023 Triad National Security, LLC. All rights
@@ -161,14 +161,14 @@ static void parent_died_fn(size_t evhdlr_registration_id, pmix_status_t status,
                            pmix_info_t results[], size_t nresults,
                            pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
 {
-    pmix_server_req_t *cd;
+    prte_pmix_server_req_t *cd;
     PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id, status, source, info, ninfo, results, nresults);
 
     // allow the pmix event base to continue
     cbfunc(PMIX_EVENT_ACTION_COMPLETE, NULL, 0, NULL, NULL, cbdata);
 
     // shift this into our event base
-    cd = PMIX_NEW(pmix_server_req_t);
+    cd = PMIX_NEW(prte_pmix_server_req_t);
     prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, clean_abort, cd);
     prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 }
@@ -216,7 +216,6 @@ static void setup_sighandler(int signal, prte_event_t *ev, prte_event_cbfunc_t c
 static void shutdown_callback(int fd, short flags, void *arg)
 {
     prte_timer_t *tm = (prte_timer_t *) arg;
-    prte_job_t *jdata;
     PRTE_HIDE_UNUSED_PARAMS(fd, flags);
 
     if (NULL != tm) {
@@ -234,8 +233,11 @@ static void shutdown_callback(int fd, short flags, void *arg)
     prte_odls.kill_local_procs(NULL);
     // mark that we are finalizing so the session directory will cleanup
     prte_finalizing = true;
-    jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    PMIX_RELEASE(jdata);
+#if PRTE_PMIX_STOP_PRGTHRD
+    PMIx_Progress_thread_stop(NULL, 0);
+#endif
+    prte_job_session_dir_finalize(NULL);
+    PMIx_server_finalize();
     exit(PRTE_ERROR_DEFAULT_EXIT_CODE);
 }
 
@@ -399,12 +401,50 @@ int prte(int argc, char *argv[])
         return rc;
     }
 
-    /* look for any personality specification */
+    /* look for any personality specification and do a quick sanity check */
     personality = NULL;
-    for (i = 0; NULL != argv[i]; i++) {
-        if (0 == strcmp(argv[i], "--personality")) {
-            personality = argv[i + 1];
-            break;
+    bool rankby_found = false;
+    bool bindto_found = false;
+    for (i = 0; NULL != pargv[i]; i++) {
+        if (0 == strcmp(pargv[i], "--personality")) {
+            personality = pargv[i + 1];
+            continue;
+        }
+        if (0 == strcmp(pargv[i], "--map-by")) {
+            free(pargv[i]);
+            pargv[i] = strdup("--mapby");
+            continue;
+        }
+        if (0 == strcmp(pargv[i], "--rank-by") ||
+            0 == strcmp(pargv[i], "--rankby")) {
+            if (rankby_found) {
+                pmix_show_help("help-schizo-base.txt", "multi-instances", true, pargv[i]);
+                return PRTE_ERR_BAD_PARAM;
+            }
+            rankby_found = true;
+            if (0 == strcmp(pargv[i], "--rank-by")) {
+                free(pargv[i]);
+                pargv[i] = strdup("--rankby");
+            }
+            continue;
+        }
+        if (0 == strcmp(pargv[i], "--bind-to") ||
+            0 == strcmp(pargv[i], "--bindto")) {
+            if (bindto_found) {
+                pmix_show_help("help-schizo-base.txt", "multi-instances", true, "bind-to");
+                return PRTE_ERR_BAD_PARAM;
+            }
+            bindto_found = true;
+            if (0 == strcmp(pargv[i], "--bind-to")) {
+                free(pargv[i]);
+                pargv[i] = strdup("--bindto");
+            }
+            continue;
+        }
+        if (0 == strcmp(pargv[i], "--runtime-options")) {
+            free(pargv[i]);
+            pargv[i] = strdup("--rtos");
+            continue;
         }
     }
 
@@ -433,6 +473,7 @@ int prte(int argc, char *argv[])
     /* ensure we don't confuse any downstream PRRTE tools on
      * choice of proxy since some environments forward their envars */
     unsetenv("PRTE_MCA_schizo_proxy");
+    unsetenv("PRTE_MCA_personality");
 
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (rc = prte_register_params())) {
@@ -592,7 +633,19 @@ int prte(int argc, char *argv[])
                 return 1;
             }
         }
+
+        // open the ess framework so it can init the signal forwarding
+        // list - we don't actually need the components
+        rc = pmix_mca_base_framework_open(&prte_ess_base_framework,
+                                        PMIX_MCA_BASE_OPEN_DEFAULT);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+            exit(rc);
+        }
         rc = prun_common(&results, schizo, argc, argv);
+
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
         exit(rc);
     }
 
@@ -758,7 +811,7 @@ int prte(int argc, char *argv[])
     /* if we are supporting a singleton, add it to our jobs */
     if (NULL != prte_pmix_server_globals.singleton) {
         rc = prep_singleton(prte_pmix_server_globals.singleton);
-        if (PRTE_SUCCESS != ret) {
+        if (PRTE_SUCCESS != rc) {
             PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
             goto DONE;
         }
@@ -996,26 +1049,80 @@ int prte(int argc, char *argv[])
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_RTOS);
     if (NULL != opt) {
         rc = prte_state_base_set_runtime_options(jdata, opt->values[0]);
-        if (PRTE_SUCCESS != rc) {
-            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
-            goto DONE;
-        }
+    } else {
+        rc = prte_state_base_set_runtime_options(jdata, prte_schizo_base.default_runtime_options);
+    }
+    if (PRTE_SUCCESS != rc) {
+        PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+        goto DONE;
     }
 
     /* check a couple of display options for the DVM itself */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_DISPLAY);
     if (NULL != opt) {
         char **targv;
+        char *tptr;
+        int m;
         for (n=0; NULL != opt->values[n]; n++) {
             targv = PMIX_ARGV_SPLIT_COMPAT(opt->values[n], ',');
             for (i=0; NULL != targv[i]; i++) {
                 if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_ALLOC)) {
                     prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC,
                                        PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                    break;
                 } else if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSEABLE) ||
                            PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSABLE)) {
                     prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
                                        PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                }
+            }
+            PMIX_ARGV_FREE_COMPAT(targv);
+            /* check for qualifiers */
+            tptr = strchr(opt->values[n], ':');
+            if (NULL != tptr) {
+                ++tptr;
+                targv = PMIX_ARGV_SPLIT_COMPAT(tptr, ':');
+                /* check qualifiers */
+                for (m=0; NULL != targv[m]; m++) {
+                    if (PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSEABLE) ||
+                        PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSABLE)) {
+                        prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
+                                           PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                        break;
+                    }
+                }
+                PMIX_ARGV_FREE_COMPAT(targv);
+            }
+        }
+
+    } else if (NULL != prte_schizo_base.default_display_options) {
+        char **targv;
+        char *tptr;
+        int m;
+        targv = PMIX_ARGV_SPLIT_COMPAT(prte_schizo_base.default_display_options, ',');
+        for (i=0; NULL != targv[i]; i++) {
+            if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_ALLOC)) {
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC,
+                                   PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+            } else if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSEABLE) ||
+                       PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSABLE)) {
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
+                                   PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+            }
+        }
+        PMIX_ARGV_FREE_COMPAT(targv);
+        /* check for qualifiers */
+        tptr = strchr(prte_schizo_base.default_display_options, ':');
+        if (NULL != tptr) {
+            ++tptr;
+            targv = PMIX_ARGV_SPLIT_COMPAT(tptr, ':');
+            /* check qualifiers */
+            for (m=0; NULL != targv[m]; m++) {
+                if (PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSEABLE) ||
+                    PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSABLE)) {
+                    prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
+                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                    break;
                 }
             }
             PMIX_ARGV_FREE_COMPAT(targv);
@@ -1034,7 +1141,8 @@ int prte(int argc, char *argv[])
     PMIX_INFO_LIST_START(jinfo);
 
     /* see if we ourselves were spawned by someone */
-    ret = PMIx_Get(&prte_process_info.myproc, PMIX_PARENT_ID, NULL, 0, &val);
+    PMIX_LOAD_PROCID(&pname, myproc.nspace, PMIX_RANK_WILDCARD);
+    ret = PMIx_Get(&pname, PMIX_PARENT_ID, NULL, 0, &val);
     if (PMIX_SUCCESS == ret) {
         PMIX_LOAD_PROCID(&prte_process_info.my_parent, val->data.proc->nspace, val->data.proc->rank);
         PMIX_VALUE_RELEASE(val);
@@ -1118,12 +1226,13 @@ int prte(int argc, char *argv[])
                  * indicating clean termination! Instead, just forcibly cleanup
                  * the local session_dir tree and exit
                  */
-                jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-                PMIX_RELEASE(jdata);
-
-                /* return with non-zero status */
-                ret = PRTE_ERROR_DEFAULT_EXIT_CODE;
-                goto DONE;
+                prte_finalizing = true;
+#if PRTE_PMIX_STOP_PRGTHRD
+                PMIx_Progress_thread_stop(NULL, 0);
+#endif
+                prte_job_session_dir_finalize(NULL);
+                PMIx_server_finalize();
+                exit(PRTE_ERROR_DEFAULT_EXIT_CODE);
             }
         }
     }
@@ -1324,56 +1433,6 @@ DONE:
     exit(prte_exit_status);
 }
 
-static void clean_abort(int fd, short flags, void *arg)
-{
-    PRTE_HIDE_UNUSED_PARAMS(fd, flags);
-
-    if (keepalive && NULL == arg) {
-        // ignore this
-        return;
-    }
-
-    /* if we have already ordered this once, don't keep
-     * doing it to avoid race conditions
-     */
-    if (pmix_mutex_trylock(&prun_abort_inprogress_lock)) { /* returns 1 if already locked */
-        if (forcibly_die) {
-            /* exit with a non-zero status */
-            exit(1);
-        }
-        fprintf(stderr,
-                "%s: abort is already in progress...hit ctrl-c again to forcibly terminate\n\n",
-                prte_tool_basename);
-        forcibly_die = true;
-        /* reset the event */
-        prte_event_add(&term_handler, NULL);
-        return;
-    }
-
-    fflush(stderr);
-    /* ensure we exit with a non-zero status */
-    PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
-    /* ensure that the forwarding of stdin stops */
-    prte_dvm_abort_ordered = true;
-    /* tell us to be quiet - hey, the user killed us with a ctrl-c,
-     * so need to tell them that!
-     */
-    prte_execute_quiet = true;
-    prte_abnormal_term_ordered = true;
-    /* We are in an event handler; the job completed procedure
-     will delete the signal handler that is currently running
-     (which is a Bad Thing), so we can't call it directly.
-     Instead, we have to exit this handler and setup to call
-     job_completed() after this. */
-    prte_plm.terminate_orteds();
-    if (NULL != arg) {
-        PMIX_RELEASE(arg);
-    }
-}
-
-static bool first = true;
-static bool second = true;
-
 static void surekill(void)
 {
     prte_proc_t *child;
@@ -1408,6 +1467,47 @@ static void surekill(void)
     }
 }
 
+static void clean_abort(int fd, short flags, void *arg)
+{
+    PRTE_HIDE_UNUSED_PARAMS(fd, flags);
+
+    if (keepalive && NULL == arg) {
+        // ignore this
+        return;
+    }
+
+    /* if we have already ordered this once, don't keep
+     * doing it to avoid race conditions
+     */
+    if (pmix_mutex_trylock(&prun_abort_inprogress_lock)) { /* returns 1 if already locked */
+        if (forcibly_die) {
+            /* exit with a non-zero status */
+            exit(1);
+        }
+        fprintf(stderr,
+                "%s: abort is already in progress...hit ctrl-c again to forcibly terminate\n\n",
+                prte_tool_basename);
+        forcibly_die = true;
+        /* reset the event */
+        prte_event_add(&term_handler, NULL);
+        return;
+    }
+
+    fflush(stderr);
+    prte_finalizing = true;
+    /* ensure we exit with a non-zero status */
+#if PRTE_PMIX_STOP_PRGTHRD
+    PMIx_Progress_thread_stop(NULL, 0);
+#endif
+    surekill();  // ensure we attempt to kill everything
+    prte_job_session_dir_finalize(NULL);
+    PMIx_server_finalize();
+    exit(PRTE_ERROR_DEFAULT_EXIT_CODE);
+}
+
+static bool first = true;
+static bool second = true;
+
 /*
  * Attempt to terminate the job and wait for callback indicating
  * the job has been aborted.
@@ -1435,7 +1535,12 @@ static void abort_signal_callback(int fd)
         second = false;
     } else {
         surekill();  // ensure we attempt to kill everything
-        pmix_os_dirpath_destroy(prte_process_info.top_session_dir, true, NULL);
+        prte_finalizing = true;
+#if PRTE_PMIX_STOP_PRGTHRD
+        PMIx_Progress_thread_stop(NULL, 0);
+#endif
+        prte_job_session_dir_finalize(NULL);
+        PMIx_server_finalize();
         exit(1);
     }
 }
