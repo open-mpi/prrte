@@ -16,7 +16,7 @@
  * Copyright (c) 2015-2017 Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018      Inria.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -65,8 +65,9 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
     prte_hwloc_obj_data_t *objcnt;
 
     pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
-                        "mca:rmaps: bind %s with policy %s",
+                        "mca:rmaps: bind %s to %s with policy %s",
                         PRTE_NAME_PRINT(&proc->name),
+                        hwloc_obj_type_string(options->maptype),
                         prte_hwloc_base_print_binding(jdata->map->binding));
     /* initialize */
     if (NULL == obj) {
@@ -352,7 +353,8 @@ static int bind_multiple(prte_job_t *jdata, prte_proc_t *proc,
             pmix_show_help("help-prte-rmaps-base.txt", "span-packages-multiple", true,
                            prte_rmaps_base_print_mapping(jdata->map->mapping),
                            prte_hwloc_base_print_binding(jdata->map->binding),
-                           options->cpus_per_rank);
+                           options->cpus_per_rank,
+                           node->name);
             return PRTE_ERR_SILENT;
         }
     } else {
@@ -392,8 +394,7 @@ int prte_rmaps_base_bind_proc(prte_job_t *jdata,
                         PRTE_JOBID_PRINT(jdata->nspace),
                         prte_hwloc_base_print_binding(jdata->map->binding), jdata->map->binding);
 
-    if (PRTE_MAPPING_BYUSER == options->map ||
-        PRTE_MAPPING_LIKWID == options->map) {
+    if (PRTE_MAPPING_BYUSER == options->map) {
         /* user specified binding by rankfile or it was computed
          * by the likwid mapper - nothing for us to do */
         return PRTE_SUCCESS;

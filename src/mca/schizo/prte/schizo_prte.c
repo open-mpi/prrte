@@ -18,7 +18,7 @@
  * Copyright (c) 2015      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2018-2022 IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -783,7 +783,7 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
         }
 
         /* --output-filename DIR  ->  --output file=file */
-        else if (0 == strcmp(option, "--output-filename")) {
+        else if (0 == strcmp(option, "output-filename")) {
             pmix_asprintf(&p2, "file=%s", opt->values[0]);
             rc = prte_schizo_base_add_directive(results, option,
                                                 PRTE_CLI_OUTPUT, p2,
@@ -1068,7 +1068,8 @@ static int detect_proxy(char *personalities)
     }
 
     /* if we were told the proxy, then use it */
-    if (NULL != (evar = getenv("PRTE_MCA_schizo_proxy"))) {
+    if (NULL != (evar = getenv("PRTE_MCA_schizo_proxy")) ||
+        NULL != (evar = getenv("PRTE_MCA_personality"))) {
         if (0 == strcmp(evar, "prte")) {
             /* they asked exclusively for us */
             return 100;

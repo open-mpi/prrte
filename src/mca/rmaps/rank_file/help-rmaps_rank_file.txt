@@ -4,7 +4,7 @@
 # Copyright (c) 2013      Los Alamos National Security, LLC.
 #                         All rights reserved.
 # Copyright (c) 2018-2020 Intel, Inc.  All rights reserved.
-# Copyright (c) 2021-2024 Nanook Consulting  All rights reserved.
+# Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -18,7 +18,7 @@
   Filename: %s
 Check to make sure the path and filename are correct.
 
-usage:  %s -mca rmaps_rankfile_path rankfile ./app
+usage:  %s --map-by rankfile:file=<path> ./app
 
 Examples of proper syntax include:
   cat hostfile
@@ -78,21 +78,6 @@ a non-existent CPU:
 
 Please correct the line and try again.
 #
-[lsf-affinity-file-not-found]
-The affinity file provided in LSB_AFFINITY_HOSTFILE could not be found:
-
-  File:  %s
-
-We cannot continue.
-#
-[lsf-affinity-file-failed-convert]
-The affinity file provided in LSB_AFFINITY_HOSTFILE could not be converted
-to a rankfile:
-
-  File:  %s
-
-We cannot continue.
-#
 [rmaps:proc-slots-overloaded]
 A process attempted to bind to resources already allocated on a node
 to a different process.
@@ -105,9 +90,3 @@ to a different process.
 If this is intentional then you must pass the "overload-allowed"
 qualifier to the --bind-to option.
   --bind-to :overload-allowed
-#
-[resource-not-found]
-The specified LSF affinity file contained a node (%s) that is not in your
-allocation. We therefore cannot map a process rank to it. Please
-check your allocation and affinity file to ensure the latter only
-contains allocated nodes.

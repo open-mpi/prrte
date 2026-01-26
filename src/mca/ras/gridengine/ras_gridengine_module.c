@@ -34,7 +34,7 @@
 #include <unistd.h>
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/ras/base/ras_private.h"
+#include "src/mca/ras/base/base.h"
 #include "src/mca/ras/gridengine/ras_gridengine.h"
 #include "src/runtime/prte_globals.h"
 #include "src/util/pmix_net.h"
@@ -53,8 +53,10 @@ static int get_slot_count(char* node_name, int* slot_cnt);
 /*
  * Global variable
  */
-prte_ras_base_module_t prte_ras_gridengine_module = {NULL, prte_ras_gridengine_allocate, NULL,
-                                                     prte_ras_gridengine_finalize};
+prte_ras_base_module_t prte_ras_gridengine_module = {
+    .allocate = prte_ras_gridengine_allocate,
+    .finalize = prte_ras_gridengine_finalize
+};
 
 /**
  *  Discover available (pre-allocated) nodes. Allocate the

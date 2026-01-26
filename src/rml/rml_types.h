@@ -15,7 +15,7 @@
  * Copyright (c) 2014-2019 Intel, Inc.  All rights reserved.
  * Copyright (c) 2017      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -161,14 +161,19 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 
 /* pmix log requests */
 #define PRTE_RML_TAG_LOGGING              65
+#define PRTE_RML_TAG_LOGGING_RESP         66
 
 /* scheduler requests */
 #define PRTE_RML_TAG_SCHED                72
 #define PRTE_RML_TAG_SCHED_RESP           73
 
 /* group construct */
-#define PRTE_RML_TAG_GROUP         74
-#define PRTE_RML_TAG_GROUP_RELEASE 75
+#define PRTE_RML_TAG_GROUP                74
+#define PRTE_RML_TAG_GROUP_RELEASE        75
+
+// monitor
+#define PRTE_RML_TAG_MONITOR_REQUEST      76
+#define PRTE_RML_TAG_MONITOR_RESP         77
 
 #define PRTE_RML_TAG_MAX                 100
 

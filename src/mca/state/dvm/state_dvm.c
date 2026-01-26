@@ -517,7 +517,7 @@ static void check_complete(int fd, short args, void *cbdata)
     hwloc_obj_type_t type;
     hwloc_cpuset_t boundcpus, tgt;
     bool takeall, sep, *sepptr = &sep;
-    pmix_server_pset_t *pst, *pst2;
+    prte_pmix_server_pset_t *pst, *pst2;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(caddy);
@@ -815,7 +815,7 @@ release:
         jdata->map = NULL;
     }
     // if this job has apps that named a pset, then remove them
-    PMIX_LIST_FOREACH_SAFE(pst, pst2, &prte_pmix_server_globals.psets, pmix_server_pset_t) {
+    PMIX_LIST_FOREACH_SAFE(pst, pst2, &prte_pmix_server_globals.psets, prte_pmix_server_pset_t) {
         if (pst->jdata == jdata) {
             pmix_list_remove_item(&prte_pmix_server_globals.psets, &pst->super);
             PMIX_RELEASE(pst);
@@ -837,7 +837,6 @@ release:
         PMIX_LIST_FOREACH(jptr, &jdata->children, prte_job_t)
         {
             if (prte_get_attribute(&jptr->attributes, PRTE_JOB_CHILD_SEP, (void**)&sepptr, PMIX_BOOL) && !sep) {
-                pmix_output(0, "TERMINATING CHILD");
                 proc = PMIX_NEW(prte_proc_t);
                 PMIX_LOAD_PROCID(&proc->name, jptr->nspace, PMIX_RANK_WILDCARD);
                 pmix_pointer_array_add(&procs, proc);

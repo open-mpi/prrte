@@ -16,7 +16,7 @@
  * Copyright (c) 2017      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
- * Copyright (c) 2021-2024 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2021      Amazon.com, Inc. or its affiliates.  All Rights
  *                         reserved.
  * $COPYRIGHT$
@@ -33,6 +33,7 @@
 
 #include "src/mca/base/pmix_mca_base_framework.h"
 #include "src/util/pmix_argv.h"
+#include "src/util/pmix_os_dirpath.h"
 #include "src/util/pmix_output.h"
 
 #include "src/mca/base/pmix_mca_base_alias.h"
@@ -42,9 +43,11 @@
 #include "src/mca/ess/ess.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_locks.h"
+#include "src/runtime/prte_progress_threads.h"
 #include "src/runtime/runtime.h"
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
+#include "src/util/session_dir.h"
 
 int prte_finalize(void)
 {
@@ -68,9 +71,22 @@ int prte_finalize(void)
         return PRTE_SUCCESS;
     }
 
+#if PRTE_PMIX_STOP_PRGTHRD
+    /* Stop the PMIx server's internal progress thread and wait here
+     * until all active events have been processed */
+    PMIx_Progress_thread_stop(NULL, 0);
+#endif
+
     /* flag that we are finalizing */
     prte_finalizing = true;
 
+    // stop ALL prte progress threads
+    prte_progress_thread_pause(NULL);
+
+    // we always must cleanup the session directory tree
+    prte_job_session_dir_finalize(NULL);
+
+#ifdef PRTE_PICKY_COMPILERS
     /* release the cache */
     PMIX_RELEASE(prte_cache);
 
@@ -142,6 +158,7 @@ int prte_finalize(void)
     prte_proc_info_finalize();
 
     pmix_output_finalize();
+#endif
 
     /* now shutdown PMIx - need to do this last as it finalizes
      * the utilities and class system we depend upon */

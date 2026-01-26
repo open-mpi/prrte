@@ -13,7 +13,7 @@
  *                         reserved.
  * Copyright (c) 2016-2020 Intel, Inc.  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2023 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -52,6 +52,7 @@ PRTE_EXPORT int prte_ras_base_select(void);
  * globals that might be needed
  */
 typedef struct prte_ras_base_t {
+    bool first_pass_completed;
     bool allocation_read;
     prte_ras_base_module_t *active_module;
     int total_slots_alloc;
@@ -62,11 +63,18 @@ typedef struct prte_ras_base_t {
 
 PRTE_EXPORT extern prte_ras_base_t prte_ras_base;
 
+/**
+ * Add the specified node definitions to the registry
+ */
+PRTE_EXPORT int prte_ras_base_node_insert(pmix_list_t *, prte_job_t *);
+
 PRTE_EXPORT void prte_ras_base_display_alloc(prte_job_t *jdata);
 
 PRTE_EXPORT void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist);
 
 PRTE_EXPORT void prte_ras_base_allocate(int fd, short args, void *cbdata);
+
+PRTE_EXPORT void prte_ras_base_modify(int fd, short args, void *cbdata);
 
 PRTE_EXPORT int prte_ras_base_add_hosts(prte_job_t *jdata);
 
