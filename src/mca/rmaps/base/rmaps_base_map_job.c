@@ -17,7 +17,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2019      UT-Battelle, LLC. All rights reserved.
  *
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2022      IBM Corporation.  All rights reserved.
  * $COPYRIGHT$
  *
@@ -376,7 +376,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                     continue;
                 }
                 env = pmix_environ_merge(prte_launch_environ, app->env);
-                PMIX_ARGV_FREE_COMPAT(app->env);
+                PMIx_Argv_free(app->env);
                 app->env = env;
             }
         }
@@ -393,7 +393,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                         continue;
                     }
                     env = pmix_environ_merge(prte_launch_environ, app->env);
-                    PMIX_ARGV_FREE_COMPAT(app->env);
+                    PMIx_Argv_free(app->env);
                     app->env = env;
                 }
             }
@@ -464,11 +464,11 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     }
 
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_PPR, (void **) &tmp, PMIX_STRING)) {
-        ck = PMIX_ARGV_SPLIT_COMPAT(tmp, ':');
-        if (2 != PMIX_ARGV_COUNT_COMPAT(ck)) {
+        ck = PMIx_Argv_split(tmp, ':');
+        if (2 != PMIx_Argv_count(ck)) {
             /* must provide a specification */
             pmix_show_help("help-prte-rmaps-ppr.txt", "invalid-ppr", true, tmp);
-            PMIX_ARGV_FREE_COMPAT(ck);
+            PMIx_Argv_free(ck);
             free(tmp);
             jdata->exit_code = PRTE_ERR_BAD_PARAM;
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
@@ -510,13 +510,13 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             pmix_show_help("help-prte-rmaps-ppr.txt", "unrecognized-ppr-option", true,
                            ck[1], tmp);
             free(tmp);
-            PMIX_ARGV_FREE_COMPAT(ck);
+            PMIx_Argv_free(ck);
             jdata->exit_code = PRTE_ERR_BAD_PARAM;
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
             goto cleanup;
         }
         free(tmp);
-        PMIX_ARGV_FREE_COMPAT(ck);
+        PMIx_Argv_free(ck);
     }
 
     /* add up all the expected procs */
@@ -539,25 +539,25 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
         }
 
        if (NULL != options.cpuset) {
-            ck = PMIX_ARGV_SPLIT_COMPAT(options.cpuset, ',');
-            app->num_procs = PMIX_ARGV_COUNT_COMPAT(ck);
-            PMIX_ARGV_FREE_COMPAT(ck);
+            ck = PMIx_Argv_split(options.cpuset, ',');
+            app->num_procs = PMIx_Argv_count(ck);
+            PMIx_Argv_free(ck);
         } else {
+            /*
+             * get the target nodes for this app - the base function
+             * will take any host or hostfile directive into account
+             */
+            PMIX_CONSTRUCT(&nodes, pmix_list_t);
+            rc = prte_rmaps_base_get_target_nodes(&nodes, &slots,
+                                                  jdata, app, jdata->map->mapping,
+                                                  true, true, false);
+            if (PRTE_SUCCESS != rc) {
+                PMIX_LIST_DESTRUCT(&nodes);
+                jdata->exit_code = rc;
+                PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
+                goto cleanup;
+            }
             if (1 < options.cpus_per_rank) {
-                /*
-                 * get the target nodes for this app - the base function
-                 * will take any host or hostfile directive into account
-                 */
-                PMIX_CONSTRUCT(&nodes, pmix_list_t);
-                rc = prte_rmaps_base_get_target_nodes(&nodes, &slots,
-                                                      jdata, app, jdata->map->mapping,
-                                                      true, true, false);
-                if (PRTE_SUCCESS != rc) {
-                    PMIX_LIST_DESTRUCT(&nodes);
-                    jdata->exit_code = rc;
-                    PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
-                    goto cleanup;
-                }
                 // compute the number of cpus on each node
                 len = 0;
                 PMIX_LIST_FOREACH (node, &nodes, prte_node_t) {
@@ -569,7 +569,6 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
                                                                   HWLOC_OBJ_CORE) / options.cpus_per_rank;
                     }
                 }
-                PMIX_LIST_DESTRUCT(&nodes);
                 app->num_procs = len;
                 // ensure we always wind up with at least one proc
                 if (0 == app->num_procs) {
@@ -580,6 +579,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             } else {
                 app->num_procs = slots;
             }
+            PMIX_LIST_DESTRUCT(&nodes);
         }
         options.nprocs += app->num_procs;
     }
@@ -1038,7 +1038,7 @@ void prte_rmaps_base_report_bindings(prte_job_t *jdata,
                           proc->node->name, tmp);
             free(tmp);
         }
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&cache, out);
+        PMIx_Argv_append_nosize(&cache, out);
         free(out);
     }
 
@@ -1046,9 +1046,9 @@ void prte_rmaps_base_report_bindings(prte_job_t *jdata,
         out = strdup("Error: job has no procs");
     } else {
         /* add a blank line with \n on it so IOF will output the last line */
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&cache, "");
-        out = PMIX_ARGV_JOIN_COMPAT(cache, '\n');
-        PMIX_ARGV_FREE_COMPAT(cache);
+        PMIx_Argv_append_nosize(&cache, "");
+        out = PMIx_Argv_join(cache, '\n');
+        PMIx_Argv_free(cache);
     }
     PMIX_LOAD_PROCID(&source, jdata->nspace, PMIX_RANK_WILDCARD);
     prte_iof_base_output(&source, PMIX_FWD_STDOUT_CHANNEL, out);
