@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2022-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -16,8 +16,6 @@
 #include "src/mca/ras/base/base.h"
 #include "src/mca/rmaps/rmaps.h"
 #include "src/mca/schizo/base/base.h"
-
-#ifdef PMIX_SESSION_INSTANTIATE
 
 static void localrelease(void *cbdata)
 {
@@ -132,7 +130,7 @@ static int process_directive(prte_pmix_server_req_t *req)
         } else if (PMIX_CHECK_KEY(&req->info[n], PMIX_PERSONALITY)) {
             personality = &req->info[n];
             if (NULL != jdata && NULL == jdata->personality) {
-                jdata->personality = PMIX_ARGV_SPLIT_COMPAT(personality->value.data.string, ',');
+                jdata->personality = PMIx_Argv_split(personality->value.data.string, ',');
                 jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(personality->value.data.string);
                 pmix_server_cache_job_info(jdata, personality);
             }
@@ -237,7 +235,7 @@ static int process_directive(prte_pmix_server_req_t *req)
             /* use the default */
             jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(NULL);
         } else {
-            jdata->personality = PMIX_ARGV_SPLIT_COMPAT(personality->value.data.string, ',');
+            jdata->personality = PMIx_Argv_split(personality->value.data.string, ',');
             jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(personality->value.data.string);
             pmix_server_cache_job_info(jdata, personality);
         }
@@ -417,5 +415,3 @@ pmix_status_t pmix_server_session_ctrl_fn(const pmix_proc_t *requestor,
     prte_event_active(&req->ev, PRTE_EV_WRITE, 1);
     return PRTE_SUCCESS;
 }
-
-#endif

@@ -19,7 +19,7 @@
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2016-2022 IBM Corporation.  All rights reserved.
  *
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -64,23 +64,6 @@ prte_rmaps_base_module_t prte_rmaps_lsf_module = {
 };
 
 static int file_parse(const char *);
-
-#if PMIX_NUMERIC_VERSION < 0x00040205
-static char *pmix_getline(FILE *fp)
-{
-    char *ret, *buff;
-    char input[1024];
-
-    ret = fgets(input, 1024, fp);
-    if (NULL != ret) {
-        input[strlen(input) - 1] = '\0'; /* remove newline */
-        buff = strdup(input);
-        return buff;
-    }
-
-    return NULL;
-}
-#endif
 
 /*
  * Local variable
@@ -569,12 +552,12 @@ static int file_parse(const char *affinity_file)
         }
 
         if (NULL != sep) {
-            cpus = PMIX_ARGV_SPLIT_COMPAT(sep, ',');
+            cpus = PMIx_Argv_split(sep, ',');
             for(i = 0; NULL != cpus[i]; ++i) {
                 // get the specified object
                 obj = hwloc_get_pu_obj_by_os_index(nptr->topology->topo, strtol(cpus[i], NULL, 10)) ;
                 if (NULL == obj) {
-                    PMIX_ARGV_FREE_COMPAT(cpus);
+                    PMIx_Argv_free(cpus);
                     fclose(fp);
                     free(hstname);
                     return PRTE_ERROR;
@@ -584,8 +567,8 @@ static int file_parse(const char *affinity_file)
                 cpus[i] = (char*)malloc(sizeof(char) * 10);
                 snprintf(cpus[i], 10, "%d", obj->logical_index);
             }
-            sep = PMIX_ARGV_JOIN_COMPAT(cpus, ',');
-            PMIX_ARGV_FREE_COMPAT(cpus);
+            sep = PMIx_Argv_join(cpus, ',');
+            PMIx_Argv_free(cpus);
             pmix_output_verbose(20, prte_rmaps_base_framework.framework_output,
                                 "mca:rmaps:lsf: (lsf) Convert Physical CPUSET to   <%s>", sep);
         }

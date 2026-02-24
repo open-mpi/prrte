@@ -225,16 +225,6 @@ int prun(int argc, char *argv[])
         personality = schizo->name;
     }
 
-    /* Register all global MCA Params */
-    if (PRTE_SUCCESS != (rc = prte_register_params())) {
-        if (PRTE_ERR_SILENT != rc) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
-                           "prte register params",
-                           PRTE_ERROR_NAME(rc), rc);
-        }
-        return 1;
-    }
-
     /* parse the input argv to get values, including everyone's MCA params */
     PMIX_CONSTRUCT(&results, pmix_cli_result_t);
     // check for special case of executable immediately following tool
@@ -321,16 +311,16 @@ int prun(int argc, char *argv[])
         while (NULL != (param = pmix_getline(fp))) {
             if (!first) {
                 // add a colon delimiter
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&pargv, ":");
+                PMIx_Argv_append_nosize(&pargv, ":");
                 ++pargc;
             }
             // break the line down into parts
-            split = PMIX_ARGV_SPLIT_COMPAT(param, ' ');
+            split = PMIx_Argv_split(param, ' ');
             for (n=0; NULL != split[n]; n++) {
-                PMIX_ARGV_APPEND_NOSIZE_COMPAT(&pargv, split[n]);
+                PMIx_Argv_append_nosize(&pargv, split[n]);
                 ++pargc;
             }
-            PMIX_ARGV_FREE_COMPAT(split);
+            PMIx_Argv_free(split);
             first = false;
         }
         fclose(fp);

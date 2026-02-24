@@ -15,7 +15,7 @@
  * Copyright (c) 2018      Research Organization for Information Science
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * Copyright (c) 2023      Advanced Micro Devices, Inc. All rights reserved.
  * $COPYRIGHT$
  *
@@ -59,23 +59,6 @@
 
 #include "src/mca/ras/base/base.h"
 
-#if PMIX_NUMERIC_VERSION < 0x00040205
-static char *pmix_getline(FILE *fp)
-{
-    char *ret, *buff;
-    char input[1024];
-
-    ret = fgets(input, 1024, fp);
-    if (NULL != ret) {
-        input[strlen(input) - 1] = '\0'; /* remove newline */
-        buff = strdup(input);
-        return buff;
-    }
-
-    return NULL;
-}
-#endif
-
 char *prte_ras_base_flag_string(prte_node_t *node)
 {
     char *tmp, *t3, **t2 = NULL;
@@ -86,28 +69,28 @@ char *prte_ras_base_flag_string(prte_node_t *node)
     }
 
     if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_DAEMON_LAUNCHED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&t2, "DAEMON_LAUNCHED");
+        PMIx_Argv_append_nosize(&t2, "DAEMON_LAUNCHED");
     }
     if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_LOC_VERIFIED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&t2, "LOCATION_VERIFIED");
+        PMIx_Argv_append_nosize(&t2, "LOCATION_VERIFIED");
     }
     if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_OVERSUBSCRIBED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&t2, "OVERSUBSCRIBED");
+        PMIx_Argv_append_nosize(&t2, "OVERSUBSCRIBED");
     }
     if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_MAPPED)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&t2, "MAPPED");
+        PMIx_Argv_append_nosize(&t2, "MAPPED");
     }
     if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&t2, "SLOTS_GIVEN");
+        PMIx_Argv_append_nosize(&t2, "SLOTS_GIVEN");
     }
     if (PRTE_FLAG_TEST(node, PRTE_NODE_NON_USABLE)) {
-        PMIX_ARGV_APPEND_NOSIZE_COMPAT(&t2, "NONUSABLE");
+        PMIx_Argv_append_nosize(&t2, "NONUSABLE");
     }
     if (NULL != t2) {
-        t3 = PMIX_ARGV_JOIN_COMPAT(t2, ':');
+        t3 = PMIx_Argv_join(t2, ':');
         pmix_asprintf(&tmp, "Flags: %s", t3);
         free(t3);
-        PMIX_ARGV_FREE_COMPAT(t2);
+        PMIx_Argv_free(t2);
     } else {
         tmp = strdup("Flags: NONE");
     }
@@ -157,7 +140,7 @@ void prte_ras_base_display_alloc(prte_job_t *jdata)
             flgs = prte_ras_base_flag_string(alloc);
             /* build the aliases string */
             if (NULL != alloc->aliases) {
-                aliases = PMIX_ARGV_JOIN_COMPAT(alloc->aliases, ',');
+                aliases = PMIx_Argv_join(alloc->aliases, ',');
             } else {
                 aliases = NULL;
             }
@@ -297,7 +280,7 @@ void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist)
         return;
     }
 
-    nodes = PMIX_ARGV_SPLIT_COMPAT(nodelist, ';');
+    nodes = PMIx_Argv_split(nodelist, ';');
     for (j=0; NULL != nodes[j]; j++) {
         moveon = false;
         for (i=0; i < prte_node_pool->size && !moveon; i++) {
@@ -323,7 +306,7 @@ void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist)
             }
         }
     }
-    PMIX_ARGV_FREE_COMPAT(nodes);
+    PMIx_Argv_free(nodes);
 }
 
 
@@ -452,11 +435,11 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
                 if (prte_keep_fqdn_hostnames) {
                     /* retain the non-fqdn name as an alias */
                     *ptr = '\0';
-                    PMIX_ARGV_APPEND_UNIQUE_COMPAT(&node->aliases, node->name);
+                    PMIx_Argv_append_unique_nosize(&node->aliases, node->name);
                     *ptr = '.';
                 } else {
                     /* add the fqdn name as an alias */
-                    PMIX_ARGV_APPEND_UNIQUE_COMPAT(&node->aliases, node->name);
+                    PMIx_Argv_append_unique_nosize(&node->aliases, node->name);
                     /* retain the non-fqdn name as the node's name */
                     *ptr = '\0';
                 }
@@ -609,11 +592,11 @@ parsehostfile:
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), hosts));
 
             /* hostfile was specified - parse it and add it to the list */
-            hostlist = PMIX_ARGV_SPLIT_COMPAT(hosts, ',');
+            hostlist = PMIx_Argv_split(hosts, ',');
             free(hosts);
             for (j=0; NULL != hostlist[j]; j++) {
                 if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(&nodes, hostlist[j]))) {
-                    PMIX_ARGV_FREE_COMPAT(hostlist);
+                    PMIx_Argv_free(hostlist);
                     PMIX_DESTRUCT(&nodes);
                     /* set an error event */
                     PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
@@ -621,7 +604,7 @@ parsehostfile:
                     return;
                 }
             }
-            PMIX_ARGV_FREE_COMPAT(hostlist);
+            PMIx_Argv_free(hostlist);
         }
     }
 
@@ -748,7 +731,7 @@ next_state:
     hosts = NULL;
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_TOPO, (void**)&hosts, PMIX_STRING)) {
         if (NULL != hosts) {
-            hostlist = PMIX_ARGV_SPLIT_COMPAT(hosts, ';');
+            hostlist = PMIx_Argv_split(hosts, ';');
             free(hosts);
             for (j=0; NULL != hostlist[j]; j++) {
                 node = prte_node_match(NULL, hostlist[j]);
@@ -764,7 +747,7 @@ next_state:
                 pmix_output(prte_clean_output,
                             "=================================================================\n");
             }
-            PMIX_ARGV_FREE_COMPAT(hostlist);
+            PMIx_Argv_free(hostlist);
         } else {
             for (j=0; j < prte_node_pool->size; j++) {
                 node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, j);
@@ -912,7 +895,7 @@ proceed:
 
             prte_remove_attribute(&app->attributes, PRTE_APP_ADD_HOSTFILE);
 
-            hostfiles = PMIX_ARGV_SPLIT_COMPAT(hosts, ',');
+            hostfiles = PMIx_Argv_split(hosts, ',');
             free(hosts);
 
             for (k=0; NULL != hostfiles[k]; k++) {
@@ -923,7 +906,7 @@ proceed:
                 fp = fopen(hostfiles[k], "r");
                 if (NULL == fp) {
                     pmix_show_help("help-ras-base.txt", "ras-base:addhost-not-found", true, hostfiles[k]);
-                    PMIX_ARGV_FREE_COMPAT(hostfiles);
+                    PMIx_Argv_free(hostfiles);
                     PMIX_LIST_DESTRUCT(&nodes);
                     return PRTE_ERR_SILENT;
                 }
@@ -976,7 +959,7 @@ proceed:
                         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
                         fclose(fp);
                         free(line);
-                        PMIX_ARGV_FREE_COMPAT(hostfiles);
+                        PMIx_Argv_free(hostfiles);
                         PMIX_LIST_DESTRUCT(&nodes);
                         return PRTE_ERR_SILENT;
                     }
@@ -1041,7 +1024,7 @@ proceed:
                 }
                 fclose(fp);
             }
-            PMIX_ARGV_FREE_COMPAT(hostfiles);
+            PMIx_Argv_free(hostfiles);
         }
     }
     if (!pmix_list_is_empty(&nodes)) {

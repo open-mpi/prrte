@@ -3,7 +3,7 @@
 ompi-prted
 ==========
 
-ompi-prted |mdash| helper daemon for PRRTE
+ompi-prte |mdash| heler daemon for PRRTE
 
 SYNOPSIS
 --------
@@ -12,11 +12,12 @@ SYNOPSIS
 
    shell$ ompi-prted ...options...
 
+
 DESCRIPTION
 -----------
 
-``ompi-prted`` is the back end helper daemon for PMIx Reference Runtime
-Environment (PRRTE).
+``ompi-prted`` is the back end helper daemon for Open MPI version of the
+PMIx Reference Runtime Environment (PRRTE).
 
 Extensive help documentation for this command is provided through
 ``ompi-prted --help [topic]``.
