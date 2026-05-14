@@ -128,33 +128,6 @@ static bool node_regex_waiting = false;
 static char *prte_parent_uri = NULL;
 static pmix_cli_result_t results;
 
-typedef struct {
-    prte_pmix_lock_t lock;
-    pmix_info_t *info;
-    size_t ninfo;
-} myxfer_t;
-
-static void infocbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo, void *cbdata,
-                       pmix_release_cbfunc_t release_fn, void *release_cbdata)
-{
-    myxfer_t *xfer = (myxfer_t *) cbdata;
-    size_t n;
-    PRTE_HIDE_UNUSED_PARAMS(status);
-
-    if (NULL != info) {
-        xfer->ninfo = ninfo;
-        PMIX_INFO_CREATE(xfer->info, xfer->ninfo);
-        for (n = 0; n < ninfo; n++) {
-            PMIX_INFO_XFER(&xfer->info[n], &info[n]);
-        }
-    }
-
-    if (NULL != release_fn) {
-        release_fn(release_cbdata);
-    }
-    PRTE_PMIX_WAKEUP_THREAD(&xfer->lock);
-}
-
 static int wait_pipe[2];
 
 static int wait_dvm(pid_t pid)
@@ -187,10 +160,8 @@ int main(int argc, char *argv[])
     pmix_value_t val;
     pmix_proc_t proc;
     pmix_status_t prc;
-    myxfer_t xfer;
-    pmix_data_buffer_t pbuf, *wbuf;
+    pmix_data_buffer_t *wbuf;
     pmix_byte_object_t pbo;
-    int8_t flag;
     char **nonlocal, *aliases, *personality;
     int n;
     pmix_value_t *vptr;
@@ -199,6 +170,9 @@ int main(int argc, char *argv[])
     prte_schizo_base_module_t *schizo;
     pmix_cli_item_t *opt;
     prte_job_t *jdata;
+    pmix_data_buffer_t data;
+    pmix_topology_t ptopo;
+    bool compressed;
 
     char *umask_str = getenv("PRTE_DAEMON_UMASK_VALUE");
     if (NULL != umask_str) {
@@ -233,11 +207,6 @@ int main(int argc, char *argv[])
             0 != strncmp(environ[i], "PRTE_", 5)) {
             PMIx_Argv_append_nosize(&prte_launch_environ, environ[i]);
         }
-    }
-
-    ret = prte_init_minimum();
-    if (PRTE_SUCCESS != ret) {
-        return ret;
     }
 
     /* we always need the prrte and pmix params */
@@ -329,9 +298,9 @@ int main(int argc, char *argv[])
         prte_leave_session_attached = true;
     }
 
-    // check for hetero nodes
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_HETERO_NODES)) {
-        prte_hetero_nodes = true;
+    // check for homo nodes
+    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_HOMO_NODES)) {
+        prte_homo_nodes = true;
     }
 
     /* if prte_daemon_debug is set, let someone know we are alive right
@@ -370,6 +339,7 @@ int main(int argc, char *argv[])
     if (pmix_cmd_line_is_taken(&results, PRTE_CLI_BOOTSTRAP)) {
         /* fill in our procID and other information
          * from the configuration file */
+        prte_bootstrap_setup = true;
         ret = prte_ess_base_bootstrap();
         if (PRTE_SUCCESS != ret) {
             return ret;
@@ -600,19 +570,9 @@ int main(int argc, char *argv[])
         PMIX_DATA_BUFFER_RELEASE(buffer);
         goto DONE;
     }
-    prc = PMIx_Data_pack(NULL, buffer, &prte_topo_signature, 1, PMIX_STRING);
-    if (PMIX_SUCCESS != prc) {
-        PMIX_ERROR_LOG(prc);
-        PMIX_DATA_BUFFER_RELEASE(buffer);
-        goto DONE;
-    }
 
-    /* if we are rank=1 or designated as having hetero node, then send our
-     * topology back - otherwise, prte will request it if necessary */
-    if (1 == PRTE_PROC_MY_NAME->rank || prte_hetero_nodes) {
-        pmix_data_buffer_t data;
-        pmix_topology_t ptopo;
-        bool compressed;
+    if (!prte_homo_nodes || 1 == PRTE_PROC_MY_NAME->rank) {
+        /* send our topology back */
 
         /* setup an intermediate buffer */
         PMIX_DATA_BUFFER_CONSTRUCT(&data);
@@ -656,65 +616,6 @@ int main(int argc, char *argv[])
         PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
     }
 
-    /* collect our network inventory */
-    memset(&xfer, 0, sizeof(myxfer_t));
-    PRTE_PMIX_CONSTRUCT_LOCK(&xfer.lock);
-    if (PMIX_SUCCESS != (prc = PMIx_server_collect_inventory(NULL, 0, infocbfunc, &xfer))) {
-        PMIX_ERROR_LOG(prc);
-        ret = PRTE_ERR_NOT_SUPPORTED;
-        goto DONE;
-    }
-    PRTE_PMIX_WAIT_THREAD(&xfer.lock);
-    if (NULL != xfer.info) {
-        /* pack a flag indicating that the inventory is included */
-        flag = 1;
-        prc = PMIx_Data_pack(NULL, buffer, &flag, 1, PMIX_INT8);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            goto DONE;
-        }
-        PMIX_DATA_BUFFER_CONSTRUCT(&pbuf);
-        if (PMIX_SUCCESS != (prc = PMIx_Data_pack(NULL, &pbuf, &xfer.ninfo, 1, PMIX_SIZE))) {
-            PMIX_ERROR_LOG(prc);
-            ret = PRTE_ERROR;
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        if (PMIX_SUCCESS != (prc = PMIx_Data_pack(NULL, &pbuf, xfer.info, xfer.ninfo, PMIX_INFO))) {
-            PMIX_ERROR_LOG(prc);
-            ret = PRTE_ERROR;
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        prc = PMIx_Data_unload(&pbuf, &pbo);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        prc = PMIx_Data_pack(NULL, buffer, &pbo, 1, PMIX_BYTE_OBJECT);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-            goto DONE;
-        }
-        PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-    } else {
-        /* pack a flag indicating no inventory was provided */
-        flag = 0;
-        prc = PMIx_Data_pack(NULL, buffer, &flag, 1, PMIX_INT8);
-        if (PMIX_SUCCESS != prc) {
-            PMIX_ERROR_LOG(prc);
-            PMIX_DATA_BUFFER_RELEASE(buffer);
-            goto DONE;
-        }
-    }
-
     if (pmix_cmd_line_is_taken(&results, PRTE_CLI_TREE_SPAWN)) {
         /* if we are tree-spawning, start by sending it to ourselves */
         PRTE_RML_SEND(ret, PRTE_PROC_MY_NAME->rank, buffer, PRTE_RML_TAG_PRTED_CALLBACK);
@@ -725,7 +626,7 @@ int main(int argc, char *argv[])
         }
     } else {
         /* send it to the HNP */
-        PRTE_RML_SEND(ret, PRTE_PROC_MY_HNP->rank, buffer, PRTE_RML_TAG_PRTED_CALLBACK);
+        PRTE_RML_RELIABLE_SEND(ret, PRTE_PROC_MY_HNP->rank, buffer, PRTE_RML_TAG_PRTED_CALLBACK);
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             PMIX_DATA_BUFFER_RELEASE(buffer);
@@ -909,7 +810,7 @@ static void report_prted(void)
     int nreqd, ret;
 
     /* get the number of children */
-    nreqd = pmix_list_get_size(&prte_rml_base.children) + 1;
+    nreqd = prte_rml_base.n_children + 1;
     if (nreqd == ncollected && NULL != mybucket && !node_regex_waiting) {
         /* add the collection of our children's buckets to ours */
         ret = PMIx_Data_copy_payload(mybucket, bucket);
