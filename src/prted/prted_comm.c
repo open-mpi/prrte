@@ -390,7 +390,7 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         // ensure daemons know we were ordered to terminate
         prte_prteds_term_ordered = true;
         /* if all my routes and local children are gone, then terminate ourselves */
-        if (0 == (ret = pmix_list_get_size(&prte_rml_base.children))) {
+        if (0 == (ret = prte_rml_base.n_children)) {
             for (i = 0; i < prte_local_children->size; i++) {
                 proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
                 if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
@@ -446,7 +446,7 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         prte_prteds_term_ordered = true;
         if (PRTE_PROC_IS_MASTER) {
             /* if all my routes and local children are gone, then terminate ourselves */
-            if (0 == pmix_list_get_size(&prte_rml_base.children)) {
+            if (0 == prte_rml_base.n_children) {
                 for (i = 0; i < prte_local_children->size; i++) {
                     proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
                     if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
@@ -610,7 +610,7 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
             free(gstack_exec);
         }
         /* always send our response */
-        PRTE_RML_SEND(ret, PRTE_PROC_MY_HNP->rank, answer, PRTE_RML_TAG_STACK_TRACE);
+        PRTE_RML_RELIABLE_SEND(ret, PRTE_PROC_MY_HNP->rank, answer, PRTE_RML_TAG_STACK_TRACE);
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             PMIX_DATA_BUFFER_RELEASE(answer);

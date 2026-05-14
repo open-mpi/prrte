@@ -209,11 +209,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    ret = prte_init_minimum();
-    if (PRTE_SUCCESS != ret) {
-        return ret;
-    }
-
     /* we always need the prrte and pmix params */
     ret = prte_schizo_base_parse_prte(pargc, 0, pargv, NULL);
     if (PRTE_SUCCESS != ret) {
@@ -631,7 +626,7 @@ int main(int argc, char *argv[])
         }
     } else {
         /* send it to the HNP */
-        PRTE_RML_SEND(ret, PRTE_PROC_MY_HNP->rank, buffer, PRTE_RML_TAG_PRTED_CALLBACK);
+        PRTE_RML_RELIABLE_SEND(ret, PRTE_PROC_MY_HNP->rank, buffer, PRTE_RML_TAG_PRTED_CALLBACK);
         if (PRTE_SUCCESS != ret) {
             PRTE_ERROR_LOG(ret);
             PMIX_DATA_BUFFER_RELEASE(buffer);
@@ -815,7 +810,7 @@ static void report_prted(void)
     int nreqd, ret;
 
     /* get the number of children */
-    nreqd = pmix_list_get_size(&prte_rml_base.children) + 1;
+    nreqd = prte_rml_base.n_children + 1;
     if (nreqd == ncollected && NULL != mybucket && !node_regex_waiting) {
         /* add the collection of our children's buckets to ours */
         ret = PMIx_Data_copy_payload(mybucket, bucket);
