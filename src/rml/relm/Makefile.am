@@ -1,5 +1,6 @@
 #
 # Copyright (c) 2026      Sandia National Laboratories  All rights reserved.
+# Copyright (c) 2026      Triad National Security, LLC.  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -13,7 +14,7 @@ headers += \
       rml/relm/types.h \
       rml/relm/util.h
 
-libprrte_la_SOURCES += \
+lib@PRTE_BINARY_PREFIX@prrte_la_SOURCES += \
       rml/relm/relm.c \
       rml/relm/state_machine.c \
       rml/relm/types.c \
