@@ -292,7 +292,7 @@ static void track_jobs(int fd, short argc, void *cbdata)
 
     if (NULL != alert) {
         /* send it */
-        PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
+        PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(alert);
@@ -426,7 +426,7 @@ static void track_procs(int fd, short argc, void *cbdata)
                 }
             }
             /* send it */
-            PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
+            PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
             if (PRTE_SUCCESS != rc) {
                 PRTE_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
@@ -478,8 +478,7 @@ static void track_procs(int fd, short argc, void *cbdata)
          * gone, then terminate ourselves IF no local procs
          * remain (might be some from another job)
          */
-        if (prte_prteds_term_ordered &&
-            0 == pmix_list_get_size(&prte_rml_base.children)) {
+        if (prte_prteds_term_ordered && 0 == prte_rml_base.n_children) {
             for (i = 0; i < prte_local_children->size; i++) {
                 pdata = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
                 if (NULL != pdata && PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_ALIVE)) {
@@ -521,7 +520,7 @@ static void track_procs(int fd, short argc, void *cbdata)
                                  "%s state:prted: SENDING JOB LOCAL TERMINATION UPDATE FOR JOB %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  PRTE_JOBID_PRINT(jdata->nspace)));
-            PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
+            PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
             if (PRTE_SUCCESS != rc) {
                 PRTE_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
