@@ -303,15 +303,6 @@ int prte(int argc, char *argv[])
         }
     }
 
-    /* do a minimal setup of key infrastructure, including
-     * parsing the install-level and user-level PRRTE param
-     * files
-     */
-    rc = prte_init_minimum();
-    if (PRTE_SUCCESS != rc) {
-        return rc;
-    }
-
     /* because we have to use the schizo framework and init our hostname
      * prior to parsing the incoming argv for cmd line options, do a hacky
      * search to support passing of impacted options (e.g., verbosity for schizo) */
@@ -534,6 +525,12 @@ int prte(int argc, char *argv[])
         schizo->allow_run_as_root(&results); // will exit us if not allowed
     }
 
+    /* check for bootstrap operation */
+    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_BOOTSTRAP)) {
+        /* flag that allocation is read from config file */
+        prte_bootstrap_setup = true;
+    }
+
     // check for an appfile
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_APPFILE);
     if (NULL != opt) {
@@ -655,9 +652,9 @@ int prte(int argc, char *argv[])
         prte_leave_session_attached = true;
     }
 
-    // check for hetero nodes
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_HETERO_NODES)) {
-        prte_hetero_nodes = true;
+    // check for homo nodes
+    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_HOMO_NODES)) {
+        prte_homo_nodes = true;
     }
 
     /* detach from controlling terminal

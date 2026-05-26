@@ -599,7 +599,7 @@ static void _toolconn(int sd, short args, void *cbdata)
     }
 
     /* send it to the HNP for processing - might be myself! */
-    PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank,
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank,
                   buf, PRTE_RML_TAG_PLM);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
@@ -792,7 +792,7 @@ static void process_log(int sd, short args, void *cbdata)
     }
 
     /* send the result to the HNP */
-    PRTE_RML_SEND(rc, PRTE_PROC_MY_HNP->rank, buf,
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, buf,
                   PRTE_RML_TAG_LOGGING);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
