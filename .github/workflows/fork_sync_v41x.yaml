@@ -1,0 +1,24 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '* 14 * * *' # every day at 14 hours
+  workflow_dispatch: # on button click
+
+jobs:
+  sync:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: tgymnich/fork-sync@v1.8
+        with:
+          owner: openpmix
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: v4.1
+          head: v4.1
+          auto_merge: false
+          auto_approve: false
+          ignore_fail: true
+
+          
