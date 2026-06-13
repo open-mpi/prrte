@@ -36,8 +36,9 @@
 #include "src/mca/ras/base/base.h"
 #include "src/mca/ras/ras.h"
 
-#define PRTE_SLURM_ERR_STR_MAX_SIZE 256
+#define PRTE_SLURM_ERR_STR_MAX_LEN 256
 #define PRTE_SLURM_JOB_ID_MAX_LEN 20
+#define PRTE_SLURM_HOSTNAME_MAX_LEN 256
 
 /* Markers to indicate a given Slurm JSON-format number is set or infinite */
 #define PRTE_SLURM_UNSET_NUM_MARKER "prte_slurm_unset"
@@ -51,20 +52,32 @@ bool prte_ras_slurm_have_jansson(void);
 /* Features requiring JSON parser */
 int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
 int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list);
+int prte_ras_slurm_detach_nodes(const char *slurm_jobid, prte_session_t *session, pmix_pointer_array_t *removed_nodes);
 int prte_ras_slurm_check_resources(const char *slurm_jobid);
 
-/* Features to serve request extension */
+/* Features to serve cancel requests */
+int prte_ras_slurm_add_pending_req(const char *request_id, const char *slurm_job_id);
+int prte_ras_slurm_remove_pending_req(const char *request_id);
+bool prte_ras_slurm_pending_req_exists(const char *request_id);
+int prte_ras_slurm_cancel_pending_req(const char *request_id);
+int prte_ras_slurm_modify_cancel_init(void);
+int prte_ras_slurm_modify_cancel_finalize(void);
+int prte_ras_slurm_serve_cancel_req(prte_pmix_server_req_t *req);
+
+/* Features to serve extension requests */
 int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req);
 
-/* Features to serve request release */
+/* Features to serve release requests */
 int prte_ras_slurm_serve_release_req(prte_pmix_server_req_t *req);
 
 /* Common modify extend/release features */
-int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg);
+int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg, size_t err_msg_size);
 int prte_ras_slurm_token_has_control_chars(const char *s, size_t len, bool *has_control_chars);
+int prte_ras_slurm_drain_cmd_output(FILE *fp, char *output, size_t output_size);
 
 /* Common features for the module */
 int prte_ras_slurm_validate_jobid(const char *slurm_jobid);
+int prte_ras_slurm_validate_hostname(const char *hostname);
 int prte_ras_slurm_convert_jobid(const char *slurm_jobid, uint32_t *slurm_jobid_numeric);
 int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid, pmix_list_t *node_list);
 int prte_ras_slurm_tag_node_allocation(const char *slurm_jobid, pmix_list_t *node_list);
@@ -131,6 +144,19 @@ enum record_job_data_field {
     PRTE_JOB_DATA_JOB_ID,
     PRTE_JOB_DATA_COUNT
 };
+
+/* Stack item type for our session stack */
+
+typedef struct {
+    pmix_list_item_t super;
+    prte_session_t *session;
+    int nodes_in_session;
+} prte_session_stack_item_t;
+PMIX_CLASS_DECLARATION(prte_session_stack_item_t);
+
+/* Stack to keep track of our Slurm allocations in LIFO order */
+
+extern pmix_list_t *prte_slurm_session_stack;
 
 END_C_DECLS
 

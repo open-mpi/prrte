@@ -86,6 +86,13 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
 static int prte_ras_slurm_parse_ranges(char *base, char *ranges, char ***nodelist);
 static int prte_ras_slurm_parse_range(char *base, char *range, char ***nodelist);
 
+pmix_list_t *prte_slurm_session_stack = NULL;
+
+PMIX_CLASS_INSTANCE(prte_session_stack_item_t,
+                    pmix_list_item_t,
+                    NULL,
+                    NULL);
+
 static bool check_taint(char *name, char *evar)
 {
     int n;
@@ -104,7 +111,29 @@ static bool check_taint(char *name, char *evar)
 /* init the module */
 static int init(void)
 {
-    return PRTE_SUCCESS;
+    int err = PRTE_SUCCESS;
+
+    prte_slurm_session_stack = PMIX_NEW(pmix_list_t);
+
+    if(NULL == prte_slurm_session_stack) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    err = prte_ras_slurm_modify_cancel_init();
+    if (PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+cleanup:
+
+    if (PRTE_SUCCESS != err) {
+        PMIX_RELEASE(prte_slurm_session_stack);
+        prte_slurm_session_stack = NULL;
+    }
+
+    return err;
 }
 
 /**
@@ -253,23 +282,33 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
     int err = PRTE_SUCCESS;
 
     if(PMIX_ALLOC_EXTEND == req->allocdir) {
-
-       err = prte_ras_slurm_serve_extend_req(req);
-
+        err = prte_ras_slurm_serve_extend_req(req);
+        req->pstatus = prte_pmix_convert_rc(err);
     } else if(PMIX_ALLOC_RELEASE == req->allocdir) {
-
         err = prte_ras_slurm_serve_release_req(req);
-
-        req->status = PMIX_ERR_NOT_SUPPORTED;
-        return PMIX_ERR_NOT_SUPPORTED;;
+        req->pstatus = prte_pmix_convert_rc(err);
+    } else if(PMIX_ALLOC_REQ_CANCEL == req->allocdir) {
+        err = prte_ras_slurm_serve_cancel_req(req);
+        req->pstatus = prte_pmix_convert_rc(err);
+    } else {
+        req->pstatus = PMIX_ERR_NOT_SUPPORTED;
     }
 
-    req->pstatus = prte_pmix_convert_rc(err);
+    /* Success at this stage means the request was served atomically.
+    * Return PMIX_OPERATION_SUCCEEDED so the RAS base completes the
+    * request instead of waiting for an asynchronous callback.
+    */
+    if (PMIX_SUCCESS == req->pstatus) {
+        return PMIX_OPERATION_SUCCEEDED;
+    }
+
     return req->pstatus;
 }
 
 static int prte_ras_slurm_finalize(void)
 {
+    prte_ras_slurm_modify_cancel_finalize();
+    PMIX_RELEASE(prte_slurm_session_stack);
     return PRTE_SUCCESS;
 }
 
@@ -665,6 +704,40 @@ int prte_ras_slurm_validate_jobid(const char *slurm_jobid) {
 }
 
 /*
+ * Validate that a Slurm hostname does not contain unexpected characters.
+ *
+ * A valid Slurm hostname must be non-NULL, non-empty, must not exceed
+ * PRTE_SLURM_HOSTNAME_MAX_LEN characters, and may contain only characters
+ * from a restricted allowlist.
+ *
+ * @param[in] hostname  Null-terminated Slurm hostname string to validate.
+ */
+int prte_ras_slurm_validate_hostname(const char *hostname)
+{
+    if (NULL == hostname) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    size_t len = strnlen(hostname, PRTE_SLURM_HOSTNAME_MAX_LEN + 1);
+    if (0 == len || len > PRTE_SLURM_HOSTNAME_MAX_LEN) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char) hostname[i];
+
+        if (!(isalnum(c) ||
+              c == '-' || c == '_' || c == '.' ||
+              c == '+' || c == ':' || c == '@' ||
+              c == '%' || c == '=')) {
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+
+    return PRTE_SUCCESS;
+}
+
+/*
  * Convert a Slurm job ID string to uint32_t.
  *
  * Expects a strictly decimal, non-negative string.
@@ -703,7 +776,7 @@ int prte_ras_slurm_convert_jobid(const char *slurm_jobid, uint32_t *slurm_jobid_
  *
  * Creates a new prte_session_t using slurm_jobid as the session ID,
  * associates the nodes in node_list with the session, and adds it to
- * the global session table.
+ * the global session table and the internal session tracker list.
  * 
  * @note Nodes in the list are duplicates of the originals
  *
@@ -719,6 +792,7 @@ int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_
     }
 
     int err = PRTE_SUCCESS;
+    int pmix_err = PMIX_SUCCESS;
 
     err = prte_ras_slurm_validate_jobid(slurm_jobid);
 
@@ -788,10 +862,9 @@ int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_
             goto cleanup;
         }
 
-        int idx = pmix_pointer_array_add(session->nodes, node_cpy);
-        if (0 > idx) {
-            /* Negative returned idx indicates PMIX error */
-            err = prte_pmix_convert_status(idx);
+        pmix_err = pmix_pointer_array_add(session->nodes, node_cpy);
+        if (0 > pmix_err) {
+            err = prte_pmix_convert_status(pmix_err);
             PMIX_RELEASE(node);
             PRTE_ERROR_LOG(err);
             goto cleanup;
@@ -803,6 +876,19 @@ int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
+
+    prte_session_stack_item_t *item = PMIX_NEW(prte_session_stack_item_t);
+
+    if(NULL == item) {
+        err = PRTE_ERR_OUT_OF_RESOURCE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    item->session = session;
+    item->nodes_in_session = pmix_list_get_size(node_list);
+
+    pmix_list_append(prte_slurm_session_stack, &item->super);
 
     cleanup:
 
