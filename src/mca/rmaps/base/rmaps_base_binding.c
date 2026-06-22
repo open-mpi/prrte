@@ -113,7 +113,12 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
         hwloc_bitmap_and(prte_rmaps_base.available, node->available, tmpcpus);
         hwloc_bitmap_and(prte_rmaps_base.available, prte_rmaps_base.available, prte_rmaps_base.baseset);
 
-        if (options->use_hwthreads) {
+        if (options->use_hwthreads || HWLOC_OBJ_PU == options->hwb) {
+            /* count available hwthreads when treating them as cpus, or when
+             * the binding target itself is a hwthread - a single PU is finer
+             * than a core, so counting whole cores "inside" it would yield
+             * zero on an SMT topology and wrongly reject every PU
+             */
             ncpus = hwloc_bitmap_weight(prte_rmaps_base.available);
         } else {
             /* if we are treating cores as cpus, then we really
@@ -136,6 +141,49 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
         }
     }
     if (NULL == trg_obj) {
+        /* None of the candidate objects has a free CPU. If overload binding
+         * is permitted, this is not an error: the node is oversubscribed -
+         * typically because another still-running job (e.g., the parent of a
+         * PMIx_Spawn) already consumed the CPUs - and the caller has
+         * explicitly accepted binding more procs to a CPU than there are
+         * CPUs. Pick a target object by round-robin (the one carrying the
+         * fewest procs from this pass) and bind to it anyway. We deliberately
+         * do not consume node->available here: those CPUs remain accounted to
+         * whatever job holds them, so a later job that does not allow overload
+         * still sees the node as full and is not bound on top of them. */
+        if (options->overload) {
+            unsigned least = 0;
+            for (n = 0; n < nobjs; n++) {
+                tmp_obj = prte_hwloc_base_get_obj_by_type(node->topology->topo,
+                                                          options->hwb, n);
+                if (NULL == tmp_obj) {
+                    continue;
+                }
+                if (NULL == tmp_obj->userdata) {
+                    objcnt = PMIX_NEW(prte_hwloc_obj_data_t);
+                    tmp_obj->userdata = (void *) objcnt;
+                } else {
+                    objcnt = (prte_hwloc_obj_data_t *) tmp_obj->userdata;
+                }
+                if (NULL == trg_obj || objcnt->nprocs < least) {
+                    least = objcnt->nprocs;
+                    trg_obj = tmp_obj;
+                }
+            }
+            if (NULL == trg_obj) {
+                PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                return PRTE_ERR_SILENT;
+            }
+            objcnt = (prte_hwloc_obj_data_t *) trg_obj->userdata;
+            objcnt->nprocs++;
+            hwloc_bitmap_list_asprintf(&proc->cpuset, trg_obj->cpuset);
+            pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
+                                "%s BOUND PROC %s[%s] TO %s (overloaded)",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                PRTE_NAME_PRINT(&proc->name), node->name,
+                                (NULL == proc->cpuset) ? "NULL" : proc->cpuset);
+            return PRTE_SUCCESS;
+        }
         /* there aren't any appropriate targets under this object */
         if (PRTE_BINDING_REQUIRED(jdata->map->binding)) {
             pmix_show_help("help-prte-rmaps-base.txt", "rmaps:no-available-cpus", true, node->name);
@@ -177,6 +225,17 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
     tmp_obj = hwloc_get_obj_inside_cpuset_by_type(node->topology->topo,
                                                   prte_rmaps_base.available,
                                                   type, 0);
+    if (NULL == tmp_obj && HWLOC_OBJ_CORE == type) {
+        /* the binding target is finer than a core (e.g. --bind-to hwthread
+         * while treating cores as cpus): the consumed core is not *inside*
+         * the target's cpuset, it *covers* it. Consume the containing core so
+         * the whole core is accounted for - one process per core. */
+        tmp_obj = hwloc_get_obj_covering_cpuset(node->topology->topo,
+                                                prte_rmaps_base.available);
+        while (NULL != tmp_obj && HWLOC_OBJ_CORE != tmp_obj->type) {
+            tmp_obj = tmp_obj->parent;
+        }
+    }
     if (NULL == tmp_obj) {
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
         if (PRTE_BINDING_REQUIRED(jdata->map->binding)) {

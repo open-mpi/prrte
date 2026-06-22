@@ -56,7 +56,10 @@ static int ppr_mapper(prte_job_t *jdata,
     pmix_list_t node_list;
     int32_t num_slots;
     char *jobppr = NULL;
-    bool initial_map = true;
+    /* see rmaps_rr.c: reset the per-node "mapped" flags only on the genuine
+     * first mapping pass so per-app dispatch (one entry per app) does not
+     * re-add nodes a previous app already placed in the job map */
+    bool initial_map = (0 == jdata->map->num_nodes);
     prte_binding_policy_t savebind = options->bind;
     uint16_t jobppn, jobpes;
 
@@ -390,13 +393,23 @@ static int ppr_mapper(prte_job_t *jdata,
             goto error;
         }
 
+        /* this app mapped successfully - the loop above can leave rc set to
+         * the per-node PRTE_ERR_TAKE_NEXT_OPTION "this node is full" signal
+         * returned by the final check_oversubscribed call, so clear it now to
+         * avoid leaking that as the mapper's overall result */
+        rc = PRTE_SUCCESS;
+
         jdata->num_procs += app->num_procs;
 
         PMIX_LIST_DESTRUCT(&node_list);
     }
     free(jobppr);
-    /* calculate the ranks for this app */
-    rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    /* calculate the ranks for this job - in per-app dispatch mode
+     * (app_idx >= 0) the base computes the vpids with the correct
+     * cross-app numbering, so skip it here to avoid colliding ranks */
+    if (options->app_idx < 0) {
+        rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    }
     return rc;
 
 error:

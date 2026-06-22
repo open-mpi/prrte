@@ -410,7 +410,7 @@ int prte_rmaps_rr_bycpu(prte_job_t *jdata, prte_app_context_t *app,
     }
 
     nprocs_mapped = 0;
-    savecpuset = strdup(options->cpuset);
+    savecpuset = (NULL != options->cpuset) ? strdup(options->cpuset) : NULL;
 
 pass:
     PMIX_LIST_FOREACH_SAFE(node, nd, node_list, prte_node_t)
@@ -509,7 +509,7 @@ pass:
                 hwloc_bitmap_free(options->job_cpuset);
                 options->job_cpuset = NULL;
             }
-            options->cpuset = strdup(savecpuset);
+            options->cpuset = (NULL != savecpuset) ? strdup(savecpuset) : NULL;
             if (NULL != savecpuset) {
                 free(savecpuset);
             }
@@ -526,7 +526,7 @@ pass:
         if (NULL != options->cpuset) {
             free(options->cpuset);
         }
-        options->cpuset = strdup(savecpuset);
+        options->cpuset = (NULL != savecpuset) ? strdup(savecpuset) : NULL;
     } // next node
 
     /* second pass: if we haven't mapped everyone yet, it is
@@ -553,7 +553,7 @@ pass:
         if (NULL != options->cpuset) {
             free(options->cpuset);
         }
-        options->cpuset = strdup(savecpuset);
+        options->cpuset = (NULL != savecpuset) ? strdup(savecpuset) : NULL;
         // Rescan the nodes
         second_pass = true;
         goto pass;
@@ -676,9 +676,19 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
                     break;
                 }
                 /* does this object have enough available cpus to
-                 * support the requested cpus_per_rank? */
+                 * support the requested cpus_per_rank? This only matters
+                 * when we are actually going to bind. If binding has been
+                 * turned off - e.g., because the node is oversubscribed and
+                 * the top-of-function check reset an unset binding policy to
+                 * BIND_TO_NONE - then a shortage of free cpus on the object
+                 * must not block placement. Otherwise a genuinely
+                 * oversubscribed node (whose cpus were already consumed by an
+                 * earlier job, such as the parent of a PMIx_Spawn) would be
+                 * wrongly rejected as overloaded and the unbound proc would
+                 * fail to map. */
                 ncpus = prte_rmaps_base_get_ncpus(node, obj, options);
-                if (ncpus < options->cpus_per_rank && !options->overload) {
+                if (PRTE_BIND_TO_NONE != options->bind &&
+                    ncpus < options->cpus_per_rank && !options->overload) {
                     outofcpus = true;
                     continue;
                 }

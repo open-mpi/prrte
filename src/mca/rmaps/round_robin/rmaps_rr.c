@@ -53,7 +53,12 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
     int32_t num_slots;
     int rc;
     pmix_mca_base_component_t *c = &prte_mca_rmaps_round_robin_component;
-    bool initial_map = true;
+    /* Reset the per-node "mapped" flags only on the genuine first mapping pass.
+     * In per-app dispatch this module is entered once per app context; treating
+     * each entry as an initial map would re-clear the flags on nodes a previous
+     * app already added, causing those nodes to be appended to the job map a
+     * second time.  An empty job map marks the true first pass. */
+    bool initial_map = (0 == jdata->map->num_nodes);
 
     /* this mapper can only handle initial launch
      * when rr mapping is desired - allow
@@ -165,8 +170,12 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
          */
         PMIX_LIST_DESTRUCT(&node_list);
     }
-    /* calculate the ranks for this job */
-    rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    /* calculate the ranks for this job - in per-app dispatch mode
+     * (app_idx >= 0) the base computes the vpids with the correct
+     * cross-app numbering, so skip it here to avoid colliding ranks */
+    if (options->app_idx < 0) {
+        rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    }
 
     return rc;
 

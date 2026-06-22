@@ -94,7 +94,10 @@ static int prte_rmaps_rf_map(prte_job_t *jdata,
     prte_proc_t *proc;
     pmix_mca_base_component_t *c = &prte_mca_rmaps_rank_file_component.super;
     char *slots = NULL;
-    bool initial_map = true;
+    /* see rmaps_rr.c: reset the per-node "mapped" flags only on the genuine
+     * first mapping pass so per-app dispatch (one entry per app) does not
+     * re-add nodes a previous app already placed in the job map */
+    bool initial_map = (0 == jdata->map->num_nodes);
     char *rankfile = NULL;
     char *affinity_file = NULL;
     hwloc_cpuset_t proc_bitmap, bitmap;
@@ -453,8 +456,12 @@ static int prte_rmaps_rf_map(prte_job_t *jdata,
     if (NULL != rankfile) {
         free(rankfile);
     }
-    /* compute local/app ranks */
-    rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    /* compute local/app ranks - in per-app dispatch mode (app_idx >= 0)
+     * the base computes the ranks with the correct cross-app numbering,
+     * so skip it here */
+    if (options->app_idx < 0) {
+        rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    }
     return rc;
 
 error:
