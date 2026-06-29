@@ -45,6 +45,9 @@
 #include <pmix_server.h>
 #include <signal.h>
 #include <time.h>
+#ifdef HAVE_SYS_PTRACE_H
+#    include <sys/ptrace.h>
+#endif
 
 #include "prte_stdint.h"
 #include "src/hwloc/hwloc-internal.h"
@@ -1541,12 +1544,28 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  PRTE_NAME_PRINT(&child->name)));
 
-            /* determine the thread that will handle this child */
-            ++prte_odls_globals.next_base;
-            if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
-                prte_odls_globals.next_base = 0;
+            /* determine the thread that will handle this child.
+             *
+             * STOP_ON_EXEC requires that the SAME thread which calls fork()
+             * (and thereby becomes the ptrace(2) tracer of the child) also
+             * performs the later ptrace(PTRACE_DETACH) call - ptrace control
+             * operations are only permitted from the exact tracer thread,
+             * even though waitpid() for the same status is visible to any
+             * thread in the process.  Our STOP_ON_EXEC detach happens in
+             * wait_local_proc(), which always runs on prte_event_base, so
+             * force the fork onto that same base instead of handing it to
+             * one of the odls worker threads - otherwise the PTRACE_DETACH
+             * call fails (ESRCH) once the local proc count reaches the
+             * worker-thread-pool cutoff. */
+            if (prte_get_attribute(&jobdat->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL)) {
+                evb = prte_event_base;
+            } else {
+                ++prte_odls_globals.next_base;
+                if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
+                    prte_odls_globals.next_base = 0;
+                }
+                evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
             }
-            evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
 
             /* set the waitpid callback here for thread protection and
              * to ensure we can capture the callback on shortlived apps */
@@ -1742,6 +1761,46 @@ void prte_odls_base_default_wait_local_proc(int fd, short sd, void *cbdata)
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name)));
         goto MOVEON;
     }
+
+#if PRTE_HAVE_STOP_ON_EXEC
+    /* If the child stopped due to the ptrace TRACEME+exec SIGTRAP, this is the
+     * stop-on-exec debug-attach point.  The wait_signal_callback consumed the
+     * ptrace-stop notification before do_parent could see it; handle it here
+     * instead.  Detach with SIGSTOP injected so the child stays stopped for
+     * the debugger, re-register for its eventual exit, and fire READY_FOR_DEBUG.
+     * Do NOT fall through to the exit-handling logic below. */
+    if (WIFSTOPPED(proc->exit_code) && WSTOPSIG(proc->exit_code) == SIGTRAP) {
+        if (NULL != jobdat &&
+            prte_get_attribute(&jobdat->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL)) {
+            PMIX_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
+                                 "%s odls:waitpid_fired ptrace-stop for %s, detaching with SIGSTOP",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_NAME_PRINT(&proc->name)));
+            errno = 0;
+#    if PRTE_HAVE_LINUX_PTRACE
+            ptrace(PRTE_DETACH, proc->pid, 0, (void *) SIGSTOP);
+#    else
+            ptrace(PRTE_DETACH, proc->pid, 0, SIGSTOP);
+#    endif
+            if (0 != errno) {
+                PMIX_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
+                                     "%s odls:waitpid_fired ptrace detach failed for %s: %s",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                     PRTE_NAME_PRINT(&proc->name), strerror(errno)));
+                state = PRTE_PROC_STATE_FAILED_TO_START;
+                PRTE_FLAG_UNSET(proc, PRTE_PROC_FLAG_ALIVE);
+                goto MOVEON;
+            }
+            proc->state = PRTE_PROC_STATE_RUNNING;
+            PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_ALIVE);
+            /* re-register to catch the child's eventual exit after the debugger releases it */
+            prte_wait_cb(proc, prte_odls_base_default_wait_local_proc, NULL);
+            PRTE_ACTIVATE_PROC_STATE(&proc->name, PRTE_PROC_STATE_READY_FOR_DEBUG);
+            PMIX_RELEASE(t2);
+            return;
+        }
+    }
+#endif
 
     /* determine the state of this process */
     if (WIFEXITED(proc->exit_code)) {
@@ -2201,11 +2260,17 @@ int prte_odls_base_default_restart_proc(prte_proc_t *child,
             goto CLEANUP;
         }
     }
-    ++prte_odls_globals.next_base;
-    if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
-        prte_odls_globals.next_base = 0;
+    /* see comment in launch_local_procs() regarding STOP_ON_EXEC + ptrace
+     * tracer-thread affinity */
+    if (prte_get_attribute(&jobdat->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL)) {
+        evb = prte_event_base;
+    } else {
+        ++prte_odls_globals.next_base;
+        if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
+            prte_odls_globals.next_base = 0;
+        }
+        evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
     }
-    evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
     prte_wait_cb(child, prte_odls_base_default_wait_local_proc, NULL);
 
     PMIX_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output, "%s restarting app %s",
