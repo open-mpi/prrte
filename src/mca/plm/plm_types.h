@@ -130,6 +130,7 @@ typedef int32_t prte_job_state_t;
 #define PRTE_JOB_STATE_RUNNING               14 /* all procs have been fork'd */
 #define PRTE_JOB_STATE_SUSPENDED             15 /* job has been suspended */
 #define PRTE_JOB_STATE_REGISTERED            16 /* all procs registered for sync */
+#define PRTE_JOB_STATE_WAITING_FOR_DAEMONS   17 /* parked: daemon launch/shrink campaign in progress */
 #define PRTE_JOB_STATE_LOCAL_LAUNCH_COMPLETE 18 /* all local procs have attempted launch */
 #define PRTE_JOB_STATE_READY_FOR_DEBUG       19 /* all local procs report ready for debug */
 #define PRTE_JOB_STATE_STARTED               20 /* first process has been started */

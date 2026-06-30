@@ -506,7 +506,9 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
                 PRTE_PMIX_DESTRUCT_LOCK(&lk);
                 // mark abnormal exit status
                 PRTE_UPDATE_EXIT_STATUS(-1);
-                // do a clean exit
+                /* do a clean exit; the HNP detects our departure via the
+                 * normal daemon-loss (comm-failure) path and completes the
+                 * shrink campaign there */
                 PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
                 break;
             }

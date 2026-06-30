@@ -43,6 +43,7 @@
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/base/base.h"
+#include "src/mca/ras/base/base.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/mca/state/base/base.h"
@@ -60,6 +61,7 @@
 #include "src/mca/errmgr/base/base.h"
 #include "src/mca/errmgr/base/errmgr_private.h"
 #include "src/mca/errmgr/errmgr.h"
+#include "src/mca/plm/base/plm_private.h"
 
 #include "errmgr_dvm.h"
 
@@ -270,6 +272,55 @@ static void proc_errors(int fd, short args, void *cbdata)
             pptr->state = state;
             /* adjust our num_procs */
             --prte_process_info.num_daemons;
+            /* if this daemon was the target of an in-progress grow campaign,
+             * resolve its rank against the launch fence (failure).  Only the
+             * specific ranks being launched affect the fence, so an unrelated
+             * daemon loss during a grow no longer consumes the fence.  When it
+             * was a grow target the campaign is rolled back out of the DVM and
+             * the loss is fully handled here, so skip the general daemon-loss
+             * handling below — that path would otherwise abort the whole DVM
+             * over a failure the grow rollback has already absorbed. */
+            if (prte_plm_base_grow_target_failed(proc->rank)) {
+                goto cleanup;
+            }
+            /* check if this daemon was a pending shrink target */
+            {
+                prte_shrink_campaign_t *_camp, *_next;
+                int _t;
+                PMIX_LIST_FOREACH_SAFE(_camp, _next,
+                                       &prte_shrink_campaigns, prte_shrink_campaign_t) {
+                    for (_t = 0; _t < _camp->ntargets; _t++) {
+                        if (_camp->targets[_t] != proc->rank) continue;
+                        /* stamp this slot so a repeated comm event for the
+                         * same daemon cannot decrement the campaign twice */
+                        _camp->targets[_t] = PMIX_RANK_INVALID;
+                        _camp->pending--;
+                        prte_dvm_launch_fence--;
+                        if (0 == _camp->pending) {
+                            /* this request's shrink is complete — first let the
+                             * active RAS modules release the freed resources
+                             * back to the scheduler, then notify the requester
+                             * that the DVM now reflects the new size (clean exit
+                             * and crash are both successes for the campaign, so
+                             * this drain is always success) */
+                            prte_ras_base_shrink_complete(_camp);
+                            if (_camp->have_requester) {
+                                prte_plm_base_dvm_mod_notify(&_camp->requester,
+                                                             _camp->alloc_id,
+                                                             _camp->req_id,
+                                                             true, PMIX_SUCCESS);
+                            }
+                            pmix_list_remove_item(&prte_shrink_campaigns, &_camp->super);
+                            PMIX_RELEASE(_camp);
+                        }
+                        if (0 == prte_dvm_launch_fence) {
+                            prte_plm_base_fence_release();
+                        }
+                        goto errmgr_shrink_done;
+                    }
+                }
+              errmgr_shrink_done: ;
+            }
             /* if we have ordered prteds to terminate or abort
              * is in progress, record it */
             if (prte_prteds_term_ordered || prte_abnormal_term_ordered) {

@@ -596,6 +596,63 @@ PRTE_EXPORT extern char *prte_data_server_uri;
 PRTE_EXPORT extern bool prte_dvm_ready;
 PRTE_EXPORT extern pmix_pointer_array_t *prte_cache;
 PRTE_EXPORT extern bool prte_persistent;
+
+/* --- DVM launch fence --- */
+
+/* tracks in-progress daemon launch campaigns (grow and shrink combined) */
+PRTE_EXPORT extern int prte_dvm_launch_fence;
+
+/* app jobs parked at VM_READY → MAP while a campaign is active */
+PRTE_EXPORT extern pmix_pointer_array_t *prte_held_jobs;
+
+/* app jobs parked at LAUNCH_APPS while a shrink campaign is active */
+PRTE_EXPORT extern pmix_pointer_array_t *prte_prelaunch_held_jobs;
+
+/* one entry per in-progress shrink campaign */
+typedef struct {
+    pmix_list_item_t super;
+    pmix_rank_t     *targets;   /* daemon ranks being terminated */
+    int              ntargets;  /* initial count */
+    int              pending;   /* targets not yet known to have departed */
+    /* requester recorded so the spec's phase-two completion event can be
+     * directed at the process that issued the PMIX_ALLOC_RELEASE; left unset
+     * (have_requester == false) for a scheduler-driven release */
+    pmix_proc_t      requester;
+    char            *alloc_id;       /* PMIX_ALLOC_ID of the allocation, or NULL */
+    char            *req_id;         /* requester's PMIX_ALLOC_REQ_ID, or NULL */
+    bool             have_requester;
+} prte_shrink_campaign_t;
+PMIX_CLASS_DECLARATION(prte_shrink_campaign_t);
+
+/* list of active shrink campaigns */
+PRTE_EXPORT extern pmix_list_t prte_shrink_campaigns;
+
+/* one entry per in-progress grow (daemon-launch) campaign.  The campaign
+ * records the specific daemon ranks being launched so that the launch fence
+ * is only affected by those ranks: an unrelated daemon loss during a grow
+ * must not consume the fence, and concurrent campaigns must be tracked
+ * independently.  The fence contribution (ntargets) is held in full until
+ * the campaign is drained at a safe point — on success in vm_ready, after
+ * the WIREUP xcast, or on failure when one of the targets dies — so that
+ * jobs held at the VM_READY → MAP boundary are not admitted before the new
+ * daemons are wired up. */
+typedef struct {
+    pmix_list_item_t super;
+    pmix_rank_t     *targets;   /* daemon ranks being launched */
+    int              ntargets;  /* count, == this campaign's fence contribution */
+    /* requester recorded so the spec's phase-two completion event can be
+     * directed at the process that drove the grow; left unset
+     * (have_requester == false) for a scheduler-driven push */
+    pmix_proc_t      requester;
+    char            *alloc_id;       /* PMIX_ALLOC_ID of the allocation, or NULL */
+    char            *req_id;         /* requester's PMIX_ALLOC_REQ_ID, or NULL */
+    bool             have_requester;
+} prte_grow_campaign_t;
+PMIX_CLASS_DECLARATION(prte_grow_campaign_t);
+
+/* list of active grow campaigns */
+PRTE_EXPORT extern pmix_list_t prte_grow_campaigns;
+
 PRTE_EXPORT extern bool prte_allow_run_as_root;
 PRTE_EXPORT extern bool prte_fwd_environment;
 PRTE_EXPORT extern bool prte_xml_output;

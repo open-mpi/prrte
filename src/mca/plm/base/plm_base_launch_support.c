@@ -837,6 +837,18 @@ void prte_plm_base_launch_apps(int fd, short args, void *cbdata)
     /* update job state */
     caddy->jdata->state = caddy->job_state;
 
+    /* if a shrink campaign is active, hold this job until all targeted
+     * daemons have departed the DVM to avoid sending launch data to a dying
+     * daemon (shrink campaigns are only ever created in elastic mode, so the
+     * explicit guard keeps the non-elastic launch path identical) */
+    if (prte_elastic_mode && !pmix_list_is_empty(&prte_shrink_campaigns)) {
+        jdata->state = PRTE_JOB_STATE_WAITING_FOR_DAEMONS;
+        PMIX_RETAIN(jdata);
+        pmix_pointer_array_add(prte_prelaunch_held_jobs, jdata);
+        PMIX_RELEASE(caddy);
+        return;
+    }
+
     PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                          "%s plm:base:launch_apps for job %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          PRTE_JOBID_PRINT(jdata->nspace)));
@@ -2388,5 +2400,420 @@ process:
         }
     }
 
+    /* The launch fence only operates when the DVM is permitted to grow/shrink.
+     * Outside elastic mode the DVM is fixed-size, so no campaign is recorded
+     * and the fence is never raised — leaving the normal launch path, and the
+     * normal daemon-failure handling, completely unchanged. */
+    if (prte_elastic_mode && 0 < map->num_new_daemons) {
+        prte_grow_campaign_t *gcamp;
+        pmix_rank_t gr;
+        int gk;
+
+        /* Record this launch campaign so the launch fence can be resolved on
+         * a per-daemon basis: each new daemon either reports home (success)
+         * or its launch fails (comm-failure / failed-to-start), and only
+         * those specific ranks affect this campaign.  This avoids an
+         * unrelated daemon loss consuming the fence, and lets concurrent
+         * campaigns be tracked independently.  The new daemons were assigned
+         * consecutive vpids starting at map->daemon_vpid_start (see the
+         * daemon-creation loop above). */
+        gcamp = PMIX_NEW(prte_grow_campaign_t);
+        gcamp->ntargets = map->num_new_daemons;
+        gcamp->targets = (pmix_rank_t *) malloc(gcamp->ntargets * sizeof(pmix_rank_t));
+        for (gk = 0, gr = map->daemon_vpid_start; gk < gcamp->ntargets; gk++, gr++) {
+            gcamp->targets[gk] = gr;
+        }
+        /* Record the requester for the spec's phase-two completion event.  The
+         * RAS reservation machinery sets each reserved node's ->session
+         * backpointer (add_nodes_to_session), and that session carries the
+         * requestor and the allocation ids; take them from the first new
+         * daemon's node.  The initial DVM bring-up and a scheduler-driven push
+         * have no such requestor (the default session, or an invalid requestor
+         * rank), so have_requester stays false and grow_drain() emits no event
+         * for them. */
+        {
+            prte_proc_t *dproc = (prte_proc_t *)
+                pmix_pointer_array_get_item(daemons->procs, map->daemon_vpid_start);
+            prte_session_t *sess =
+                (NULL != dproc && NULL != dproc->node) ? dproc->node->session : NULL;
+            if (NULL != sess && PMIX_RANK_INVALID != sess->requestor.rank) {
+                PMIX_XFER_PROCID(&gcamp->requester, &sess->requestor);
+                gcamp->alloc_id = (NULL != sess->alloc_refid) ? strdup(sess->alloc_refid) : NULL;
+                gcamp->req_id = (NULL != sess->user_refid) ? strdup(sess->user_refid) : NULL;
+                gcamp->have_requester = true;
+            }
+        }
+        pmix_list_append(&prte_grow_campaigns, &gcamp->super);
+        prte_dvm_launch_fence += map->num_new_daemons;
+    }
+
     return PRTE_SUCCESS;
+}
+
+void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
+                                  const char *alloc_id,
+                                  const char *req_id,
+                                  bool success,
+                                  pmix_status_t cause)
+{
+#if PRTE_HAVE_DVM_MOD_EVENTS
+    pmix_status_t code = success ? PMIX_DVM_IS_READY : PMIX_ERR_DVM_MOD;
+    pmix_info_t *rinfo;
+    pmix_data_array_t parray;
+    pmix_proc_t ptarg;
+    size_t nrinfo, idx;
+    pmix_status_t rc;
+
+    /* Assemble a directed (custom-range) notification to the requester only,
+     * mirroring the PMIX_ALLOC_TIMEOUT_WARNING delivery: custom range plus the
+     * allocation id, the requester's own request id when one was supplied, and
+     * — on failure — the underlying cause so the requester can distinguish
+     * what went wrong rather than only that something did. */
+    nrinfo = 2;
+    if (NULL != req_id) {
+        nrinfo++;
+    }
+    if (!success) {
+        nrinfo++;
+    }
+    PMIX_INFO_CREATE(rinfo, nrinfo);
+    idx = 0;
+    PMIX_LOAD_PROCID(&ptarg, requester->nspace, requester->rank);
+    parray.type = PMIX_PROC;
+    parray.size = 1;
+    parray.array = &ptarg;
+    /* PMIX_INFO_LOAD deep-copies the data, so the stack copies are fine */
+    PMIX_INFO_LOAD(&rinfo[idx++], PMIX_EVENT_CUSTOM_RANGE, &parray, PMIX_DATA_ARRAY);
+    PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_ID, (void *) alloc_id, PMIX_STRING);
+    if (NULL != req_id) {
+        PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_REQ_ID, (void *) req_id, PMIX_STRING);
+    }
+    if (!success) {
+        /* carry the underlying failure status; PMIX_JOB_TERM_STATUS is the
+         * standard pmix_status_t-typed info key (reconcile the carrier with
+         * PMIx PR openpmix#3917 should it define a dedicated DVM-mod cause
+         * key) */
+        PMIX_INFO_LOAD(&rinfo[idx++], PMIX_JOB_TERM_STATUS, &cause, PMIX_STATUS);
+    }
+    rc = PMIx_Notify_event(code, PRTE_PROC_MY_NAME, PMIX_RANGE_CUSTOM,
+                           rinfo, nrinfo, NULL, NULL);
+    if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
+        PMIX_ERROR_LOG(rc);
+    }
+    PMIX_INFO_FREE(rinfo, nrinfo);
+#else
+    /* The installed PMIx defines neither DVM modification event code, so the
+     * completion notification is compiled out per the spec's backward-
+     * compatibility clause.  The DVM still grows/shrinks; only the event is
+     * omitted. */
+    PRTE_HIDE_UNUSED_PARAMS(requester, alloc_id, req_id, success, cause);
+#endif
+}
+
+void prte_plm_base_fence_release(void)
+{
+    int hi;
+    prte_job_t *held;
+    prte_shrink_campaign_t *scamp, *snext;
+    prte_grow_campaign_t *gcamp, *gnext;
+
+    /* SUCCESS release — reached only when the global fence has dropped to
+     * zero, i.e. every grow and shrink campaign has completed successfully.
+     * Both classes of held job are admitted.  The only path that *fails* a
+     * held job is prte_plm_base_abort_premap_held() on a grow failure. */
+    for (hi = 0; hi < prte_held_jobs->size; hi++) {
+        held = (prte_job_t *) pmix_pointer_array_get_item(prte_held_jobs, hi);
+        if (NULL == held) {
+            continue;
+        }
+        pmix_pointer_array_set_item(prte_held_jobs, hi, NULL);
+        PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_VM_READY);
+        PMIX_RELEASE(held);
+    }
+
+    for (hi = 0; hi < prte_prelaunch_held_jobs->size; hi++) {
+        held = (prte_job_t *) pmix_pointer_array_get_item(prte_prelaunch_held_jobs, hi);
+        if (NULL == held) {
+            continue;
+        }
+        pmix_pointer_array_set_item(prte_prelaunch_held_jobs, hi, NULL);
+        if (prte_plm_base_job_needs_remap(held)) {
+            prte_plm_base_reset_proc_map(held);
+            PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_MAP);
+        } else {
+            PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_LAUNCH_APPS);
+        }
+        PMIX_RELEASE(held);
+    }
+
+    /* Campaigns are removed individually as they drain, so both lists should
+     * be empty here.  Sweep each defensively anyway — and sweep both kinds,
+     * not just shrink — so a future change that can leave a residual campaign
+     * behind cannot wedge the fence. */
+    PMIX_LIST_FOREACH_SAFE(scamp, snext, &prte_shrink_campaigns, prte_shrink_campaign_t) {
+        pmix_list_remove_item(&prte_shrink_campaigns, &scamp->super);
+        PMIX_RELEASE(scamp);
+    }
+    PMIX_LIST_FOREACH_SAFE(gcamp, gnext, &prte_grow_campaigns, prte_grow_campaign_t) {
+        pmix_list_remove_item(&prte_grow_campaigns, &gcamp->super);
+        PMIX_RELEASE(gcamp);
+    }
+}
+
+void prte_plm_base_abort_premap_held(void)
+{
+    int hi;
+    prte_job_t *held;
+
+    /* GROW-FAILURE abort — fail every job parked at the VM_READY -> MAP
+     * boundary, immediately and independent of the fence value, so a grow
+     * failure aborts its pre-map waiters even while a concurrent shrink keeps
+     * the fence nonzero.  The pre-launch held jobs are deliberately left
+     * untouched: they wait only on a shrink, never on the grow (spec
+     * conformance #4). */
+    for (hi = 0; hi < prte_held_jobs->size; hi++) {
+        held = (prte_job_t *) pmix_pointer_array_get_item(prte_held_jobs, hi);
+        if (NULL == held) {
+            continue;
+        }
+        pmix_pointer_array_set_item(prte_held_jobs, hi, NULL);
+        PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_NEVER_LAUNCHED);
+        PMIX_RELEASE(held);
+    }
+}
+
+void prte_plm_base_grow_drain(bool success)
+{
+    prte_grow_campaign_t *camp;
+
+    /* Resolve all in-progress grow campaigns at once and drop their entire
+     * contribution from the launch fence.  This is called from exactly the
+     * two safe points: from vm_ready on the all-success path (after the
+     * WIREUP xcast, so held jobs are only admitted once the new daemons are
+     * wired up), and from the failure path when one of the launched daemons
+     * dies.  Each drained campaign emits its phase-two completion event to its
+     * requester — PMIX_DVM_IS_READY on success, PMIX_ERR_DVM_MOD on failure. */
+    while (NULL != (camp = (prte_grow_campaign_t *)
+                               pmix_list_remove_first(&prte_grow_campaigns))) {
+        prte_dvm_launch_fence -= camp->ntargets;
+        if (camp->have_requester) {
+            /* the specific daemon-failure status is not threaded down to this
+             * layer yet, so report a generic cause on failure (reconcile by
+             * passing the dying daemon's status as a follow-up) */
+            prte_plm_base_dvm_mod_notify(&camp->requester, camp->alloc_id,
+                                         camp->req_id, success,
+                                         success ? PMIX_SUCCESS : PMIX_ERROR);
+        }
+        PMIX_RELEASE(camp);
+    }
+    if (success) {
+        /* admit the held jobs only once the *global* fence is clear — a
+         * concurrent shrink may still hold it nonzero */
+        if (0 == prte_dvm_launch_fence) {
+            prte_plm_base_fence_release();
+        }
+    } else {
+        /* a grow failure fails the whole pre-map held-job set immediately,
+         * regardless of the fence value, so a concurrent shrink cannot later
+         * admit a job whose grow dependency has failed; the shrink-only
+         * pre-launch held jobs are left parked */
+        prte_plm_base_abort_premap_held();
+    }
+}
+
+/* Roll a failed grow campaign back out of the DVM so a failed grow leaves the
+ * DVM at its exact pre-grow membership rather than half-extended (spec
+ * conformance #5).  `trigger` is the rank whose death triggered the failure;
+ * the errmgr has already marked it not-alive and decremented num_daemons, and
+ * its routing is repaired here.  Every *other* target is handled by whether a
+ * daemon actually came up:
+ *
+ *   - a target that started (PRTE_PROC_FLAG_ALIVE) is terminated using the same
+ *     PRTE_DAEMON_SHRINK_CMD machinery the DVM shrink path uses; its departure
+ *     is then reconciled on the normal daemon-loss path as it exits;
+ *   - a target that never started has no daemon to signal, so its launch-time
+ *     daemon-count bump is reverted here (no comm-failure event will arrive for
+ *     it).
+ *
+ * In all cases the node's daemon backpointer is cleared so the mapper can no
+ * longer place a later job on it.  The new nodes carry no application procs —
+ * the jobs that would have used them were held at the fence, never launched —
+ * so clearing ``node->daemon`` is sufficient to remove the node from the DVM's
+ * usable set.  The teardown is strictly campaign-scoped: it touches only the
+ * ranks in this campaign's ``targets`` array. */
+static void grow_rollback(prte_grow_campaign_t *camp, pmix_rank_t trigger)
+{
+    prte_job_t *daemons;
+    prte_proc_t *dproc;
+    prte_node_t *node;
+    pmix_rank_t *kill;
+    int32_t nkill = 0;
+    int t;
+
+    daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons) {
+        return;
+    }
+    kill = (pmix_rank_t *) malloc(camp->ntargets * sizeof(pmix_rank_t));
+    if (NULL == kill) {
+        return;
+    }
+
+    /* repair routing for the daemon whose loss triggered the failure — the
+     * errmgr's own route_lost call is skipped because grow_target_failed()
+     * reports the death as handled (so the errmgr does not abort the DVM) */
+    prte_rml_route_lost(trigger);
+
+    for (t = 0; t < camp->ntargets; t++) {
+        pmix_rank_t r = camp->targets[t];
+        if (PMIX_RANK_INVALID == r) {
+            continue;
+        }
+        dproc = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, r);
+        if (NULL == dproc) {
+            continue;
+        }
+        node = dproc->node;
+        if (r != trigger) {
+            if (PRTE_FLAG_TEST(dproc, PRTE_PROC_FLAG_ALIVE)) {
+                /* a started daemon — terminate it via the shrink command */
+                kill[nkill++] = r;
+            } else {
+                /* never started: no comm-failure event will arrive, so revert
+                 * its launch-time daemon-count bump here */
+                if (0 < prte_process_info.num_daemons) {
+                    --prte_process_info.num_daemons;
+                }
+            }
+        }
+        /* detach the node from the DVM's usable set */
+        if (NULL != node) {
+            if (NULL != node->session && node->session != prte_default_session) {
+                node->session = NULL;
+            }
+            if (node->daemon == dproc) {
+                node->daemon = NULL;
+                PMIX_RELEASE(dproc);
+            }
+        }
+    }
+
+    if (0 < nkill) {
+        pmix_data_buffer_t msg;
+        prte_daemon_cmd_flag_t cmd = PRTE_DAEMON_SHRINK_CMD;
+        pmix_status_t rc;
+
+        PMIX_DATA_BUFFER_CONSTRUCT(&msg);
+        rc = PMIx_Data_pack(NULL, &msg, &cmd, 1, PMIX_UINT8);
+        if (PMIX_SUCCESS == rc) {
+            rc = PMIx_Data_pack(NULL, &msg, &nkill, 1, PMIX_INT32);
+        }
+        if (PMIX_SUCCESS == rc) {
+            rc = PMIx_Data_pack(NULL, &msg, kill, nkill, PMIX_PROC_RANK);
+        }
+        if (PMIX_SUCCESS == rc) {
+            if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &msg))) {
+                PRTE_ERROR_LOG(rc);
+            }
+        } else {
+            PMIX_ERROR_LOG(rc);
+        }
+        PMIX_DATA_BUFFER_DESTRUCT(&msg);
+    }
+    free(kill);
+}
+
+bool prte_plm_base_grow_target_failed(pmix_rank_t rank)
+{
+    prte_grow_campaign_t *camp;
+    int t;
+
+    /* Outside elastic mode there are no grow campaigns and the daemon loss is
+     * the errmgr's to handle exactly as it always has — never report it as
+     * handled here, so the normal DVM-failure path is preserved. */
+    if (!prte_elastic_mode) {
+        return false;
+    }
+
+    /* A daemon has died.  Only act if it was actually the target of an
+     * in-progress grow campaign — an unrelated daemon loss must not consume
+     * the launch fence (and must be left to the errmgr's normal handling).
+     * If it was a grow target, that campaign is compromised: roll it back out
+     * of the DVM, drop its fence contribution, notify its requester of the
+     * failure, and abort the pre-map held jobs.  The teardown is scoped to the
+     * matched campaign, so any concurrent grow keeps its own daemons and
+     * completes normally (spec conformance #5). */
+    PMIX_LIST_FOREACH(camp, &prte_grow_campaigns, prte_grow_campaign_t) {
+        for (t = 0; t < camp->ntargets; t++) {
+            if (camp->targets[t] != rank) {
+                continue;
+            }
+            pmix_list_remove_item(&prte_grow_campaigns, &camp->super);
+            prte_dvm_launch_fence -= camp->ntargets;
+            grow_rollback(camp, rank);
+            if (camp->have_requester) {
+                /* the specific daemon-failure status is not threaded down to
+                 * this layer yet, so report a generic cause */
+                prte_plm_base_dvm_mod_notify(&camp->requester, camp->alloc_id,
+                                             camp->req_id, false, PMIX_ERROR);
+            }
+            PMIX_RELEASE(camp);
+            /* any grow failure fails the whole pre-map held-job set */
+            prte_plm_base_abort_premap_held();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool prte_plm_base_job_needs_remap(prte_job_t *jdata)
+{
+    prte_shrink_campaign_t *camp;
+    prte_proc_t *proc;
+    int p, t;
+
+    PMIX_LIST_FOREACH(camp, &prte_shrink_campaigns, prte_shrink_campaign_t) {
+        for (p = 0; p < jdata->procs->size; p++) {
+            proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, p);
+            if (NULL == proc || NULL == proc->node || NULL == proc->node->daemon) continue;
+            for (t = 0; t < camp->ntargets; t++) {
+                if (camp->targets[t] == proc->node->daemon->name.rank) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void prte_plm_base_reset_proc_map(prte_job_t *jdata)
+{
+    int p, np;
+    prte_proc_t *proc;
+    prte_node_t *node;
+    prte_app_context_t *app;
+
+    for (p = 0; p < jdata->procs->size; p++) {
+        proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, p);
+        if (NULL == proc) continue;
+        node = proc->node;
+        if (NULL != node) {
+            for (np = 0; np < node->procs->size; np++) {
+                if (pmix_pointer_array_get_item(node->procs, np) == proc) {
+                    pmix_pointer_array_set_item(node->procs, np, NULL);
+                    node->num_procs--;
+                    app = (prte_app_context_t *)
+                        pmix_pointer_array_get_item(jdata->apps, proc->app_idx);
+                    if (NULL == app || !PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL)) {
+                        node->slots_inuse--;
+                    }
+                    break;
+                }
+            }
+        }
+        pmix_pointer_array_set_item(jdata->procs, p, NULL);
+        PMIX_RELEASE(proc);
+    }
+    jdata->num_procs = 0;
+    jdata->num_launched = 0;
 }

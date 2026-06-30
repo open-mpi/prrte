@@ -42,6 +42,7 @@
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/odls_types.h"
+#include "src/mca/plm/base/plm_private.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/state/state.h"
 #include "src/runtime/prte_globals.h"
@@ -616,6 +617,21 @@ void prte_ras_base_modify(int fd, short args, void *cbdata)
     PMIX_RELEASE(req);
 }
 
+void prte_ras_base_shrink_complete(prte_shrink_campaign_t *campaign)
+{
+    prte_ras_base_selected_module_t *mod;
+
+    /* cycle across the active modules and give each that supports the
+     * entry point a chance to release the freed resources back to the
+     * scheduler. Unlike modify, a shrink completion is not keyed to a
+     * single component, so every module is offered the campaign. */
+    PMIX_LIST_FOREACH(mod, &prte_ras_base.selected_modules, prte_ras_base_selected_module_t) {
+        if (NULL != mod->module->shrink_complete) {
+            mod->module->shrink_complete(campaign);
+        }
+    }
+}
+
 /* monotonic counter used to mint unique session ids for reservations that
  * the host (rather than a scheduler) must identify on its own. */
 static uint32_t prte_ras_reservation_counter = 0;
@@ -675,20 +691,23 @@ static prte_session_t *create_reservation(const char *nspace, uint8_t inherit,
     return s;
 }
 
-/* Register the nodes named in ndlist with the destination reservation: set
- * each node's session backpointer and store a retained reference in the
- * reservation. The node objects themselves live in the global pool. */
-static void add_nodes_to_session(pmix_list_t *ndlist, prte_session_t *dest)
+/* Register the named nodes with the destination reservation: set each node's
+ * session backpointer and store a retained reference in the reservation. The
+ * node objects themselves live in the global pool, which is why this takes the
+ * node *names* and resolves them with prte_node_match: the caller's working
+ * list has already been drained into the pool by prte_ras_base_node_insert, so
+ * the names must be snapshotted before that insert and handed in here. */
+static void add_nodes_to_session(char **names, prte_session_t *dest)
 {
-    prte_node_t *nd, *gnode;
-    int k;
+    prte_node_t *gnode;
+    int k, i;
     bool present;
 
-    if (NULL == dest || dest == prte_default_session) {
+    if (NULL == dest || dest == prte_default_session || NULL == names) {
         return;
     }
-    PMIX_LIST_FOREACH(nd, ndlist, prte_node_t) {
-        gnode = prte_node_match(NULL, nd->name);
+    for (i = 0; NULL != names[i]; i++) {
+        gnode = prte_node_match(NULL, names[i]);
         if (NULL == gnode) {
             continue;
         }
@@ -945,6 +964,7 @@ void prte_ras_base_complete_request(prte_pmix_server_req_t *req)
     prte_daemon_cmd_flag_t cmd = PRTE_DAEMON_SHRINK_CMD;
     size_t n;
     char **nodes, *ndstring;
+    char **rsv_names = NULL;
     int32_t cnt=0, m;
     int ret;
     prte_node_t *node;
@@ -1099,16 +1119,30 @@ void prte_ras_base_complete_request(prte_pmix_server_req_t *req)
                     return;
                 }
                 free(ndstring);
+                /* prte_ras_base_node_insert() drains ndlist into the global
+                 * pool, so snapshot the node names first: add_nodes_to_session()
+                 * below needs them to re-find the pool objects and set their
+                 * session backpointer (which carries the requestor for the
+                 * phase-two completion event). */
+                {
+                    prte_node_t *snap;
+                    PMIX_LIST_FOREACH(snap, &ndlist, prte_node_t) {
+                        PMIx_Argv_append_nosize(&rsv_names, snap->name);
+                    }
+                }
                 ret = prte_ras_base_node_insert(&ndlist, NULL);
                 if (PRTE_SUCCESS != ret) {
                     PRTE_ERROR_LOG(ret);
                     PMIX_LIST_DESTRUCT(&ndlist);
+                    PMIx_Argv_free(rsv_names);
                     req->pstatus = prte_pmix_convert_rc(ret);
                     return;
                 }
                 /* when reserving, withhold these nodes from the default pool by
                  * registering them with the destination session */
-                add_nodes_to_session(&ndlist, dest);
+                add_nodes_to_session(rsv_names, dest);
+                PMIx_Argv_free(rsv_names);
+                rsv_names = NULL;
                 PMIX_LIST_DESTRUCT(&ndlist);
                 found = true;
             }
@@ -1261,11 +1295,54 @@ void prte_ras_base_complete_request(prte_pmix_server_req_t *req)
             req->pstatus = rc;
             return;
         }
+        /* Record the shrink campaign before freeing the ranks array.  Only in
+         * elastic mode: outside it the DVM is fixed-size, so the release still
+         * xcasts the shrink command below but no campaign is recorded and the
+         * fence is never raised — the legacy fire-and-forget behavior.  Also
+         * skip when the release removes no daemons (m == 0): an empty campaign
+         * would never drain (no target ever departs on the comm-failure path),
+         * so prte_shrink_campaigns would stay non-empty forever and stall every
+         * later job at the LAUNCH_APPS hold, and no completion event would fire.
+         * This mirrors the grow path's num_new_daemons > 0 guard and the spec's
+         * "no event when nothing changes" clause. */
+        if (prte_elastic_mode && 0 < m) {
+            prte_shrink_campaign_t *_camp = PMIX_NEW(prte_shrink_campaign_t);
+            _camp->targets = (pmix_rank_t *) malloc(m * sizeof(pmix_rank_t));
+            memcpy(_camp->targets, ranks, m * sizeof(pmix_rank_t));
+            _camp->ntargets = m;
+            _camp->pending  = m;
+            /* record the requester so the phase-two completion event can be
+             * directed at the process that issued this PMIX_ALLOC_RELEASE */
+            PMIX_XFER_PROCID(&_camp->requester, &req->tproc);
+            for (n = 0; n < req->ninfo; n++) {
+                if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_ID)) {
+                    _camp->alloc_id = strdup(req->info[n].value.data.string);
+                } else if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_REQ_ID)) {
+                    _camp->req_id = strdup(req->info[n].value.data.string);
+                }
+            }
+            _camp->have_requester = true;
+            pmix_list_append(&prte_shrink_campaigns, &_camp->super);
+            prte_dvm_launch_fence += m;
+        }
         free(ranks);
 
         /* goes to all daemons */
         if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &msg))) {
             PRTE_ERROR_LOG(rc);
+            /* undo the campaign we just added (only if one was created), and
+             * tell the requester the DVM modification failed */
+            if (prte_elastic_mode && 0 < m) {
+                prte_shrink_campaign_t *_camp =
+                    (prte_shrink_campaign_t *) pmix_list_remove_last(&prte_shrink_campaigns);
+                prte_dvm_launch_fence -= _camp->pending;
+                if (_camp->have_requester) {
+                    prte_plm_base_dvm_mod_notify(&_camp->requester, _camp->alloc_id,
+                                                 _camp->req_id, false,
+                                                 prte_pmix_convert_rc(rc));
+                }
+                PMIX_RELEASE(_camp);
+            }
         }
         PMIX_DATA_BUFFER_DESTRUCT(&msg);
     }
