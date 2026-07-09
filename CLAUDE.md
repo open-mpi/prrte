@@ -293,16 +293,6 @@ buffers unless interfacing with PMIx routines that require it.
 PRRTE targets C11.  Do not add `-Wno-*` flags to suppress warnings —
 fix the underlying issue.
 
-### Use the `__prte_attribute_*__` macros for compiler attributes.**
-  [`src/include/prte_config_bottom.h`](src/include/prte_config_bottom.h),
-  pulled in transitively by `prte_config.h`, defines portable wrappers —
-  `__prte_attribute_unused__`, `__prte_attribute_noreturn__`,
-  `__prte_attribute_format__`, `__prte_attribute_deprecated__`, and many
-  more — that expand to the appropriate `__attribute__((...))` on
-  compilers that support it and to nothing elsewhere. Reach for these
-  (for example, to mark an unused function parameter) rather than writing
-  a bare `__attribute__` or leaving a warning unaddressed.
-
 ---
 
 ## Build System
