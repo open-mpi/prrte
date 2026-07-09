@@ -173,6 +173,7 @@ int main(int argc, char *argv[])
     pmix_data_buffer_t data;
     pmix_topology_t ptopo;
     bool compressed;
+    bool bootstrap_controller = false;
 
     char *umask_str = getenv("PRTE_DAEMON_UMASK_VALUE");
     if (NULL != umask_str) {
@@ -220,6 +221,22 @@ int main(int argc, char *argv[])
         return ret;
     }
 
+    /* A bootstrapping daemon must publish the DVM-wide MCA parameters (ports,
+     * address family, networks, radix, retry/heal timers, ...) BEFORE they are
+     * first registered - an MCA variable reads its environment only at that
+     * first registration, which happens inside prte_init_util.  We detect
+     * --bootstrap directly from the argument vector here, ahead of the CLI
+     * parse, and record it; prte_init_util runs the parameter-publishing phase
+     * itself once the install directories (and thus the config-file path) are
+     * known.  Identity resolution needs the hostname and is deferred to
+     * prte_ess_base_bootstrap() below. */
+    for (i = 0; NULL != pargv[i]; i++) {
+        if (0 == strcmp(pargv[i], "--" PRTE_CLI_BOOTSTRAP)) {
+            prte_bootstrap_setup = true;
+            break;
+        }
+    }
+
     /* init the tiny part of PRTE we initially use */
     prte_init_util(PRTE_PROC_DAEMON);
 
@@ -264,6 +281,17 @@ int main(int argc, char *argv[])
                     prte_strerror(ret));
         }
         return ret;
+    }
+
+    /* second bootstrap phase: now that init_util has established our hostname,
+     * resolve our identity within the DVM and learn whether we are the
+     * controller.  The parameter-publishing phase already ran ahead of
+     * prte_init_util (see above); prte_bootstrap_setup records that. */
+    if (prte_bootstrap_setup) {
+        ret = prte_ess_base_bootstrap(&bootstrap_controller);
+        if (PRTE_SUCCESS != ret) {
+            return ret;
+        }
     }
 
     /* Register all global MCA Params */
@@ -335,18 +363,18 @@ int main(int argc, char *argv[])
     /* ensure we silence any compression warnings */
     PMIx_Setenv("PMIX_MCA_compress_base_silence_warning", "1", true, &environ);
 
-    /* check for bootstrap operation */
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_BOOTSTRAP)) {
-        /* fill in our procID and other information
-         * from the configuration file */
-        prte_bootstrap_setup = true;
-        ret = prte_ess_base_bootstrap();
-        if (PRTE_SUCCESS != ret) {
-            return ret;
-        }
+    /* A bootstrapped daemon that discovered it is running on the controller
+     * host promotes itself to the HNP.  prte_init_util() already ran (from the
+     * early parameter phase) and stamped our proc_type as DAEMON; because
+     * prte_init() will find prte_init_util already initialized and skip the
+     * proc_type assignment, we must upgrade proc_type to MASTER here so the ess
+     * framework selects the HNP module rather than the daemon module. */
+    if (bootstrap_controller) {
+        prte_process_info.proc_type = PRTE_PROC_MASTER;
     }
-
-    if (PRTE_SUCCESS != (ret = prte_init(&argc, &argv, PRTE_PROC_DAEMON))) {
+    if (PRTE_SUCCESS != (ret = prte_init(&argc, &argv,
+                                         bootstrap_controller ? PRTE_PROC_MASTER
+                                                              : PRTE_PROC_DAEMON))) {
         PRTE_ERROR_LOG(ret);
         return ret;
     }
@@ -442,6 +470,18 @@ int main(int argc, char *argv[])
                 prte_process_info.nodename);
     }
 
+    if (bootstrap_controller) {
+        /* We are the self-promoted DVM controller (HNP).  The daemons were
+         * started independently on every node and are already phoning home, so
+         * we do NOT perform the daemon report-back sequence below.  Instead we
+         * drive the HNP state machine: ALLOCATE loads the configured node list
+         * into the pool (ras/bootstrap), and prte_plm_base_allocation_complete
+         * then builds the virtual machine and waits for the running daemons to
+         * report in.  Once all have reported, the DVM reaches VM_READY. */
+        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOCATE);
+        goto bootstrap_wait;
+    }
+
     /* add the DVM master's URI to our info */
     PMIX_VALUE_LOAD(&val, prte_process_info.my_hnp_uri, PMIX_STRING);
     PMIX_LOAD_NSPACE(proc.nspace, prte_process_info.myproc.nspace);
@@ -463,6 +503,20 @@ int main(int argc, char *argv[])
                                       "URI for the parent if tree launch is enabled.",
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
                                       &prte_parent_uri);
+    /* In a bootstrapped DVM there is no launcher to hand us a parent URI, and in
+     * a deep radix tree our parent is another daemon whose contact info no
+     * nidmap has yet delivered.  prte_init has by now built the routing tree and
+     * set PRTE_PROC_MY_PARENT->rank, so synthesize the parent's URI from the
+     * configuration exactly as we did the controller's.  For a flat tree the
+     * parent is the HNP (already stored above), so this is skipped. */
+    if (prte_bootstrap_setup && NULL == prte_parent_uri &&
+        PRTE_PROC_MY_PARENT->rank != PRTE_PROC_MY_HNP->rank) {
+        ret = prte_ess_base_bootstrap_peer_uri(PRTE_PROC_MY_PARENT->rank, &prte_parent_uri);
+        if (PRTE_SUCCESS != ret) {
+            PRTE_ERROR_LOG(ret);
+            goto DONE;
+        }
+    }
     if (NULL != prte_parent_uri) {
         /* set the contact info into our local database */
         ret = prte_rml_parse_uris(prte_parent_uri, PRTE_PROC_MY_PARENT, NULL);
@@ -487,6 +541,18 @@ int main(int argc, char *argv[])
     /* setup the rollup callback */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_PRTED_CALLBACK,
                   PRTE_RML_PERSISTENT, rollup, NULL);
+
+    /* In a bootstrapped DVM, announce our appearance one hop up to our parent.
+     * On a first boot the parent finds our rank live and drops the notice, so
+     * the root is never involved; if our node had left and rebooted, the parent
+     * (which had us marked absent) escalates to the HNP, which broadcasts a
+     * revival so the DVM re-inserts us into the routing tree (the unheal path).
+     * Only bootstrap daemons do this -- launched daemons cannot return with
+     * their original vpid, so nothing revives them. The controller took the
+     * bootstrap_wait branch above and never reaches here. */
+    if (prte_bootstrap_setup) {
+        prte_rml_send_return_notice();
+    }
 
     if (prte_static_ports || NULL != prte_parent_uri) {
         /* since we will be waiting for any children to send us
@@ -690,6 +756,7 @@ int main(int argc, char *argv[])
         }
     }
 
+bootstrap_wait:
     if (prte_debug_flag) {
         pmix_output(0, "%s prted: up and running - waiting for commands!",
                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
@@ -843,8 +910,13 @@ static void node_regex_report(int status, pmix_proc_t *sender, pmix_data_buffer_
 
     *active = false;
 
-    /* now launch any child daemons of ours */
-    prte_plm.remote_spawn();
+    /* now launch any child daemons of ours - but only if the active launcher
+     * spawns the tree recursively (e.g. ssh). In a bootstrapped DVM every
+     * daemon is started externally and wires itself in, so no plm is selected
+     * and remote_spawn is NULL; there is nothing for us to launch. */
+    if (NULL != prte_plm.remote_spawn) {
+        prte_plm.remote_spawn();
+    }
 
     report_prted();
 }

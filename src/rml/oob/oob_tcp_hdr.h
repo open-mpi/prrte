@@ -29,32 +29,26 @@
 
 #include "prte_config.h"
 
-/* define several internal-only message
- * types this component uses for its own
- * handshake operations, plus one indicating
- * the message came from an external (to
- * this component) source
+#include "types.h"
+
+/* Message types carried in the TCP header. IDENT and PROBE are used
+ * during the connection handshake; USER marks a normal RML message,
+ * whether it is destined for us or is being relayed on to the next hop.
  */
 typedef uint8_t prte_oob_tcp_msg_type_t;
 
 #define MCA_OOB_TCP_IDENT 1
 #define MCA_OOB_TCP_PROBE 2
-#define MCA_OOB_TCP_PING  3
 #define MCA_OOB_TCP_USER  4
-
-#define PRTE_MAX_RTD_SIZE 31
 
 /* header for tcp msgs */
 typedef struct {
-    /* the originator of the message - if we are routing,
-     * it could be someone other than me
+    /* the originator of the message - when relaying, this is the
+     * process that first sent the message, not necessarily our peer
      */
     pmix_proc_t origin;
-    /* the intended final recipient - if we don't have
-     * a path directly to that process, then we will
-     * attempt to route. If we have no route to that
-     * process, then we should have rejected the message
-     * and let some other module try to send it
+    /* the intended final recipient. If it is not us, we relay the
+     * message onward toward that process using the routing tree
      */
     pmix_proc_t dst;
     /* the rml tag where this message is headed */
@@ -63,10 +57,12 @@ typedef struct {
     uint32_t seq_num;
     /* number of bytes in message */
     uint32_t nbytes;
+    /* boot epoch (incarnation) of the origin. A daemon that departs and reboots
+     * into the same rank comes back with a strictly-greater epoch, so a hop can
+     * drop late traffic stamped with the stale incarnation's epoch. */
+    uint64_t epoch;
     /* type of message */
     prte_oob_tcp_msg_type_t type;
-    /* routed module to be used */
-    char routed[PRTE_MAX_RTD_SIZE + 1];
 } prte_oob_tcp_hdr_t;
 /**
  * Convert the message header to host byte order
@@ -75,7 +71,8 @@ typedef struct {
     (h)->origin.rank = ntohl((h)->origin.rank); \
     (h)->dst.rank = ntohl((h)->dst.rank);       \
     (h)->tag = PRTE_RML_TAG_NTOH((h)->tag);     \
-    (h)->nbytes = ntohl((h)->nbytes);
+    (h)->nbytes = ntohl((h)->nbytes);           \
+    (h)->epoch = prte_ntoh64((h)->epoch);
 
 /**
  * Convert the message header to network byte order
@@ -84,6 +81,7 @@ typedef struct {
     (h)->origin.rank = htonl((h)->origin.rank); \
     (h)->dst.rank = htonl((h)->dst.rank);       \
     (h)->tag = PRTE_RML_TAG_HTON((h)->tag);     \
-    (h)->nbytes = htonl((h)->nbytes);
+    (h)->nbytes = htonl((h)->nbytes);           \
+    (h)->epoch = prte_hton64((h)->epoch);
 
 #endif /* _MCA_OOB_TCP_HDR_H_ */

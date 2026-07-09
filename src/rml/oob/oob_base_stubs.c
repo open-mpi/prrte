@@ -22,6 +22,7 @@
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_printf.h"
 #include "src/mca/errmgr/errmgr.h"
+#include "src/mca/ess/base/base.h"
 #include "src/rml/rml.h"
 #include "src/mca/state/state.h"
 #include "src/threads/pmix_threads.h"
@@ -106,7 +107,20 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
                 PMIX_RELEASE(msg);
                 return;
             }
-        } else {
+        } else if (prte_bootstrap_setup) {
+            /* In a bootstrapped DVM no nidmap has distributed peer URIs during
+             * formation, and after a lifeline heals our new parent (a former
+             * grandparent) was never pre-synthesized.  Derive the next hop's
+             * contact URI from the configuration - the same synthesis prted
+             * used for our original parent - and connect to it. */
+            char *synth = NULL;
+            if (PRTE_SUCCESS == prte_ess_base_bootstrap_peer_uri(hop.rank, &synth)
+                && NULL != synth) {
+                peer = process_uri(synth);
+                free(synth);
+            }
+        }
+        if (NULL == peer) {
             // unable to send it
              if (prte_prteds_term_ordered || prte_finalizing || prte_abnormal_term_ordered) {
                 /* just ignore the problem */
@@ -159,12 +173,9 @@ send:
  * Obtain a uri for initial connection purposes
  *
  * During initial wireup, we can only transfer contact info on the daemon
- * command line. This limits what we can send to a string representation of
- * the actual contact info, which gets sent in a uri-like form. Not every
- * oob module can support this transaction, so this function will loop
- * across all oob components/modules, letting each add to the uri string if
- * it supports bootstrap operations. An error will be returned in the cbfunc
- * if NO component can successfully provide a contact.
+ * command line, so we render it as a compact, uri-like string: our process
+ * name followed by the TCP endpoints (IPv4 and, if enabled, IPv6) we are
+ * listening on. Returns *uri == NULL if we have no usable connection.
  *
  * Note: since there is a limit to what an OS will allow on a cmd line, we
  * impose a limit on the length of the resulting uri via an MCA param. The
@@ -380,12 +391,15 @@ static void set_addr(pmix_proc_t *peer, char **uris)
 
         /* cycle across the provided addrs */
         for (j = 0; NULL != addrs[j]; j++) {
-            if (NULL == masks[j]) {
-                /* Missing mask information */
-                pmix_output_verbose(2, prte_oob_base.output,
-                                    "%s oob:tcp: uri missing mask information.",
-                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-                return;
+            int if_mask;
+            /* A mask may be absent - e.g., from a contact URI synthesized by
+             * the bootstrap path, which cannot know the peer's interface mask.
+             * Treat a missing/empty mask as a /0, i.e. universally reachable,
+             * rather than rejecting the address. */
+            if (NULL == masks || NULL == masks[j] || '\0' == masks[j][0]) {
+                if_mask = 0;
+            } else {
+                if_mask = atoi(masks[j]);
             }
             /* if they gave us "localhost", then just take the first conn on our list */
             if (0 == strcasecmp(addrs[j], "localhost")) {
@@ -430,7 +444,7 @@ static void set_addr(pmix_proc_t *peer, char **uris)
                 PMIX_RELEASE(pr);
                 return;
             }
-            maddr->if_mask = atoi(masks[j]);
+            maddr->if_mask = if_mask;
 
             pmix_output_verbose(20, prte_oob_base.output,
                                 "%s set_peer: peer %s is listening on net %s port %s",

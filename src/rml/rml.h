@@ -162,7 +162,6 @@ PRTE_EXPORT void prte_rml_simulate_node_failure(void);
 typedef struct {
     int rml_output;
     int routed_output;
-    int oob_output;
     int max_retries;
     pmix_list_t posted_recvs;
     pmix_list_t unmatched_msgs;
@@ -175,6 +174,28 @@ typedef struct {
     pmix_bitmap_t failed_dmns;
     // All daemons globally confirmed to have failed
     pmix_bitmap_t global_failed_dmns;
+    // Ranks that have permanently departed the DVM (shrunk out, or lost to a
+    // fault in a launched/elastic DVM). Unlike failed_dmns, this set is NOT
+    // re-initialized by prte_rml_compute_routing_tree, so it survives the
+    // recompute that a grow triggers and lets the rebuilt tree keep routing
+    // around the hole (#2491).
+    pmix_bitmap_t dead_dmns;
+    // Ranks currently absent from a bootstrapped DVM because their node was
+    // lost (e.g. powered off) but which may return with the same rank when the
+    // node reboots. Like dead_dmns this persists across compute_routing_tree
+    // recomputes and is restored into failed_dmns, so the tree routes around
+    // the hole while the daemon is gone; unlike dead_dmns it is cleared when
+    // the daemon returns (the "unheal" path). Only bootstrap faults populate
+    // it -- a launched/elastic departure remains permanent in dead_dmns.
+    pmix_bitmap_t absent_dmns;
+
+    // Highest boot epoch (incarnation) known for each daemon rank, indexed by
+    // rank; 0 means "not yet learned". A rebooted bootstrap daemon returns with
+    // a strictly-greater epoch, so traffic stamped with an older epoch for a
+    // rank is a stale incarnation and is dropped. Grown on demand as ranks
+    // appear; see prte_rml_epoch_ok / prte_rml_record_epoch.
+    uint64_t *peer_epochs;
+    size_t peer_epochs_size;
 
     // Track all ancestors up to HNP, to simplify fault handling
     pmix_data_array_t ancestors;
@@ -193,6 +214,23 @@ typedef struct {
 
 PRTE_EXPORT extern prte_rml_base_t prte_rml_base;
 
+/* This process's boot epoch (incarnation) - a millisecond wall-clock timestamp
+ * captured once at startup. A daemon that departs and reboots into the same
+ * rank comes back with a strictly-greater epoch. Stamped into every outgoing
+ * message's wire header as the origin's epoch. */
+PRTE_EXPORT extern uint64_t prte_rml_boot_epoch;
+
+/* Incarnation guard. prte_rml_epoch_ok records rank's epoch on first sight and
+ * returns false only for traffic stamped with an epoch strictly older than the
+ * one already known for that rank (a stale incarnation to be dropped); a newer
+ * epoch passes but does not advance the table (the arbitrated revival does
+ * that). prte_rml_record_epoch force-sets the authoritative epoch for a rank
+ * (used by the revival path and the HNP's return validation);
+ * prte_rml_get_epoch reads it (0 if unknown). */
+PRTE_EXPORT bool prte_rml_epoch_ok(pmix_rank_t rank, uint64_t epoch);
+PRTE_EXPORT void prte_rml_record_epoch(pmix_rank_t rank, uint64_t epoch);
+PRTE_EXPORT uint64_t prte_rml_get_epoch(pmix_rank_t rank);
+
 PRTE_EXPORT void prte_rml_register(void);
 PRTE_EXPORT void prte_rml_close(void);
 PRTE_EXPORT int prte_rml_open(void);
@@ -206,6 +244,7 @@ PRTE_EXPORT void prte_rml_compute_routing_tree(void);
 PRTE_EXPORT void prte_rml_update_ancestors(pmix_data_array_t* ancestors);
 PRTE_EXPORT void prte_rml_repair_routing_tree(pmix_data_array_t* failed_ranks,
                                               bool global);
+PRTE_EXPORT void prte_rml_revive_routing_tree(pmix_rank_t rank);
 PRTE_EXPORT void prte_rml_fault_handler(const prte_rml_recovery_status_t* s);
 PRTE_EXPORT int prte_rml_get_num_contributors(pmix_rank_t *dmns, size_t ndmns);
 PRTE_EXPORT void prte_rml_recv_failures_notice(int status, pmix_proc_t *sender,
@@ -216,6 +255,17 @@ PRTE_EXPORT void prte_rml_recv_adoption_notice(int status, pmix_proc_t *sender,
                                                pmix_data_buffer_t* buf,
                                                prte_rml_tag_t tag,
                                                void *cbdata);
+/* A bootstrap daemon announces its (re)appearance to the HNP; the HNP
+ * validates the rank is currently absent and broadcasts a revival. */
+PRTE_EXPORT void prte_rml_send_return_notice(void);
+PRTE_EXPORT void prte_rml_recv_return_request(int status, pmix_proc_t *sender,
+                                              pmix_data_buffer_t* buf,
+                                              prte_rml_tag_t tag,
+                                              void *cbdata);
+PRTE_EXPORT void prte_rml_recv_revival_notice(int status, pmix_proc_t *sender,
+                                              pmix_data_buffer_t* buf,
+                                              prte_rml_tag_t tag,
+                                              void *cbdata);
 PRTE_EXPORT int prte_rml_route_lost(pmix_rank_t route);
 PRTE_EXPORT pmix_rank_t prte_rml_get_route(pmix_rank_t target);
 PRTE_EXPORT int prte_rml_get_subtree_index(pmix_rank_t target);

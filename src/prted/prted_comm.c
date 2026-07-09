@@ -93,6 +93,27 @@ static void _notify_release(pmix_status_t status, void *cbdata)
 
 static pmix_pointer_array_t *procs_prev_ordered_to_terminate = NULL;
 
+/* A daemon named as a target of a DVM shrink does not exit the instant it
+ * receives PRTE_DAEMON_SHRINK_CMD: it must stay alive long enough for its
+ * subtree's ACK of the shrink broadcast to reach the master, or the master's
+ * collective shrink-completion handler would never fire.  It therefore records
+ * that it is leaving and arms this bounded timer; the timer fires well after the
+ * broadcast has completed (broadcast ACKs propagate in milliseconds) and drives
+ * the actual departure.  A daemon leaves only once, so a file-static event
+ * suffices.  This is the "bounded self-exit fallback"; a lifeline-loss fast path
+ * (prte_rml_route_lost) departs sooner when the connection actually drops. */
+static prte_event_t prte_shrink_depart_ev;
+static struct timeval prte_shrink_depart_tv = {2, 0};
+
+static void prte_shrink_depart(int sd, short args, void *cbdata)
+{
+    PRTE_HIDE_UNUSED_PARAMS(sd, args, cbdata);
+    /* communications to the rest of the DVM can no longer be relied upon, so
+     * force a local termination exactly as the comm-failure path would */
+    prte_abnormal_term_ordered = true;
+    PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+}
+
 void prte_daemon_recv(int status, pmix_proc_t *sender,
                       pmix_data_buffer_t *buffer,
                       prte_rml_tag_t tag, void *cbdata)
@@ -491,8 +512,6 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
         // see if we are one of them
         for (i=0; i < num_procs; i++) {
             if (ranks[i] == PRTE_PROC_MY_NAME->rank) {
-                /* this is an abnormal termination */
-                prte_abnormal_term_ordered = true;
                 /* any tools attached to us will have done so via PMIx, so
                  * let's provide them with a friendly "job end" notification */
                 PMIX_INFO_LOAD(&info[0], PMIX_EVENT_NON_DEFAULT, NULL, PMIX_BOOL);
@@ -506,10 +525,28 @@ void prte_daemon_recv(int status, pmix_proc_t *sender,
                 PRTE_PMIX_DESTRUCT_LOCK(&lk);
                 // mark abnormal exit status
                 PRTE_UPDATE_EXIT_STATUS(-1);
-                /* do a clean exit; the HNP detects our departure via the
-                 * normal daemon-loss (comm-failure) path and completes the
-                 * shrink campaign there */
-                PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+                if (prte_elastic_mode) {
+                    /* Elastic shrink: the master completes the campaign from the
+                     * broadcast's completion, so we must NOT exit until our
+                     * subtree's ACK of this broadcast has reached it.  Record that
+                     * we are leaving — which also lets the lifeline-loss path treat
+                     * a dropped connection as a cue to depart rather than recover —
+                     * and arm a bounded departure timer; we exit when it fires or,
+                     * if sooner, when our lifeline drops (prte_rml_route_lost
+                     * departs early once prte_dvm_leaving is set).  Because the
+                     * shrink command reached us through our own lifeline, setting
+                     * this here can never race ahead of a genuine fault. */
+                    prte_dvm_leaving = true;
+                    prte_event_evtimer_set(prte_event_base, &prte_shrink_depart_ev,
+                                           prte_shrink_depart, NULL);
+                    prte_event_evtimer_add(&prte_shrink_depart_ev, &prte_shrink_depart_tv);
+                } else {
+                    /* legacy fire-and-forget shrink (no completion tracking): do a
+                     * clean immediate exit, exactly as before.  The HNP detects our
+                     * departure via the normal daemon-loss (comm-failure) path. */
+                    prte_abnormal_term_ordered = true;
+                    PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+                }
                 break;
             }
         }

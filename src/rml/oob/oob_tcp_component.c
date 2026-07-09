@@ -115,52 +115,6 @@ void prte_mca_oob_tcp_component_lost_connection(int fd, short args, void *cbdata
     PMIX_RELEASE(pop);
 }
 
-void prte_mca_oob_tcp_component_no_route(int fd, short args, void *cbdata)
-{
-    prte_oob_tcp_msg_error_t *mop = (prte_oob_tcp_msg_error_t *) cbdata;
-    PRTE_HIDE_UNUSED_PARAMS(fd, args);
-
-    PMIX_ACQUIRE_OBJECT(mop);
-
-    pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
-                        "%s tcp:no route called for peer %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                        PRTE_NAME_PRINT(&mop->hop));
-
-    if (prte_prteds_term_ordered || prte_finalizing || prte_abnormal_term_ordered) {
-        /* just ignore the problem */
-        PMIX_RELEASE(mop);
-        return;
-    }
-
-    /* report the error */
-    PRTE_ACTIVATE_PROC_STATE(&mop->hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
-
-    PMIX_RELEASE(mop);
-}
-
-void prte_mca_oob_tcp_component_hop_unknown(int fd, short args, void *cbdata)
-{
-    prte_oob_tcp_msg_error_t *mop = (prte_oob_tcp_msg_error_t *) cbdata;
-    PRTE_HIDE_UNUSED_PARAMS(fd, args);
-
-    PMIX_ACQUIRE_OBJECT(mop);
-
-    pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
-                        "%s tcp:unknown hop called for peer %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                        PRTE_NAME_PRINT(&mop->hop));
-
-    if (prte_prteds_term_ordered || prte_finalizing || prte_abnormal_term_ordered) {
-        /* just ignore the problem */
-        PMIX_RELEASE(mop);
-        return;
-    }
-
-    /* post the error */
-    PRTE_ACTIVATE_PROC_STATE(&mop->hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
-
-    PMIX_RELEASE(mop);
-}
-
 void prte_mca_oob_tcp_component_failed_to_connect(int fd, short args, void *cbdata)
 {
     prte_oob_tcp_peer_op_t *pop = (prte_oob_tcp_peer_op_t *) cbdata;
@@ -183,7 +137,22 @@ void prte_mca_oob_tcp_component_failed_to_connect(int fd, short args, void *cbda
                         "%s tcp:failed_to_connect unable to reach peer %s",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&pop->peer));
 
-    PRTE_ACTIVATE_PROC_STATE(&pop->peer, PRTE_PROC_STATE_FAILED_TO_CONNECT);
+    /* In a bootstrapped DVM the daemons boot independently, so a parent may
+     * simply not be up yet when we time out on it.  Rather than treat that as
+     * a fatal failure to connect, we heal the routing tree the same way we do
+     * when a live parent is lost: prte_rml_route_lost promotes us to the next
+     * ancestor and returns SUCCESS (a COMM_FAILED recovery), or returns an
+     * error for the HNP itself - which we never reach here, because the HNP is
+     * retried forever rather than being allowed to time out. */
+    if (prte_bootstrap_setup) {
+        if (PRTE_SUCCESS != prte_rml_route_lost(pop->peer.rank)) {
+            PRTE_ACTIVATE_PROC_STATE(&pop->peer, PRTE_PROC_STATE_LIFELINE_LOST);
+        } else {
+            PRTE_ACTIVATE_PROC_STATE(&pop->peer, PRTE_PROC_STATE_COMM_FAILED);
+        }
+    } else {
+        PRTE_ACTIVATE_PROC_STATE(&pop->peer, PRTE_PROC_STATE_FAILED_TO_CONNECT);
+    }
     PMIX_RELEASE(pop);
 }
 
@@ -198,6 +167,7 @@ static void peer_cons(prte_oob_tcp_peer_t *peer)
     peer->active_addr = NULL;
     peer->state = MCA_OOB_TCP_UNCONNECTED;
     peer->num_retries = 0;
+    peer->first_attempt = 0;
     PMIX_CONSTRUCT(&peer->send_queue, pmix_list_t);
     peer->send_msg = NULL;
     peer->recv_msg = NULL;
@@ -253,8 +223,6 @@ static void pop_des(prte_oob_tcp_peer_op_t *pop)
     }
 }
 PMIX_CLASS_INSTANCE(prte_oob_tcp_peer_op_t, pmix_object_t, pop_cons, pop_des);
-
-PMIX_CLASS_INSTANCE(prte_oob_tcp_msg_op_t, pmix_object_t, NULL, NULL);
 
 PMIX_CLASS_INSTANCE(prte_oob_tcp_conn_op_t, pmix_object_t, NULL, NULL);
 

@@ -80,8 +80,20 @@ PRTE_EXPORT int prte_ess_base_proc_binding(void);
  */
 PRTE_EXPORT int prte_ess_env_put(int32_t num_procs, int32_t num_local_procs, char ***env);
 
-/* read a bootstrap configuration file */
-PRTE_EXPORT int prte_ess_base_bootstrap(void);
+/* read a bootstrap configuration file and publish the local daemon's
+ * identity/role into the environment; sets *is_controller true iff this node
+ * is the DVM controller */
+PRTE_EXPORT int prte_ess_base_bootstrap_params(void);
+PRTE_EXPORT int prte_ess_base_bootstrap(bool *is_controller);
+
+/* Synthesize the RML contact URI of the daemon holding @c rank, entirely from
+ * the bootstrap configuration, so a daemon can reach a peer before any nidmap
+ * has been distributed.  Used by prted to reach its initial parent in a deep
+ * radix tree, and by the OOB to reach a peer it must route through but whose
+ * contact info it does not yet know - most importantly the new parent (a former
+ * grandparent) adopted after a lost lifeline heals the tree.  On success @c *uri
+ * is a malloc'd string the caller frees. */
+PRTE_EXPORT int prte_ess_base_bootstrap_peer_uri(pmix_rank_t rank, char **uri);
 
 typedef struct {
     pmix_list_item_t super;

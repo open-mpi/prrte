@@ -187,9 +187,39 @@ void prte_plm_base_allocation_complete(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     prte_node_t *node;
+    int rc;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(caddy);
+
+    /* In a bootstrapped DVM the daemons were started independently on every
+     * node and are already phoning home - there is nothing for us to launch.
+     * We therefore establish the virtual machine directly from the allocated
+     * node pool (assigning vpids, building the routing tree, and setting the
+     * expected daemon count) and then simply wait: as each running daemon
+     * reports in, prte_plm_base_daemon_callback advances the state machine to
+     * DAEMONS_REPORTED and on to VM_READY.
+     *
+     * This special handling applies ONLY to the daemon job (the one-time DVM
+     * formation). Application jobs launched later into the running DVM must
+     * follow the normal path: their LAUNCH_DAEMONS step calls setup_vm, finds
+     * every daemon already present ("no new daemons required"), and advances
+     * itself to DAEMONS_REPORTED. Taking the bootstrap branch for an app job
+     * would strand it in DAEMONS_LAUNCHED with nothing left to report in. */
+    if (prte_bootstrap_setup &&
+        caddy->jdata == prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace)) {
+        caddy->jdata->state = PRTE_JOB_STATE_ALLOCATION_COMPLETE;
+        rc = prte_plm_base_setup_virtual_machine(caddy->jdata);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            PRTE_ACTIVATE_JOB_STATE(caddy->jdata, PRTE_JOB_STATE_FAILED_TO_START);
+            PMIX_RELEASE(caddy);
+            return;
+        }
+        caddy->jdata->state = PRTE_JOB_STATE_DAEMONS_LAUNCHED;
+        PMIX_RELEASE(caddy);
+        return;
+    }
 
     /* if we don't want to launch, then we at least want
      * to map so we can see where the procs would have
@@ -1292,6 +1322,20 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             prted_failed_launch = true;
             goto CLEANUP;
         }
+        /* A returning daemon (the bootstrap unheal path): its node rebooted and
+         * it is reporting in again after we recorded it COMM_FAILED and
+         * decremented num_daemons on its death. Restore the count so the nidmap
+         * span [0, num_daemons) and every daemon-count-derived computation are
+         * correct again -- otherwise the launch nidmap encodes a shorter span
+         * than the live daemon set and re-poisons the returned daemon (it decodes
+         * its own rank, or a peer beyond the truncated span, as a dead hole).
+         * Only a daemon that had actually failed reaches this: a first launch or
+         * a grow target is not COMM_FAILED here, so formation and grow are
+         * unaffected, and once set RUNNING below a duplicate report cannot
+         * double-count. Gated on bootstrap, the only mode a daemon can return in. */
+        if (prte_bootstrap_setup && PRTE_PROC_STATE_COMM_FAILED == daemon->state) {
+            ++prte_process_info.num_daemons;
+        }
         daemon->state = PRTE_PROC_STATE_RUNNING;
         /* record that this daemon is alive */
         PRTE_FLAG_SET(daemon, PRTE_PROC_FLAG_ALIVE);
@@ -1854,6 +1898,13 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_EXTEND_DVM, NULL, PMIX_BOOL)) {
         // nodes have been added, so extend the DVM
         prte_remove_attribute(&jdata->attributes, PRTE_JOB_EXTEND_DVM);
+        /* Reset the per-launch daemon accounting. The initial-VM path zeroes
+         * these further below, but the grow path jumps straight to construct:
+         * and would otherwise accumulate num_new_daemons across successive
+         * grows and reuse a stale daemon_vpid_start - corrupting the grow
+         * campaign's target list and suppressing its completion event (#2491). */
+        map->num_new_daemons = 0;
+        map->daemon_vpid_start = PMIX_RANK_INVALID;
         goto construct;
     }
 
@@ -2621,6 +2672,46 @@ void prte_plm_base_grow_drain(bool success)
     }
 }
 
+/* Return a node that has been torn out of the DVM (by a completed shrink or a
+ * rolled-back grow) to a pristine, never-launched state so a later grow can
+ * relaunch a daemon on it.  Clearing the daemon backpointer alone is not enough:
+ * the launch machinery keys off per-node flags and the persistent daemon-job
+ * map, and stale values there make a re-grow silently misbehave.  Specifically,
+ * PRTE_NODE_FLAG_DAEMON_LAUNCHED left set makes every plm launcher skip the node
+ * ("daemon already exists"), so the new prted is never spawned; and leaving the
+ * node in the daemon map lets setup_vm add it a second time, duplicating it in
+ * the VM.  Reset both here. */
+void prte_plm_base_reset_dvm_node(prte_node_t *node)
+{
+    prte_job_t *daemons;
+    prte_node_t *nptr;
+    int i;
+
+    if (NULL == node) {
+        return;
+    }
+
+    PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_DAEMON_LAUNCHED);
+    PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_LOC_VERIFIED);
+
+    daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons || NULL == daemons->map) {
+        return;
+    }
+    for (i = 0; i < daemons->map->nodes->size; i++) {
+        nptr = (prte_node_t *) pmix_pointer_array_get_item(daemons->map->nodes, i);
+        if (nptr != node) {
+            continue;
+        }
+        pmix_pointer_array_set_item(daemons->map->nodes, i, NULL);
+        if (0 < daemons->map->num_nodes) {
+            --daemons->map->num_nodes;
+        }
+        PMIX_RELEASE(node); /* the map held a retain */
+        break;
+    }
+}
+
 /* Roll a failed grow campaign back out of the DVM so a failed grow leaves the
  * DVM at its exact pre-grow membership rather than half-extended (spec
  * conformance #5).  `trigger` is the rank whose death triggered the failure;
@@ -2635,12 +2726,11 @@ void prte_plm_base_grow_drain(bool success)
  *     daemon-count bump is reverted here (no comm-failure event will arrive for
  *     it).
  *
- * In all cases the node's daemon backpointer is cleared so the mapper can no
- * longer place a later job on it.  The new nodes carry no application procs —
- * the jobs that would have used them were held at the fence, never launched —
- * so clearing ``node->daemon`` is sufficient to remove the node from the DVM's
- * usable set.  The teardown is strictly campaign-scoped: it touches only the
- * ranks in this campaign's ``targets`` array. */
+ * In all cases the node is reset out of the DVM's usable set (see
+ * prte_plm_base_reset_dvm_node).  The new nodes carry no application procs — the
+ * jobs that would have used them were held at the fence, never launched.  The
+ * teardown is strictly campaign-scoped: it touches only the ranks in this
+ * campaign's ``targets`` array. */
 static void grow_rollback(prte_grow_campaign_t *camp, pmix_rank_t trigger)
 {
     prte_job_t *daemons;
@@ -2695,6 +2785,10 @@ static void grow_rollback(prte_grow_campaign_t *camp, pmix_rank_t trigger)
                 node->daemon = NULL;
                 PMIX_RELEASE(dproc);
             }
+            /* return the node to a pristine, never-launched state so a later
+             * grow can relaunch a daemon on it (clears the launch flags and
+             * drops it from the daemon-job map) */
+            prte_plm_base_reset_dvm_node(node);
         }
     }
 
