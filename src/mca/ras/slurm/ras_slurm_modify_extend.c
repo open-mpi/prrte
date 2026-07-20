@@ -27,7 +27,6 @@
 
 #include "ras_slurm.h"
 #include "src/mca/ras/base/base.h"
-#include "src/mca/state/state.h"
 
 #define PRTE_SLURM_MAX_SBATCH_ARGS 32
 #define PRTE_SLURM_WAIT_MIN_USEC 1000        /* 1 ms */
@@ -55,6 +54,12 @@ static int prte_ras_slurm_make_sbatch_arg(pmix_hash_table_t *fields, const char 
 static int prte_ras_slurm_exec_sbatch(char * const *argv, char *job_id);
 static int prte_ras_slurm_launch_expander_job(pmix_hash_table_t *fields);
 static int prte_ras_slurm_reject_node_duplicates(pmix_list_t *node_list);
+static int prte_ras_slurm_extract_reused_nodes(const char *slurm_jobid,
+                                               pmix_list_t *node_list,
+                                               pmix_pointer_array_t *reused_nodes);
+static int prte_ras_slurm_add_reused_nodes_to_session(const char *slurm_jobid,
+                                                      pmix_pointer_array_t *reused_nodes);
+static void prte_ras_slurm_rollback_session(const char *slurm_jobid);
 static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata);
 
 PMIX_CLASS_INSTANCE(prte_slurm_wait_tracker_t, pmix_object_t, swt_con, swt_des);
@@ -150,7 +155,8 @@ static void localrelease(void *cbdata)
  *
  * Looks up a value in the provided hash table and, if present and usable,
  * formats it according to the given format string and appends it to the
- * sbatch argv array.
+ * sbatch argv array. Missing and empty values return PRTE_ERR_NOT_FOUND so
+ * callers can omit optional Slurm attributes.
  *
  * @param[in] fields
  *     Hash table containing job configuration data.
@@ -194,7 +200,7 @@ static int prte_ras_slurm_make_sbatch_arg(pmix_hash_table_t *fields,
     }
 
     if(NULL == stored_val || '\0' == stored_val[0]) {
-        return PRTE_ERR_DATA_VALUE_NOT_FOUND;
+        return PRTE_ERR_NOT_FOUND;
     }
 
     if(obj_num) {
@@ -621,6 +627,151 @@ static int prte_ras_slurm_reject_node_duplicates(pmix_list_t *node_list)
 }
 
 /**
+ * @brief Move reusable node duplicates out of the new-node list.
+ *
+ * If Slurm regrants a node that PRRTE already knows about from an earlier
+ * shrink, reuse the existing global node object instead of treating the
+ * Slurm-discovered node as a duplicate. Only daemon-less nodes can be reused.
+ *
+ * @param[in] slurm_jobid    Slurm job ID for the new allocation.
+ * @param[in,out] node_list  Newly discovered Slurm nodes.
+ * @param[out] reused_nodes  Existing nodes to add back to the DVM.
+ */
+static int prte_ras_slurm_extract_reused_nodes(const char *slurm_jobid,
+                                               pmix_list_t *node_list,
+                                               pmix_pointer_array_t *reused_nodes)
+{
+    if (NULL == slurm_jobid || NULL == node_list || NULL == reused_nodes) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int err;
+    uint32_t slurm_id_uint;
+    prte_node_t *node, *next, *existing;
+
+    err = prte_ras_slurm_convert_jobid(slurm_jobid, &slurm_id_uint);
+    if (PRTE_SUCCESS != err) {
+        return err;
+    }
+
+    PMIX_LIST_FOREACH(node, node_list, prte_node_t) {
+        existing = prte_node_match(NULL, node->name);
+        if (NULL == existing) {
+            continue;
+        }
+
+        if (NULL != existing->daemon ||
+            PRTE_FLAG_TEST(existing, PRTE_NODE_FLAG_DAEMON_LAUNCHED)) {
+            return PRTE_EXISTS;
+        }
+    }
+
+    PMIX_LIST_FOREACH_SAFE(node, next, node_list, prte_node_t) {
+        existing = prte_node_match(NULL, node->name);
+        if (NULL == existing) {
+            continue;
+        }
+
+        err = prte_set_attribute(&existing->attributes, PRTE_NODE_ALLOC_ID,
+                                 PRTE_ATTR_LOCAL, &slurm_id_uint, PMIX_UINT32);
+        if (PRTE_SUCCESS != err) {
+            return err;
+        }
+
+        existing->slots = node->slots;
+        existing->slots_max = node->slots_max;
+        existing->slots_inuse = 0;
+        existing->state = PRTE_NODE_STATE_ADDED;
+
+        if (0 > pmix_pointer_array_add(reused_nodes, existing)) {
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+
+        pmix_list_remove_item(node_list, &node->super);
+        PMIX_RELEASE(node);
+    }
+
+    return PRTE_SUCCESS;
+}
+
+/**
+ * @brief Add reused global nodes to the dynamic Slurm session.
+ *
+ * @param[in] slurm_jobid   Slurm job ID for the destination session.
+ * @param[in] reused_nodes  Existing nodes to attach to the session.
+ */
+static int prte_ras_slurm_add_reused_nodes_to_session(const char *slurm_jobid,
+                                                      pmix_pointer_array_t *reused_nodes)
+{
+    if (NULL == slurm_jobid || NULL == reused_nodes) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int err = PRTE_SUCCESS;
+    int pmix_err;
+    int added = 0;
+    prte_session_t *session;
+    prte_session_stack_item_t *item;
+    prte_node_t *node;
+
+    session = prte_get_session_object_from_id(slurm_jobid);
+    if (NULL == session) {
+        return PRTE_ERR_NOT_FOUND;
+    }
+
+    for (int i = 0; i < reused_nodes->size; i++) {
+        node = (prte_node_t *) pmix_pointer_array_get_item(reused_nodes, i);
+        if (NULL == node) {
+            continue;
+        }
+
+        PMIX_RETAIN(node);
+        pmix_err = pmix_pointer_array_add(session->nodes, node);
+        if (0 > pmix_err) {
+            PMIX_RELEASE(node);
+            err = prte_pmix_convert_status(pmix_err);
+            return err;
+        }
+        added++;
+    }
+
+    PMIX_LIST_FOREACH(item, prte_slurm_session_stack, prte_session_stack_item_t) {
+        if (item->session == session) {
+            item->nodes_in_session += added;
+            return PRTE_SUCCESS;
+        }
+    }
+
+    return PRTE_ERR_NOT_FOUND;
+}
+
+/**
+ * @brief Remove a newly-created Slurm session after extend failure.
+ *
+ * @param[in] slurm_jobid Slurm job ID for the session to roll back.
+ */
+static void prte_ras_slurm_rollback_session(const char *slurm_jobid)
+{
+    prte_session_t *session;
+    prte_session_stack_item_t *item, *next;
+
+    session = prte_get_session_object_from_id(slurm_jobid);
+    if (NULL == session) {
+        return;
+    }
+
+    PMIX_LIST_FOREACH_SAFE(item, next, prte_slurm_session_stack, prte_session_stack_item_t) {
+        if (item->session == session) {
+            pmix_list_remove_item(prte_slurm_session_stack, &item->super);
+            PMIX_RELEASE(item);
+            break;
+        }
+    }
+
+    PMIX_RELEASE(session);
+}
+
+/**
  * @brief Finalize a Slurm resource extension request.
  *
  * Processes newly allocated Slurm resources after the wait phase completes.
@@ -633,8 +784,12 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
  
     pmix_list_t added_nodes;
+    pmix_pointer_array_t reused_nodes;
     bool have_added_nodes = false;
+    bool have_reused_nodes = false;
     bool resources_added = false;
+    int added_node_count = 0;
+    int reused_node_count = 0;
     
     prte_slurm_wait_tracker_t *trk = cbdata;
     prte_pmix_server_req_t *req = trk->req;
@@ -650,6 +805,8 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
 
     PMIX_CONSTRUCT(&added_nodes, pmix_list_t);
     have_added_nodes = true;
+    PMIX_CONSTRUCT(&reused_nodes, pmix_pointer_array_t);
+    have_reused_nodes = true;
 
     err = prte_ras_slurm_add_modified_resources(job_id, &added_nodes);
 
@@ -657,10 +814,16 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
         goto complete;
     }
 
-    /* Reject nodes that are already present in prte_node_pool.
-    * This avoids duplicate node entries, as merge semantics
-    * are not currently implemented. We already enforce an 
-    * --exclusive flag, so this is just a fallback. */
+    err = prte_ras_slurm_extract_reused_nodes(job_id, &added_nodes, &reused_nodes);
+
+    if (PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        goto complete;
+    }
+
+    /* Reject any remaining nodes that are already present in prte_node_pool.
+     * Nodes that are safe to relaunch are removed above and tracked
+     * separately as reused nodes. */
     err = prte_ras_slurm_reject_node_duplicates(&added_nodes);
 
     if(PRTE_SUCCESS != err) {
@@ -675,12 +838,27 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
         goto complete;
     }
 
+    added_node_count = pmix_list_get_size(&added_nodes);
+    for (int i = 0; i < reused_nodes.size; i++) {
+        if (NULL != pmix_pointer_array_get_item(&reused_nodes, i)) {
+            reused_node_count++;
+        }
+    }
+
     /* Create a session  */
     err = prte_ras_slurm_assign_new_session(job_id,
                                             trk->user_request_id_provided ? request_id : NULL,
-                                            &added_nodes);
+                                            &added_nodes, true);
 
     if(PRTE_SUCCESS != err) {
+        goto complete;
+    }
+
+    err = prte_ras_slurm_add_reused_nodes_to_session(job_id, &reused_nodes);
+
+    if (PRTE_SUCCESS != err) {
+        prte_ras_slurm_rollback_session(job_id);
+        PRTE_ERROR_LOG(err);
         goto complete;
     }
     
@@ -688,26 +866,12 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
     err = prte_ras_base_node_insert(&added_nodes, NULL);
 
     if(PRTE_SUCCESS != err) {
-        prte_session_t *session = prte_get_session_object_from_id(job_id);
-
-        /* Roll back session changes to avoid inconsistent state */
-        if (NULL != session) {
-            prte_session_stack_item_t *item, *next;
-            PMIX_LIST_FOREACH_SAFE(item, next, prte_slurm_session_stack, prte_session_stack_item_t) {
-                if (item->session == session) {
-                    pmix_list_remove_item(prte_slurm_session_stack, &item->super);
-                    PMIX_RELEASE(item);
-                    break;
-                }
-            }
-            PMIX_RELEASE(session);
-        }
-
+        prte_ras_slurm_rollback_session(job_id);
         PRTE_ERROR_LOG(err);
         goto complete;
     }
 
-    prte_num_allocated_nodes += pmix_list_get_size(&added_nodes);
+    prte_num_allocated_nodes += added_node_count + reused_node_count;
     resources_added = true;
 
     int pending_err = prte_ras_slurm_remove_pending_req(request_id);
@@ -726,6 +890,11 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
     if(have_added_nodes) {
         PMIX_DESTRUCT(&added_nodes);
         have_added_nodes = false;
+    }
+
+    if (have_reused_nodes) {
+        PMIX_DESTRUCT(&reused_nodes);
+        have_reused_nodes = false;
     }
 
     req->pstatus = prte_pmix_convert_rc(err);
@@ -751,9 +920,7 @@ static void prte_ras_slurm_extend_wait_complete(int fd, short args, void *cbdata
 
     /* Launch daemons on the newly secured resources */
     if (PMIX_SUCCESS == req->pstatus) {
-        prte_job_t *daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-        PRTE_ACTIVATE_JOB_STATE(daemons, PRTE_JOB_STATE_LAUNCH_DAEMONS);
-        prte_set_attribute(&daemons->attributes, PRTE_JOB_EXTEND_DVM, PRTE_ATTR_LOCAL, NULL, PMIX_BOOL);
+        prte_ras_base_activate_dvm_grow();
     }
 
     /* Execute callback if necessary */

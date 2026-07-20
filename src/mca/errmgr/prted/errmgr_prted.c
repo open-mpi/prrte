@@ -249,6 +249,7 @@ static void job_errors(int fd, short args, void *cbdata)
      * if prte is trying to shutdown, just let it
      */
     if (prte_finalizing) {
+        PMIX_RELEASE(caddy);
         return;
     }
 
@@ -264,7 +265,7 @@ static void job_errors(int fd, short args, void *cbdata)
     jdata->state = jobstate;
 
     PMIX_OUTPUT_VERBOSE((1, prte_errmgr_base_framework.framework_output,
-                         "%s errmgr:prted: job %s repprted error state %s",
+                         "%s errmgr:prted: job %s reported error state %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace),
                          prte_job_state_to_str(jobstate)));
 
@@ -469,7 +470,7 @@ static void proc_errors(int fd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
             /* pack only the data for this proc - have to start with the jobid
              * so the receiver can unpack it correctly
@@ -478,14 +479,14 @@ static void proc_errors(int fd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
 
             /* now pack the child's info */
             if (PMIX_SUCCESS != (rc = pack_state_for_proc(alert, child))) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
             /* send it */
             PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
@@ -535,7 +536,7 @@ static void proc_errors(int fd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
             /* pack only the data for this proc - have to start with the jobid
              * so the receiver can unpack it correctly
@@ -544,14 +545,14 @@ static void proc_errors(int fd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
 
             /* now pack the child's info */
             if (PMIX_SUCCESS != (rc = pack_state_for_proc(alert, child))) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
             /* send it */
             PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
@@ -651,7 +652,7 @@ static void proc_errors(int fd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
             /* pack only the data for this proc - have to start with the jobid
              * so the receiver can unpack it correctly
@@ -660,14 +661,14 @@ static void proc_errors(int fd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
             child->state = state;
             /* now pack the child's info */
             if (PMIX_SUCCESS != (rc = pack_state_for_proc(alert, child))) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
-                return;
+                goto cleanup;
             }
             pmix_output_verbose(5, prte_errmgr_base_framework.framework_output,
                                 "%s errmgr:prted reporting proc %s aborted to HNP (local procs = %d)",
@@ -707,13 +708,13 @@ static void proc_errors(int fd, short args, void *cbdata)
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(alert);
-            return;
+            goto cleanup;
         }
         /* pack the data for the job */
         if (PMIX_SUCCESS != (rc = pack_state_update(alert, jdata))) {
             PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(alert);
-            return;
+            goto cleanup;
         }
 
         PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
@@ -741,7 +742,7 @@ static void proc_errors(int fd, short args, void *cbdata)
             PRTE_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(alert);
         }
-        return;
+        goto cleanup;
     }
 
 cleanup:

@@ -234,6 +234,10 @@ static void recv_ack(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer
             }
         }
     }
+    /* no matching xfer found (e.g. the file was already fully positioned
+     * and removed) - avoid leaking the unpacked filename
+     */
+    free(file);
 }
 
 static int raw_preposition_files(prte_job_t *jdata,
@@ -474,9 +478,20 @@ static int raw_preposition_files(prte_job_t *jdata,
             pmix_output(0, "%s CANNOT ACCESS FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         fs->local_target);
             PMIX_RELEASE(item);
-            pmix_list_remove_item(&outbound_files, &outbound->super);
-            PMIX_RELEASE(outbound);
-            return PRTE_ERROR;
+            /* record the failure and stop queueing further files, but do NOT
+             * tear down the outbound here: files already handed to send_chunk
+             * still have live events queued on the progress thread, and their
+             * xfers hold open fds. Freeing the outbound now would drain those
+             * xfers (use-after-free on the queued events, leaked fds) and
+             * would also double-drive FILES_POSN_FAILED, since the caller
+             * treats our error return as a failure *and* the completion
+             * callback would fire again. Instead let the async path report
+             * the error: the callback delivers outbound->status once every
+             * queued xfer has acked (or immediately below if none were
+             * queued).
+             */
+            outbound->status = PRTE_ERR_FILE_OPEN_FAILURE;
+            break;
         }
         /* set the flags to non-blocking */
         if ((flags = fcntl(fd, F_GETFL, 0)) < 0) {
@@ -541,19 +556,26 @@ static int raw_preposition_files(prte_job_t *jdata,
         PRTE_PMIX_THREADSHIFT(xfer, prte_event_base, send_chunk);
         PMIX_RELEASE(item);
     }
-    PMIX_DESTRUCT(&fsets);
+    /* a mid-loop break (open failure) can leave entries on fsets, so use
+     * PMIX_LIST_DESTRUCT to release any that remain
+     */
+    PMIX_LIST_DESTRUCT(&fsets);
 
-    /* check to see if anything remains to be sent - if everything
-     * is a duplicate, then the list will be empty
+    /* check to see if anything remains to be sent - the list is empty if
+     * every file was a duplicate, or if the very first file failed to open
      */
     if (0 == pmix_list_get_size(&outbound->xfers)) {
+        /* capture the status before releasing the outbound: it is a failure
+         * only if an open() failed above, success if all were duplicates
+         */
+        int st = outbound->status;
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
-                             "%s filem:raw: all duplicate files - no positioning reqd",
+                             "%s filem:raw: nothing to position (all duplicates or open failed)",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         pmix_list_remove_item(&outbound_files, &outbound->super);
         PMIX_RELEASE(outbound);
         if (NULL != cbfunc) {
-            cbfunc(PRTE_SUCCESS, cbdata);
+            cbfunc(st, cbdata);
         }
         return PRTE_SUCCESS;
     }
@@ -601,6 +623,11 @@ static int create_link(char *my_dir, char *path, char *link_pt)
             return rc;
         }
         free(basedir);
+        /* the directory now exists (freshly created or already present) -
+         * clear the PMIX_ERR_EXISTS that dirpath_create may have left in
+         * rc, else a successful link is reported to the caller as a failure
+         */
+        rc = PRTE_SUCCESS;
         /* do the symlink */
         if (0 != symlink(mypath, fullname)) {
             pmix_output(0, "%s Failed to symlink %s to %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
@@ -704,12 +731,26 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
                         PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                                              "%s filem:raw: creating links for file %s",
                                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), inbnd->file));
-                        /* cycle thru the link points and create symlinks to them */
+                        /* Decide where the link lives. The staged bytes were
+                         * written under the node's top_session_dir (see
+                         * recv_files), so that - not the job session_dir - is
+                         * always the symlink *source*. The link *target* is
+                         * normally the per-proc session dir, so each proc finds
+                         * the file in its own cwd. A preloaded binary (EXE) is
+                         * the exception: --preload-binary sets
+                         * PRTE_APP_SSNDIR_CWD, which makes every proc's cwd the
+                         * *job* session dir (see setup_path in odls), so the
+                         * executable must be linked there for "./<binary>" to
+                         * resolve. That link is job-wide, so create_link's
+                         * existence check makes the repeat across procs a no-op.
+                         */
+                        char *linkdir = (PRTE_FILEM_TYPE_EXE == inbnd->type) ? session_dir : path;
                         for (j = 0; NULL != inbnd->link_pts[j]; j++) {
                             if (PRTE_SUCCESS
-                                != (rc = create_link(session_dir, path, inbnd->link_pts[j]))) {
+                                != (rc = create_link(prte_process_info.top_session_dir, linkdir,
+                                                     inbnd->link_pts[j]))) {
                                 PRTE_ERROR_LOG(rc);
-                                free(files);
+                                PMIx_Argv_free(files);
                                 free(path);
                                 return rc;
                             }
@@ -1027,6 +1068,10 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
             send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
             free(file);
             free(tmp);
+            /* drop this file from the incoming list before releasing it,
+             * else a later chunk would walk a dangling pointer
+             */
+            pmix_list_remove_item(&incoming_files, &incoming->super);
             PMIX_RELEASE(incoming);
             return;
         }
@@ -1039,6 +1084,8 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
                 send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
                 free(file);
                 free(tmp);
+                pmix_list_remove_item(&incoming_files, &incoming->super);
+                PMIX_RELEASE(incoming);
                 return;
             }
         } else {
@@ -1049,6 +1096,8 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
                 send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
                 free(file);
                 free(tmp);
+                pmix_list_remove_item(&incoming_files, &incoming->super);
+                PMIX_RELEASE(incoming);
                 return;
             }
         }
@@ -1110,6 +1159,10 @@ static void write_handler(int fd, short event, void *cbdata)
             /* close the file descriptor */
             close(sink->fd);
             sink->fd = -1;
+            /* we are done with this EOF marker - release it so it isn't
+             * leaked on the finalize paths below
+             */
+            PMIX_RELEASE(output);
             if (PRTE_FILEM_TYPE_FILE == sink->type || PRTE_FILEM_TYPE_EXE == sink->type) {
                 /* just link to the top as this will be the
                  * name we will want in each proc's session dir
@@ -1132,12 +1185,15 @@ static void write_handler(int fd, short event, void *cbdata)
                 if (NULL == getcwd(homedir, sizeof(homedir))) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    free(cmd);
                     return;
                 }
                 dirname = pmix_dirname(sink->fullpath);
                 if (0 != chdir(dirname)) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    free(cmd);
+                    free(dirname);
                     return;
                 }
                 PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
@@ -1146,11 +1202,21 @@ static void write_handler(int fd, short event, void *cbdata)
                 if (0 != system(cmd)) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    /* best-effort restore of our working directory before
+                     * bailing; log but don't mask the original failure
+                     */
+                    if (0 != chdir(homedir)) {
+                        PRTE_ERROR_LOG(PRTE_ERROR);
+                    }
+                    free(cmd);
+                    free(dirname);
                     return;
                 }
                 if (0 != chdir(homedir)) {
                     PRTE_ERROR_LOG(PRTE_ERROR);
                     send_complete(sink->file, PRTE_ERR_FILE_WRITE_FAILURE);
+                    free(cmd);
+                    free(dirname);
                     return;
                 }
                 free(dirname);

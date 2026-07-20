@@ -68,7 +68,11 @@ int prte_ras_slurm_serve_cancel_req(prte_pmix_server_req_t *req);
 int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req);
 
 /* Features to serve release requests */
+int prte_ras_slurm_modify_release_init(void);
+int prte_ras_slurm_modify_release_finalize(void);
 int prte_ras_slurm_serve_release_req(prte_pmix_server_req_t *req);
+void prte_ras_slurm_shrink_complete(prte_shrink_campaign_t *campaign);
+int prte_ras_slurm_release_allocation(prte_session_t *session);
 
 /* Common modify extend/release features */
 int prte_ras_slurm_kill_job(const char *slurm_jobid, char *err_msg, size_t err_msg_size);
@@ -79,7 +83,8 @@ int prte_ras_slurm_drain_cmd_output(FILE *fp, char *output, size_t output_size);
 int prte_ras_slurm_validate_jobid(const char *slurm_jobid);
 int prte_ras_slurm_validate_hostname(const char *hostname);
 int prte_ras_slurm_convert_jobid(const char *slurm_jobid, uint32_t *slurm_jobid_numeric);
-int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid, pmix_list_t *node_list);
+int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid,
+                                      pmix_list_t *node_list, bool dynamic);
 int prte_ras_slurm_tag_node_allocation(const char *slurm_jobid, pmix_list_t *node_list);
 
 typedef struct {

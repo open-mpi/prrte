@@ -207,6 +207,8 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
     rc = fence_sig_unpack(buffer, &sig);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
+        /* sig is NULL on failure - bail rather than deref it in get_tracker */
+        return;
     }
 
     /* check for the tracker and create it if not found */
@@ -370,6 +372,12 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
             }
         }
     }
+    /* free the unpacked info.  The non-HNP rollup path above already freed and
+     * NULLed it before forwarding; on the HNP-complete path and on every
+     * intermediate (not-yet-complete) contribution it is still live here.
+     * PMIX_INFO_FREE is a no-op on a NULL pointer, so this covers all of them
+     * without double-freeing. */
+    PMIX_INFO_FREE(info, ninfo);
 }
 
 static void relcb(void *cbdata)

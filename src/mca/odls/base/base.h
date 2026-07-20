@@ -30,6 +30,14 @@
  */
 #include "prte_config.h"
 
+#if PRTE_HAVE_SCHED_SETAFFINITY
+#    ifndef _GNU_SOURCE
+#        define _GNU_SOURCE
+#    endif
+#    include <sched.h>
+#endif
+
+#include "src/hwloc/hwloc-internal.h"
 #include "src/mca/mca.h"
 #include "src/mca/base/pmix_mca_base_framework.h"
 #include "src/mca/iof/base/iof_base_setup.h"
@@ -100,6 +108,19 @@ typedef struct {
     bool index_argv;
     prte_iof_base_io_conf_t opts;
     prte_odls_base_fork_local_proc_fn_t fork_local;
+    /* CPU/memory binding computed by the parent
+       (prte_odls_base_prepare_binding) for the child to apply in the
+       async-signal-safe window before execve(), so the child does no
+       allocation or parsing of its own. */
+    hwloc_cpuset_t bind_cpuset;         /* target cpu set, NULL if no binding */
+    bool bind_fatal;                    /* preparation hit a required-binding error */
+    bool do_membind;                    /* also apply the memory binding policy */
+    hwloc_membind_policy_t membind_policy;
+    int membind_flags;
+#if PRTE_HAVE_SCHED_SETAFFINITY
+    cpu_set_t *bind_mask;               /* CPU_ALLOC'd mask for sched_setaffinity */
+    size_t bind_masksize;               /* CPU_ALLOC_SIZE of bind_mask */
+#endif
 } prte_odls_spawn_caddy_t;
 PMIX_CLASS_DECLARATION(prte_odls_spawn_caddy_t);
 
@@ -156,8 +177,33 @@ PRTE_EXPORT void prte_odls_base_start_threads(prte_job_t *jdata);
 
 PRTE_EXPORT void prte_odls_base_harvest_threads(void);
 
-/* Binding support */
+/* Binding support.
+ *
+ * prte_odls_base_prepare_binding runs in the parent before the fork: it
+ * parses the mapper's cpuset, classifies the binding, precomputes the
+ * memory-binding policy and (where available) the raw sched_setaffinity
+ * mask, and emits any --report-bindings / warning output. It stashes the
+ * result on the caddy.  prte_odls_base_set then runs in the forked child,
+ * in the async-signal-safe window before execve(), and only issues the
+ * bind syscalls, reporting failures up the pipe. */
+PRTE_EXPORT void prte_odls_base_prepare_binding(prte_odls_spawn_caddy_t *cd);
 PRTE_EXPORT void prte_odls_base_set(prte_odls_spawn_caddy_t *cd, int write_fd);
+
+/*
+ * Async-signal-safe child->parent error reporting. These are called from
+ * inside the forked child, in the window between fork() and execve(),
+ * where only async-signal-safe operations are permitted. They write a
+ * fixed-size record (no strings, no allocation, no show_help) up the pipe
+ * to the waiting parent, which renders the human-readable diagnostic from
+ * the code and errno. child_fail is fatal - it reports the failure and
+ * terminates the child with _exit(); child_warn reports a non-fatal
+ * condition and returns so the child can continue toward execve().
+ */
+PRTE_EXPORT void prte_odls_base_child_fail(int write_fd, int exit_status,
+                                           prte_odls_child_err_t which,
+                                           int errnum) __prte_attribute_noreturn__;
+PRTE_EXPORT void prte_odls_base_child_warn(int write_fd, prte_odls_child_err_t which,
+                                           int errnum);
 
 
 #define PRTE_ODLS_SET_ERROR(ns, s, j)                                                   \

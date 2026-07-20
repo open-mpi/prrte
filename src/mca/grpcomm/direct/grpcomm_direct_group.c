@@ -292,6 +292,7 @@ static void group(int sd, short args, void *cbdata)
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DESTRUCT(&sig);
+                goto error;
             }
 
         } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_LOCAL_COLLECTIVE_STATUS)) {
@@ -424,6 +425,10 @@ static void group(int sd, short args, void *cbdata)
     }
     PMIx_Info_list_release(grpinfo);
     PMIx_Info_list_release(endpts);
+    /* consumed - NULL them so the error label below does not double-release
+     * if a send fails past this point */
+    grpinfo = NULL;
+    endpts = NULL;
 
     /* if this is a bootstrap operation, send it directly to the HNP */
     if (coll->bootstrap) {
@@ -440,6 +445,7 @@ static void group(int sd, short args, void *cbdata)
             goto error;
         }
         PMIX_DESTRUCT(&sig);
+        PMIX_RELEASE(cd);
         return;
     }
     PMIX_DESTRUCT(&sig);
@@ -456,9 +462,20 @@ static void group(int sd, short args, void *cbdata)
         rc = prte_pmix_convert_rc(rc);
         goto error;
     }
+    PMIX_RELEASE(cd);
     return;
 
 error:
+    /* the grpinfo/endpts trackers are released (and NULLed) on the success
+     * path above; on any error jump to here before that point they are still
+     * open, so release them now.  The NULL guard makes this safe for the
+     * post-release send-failure jumps too. */
+    if (NULL != grpinfo) {
+        PMIx_Info_list_release(grpinfo);
+    }
+    if (NULL != endpts) {
+        PMIx_Info_list_release(endpts);
+    }
     if (NULL != cd->cbfunc) {
         cd->cbfunc(rc, NULL, 0, cd->cbdata, NULL, NULL);
     }
@@ -498,6 +515,8 @@ void prte_grpcomm_direct_grp_recv(int status, pmix_proc_t *sender,
     rc = unpack_signature(buffer, &sig);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
+        /* sig is NULL on failure - bail rather than deref it below */
+        return;
     }
 
 #if PRTE_PMIX_HAVE_GROUP_FT

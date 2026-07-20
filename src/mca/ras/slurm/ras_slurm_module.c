@@ -78,6 +78,8 @@ prte_ras_base_module_t prte_ras_slurm_module = {
     .init = init,
     .allocate = prte_ras_slurm_allocate,
     .modify = modify,
+    .shrink_complete = prte_ras_slurm_shrink_complete,
+    .release_allocation = prte_ras_slurm_release_allocation,
     .finalize = prte_ras_slurm_finalize
 };
 
@@ -121,6 +123,11 @@ static int init(void)
         goto cleanup;
     }
 
+    err = prte_ras_slurm_modify_release_init();
+    if (PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
     err = prte_ras_slurm_modify_cancel_init();
     if (PRTE_SUCCESS != err) {
         goto cleanup;
@@ -129,6 +136,7 @@ static int init(void)
 cleanup:
 
     if (PRTE_SUCCESS != err) {
+        prte_ras_slurm_modify_release_finalize();
         PMIX_RELEASE(prte_slurm_session_stack);
         prte_slurm_session_stack = NULL;
     }
@@ -258,7 +266,7 @@ static int prte_ras_slurm_allocate(prte_job_t *jdata, pmix_list_t *nodes)
 
     /* assign the nodes to a new session, allowing us to identify
      * all members of the group later */
-    ret = prte_ras_slurm_assign_new_session(slurm_jobid, NULL, nodes);
+    ret = prte_ras_slurm_assign_new_session(slurm_jobid, NULL, nodes, false);
     
     if(PRTE_SUCCESS != ret) {
         PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
@@ -286,6 +294,11 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
         req->pstatus = prte_pmix_convert_rc(err);
     } else if(PMIX_ALLOC_RELEASE == req->allocdir) {
         err = prte_ras_slurm_serve_release_req(req);
+        if (PRTE_ERR_OP_IN_PROGRESS == err) {
+            /* We don't want to touch req->pstatus at this stage
+             * as it may be freed by the callback */
+            return PMIX_SUCCESS;
+        }
         req->pstatus = prte_pmix_convert_rc(err);
     } else if(PMIX_ALLOC_REQ_CANCEL == req->allocdir) {
         err = prte_ras_slurm_serve_cancel_req(req);
@@ -308,6 +321,7 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
 static int prte_ras_slurm_finalize(void)
 {
     prte_ras_slurm_modify_cancel_finalize();
+    prte_ras_slurm_modify_release_finalize();
     PMIX_RELEASE(prte_slurm_session_stack);
     return PRTE_SUCCESS;
 }
@@ -783,8 +797,10 @@ int prte_ras_slurm_convert_jobid(const char *slurm_jobid, uint32_t *slurm_jobid_
  * @param[in] slurm_jobid  Slurm job ID string (must be convertible to uint32_t)
  * @param[in] user_refid   Optional user-provided allocation reference ID (may be NULL)
  * @param[in] node_list    List of prte_node_t to attach to the session
+ * @param[in] dynamic      Whether the session was created by a modify request
  */
-int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid, pmix_list_t *node_list)
+int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_refid,
+                                      pmix_list_t *node_list, bool dynamic)
 {
     if(NULL == slurm_jobid || NULL == node_list) {
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
@@ -850,6 +866,10 @@ int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_
 
     session->alloc_refid = slurm_jobid_dup;
     slurm_jobid_dup = NULL;
+
+    if (dynamic) {
+        PRTE_FLAG_SET(session, PRTE_SESSION_FLAG_DYNAMIC);
+    }
 
     prte_node_t *node = NULL;
 
