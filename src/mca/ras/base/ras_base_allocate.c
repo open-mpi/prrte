@@ -553,13 +553,6 @@ void prte_ras_base_release_allocation(prte_session_t *session)
     }
 }
 
-static void localrelease(void *cbdata)
-{
-    prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
-
-    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
-    PMIX_RELEASE(req);
-}
 
 void prte_ras_base_modify(int fd, short args, void *cbdata)
 {
@@ -609,7 +602,7 @@ void prte_ras_base_modify(int fd, short args, void *cbdata)
 
     // execute the callback
     if (NULL != req->infocbfunc) {
-        req->infocbfunc(req->pstatus, req->info, req->ninfo, req->cbdata, localrelease, req);
+        req->infocbfunc(req->pstatus, req->info, req->ninfo, req->cbdata, prte_pmix_server_req_release, req);
         return;
     }
 
@@ -1226,6 +1219,10 @@ static int ras_base_insert_node_string(char *ndstring, prte_session_t *dest)
      * phase-two completion event). */
     PMIX_LIST_FOREACH(snap, &ndlist, prte_node_t) {
         PMIx_Argv_append_nosize(&rsv_names, snap->name);
+        /* mark as newly added so the DVM extension will include it
+         * despite any static -host filter given when the DVM was
+         * started */
+        snap->state = PRTE_NODE_STATE_ADDED;
     }
 
     ret = prte_ras_base_node_insert(&ndlist, NULL);
@@ -1291,6 +1288,25 @@ static void ras_base_complete_grow_request(prte_pmix_server_req_t *req)
     pmix_status_t rc;
     size_t n;
     bool found = false;
+
+    /* an add-host/add-hostfile request (from the --add-host and
+     * --add-hostfile cmd line options) grows the DVM's general pool.
+     * The nodes were already inserted by the module that claimed the
+     * request, and there is no reservation to route them to - so all
+     * that remains is to extend the DVM across the new nodes. The
+     * grow must be activated even if the request only adjusted slots
+     * on existing nodes: initiating the request marked the DVM as
+     * not-ready and parked the requesting job in the job cache, and
+     * it is the VM_READY re-entry at the end of the (possibly empty)
+     * daemon launch that marks the DVM ready again and releases the
+     * cached jobs */
+    for (n = 0; n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_ADD_HOST) ||
+            PMIx_Check_key(req->info[n].key, PMIX_ADD_HOSTFILE)) {
+            prte_ras_base_activate_dvm_grow();
+            return;
+        }
+    }
 
     rc = ras_base_prepare_grow(req, &dest);
     if (PMIX_SUCCESS != rc) {

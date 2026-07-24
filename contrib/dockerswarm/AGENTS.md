@@ -1,4 +1,12 @@
-# PRRTE DVM test "swarm"
+# AGENTS.md — the dockerswarm multi-node test harness
+
+Orientation for AI agents and human contributors who need to run PRRTE
+across multiple nodes without a cluster. **This directory is the
+canonical multi-node harness** — if you are about to hand-craft
+containers, tar a source tree into a volume, or patch files inside a
+running node, stop: `build.sh` below already does the right thing
+(bind-mounts your live working tree into a builder and compiles it
+out-of-tree into the shared volume the nodes read).
 
 A small, self-contained harness for exercising PRRTE across several container
 "nodes" — a persistent DVM, one-shot `prterun`, and the **elastic DVM**
@@ -152,6 +160,17 @@ would run even if staging did nothing. (Data-file preload, `--preload-files`,
 is **not** asserted here: staged data files land in the per-proc session dir but
 the default cwd is elsewhere, so they are not reachable by a bare relative path —
 a separate, pre-existing gap.)
+
+**Remote stdin (`iof`)**: a large base64 payload is piped into `prterun` on
+node1 for a job whose rank 0 is mapped onto **node2**, running `cat`. Because
+the reading proc is not on the head node, every byte must cross
+HNP → `PRTE_RML_TAG_IOF_PROXY` → `prted` → the proc's stdin pipe and come back
+as forwarded output; an md5 match proves nothing was dropped, truncated, or
+reordered. This is the other path a single-host build cannot validate —
+locally, `push_stdin` writes straight into the proc's sink and the wire format
+is never exercised. The payload is deliberately far larger than the 4096-byte
+read fragment and the 8192-byte write chunk. A companion case pipes a short
+line with `--stdin all` to check the wildcard/xcast delivery.
 
 **Grow** (`elastic grow node2:2,node3:2`): phase-1 `PMIX_SUCCESS`, then phase-2
 `PMIX_DVM_IS_READY`, and `prted` now running on node2 and node3.

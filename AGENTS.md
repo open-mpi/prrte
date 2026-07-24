@@ -391,7 +391,14 @@ Common configure options:
 
 Version requirements: PMIx ≥ 6.1.0, hwloc ≥ 2.1.0, libevent ≥ 2.0.21.
 
-### Test-building your changes
+### GOLDEN RULE: build with `make` from the repository root — never try to short-circuit the build
+
+Do not waste effort trying to compile a single `.c` file by hand or
+otherwise short-circuit the build system (invoking the compiler
+directly, replaying a compile command, building one object in
+isolation).  Just go to the repository root and run `make` — it is
+quick, it only rebuilds what changed, and it always builds what you
+need.
 
 Build from the repository root with `make -j$(nproc)`.  Running `make`
 from the root is what respects the generated headers and the per-target
@@ -475,6 +482,16 @@ prun -n 4 hostname                  # basic launch smoke test
 pterm                               # shut down DVM
 ```
 
+**Multi-node testing without a cluster.**  Use the container harness in
+[`contrib/dockerswarm/`](contrib/dockerswarm/) — its
+[`AGENTS.md`](contrib/dockerswarm/AGENTS.md) is the authoritative guide.
+Its `build.sh` bind-mounts your live working tree into a builder
+container and compiles it out-of-tree into a shared volume the ten
+"node" containers read, so the swarm always runs your uncommitted
+changes; `run-tests.sh` drives the multi-node suite (launch, IOF,
+preload, elastic grow/shrink, relay).  Do not invent an ad-hoc
+container flow — use the harness.
+
 For resource-manager integration (SLURM, PBS, LSF), test within an actual
 allocation on the relevant system.
 
@@ -517,6 +534,47 @@ that apply to what you touched:
 PRRTE is event-driven and single-threaded on the progress thread.  Use
 the PRRTE event loop (`prte_event_base`) for deferred work.  Do not block on
 the progress thread.
+
+### GOLDEN RULE: thread-shift every PMIx callback and server-module upcall
+
+All callback functions invoked by PMIx, and all PMIx server module
+function upcalls, execute on the **PMIx** progress thread.  PRRTE
+objects must never be accessed from that thread.  Every such callback
+or upcall must therefore thread-shift into the PRRTE progress thread
+(via the caddy pattern below, posting to `prte_event_base`) **before**
+performing any operations — the function body that PMIx calls should do
+nothing beyond capturing its arguments and posting the event.
+
+This applies even to a callback that does nothing but complete a
+blocking request: a `prte_pmix_lock_t` is a PRRTE object, so do **not**
+call `PRTE_PMIX_WAKEUP_THREAD` (or touch the lock in any other way)
+directly from the PMIx thread.  Capture the arguments, thread-shift,
+and perform the wakeup in the handler running on the PRRTE progress
+thread.  The bare-wakeup shortcut loses races: a waiter on the thread
+that drives `prte_event_base` waits by re-checking `lock.active`
+between `prte_event_loop(PRTE_EVLOOP_ONCE)` iterations rather than
+blocking in the lock's condition variable, so a direct cross-thread
+signal delivered while the loop is parked inside the event backend is
+never observed and the process hangs (this was the cause of an
+intermittent `prterun` spawn hang).  Posting the wakeup as an event
+both wakes the event loop and serializes the flag update.  The
+`prte_pmix_shifted_wakeup()` helper (declared in
+[`src/pmix/pmix-internal.h`](src/pmix/pmix-internal.h)) packages this
+pattern for completion callbacks whose only job is to record a status
+(and optionally a message string) and wake a waiter.
+
+The corollary on the waiting side: code that must block on the thread
+that drives `prte_event_base` (for example, `prte()` itself while
+waiting for a spawn to complete) must wait with the loop-driving idiom —
+
+```c
+while (prte_event_base_active && lock.active) {
+    prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
+}
+```
+
+— never with `PRTE_PMIX_WAIT_THREAD`, which would park the only thread
+able to run the thread-shifted wakeup handler.
 
 ### Thread-shifting with caddies
 
@@ -572,6 +630,45 @@ return PRTE_SUCCESS;
 Here the handler performs the work, invokes the caller's callback, and
 releases the caddy with `PMIX_RELEASE(cd)` — there is **no**
 `PRTE_PMIX_WAKEUP_THREAD` because no one is waiting on a lock.
+
+### GOLDEN RULE: mark locally-originated event notifications `prte.notify.donotloop`
+
+When PRRTE itself originates an event notification with
+`PMIx_Notify_event` — a grow/shrink completion, a job-start or
+ready-for-debug event, an allocation-timeout relay, a job-end, etc. —
+add a `"prte.notify.donotloop"` boolean to the event's info array:
+
+```c
+PMIX_INFO_LOAD(&info[idx++], "prte.notify.donotloop", NULL, PMIX_BOOL);
+```
+
+PMIx loops any event it is handed back through this daemon's **own**
+`notify_event` server upcall (`pmix_server_notify_event`) so the daemon
+can propagate it to its peers. That upcall thread-shifts its work
+(state activation, pack, xcast) onto `prte_event_base` and returns
+`PMIX_SUCCESS`. So if you originate the event with the **blocking** form
+of `PMIx_Notify_event` (a `NULL` completion callback, which waits on an
+internal condition) **from the progress thread**, you deadlock the
+process: the progress thread parks inside `PMIx_Notify_event` waiting for
+a completion that can only be produced by the thread-shifted upcall
+handler — which cannot run until the progress thread is free. The
+`notify_event` upcall checks for the `prte.notify.donotloop` marker
+**first** and, when present, returns `PMIX_OPERATION_SUCCEEDED`
+synchronously without thread-shifting; the blocking call then completes
+at once and PMIx still delivers the event to any locally-registered tool
+or process. The marker also serves its original purpose of breaking the
+xcast echo loop (an event broadcast to every daemon must not be
+re-injected and re-broadcast when it arrives).
+
+The requesters/targets of these notifications are tools connected to
+**this** HNP, so local delivery is sufficient and the marker is always
+correct. Omit it only when the event genuinely must reach processes on
+**other** daemons — and in that case never originate it with a blocking
+`PMIx_Notify_event` on the progress thread (use the non-blocking form
+with a real completion callback instead). Getting this wrong produces an
+intermittent, hard-to-trace hang: the symptom is a wedged progress
+thread (`futex_wait_queue`, event base idle) that stops servicing
+everything, including new `PMIx_tool_init` connections.
 
 ---
 

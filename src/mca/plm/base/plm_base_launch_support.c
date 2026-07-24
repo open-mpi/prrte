@@ -907,6 +907,25 @@ void prte_plm_base_launch_apps(int fd, short args, void *cbdata)
     return;
 }
 
+/* completion of the nspace registration for a do-not-launch job -
+ * executes on the PRRTE progress thread */
+static void donotlaunch_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_job_t *jdata = (prte_job_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        PRTE_ERROR_LOG(prte_pmix_convert_status(status));
+    }
+    /* if we are persistent, then we remain alive - otherwise, declare
+     * all jobs complete and terminate */
+    if (prte_persistent) {
+        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
+    } else {
+        prte_never_launched = true;
+        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALL_JOBS_COMPLETE);
+    }
+}
+
 void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
@@ -923,18 +942,14 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
 
     /* if we don't want to launch the apps, now is the time to leave */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
-        /* go ahead and register the job */
-        rc = prte_pmix_server_register_nspace(jdata);
+        /* go ahead and register the job - the completion callback
+         * advances the job state once the registration is done */
+        rc = prte_pmix_server_register_nspace(jdata, donotlaunch_reg_complete, jdata);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
-        }
-        /* if we are persistent, then we remain alive - otherwise, declare
-         * all jobs complete and terminate */
-        if (prte_persistent) {
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
-        } else {
-            prte_never_launched = true;
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALL_JOBS_COMPLETE);
+            /* the callback will never fire - advance the state
+             * ourselves */
+            donotlaunch_reg_complete(PMIX_SUCCESS, jdata);
         }
         PMIX_RELEASE(caddy);
         return;
@@ -2291,13 +2306,16 @@ construct:
 
     if (one_filter) {
         /* at least one filtering option was executed, so
-         * remove all nodes that were not mapped
-         */
+         * remove all nodes that were not mapped. Retain nodes that
+         * were dynamically added after the DVM started - they were
+         * granted by an explicit grow request, so the static specs
+         * (which predate them) cannot speak to their inclusion */
         item = pmix_list_get_first(&nodes);
         while (item != pmix_list_get_end(&nodes)) {
             next = pmix_list_get_next(item);
             node = (prte_node_t *) item;
-            if (!PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_MAPPED)) {
+            if (!PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_MAPPED) &&
+                PRTE_NODE_STATE_ADDED != node->state) {
                 pmix_list_remove_item(&nodes, item);
                 PMIX_RELEASE(item);
             } else {
@@ -2355,6 +2373,11 @@ process:
             break;
         }
         node = (prte_node_t *) item;
+        /* if this node was dynamically added, reset its state now
+         * that it is being absorbed into the DVM */
+        if (PRTE_NODE_STATE_ADDED == node->state) {
+            node->state = PRTE_NODE_STATE_UP;
+        }
         /* if this node is already in the map, skip it */
         if (NULL != node->daemon) {
             num_nodes++;
@@ -2519,8 +2542,15 @@ void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
      * mirroring the PMIX_ALLOC_TIMEOUT_WARNING delivery: custom range plus the
      * allocation id, the requester's own request id when one was supplied, and
      * — on failure — the underlying cause so the requester can distinguish
-     * what went wrong rather than only that something did. */
-    nrinfo = 2;
+     * what went wrong rather than only that something did.  The event also
+     * carries "prte.notify.donotloop" so our own notify_event server upcall
+     * short-circuits instead of thread-shifting and re-xcasting it: the
+     * requester is a tool local to this HNP, so PMIx delivers the event
+     * locally and no broadcast is needed.  Without the marker the upcall
+     * would defer its work onto this progress thread while the blocking
+     * PMIx_Notify_event below is parked here waiting for it -- a self-deadlock
+     * (see the AGENTS.md rule on locally-originated event notifications). */
+    nrinfo = 3;  /* custom range + alloc id + donotloop marker */
     if (NULL != req_id) {
         nrinfo++;
     }
@@ -2536,6 +2566,8 @@ void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
     /* PMIX_INFO_LOAD deep-copies the data, so the stack copies are fine */
     PMIX_INFO_LOAD(&rinfo[idx++], PMIX_EVENT_CUSTOM_RANGE, &parray, PMIX_DATA_ARRAY);
     PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_ID, (void *) alloc_id, PMIX_STRING);
+    /* keep delivery local: do not loop back through our own server upcall */
+    PMIX_INFO_LOAD(&rinfo[idx++], "prte.notify.donotloop", NULL, PMIX_BOOL);
     if (NULL != req_id) {
         PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_REQ_ID, (void *) req_id, PMIX_STRING);
     }

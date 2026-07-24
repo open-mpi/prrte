@@ -133,6 +133,9 @@ typedef struct {
     size_t napps;
     pmix_query_t *queries;
     size_t nqueries;
+    pmix_iof_channel_t channels;
+    pmix_data_range_t range;
+    bool flag;
     pmix_op_cbfunc_t cbfunc;
     pmix_info_cbfunc_t infocbfunc;
     pmix_tool_connection_cbfunc_t toolcbfunc;
@@ -215,6 +218,13 @@ PMIX_CLASS_DECLARATION(prte_pmix_server_op_caddy_t);
         PMIX_POST_OBJECT(_cd);                                                     \
         prte_event_active(&(_cd->ev), PRTE_EV_WRITE, 1);                           \
     } while (0);
+
+/* Release callback to hand to the PMIx server when relaying the
+ * results of a request tracked in the local request array. The PMIx
+ * library invokes it on the PMIx progress thread once it is done
+ * with the results, so it thread-shifts before clearing the request
+ * from prte_pmix_server_globals.local_reqs and releasing it */
+PRTE_EXPORT void prte_pmix_server_req_release(void *cbdata);
 
 /* define the server module functions */
 PRTE_EXPORT extern pmix_status_t pmix_server_client_connected2_fn(const pmix_proc_t *proc,
@@ -346,7 +356,8 @@ PRTE_EXPORT extern void pmix_server_tconn_return(int status, pmix_proc_t *sender
                                                  pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                                                  void *cbdata);
 
-PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd);
+PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
+                                                      pmix_op_cbfunc_t cbfunc, void *cbdata);
 
 PRTE_EXPORT extern int pmix_server_cache_job_info(prte_job_t *jdata, pmix_info_t *info);
 

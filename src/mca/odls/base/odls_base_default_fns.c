@@ -90,28 +90,69 @@
 #include "src/mca/odls/base/base.h"
 
 typedef struct {
+    pmix_object_t super;
+    pmix_event_t ev;
     prte_job_t *jdata;
     pmix_info_t *info;
     size_t ninfo;
-    prte_pmix_lock_t lock;
+    pmix_byte_object_t pbo;
+    prte_odls_base_fork_local_proc_fn_t fork_local;
+    int pending;
+    pmix_status_t rstatus;
 } prte_odls_jcaddy_t;
+static void jccon(prte_odls_jcaddy_t *p)
+{
+    p->jdata = NULL;
+    p->info = NULL;
+    p->ninfo = 0;
+    PMIX_BYTE_OBJECT_CONSTRUCT(&p->pbo);
+    p->fork_local = NULL;
+    p->pending = 0;
+    p->rstatus = PMIX_SUCCESS;
+}
+static void jcdes(prte_odls_jcaddy_t *p)
+{
+    if (NULL != p->info) {
+        PMIX_INFO_FREE(p->info, p->ninfo);
+    }
+    PMIX_BYTE_OBJECT_DESTRUCT(&p->pbo);
+}
+static PMIX_CLASS_INSTANCE(prte_odls_jcaddy_t, pmix_object_t, jccon, jcdes);
+
+static void _setup_complete(int sd, short args, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+    int rc;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* add the results to the launch msg */
+    rc = PMIx_Data_pack(NULL, &cd->jdata->launch_msg, &cd->pbo, 1, PMIX_BYTE_OBJECT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+    }
+
+    /* move to next stage */
+    PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_SEND_LAUNCH_MSG);
+
+    /* releasing the caddy also releases the app-setup info
+     * we passed to the PMIx server */
+    PMIX_RELEASE(cd);
+}
 
 static void setup_cbfunc(pmix_status_t status, pmix_info_t info[], size_t ninfo,
                          void *provided_cbdata, pmix_op_cbfunc_t cbfunc, void *cbdata)
 {
     prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) provided_cbdata;
-    prte_job_t *jdata = cd->jdata;
     pmix_data_buffer_t pbuf;
-    pmix_byte_object_t pbo;
     int rc = PRTE_SUCCESS;
     PRTE_HIDE_UNUSED_PARAMS(status);
 
-    /* release any info */
-    if (NULL != cd->info) {
-        PMIX_INFO_FREE(cd->info, cd->ninfo);
-    }
-
-    PMIX_BYTE_OBJECT_CONSTRUCT(&pbo);
+    /* this callback executes on the PMIx progress thread, so we
+     * cannot touch the job object here - capture the returned
+     * info by serializing it into a byte object, then shift to
+     * our progress thread */
     if (NULL != info) {
         PMIX_DATA_BUFFER_CONSTRUCT(&pbuf);
         /* pack the provided info */
@@ -126,29 +167,21 @@ static void setup_cbfunc(pmix_status_t status, pmix_info_t info[], size_t ninfo,
             goto done;
         }
         /* unload it */
-        rc = PMIx_Data_unload(&pbuf, &pbo);
+        rc = PMIx_Data_unload(&pbuf, &cd->pbo);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
         }
     }
-    /* add the results */
-    rc = PMIx_Data_pack(NULL, &jdata->launch_msg, &pbo, 1, PMIX_BYTE_OBJECT);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-    }
 
 done:
-    PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-    /* release our caller */
+    /* release our caller - we are done with the provided info */
     if (NULL != cbfunc) {
         cbfunc(rc, cbdata);
     }
 
-    /* move to next stage */
-    PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_SEND_LAUNCH_MSG);
-
-    /* release the original thread */
-    PRTE_PMIX_WAKEUP_THREAD(&cd->lock);
+    prte_event_set(prte_event_base, &cd->ev, -1, PRTE_EV_WRITE, _setup_complete, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&cd->ev, PRTE_EV_WRITE, 1);
 }
 
 /* IT IS CRITICAL THAT ANY CHANGE IN THE ORDER OF THE INFO PACKED IN
@@ -166,7 +199,7 @@ int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *buffer, pmix_n
     prte_node_t *node;
     int i, k;
     char **list, **procs, **micro, *tmp, *regex;
-    prte_odls_jcaddy_t cd = {0};
+    prte_odls_jcaddy_t *cd;
     prte_proc_t *pptr;
     uint32_t uid;
     uint32_t gid;
@@ -372,40 +405,130 @@ int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *buffer, pmix_n
     }
     /* convert the job info into an array */
     PMIX_INFO_LIST_CONVERT(ret, ilist, &darray);
-    cd.info = (pmix_info_t *) darray.array;
-    cd.ninfo = darray.size;
     PMIX_INFO_LIST_RELEASE(ilist);
 
-    /* we don't want to block here because it could
-     * take some indeterminate time to get the info */
-    rc = PRTE_SUCCESS;
-    cd.jdata = jdata;
-    PRTE_PMIX_CONSTRUCT_LOCK(&cd.lock);
-    ret = PMIx_server_setup_application(jdata->nspace, cd.info, cd.ninfo,
-                                        setup_cbfunc, &cd);
+    /* do not block waiting for the answer as it could take some
+     * indeterminate time to get the info - the callback will
+     * thread-shift, complete the launch message, and activate
+     * the next state */
+    cd = PMIX_NEW(prte_odls_jcaddy_t);
+    cd->jdata = jdata;
+    cd->info = (pmix_info_t *) darray.array;
+    cd->ninfo = darray.size;
+    ret = PMIx_server_setup_application(jdata->nspace, cd->info, cd->ninfo,
+                                        setup_cbfunc, cd);
     if (PMIX_SUCCESS != ret) {
         pmix_output(0, "[%s:%d] PMIx_server_setup_application failed: %s", __FILE__, __LINE__,
                     PMIx_Error_string(ret));
-        /* the callback that would have freed cd.info will never fire */
-        if (NULL != cd.info) {
-            PMIX_INFO_FREE(cd.info, cd.ninfo);
-        }
-        rc = PRTE_ERROR;
-    } else {
-        PRTE_PMIX_WAIT_THREAD(&cd.lock);
+        /* the callback will never fire - releasing the caddy
+         * also releases the info array */
+        PMIX_RELEASE(cd);
+        return PRTE_ERROR;
     }
-    PRTE_PMIX_DESTRUCT_LOCK(&cd.lock);
-    return rc;
+    return PRTE_SUCCESS;
+}
+
+static void _local_support_complete(int sd, short args, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* the local support is in place - we can now launch the
+     * local procs */
+    PRTE_ACTIVATE_LOCAL_LAUNCH(cd->jdata->nspace, cd->fork_local);
+
+    /* releasing the caddy also releases the setup info */
+    PMIX_RELEASE(cd);
 }
 
 static void ls_cbunc(pmix_status_t status, void *cbdata)
 {
-    prte_pmix_lock_t *lock = (prte_pmix_lock_t *) cbdata;
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(status);
-    PRTE_PMIX_WAKEUP_THREAD(lock);
+
+    /* this callback executes on the PMIx progress thread - shift
+     * to our progress thread before proceeding with the launch */
+    prte_event_set(prte_event_base, &cd->ev, -1, PRTE_EV_WRITE, _local_support_complete, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&cd->ev, PRTE_EV_WRITE, 1);
 }
 
-int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix_nspace_t *job)
+/* join point for the nspace registrations - once they have all
+ * reported, proceed with the local support setup and launch.
+ * Executes on the PRRTE progress thread */
+static void job_reg_join(prte_odls_jcaddy_t *cd)
+{
+    pmix_status_t ret;
+
+    cd->pending--;
+    if (0 < cd->pending) {
+        return;
+    }
+
+    /* all registrations have reported */
+    if (PMIX_SUCCESS != cd->rstatus) {
+        /* report an error back to the HNP so we don't just hang
+         * while it waits to hear that our local procs launched */
+        PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
+        PMIX_RELEASE(cd);
+        return;
+    }
+
+    /* if we have local support setup info, then execute it here - we
+     * have to do so AFTER we register the nspace so the PMIx server
+     * has the nspace info it needs */
+    if (0 < cd->ninfo) {
+        /* do not block waiting for the answer - the callback will
+         * thread-shift and activate the local launch once the
+         * support is in place */
+        ret = PMIx_server_setup_local_support(cd->jdata->nspace, cd->info, cd->ninfo,
+                                              ls_cbunc, cd);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
+            PMIX_RELEASE(cd);
+            return;
+        }
+        /* spin up the spawn threads */
+        prte_odls_base_start_threads(cd->jdata);
+        return;
+    }
+
+    /* spin up the spawn threads */
+    prte_odls_base_start_threads(cd->jdata);
+
+    /* no local support setup is required, so we can proceed
+     * directly to launching the local procs */
+    PRTE_ACTIVATE_LOCAL_LAUNCH(cd->jdata->nspace, cd->fork_local);
+    PMIX_RELEASE(cd);
+}
+
+static void _prior_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        /* not fatal - the job is already running elsewhere */
+        PMIX_ERROR_LOG(status);
+    }
+    job_reg_join(cd);
+}
+
+static void _job_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        PMIX_ERROR_LOG(status);
+        cd->rstatus = status;
+    }
+    job_reg_join(cd);
+}
+
+int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix_nspace_t *job,
+                                                prte_odls_base_fork_local_proc_fn_t fork_local)
 {
     int rc;
     int32_t cnt;
@@ -417,7 +540,9 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
     prte_proc_t *pptr, *dmn;
     prte_app_context_t *app;
     int8_t flag;
-    prte_pmix_lock_t lock;
+    prte_odls_jcaddy_t *cd;
+    pmix_pointer_array_t priorjobs;
+    prte_job_t *jptr;
     pmix_info_t *info = NULL;
     size_t ninfo = 0;
     pmix_status_t ret;
@@ -433,9 +558,13 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
     /* set a default response */
     PMIX_LOAD_NSPACE(*job, NULL);
 
+    /* setup to track any prior jobs that must be registered
+     * with the PMIx server */
+    PMIX_CONSTRUCT(&priorjobs, pmix_pointer_array_t);
+    pmix_pointer_array_init(&priorjobs, 1, INT_MAX, 8);
+
     /* get the daemon job object */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    PRTE_PMIX_CONSTRUCT_LOCK(&lock);
 
     /* unpack the flag to see if new daemons were launched */
     cnt = 1;
@@ -545,11 +674,9 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
                     }
 
                 }
-                // now register this job
-                rc = prte_pmix_server_register_nspace(jdata);
-                if (PRTE_SUCCESS != rc) {
-                    PRTE_ERROR_LOG(rc);
-                }
+                // stash this job for registration with the PMIx
+                // server once we reach the registration point below
+                pmix_pointer_array_add(&priorjobs, jdata);
             }
             /* release the buffer */
             PMIX_DATA_BUFFER_DESTRUCT(&jdbuf);
@@ -784,46 +911,51 @@ next:
         }
     }
 
-    /* register this job with the PMIx server - need to wait until after we
-     * have computed the #local_procs before calling the function */
-    if (PRTE_SUCCESS != (rc = prte_pmix_server_register_nspace(jdata))) {
-        PRTE_ERROR_LOG(rc);
-        goto REPORT_ERROR;
-    }
+    /* create the caddy that carries the launch through the
+     * asynchronous registrations and local support setup */
+    cd = PMIX_NEW(prte_odls_jcaddy_t);
+    cd->jdata = jdata;
+    cd->info = info;
+    cd->ninfo = ninfo;
+    cd->fork_local = fork_local;
+    info = NULL; // the caddy now owns the info array
 
-    /* if we have local support setup info, then execute it here - we
-     * have to do so AFTER we register the nspace so the PMIx server
-     * has the nspace info it needs */
-    if (0 < ninfo) {
-        ret = PMIx_server_setup_local_support(jdata->nspace, info, ninfo,
-                                              ls_cbunc, &lock);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-            rc = PRTE_ERROR;
-            goto REPORT_ERROR;
+    /* register this job - and any prior jobs a newly-launched
+     * daemon needs to know about - with the PMIx server. We have
+     * to wait until after we computed the #local_procs before
+     * registering this job. The registrations complete
+     * asynchronously, and the launch proceeds once all have
+     * reported. Hold a sentinel on the join so it cannot fire
+     * before we finish initiating the registrations */
+    cd->pending = 1;
+    for (n = 0; n < priorjobs.size; n++) {
+        jptr = (prte_job_t *) pmix_pointer_array_get_item(&priorjobs, n);
+        if (NULL == jptr) {
+            continue;
         }
+        rc = prte_pmix_server_register_nspace(jptr, _prior_reg_complete, cd);
+        if (PRTE_SUCCESS == rc) {
+            cd->pending++;
+        } else {
+            /* not fatal - just note it */
+            PRTE_ERROR_LOG(rc);
+        }
+    }
+    PMIX_DESTRUCT(&priorjobs);
+    rc = prte_pmix_server_register_nspace(jdata, _job_reg_complete, cd);
+    if (PRTE_SUCCESS == rc) {
+        cd->pending++;
     } else {
-        lock.active = false; // we won't get a callback
+        PRTE_ERROR_LOG(rc);
+        cd->rstatus = PMIX_ERROR;
     }
-
-    /* spin up the spawn threads */
-    prte_odls_base_start_threads(jdata);
-
-    /* to save memory, purge the job map of all procs other than
-     * our own - for daemons, this will completely release the
-     * proc structures. For the HNP, the proc structs will
-     * remain in the prte_job_t array */
-
-    /* wait here until the local support has been setup */
-    PRTE_PMIX_WAIT_THREAD(&lock);
-    PRTE_PMIX_DESTRUCT_LOCK(&lock);
-    if (NULL != info) {
-        PMIX_INFO_FREE(info, ninfo);
-    }
+    /* release our sentinel - if everything already reported,
+     * this progresses the launch */
+    job_reg_join(cd);
     return PRTE_SUCCESS;
 
 REPORT_ERROR:
-    PRTE_PMIX_DESTRUCT_LOCK(&lock);
+    PMIX_DESTRUCT(&priorjobs);
     if (NULL != info) {
         PMIX_INFO_FREE(info, ninfo);
     }

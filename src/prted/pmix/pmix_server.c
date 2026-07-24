@@ -635,11 +635,9 @@ static void regcbfunc(pmix_status_t status, size_t ref, void *cbdata)
  * requested the allocation. PRRTE is a pure relay here: it neither sets the
  * timeout nor generates the warning, only re-emits it as a directed event to
  * the recorded requestor. */
-static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_status_t status,
-                                       const pmix_proc_t *source, pmix_info_t info[], size_t ninfo,
-                                       pmix_info_t *results, size_t nresults,
-                                       pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
+static void _alloc_timeout_warning(int sd, short args, void *cbdata)
 {
+    prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
     size_t n, idx, nrinfo;
     char *alloc_id = NULL;
     uint32_t time_remaining = 0;
@@ -649,13 +647,15 @@ static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_statu
     pmix_data_array_t parray;
     pmix_proc_t ptarg;
     pmix_status_t rc;
-    PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id, status, source, results, nresults);
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
-    for (n = 0; n < ninfo; n++) {
-        if (PMIx_Check_key(info[n].key, PMIX_ALLOC_ID)) {
-            alloc_id = info[n].value.data.string;
-        } else if (PMIx_Check_key(info[n].key, PMIX_TIME_REMAINING)) {
-            time_remaining = info[n].value.data.uint32;
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    for (n = 0; n < cd->ninfo; n++) {
+        if (PMIx_Check_key(cd->info[n].key, PMIX_ALLOC_ID)) {
+            alloc_id = cd->info[n].value.data.string;
+        } else if (PMIx_Check_key(cd->info[n].key, PMIX_TIME_REMAINING)) {
+            time_remaining = cd->info[n].value.data.uint32;
             have_time = true;
         }
     }
@@ -667,8 +667,14 @@ static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_statu
         goto done;
     }
 
-    /* assemble a directed (custom-range) notification to the requestor only */
-    nrinfo = 2;  /* custom range + alloc id */
+    /* assemble a directed (custom-range) notification to the requestor only.
+     * The event carries "prte.notify.donotloop" so our own notify_event
+     * server upcall short-circuits instead of thread-shifting and re-xcasting
+     * it -- the requestor is a tool local to this HNP, so PMIx delivers the
+     * event locally.  Without the marker the blocking PMIx_Notify_event below
+     * (on the progress thread) would deadlock against the deferred upcall
+     * handler (see the AGENTS.md rule on locally-originated notifications). */
+    nrinfo = 3;  /* custom range + alloc id + donotloop marker */
     if (NULL != session->user_refid) {
         nrinfo++;
     }
@@ -684,6 +690,8 @@ static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_statu
     /* PMIX_INFO_LOAD deep-copies the data array, so the stack copy is fine */
     PMIX_INFO_LOAD(&rinfo[idx++], PMIX_EVENT_CUSTOM_RANGE, &parray, PMIX_DATA_ARRAY);
     PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_ID, session->alloc_refid, PMIX_STRING);
+    /* keep delivery local: do not loop back through our own server upcall */
+    PMIX_INFO_LOAD(&rinfo[idx++], "prte.notify.donotloop", NULL, PMIX_BOOL);
     if (NULL != session->user_refid) {
         PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_REQ_ID, session->user_refid, PMIX_STRING);
     }
@@ -698,9 +706,32 @@ static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_statu
     PMIX_INFO_FREE(rinfo, nrinfo);
 
 done:
-    if (NULL != cbfunc) {
-        cbfunc(PMIX_EVENT_ACTION_COMPLETE, NULL, 0, NULL, NULL, cbdata);
+    if (NULL != cd->evcbfunc) {
+        cd->evcbfunc(PMIX_EVENT_ACTION_COMPLETE, NULL, 0, NULL, NULL, cd->cbdata);
     }
+    PMIX_RELEASE(cd);
+}
+
+static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_status_t status,
+                                       const pmix_proc_t *source, pmix_info_t info[], size_t ninfo,
+                                       pmix_info_t *results, size_t nresults,
+                                       pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
+{
+    prte_pmix_server_op_caddy_t *cd;
+    PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id, status, source, results, nresults);
+
+    /* this executes on the PMIx progress thread, and we must access
+     * the session tracker - shift to our event base. The info array
+     * remains valid until we invoke the notification callback, so
+     * carry the pointers across */
+    cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    cd->info = info;
+    cd->ninfo = ninfo;
+    cd->evcbfunc = cbfunc;
+    cd->cbdata = cbdata;
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _alloc_timeout_warning, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 }
 #endif
 
@@ -1308,14 +1339,38 @@ error:
     return;
 }
 
-/* the modex_resp function takes place in the local PMIx server's
- * progress thread - we must therefore thread-shift it so we can
- * access our global data */
-static void modex_resp(pmix_status_t status, char *data, size_t sz, void *cbdata)
+/* caddy for shifting a dmodex response - the req's own events may
+ * be armed as timers, so the shift must use its own event */
+typedef struct {
+    pmix_object_t super;
+    pmix_event_t ev;
+    pmix_status_t status;
+    char *data;
+    size_t sz;
+    prte_pmix_server_req_t *req;
+} prte_dmdx_resp_caddy_t;
+static void dmrcon(prte_dmdx_resp_caddy_t *p)
 {
-    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+    p->status = PMIX_SUCCESS;
+    p->data = NULL;
+    p->sz = 0;
+    p->req = NULL;
+}
+static void dmrdes(prte_dmdx_resp_caddy_t *p)
+{
+    if (NULL != p->data) {
+        free(p->data);
+    }
+}
+static PMIX_CLASS_INSTANCE(prte_dmdx_resp_caddy_t, pmix_object_t, dmrcon, dmrdes);
 
-    PMIX_ACQUIRE_OBJECT(req);
+static void _modex_resp(int sd, short args, void *cbdata)
+{
+    prte_dmdx_resp_caddy_t *cd = (prte_dmdx_resp_caddy_t *) cbdata;
+    prte_pmix_server_req_t *req = cd->req;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
 
     /* clear any timeout event */
     if (req->event_active) {
@@ -1328,23 +1383,47 @@ static void modex_resp(pmix_status_t status, char *data, size_t sz, void *cbdata
     }
 
     req->inprogress = false; // we are done processing this request
-    req->pstatus = status;
-    if (PMIX_SUCCESS == status && NULL != data) {
+    req->pstatus = cd->status;
+    /* transfer ownership of the data to the req - the caddy
+     * destructor must not free it */
+    req->data = cd->data;
+    cd->data = NULL;
+    req->sz = cd->sz;
+
+    /* we are already on the progress thread, so just execute
+     * the response directly */
+    _mdxresp(0, 0, req);
+    PMIX_RELEASE(cd);
+}
+
+/* the modex_resp function takes place in the local PMIx server's
+ * progress thread - we must therefore thread-shift it so we can
+ * access our global data. Note that we cannot touch the req at
+ * all here: its fields and its timer events belong to the PRRTE
+ * progress thread, and its own event structures may be armed as
+ * timers, so the shift is carried by a separate caddy */
+static void modex_resp(pmix_status_t status, char *data, size_t sz, void *cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+    prte_dmdx_resp_caddy_t *cd;
+
+    cd = PMIX_NEW(prte_dmdx_resp_caddy_t);
+    cd->status = status;
+    cd->req = req;
+    if (PMIX_SUCCESS == status && NULL != data && 0 < sz) {
         /* we need to preserve the data as the caller
          * will free it upon our return */
-        req->data = (char *) malloc(sz);
-        if (NULL == req->data) {
+        cd->data = (char *) malloc(sz);
+        if (NULL == cd->data) {
             PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
-            req->data = NULL;
-            req->sz = 0;
         } else {
-             memcpy(req->data, data, sz);
-             req->sz = sz;
+            memcpy(cd->data, data, sz);
+            cd->sz = sz;
         }
     }
-    prte_event_set(prte_event_base, &(req->ev), -1, PRTE_EV_WRITE, _mdxresp, req);
-    PMIX_POST_OBJECT(req);
-    prte_event_active(&(req->ev), PRTE_EV_WRITE, 1);
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _modex_resp, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 }
 
 static void dmdx_check(int sd, short args, void *cbdata)
@@ -1821,23 +1900,14 @@ static void pmix_server_dmdx_resp(int status, pmix_proc_t *sender,
 }
 
 
-static void log_cbfunc(pmix_status_t status, void *cbdata)
+static void _log_resp(int sd, short args, void *cbdata)
 {
     prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
     pmix_data_buffer_t *buf;
-    pmix_status_t rc, lstat;
+    pmix_status_t rc;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
-    pmix_output_verbose(2, prte_pmix_server_globals.output,
-                        "Logging callback called");
-
-    if (PMIX_SUCCESS != status && PMIX_OPERATION_SUCCEEDED != status) {
-        pmix_output(prte_pmix_server_globals.output, "LOG FAILED");
-    }
-    if (PMIX_OPERATION_SUCCEEDED == status) {
-        lstat = PMIX_SUCCESS;
-    } else {
-        lstat = status;
-    }
+    PMIX_ACQUIRE_OBJECT(req);
 
     PMIX_DATA_BUFFER_CREATE(buf);
 
@@ -1850,7 +1920,7 @@ static void log_cbfunc(pmix_status_t status, void *cbdata)
     }
 
     // pack the operation's status
-    rc = PMIx_Data_pack(NULL, buf, &lstat, 1, PMIX_STATUS);
+    rc = PMIx_Data_pack(NULL, buf, &req->pstatus, 1, PMIX_STATUS);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(buf);
@@ -1860,7 +1930,7 @@ static void log_cbfunc(pmix_status_t status, void *cbdata)
     /* send the result to the requestor */
     pmix_output_verbose(2, prte_pmix_server_globals.output,
                         "Logging response %s sent to daemon %u",
-                        PMIx_Error_string(lstat), req->proxy.rank);
+                        PMIx_Error_string(req->pstatus), req->proxy.rank);
 
     PRTE_RML_SEND(rc, req->proxy.rank, buf,
                   PRTE_RML_TAG_LOGGING_RESP);
@@ -1871,6 +1941,29 @@ static void log_cbfunc(pmix_status_t status, void *cbdata)
 
 done:
     PMIX_RELEASE(req);
+}
+
+static void log_cbfunc(pmix_status_t status, void *cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+
+    pmix_output_verbose(2, prte_pmix_server_globals.output,
+                        "Logging callback called");
+
+    if (PMIX_SUCCESS != status && PMIX_OPERATION_SUCCEEDED != status) {
+        pmix_output(prte_pmix_server_globals.output, "LOG FAILED");
+    }
+    if (PMIX_OPERATION_SUCCEEDED == status) {
+        req->pstatus = PMIX_SUCCESS;
+    } else {
+        req->pstatus = status;
+    }
+
+    /* the PMIx library invokes this on its progress thread, so we
+     * must shift to our event base before responding over the RML */
+    prte_event_set(prte_event_base, &req->ev, -1, PRTE_EV_WRITE, _log_resp, req);
+    PMIX_POST_OBJECT(req);
+    prte_event_active(&req->ev, PRTE_EV_WRITE, 1);
 }
 
 
@@ -1986,19 +2079,18 @@ respond:
 }
 
 /* alloc callback to send the results to the requesting daemon */
-static void send_alloc_resp(pmix_status_t status,
-                            pmix_info_t info[], size_t ninfo,
-                            void *cbdata,
-                            pmix_release_cbfunc_t release_fn,
-                            void *release_cbdata)
+static void _send_alloc_resp(int sd, short args, void *cbdata)
 {
     prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
     pmix_data_buffer_t *buf;
     pmix_status_t rc;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(req);
 
     /* pack the status */
     PMIX_DATA_BUFFER_CREATE(buf);
-    if (PMIX_SUCCESS != (rc = PMIx_Data_pack(NULL, buf, &status, 1, PMIX_STATUS))) {
+    if (PMIX_SUCCESS != (rc = PMIx_Data_pack(NULL, buf, &req->pstatus, 1, PMIX_STATUS))) {
         PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(buf);
         return;
@@ -2012,14 +2104,14 @@ static void send_alloc_resp(pmix_status_t status,
     }
 
     /* pack any provided info */
-    if (PMIX_SUCCESS != (rc = PMIx_Data_pack(NULL, buf, &ninfo, 1, PMIX_SIZE))) {
+    if (PMIX_SUCCESS != (rc = PMIx_Data_pack(NULL, buf, &req->ninfo, 1, PMIX_SIZE))) {
         PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(buf);
         return;
     }
 
-    if (0 < ninfo) {
-        if (PMIX_SUCCESS != (rc = PMIx_Data_pack(NULL, buf, info, ninfo, PMIX_INFO))) {
+    if (0 < req->ninfo) {
+        if (PMIX_SUCCESS != (rc = PMIx_Data_pack(NULL, buf, req->info, req->ninfo, PMIX_INFO))) {
             PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(buf);
             return;
@@ -2034,13 +2126,42 @@ static void send_alloc_resp(pmix_status_t status,
     }
 
     /* Call the provided callback function */
-    if (NULL != release_fn) {
-        release_fn(release_cbdata);
+    if (NULL != req->rlcbfunc) {
+        req->rlcbfunc(req->rlcbdata);
     }
 
     /* Release the server op request data */
     pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
     PMIX_RELEASE(req);
+}
+
+static void send_alloc_resp(pmix_status_t status,
+                            pmix_info_t info[], size_t ninfo,
+                            void *cbdata,
+                            pmix_release_cbfunc_t release_fn,
+                            void *release_cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
+
+    /* this can be invoked on the PMIx progress thread (e.g., as the
+     * callback from PMIx_Session_control), so record the results in
+     * the request and shift the pack/send onto our event base. The
+     * results remain valid until we invoke the release callback,
+     * which now happens at the end of the shifted handler. Beware
+     * that some callers pass the request's own info array back as
+     * the results - do not free it in that case */
+    req->pstatus = status;
+    if (req->copy && NULL != req->info && info != req->info) {
+        PMIX_INFO_FREE(req->info, req->ninfo);
+        req->copy = false;
+    }
+    req->info = info;
+    req->ninfo = ninfo;
+    req->rlcbfunc = release_fn;
+    req->rlcbdata = release_cbdata;
+    prte_event_set(prte_event_base, &req->ev, -1, PRTE_EV_WRITE, _send_alloc_resp, req);
+    PMIX_POST_OBJECT(req);
+    prte_event_active(&req->ev, PRTE_EV_WRITE, 1);
 }
 
 static void pmix_server_sched(int status, pmix_proc_t *sender,
@@ -2138,7 +2259,12 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
         req->ninfo = ninfo;
         PMIX_PROC_LOAD(&req->proxy, sender->nspace, sender->rank);
         PMIX_PROC_LOAD(&req->tproc, source.nspace, source.rank);
-        /* add this request to our local request tracker array */
+        /* add this request to our local request tracker array. The
+         * extra retain balances the TWO releases that fire when the
+         * RAS completes this relayed request: it invokes
+         * send_alloc_resp as the callback, whose cleanup tail
+         * releases the req, AND hands it prte_pmix_server_req_release
+         * as the release callback, which releases it again */
         PMIX_RETAIN(req);
         req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
         // point to the proper callback function
@@ -2172,8 +2298,11 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
     req->ninfo = ninfo;
     PMIX_PROC_LOAD(&req->proxy, sender->nspace, sender->rank);
     PMIX_PROC_LOAD(&req->tproc, source.nspace, source.rank);
-    /* add this request to our local request tracker array */
-    PMIX_RETAIN(req);
+    /* add this request to our local request tracker array. Unlike
+     * the allocation branch above, do NOT retain here - only the
+     * cleanup tail of send_alloc_resp releases this req (the
+     * release callback on this path belongs to the PMIx library),
+     * so an extra retain would leak it */
     req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
 
     rc = PMIx_Session_control(sessionID, req->info, req->ninfo,
@@ -2225,6 +2354,9 @@ static void opcon(prte_pmix_server_op_caddy_t *p)
     memset(&p->proct, 0, sizeof(pmix_proc_t));
     p->procs = NULL;
     p->nprocs = 0;
+    p->channels = 0;
+    p->range = PMIX_RANGE_UNDEF;
+    p->flag = false;
     p->eprocs = NULL;
     p->neprocs = 0;
     p->info = NULL;
@@ -2244,6 +2376,28 @@ static void opcon(prte_pmix_server_op_caddy_t *p)
 PMIX_CLASS_INSTANCE(prte_pmix_server_op_caddy_t,
                     pmix_object_t,
                     opcon, NULL);
+
+static void _req_release(int sd, short args, void *cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(req);
+    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
+    PMIX_RELEASE(req);
+}
+
+void prte_pmix_server_req_release(void *cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+
+    /* this is invoked on the PMIx progress thread, so we must
+     * shift to our event base before touching the global
+     * request array */
+    prte_event_set(prte_event_base, &req->ev, -1, PRTE_EV_WRITE, _req_release, req);
+    PMIX_POST_OBJECT(req);
+    prte_event_active(&req->ev, PRTE_EV_WRITE, 1);
+}
 
 static void rqcon(prte_pmix_server_req_t *p)
 {

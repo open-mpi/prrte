@@ -344,6 +344,22 @@ pmix_status_t pmix_server_abort_fn(const pmix_proc_t *proc, void *server_object,
     return PRTE_SUCCESS;
 }
 
+/* completion of a tool registration - executes on the PRRTE
+ * progress thread */
+static void tconn_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        PMIX_ERROR_LOG(status);
+        // we can live without it
+    }
+    req->toolcbfunc(req->pstatus, &req->target, req->cbdata);
+
+    /* cleanup */
+    PMIX_RELEASE(req);
+}
+
 void pmix_server_tconn_return(int status, pmix_proc_t *sender,
                               pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                               void *cbdata)
@@ -391,18 +407,34 @@ void pmix_server_tconn_return(int status, pmix_proc_t *sender,
             return;
         }
         PMIX_LOAD_NSPACE(req->target.nspace, jobid);
-        /* the tool is not a client of ours, but we can provide at least some information */
-        rc = prte_pmix_server_register_tool(req);
-        if (PRTE_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            // we can live without it
+        /* the tool is not a client of ours, but we can provide at
+         * least some information - the registration completes
+         * asynchronously */
+        req->pstatus = ret;
+        rc = prte_pmix_server_register_tool(req, tconn_reg_complete, req);
+        if (PRTE_SUCCESS == rc) {
+            return;
         }
+        PMIX_ERROR_LOG(rc);
+        // we can live without it
     }
 
     req->toolcbfunc(ret, &req->target, req->cbdata);
 
     /* cleanup */
     PMIX_RELEASE(req);
+}
+
+/* completion of the local tool registration - executes on the
+ * PRRTE progress thread */
+static void toolconn_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_pmix_server_req_t *cd = (prte_pmix_server_req_t *) cbdata;
+
+    if (NULL != cd->toolcbfunc) {
+        cd->toolcbfunc(status, &cd->target, cd->cbdata);
+    }
+    PMIX_RELEASE(cd);
 }
 
 static void _toolconn(int sd, short args, void *cbdata)
@@ -548,11 +580,13 @@ static void _toolconn(int sd, short args, void *cbdata)
             free(tmp);
             prte_plm_globals.next_jobid++;
         }
-        // register this job - will add to our array of jobs
-        rc = prte_pmix_server_register_tool(cd);
-        if (PMIX_SUCCESS != rc) {
-            rc = prte_pmix_convert_rc(rc);
+        // register this job - will add to our array of jobs. The
+        // registration completes asynchronously
+        rc = prte_pmix_server_register_tool(cd, toolconn_reg_complete, cd);
+        if (PRTE_SUCCESS == rc) {
+            return;
         }
+        rc = prte_pmix_convert_rc(rc);
         goto complete;
     }
 
@@ -897,15 +931,51 @@ pmix_status_t pmix_server_log2_fn(const pmix_proc_t *client, const pmix_info_t d
 }
 #endif
 
+static void _iof_pull(int sd, short args, void *cbdata)
+{
+    prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
+    prte_iof_sink_t *sink;
+    size_t i;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* Set up I/O forwarding sinks and handlers for stdout and stderr for each proc
+     * requesting I/O forwarding */
+    for (i = 0; i < cd->nprocs; i++) {
+        if (cd->channels & PMIX_FWD_STDOUT_CHANNEL) {
+            if (cd->flag) {
+                /* ask the IOF to stop forwarding this channel */
+            } else {
+                PRTE_IOF_SINK_DEFINE(&sink, &cd->procs[i], fileno(stdout), PRTE_IOF_STDOUT,
+                                     prte_iof_base_write_handler);
+                PRTE_IOF_SINK_ACTIVATE(sink->wev);
+            }
+        }
+        if (cd->channels & PMIX_FWD_STDERR_CHANNEL) {
+            if (cd->flag) {
+                /* ask the IOF to stop forwarding this channel */
+            } else {
+                PRTE_IOF_SINK_DEFINE(&sink, &cd->procs[i], fileno(stderr), PRTE_IOF_STDERR,
+                                     prte_iof_base_write_handler);
+                PRTE_IOF_SINK_ACTIVATE(sink->wev);
+            }
+        }
+    }
+    if (NULL != cd->cbfunc) {
+        cd->cbfunc(PMIX_SUCCESS, cd->cbdata);
+    }
+    PMIX_RELEASE(cd);
+}
+
 pmix_status_t pmix_server_iof_pull_fn(const pmix_proc_t procs[], size_t nprocs,
                                       const pmix_info_t directives[], size_t ndirs,
                                       pmix_iof_channel_t channels, pmix_op_cbfunc_t cbfunc,
                                       void *cbdata)
 {
-    prte_iof_sink_t *sink;
+    prte_pmix_server_op_caddy_t *cd;
     size_t i;
     bool stop = false;
-    PRTE_HIDE_UNUSED_PARAMS(cbfunc, cbdata);
 
     /* no really good way to do this - we have to search the directives to
      * see if we are being asked to stop the specified channels before
@@ -917,29 +987,22 @@ pmix_status_t pmix_server_iof_pull_fn(const pmix_proc_t procs[], size_t nprocs,
         }
     }
 
-    /* Set up I/O forwarding sinks and handlers for stdout and stderr for each proc
-     * requesting I/O forwarding */
-    for (i = 0; i < nprocs; i++) {
-        if (channels & PMIX_FWD_STDOUT_CHANNEL) {
-            if (stop) {
-                /* ask the IOF to stop forwarding this channel */
-            } else {
-                PRTE_IOF_SINK_DEFINE(&sink, &procs[i], fileno(stdout), PRTE_IOF_STDOUT,
-                                     prte_iof_base_write_handler);
-                PRTE_IOF_SINK_ACTIVATE(sink->wev);
-            }
-        }
-        if (channels & PMIX_FWD_STDERR_CHANNEL) {
-            if (stop) {
-                /* ask the IOF to stop forwarding this channel */
-            } else {
-                PRTE_IOF_SINK_DEFINE(&sink, &procs[i], fileno(stderr), PRTE_IOF_STDERR,
-                                     prte_iof_base_write_handler);
-                PRTE_IOF_SINK_ACTIVATE(sink->wev);
-            }
-        }
-    }
-    return PMIX_OPERATION_SUCCEEDED;
+    /* this upcall arrives on the PMIx progress thread, and setting up
+     * IOF sinks manipulates framework state and arms events on our
+     * event base - shift it. The procs array remains valid until we
+     * invoke the callback, which happens at the end of the shifted
+     * handler */
+    cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    cd->procs = (pmix_proc_t *) procs;
+    cd->nprocs = nprocs;
+    cd->channels = channels;
+    cd->flag = stop;
+    cd->cbfunc = cbfunc;
+    cd->cbdata = cbdata;
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, _iof_pull, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
+    return PMIX_SUCCESS;
 }
 
 static void pmix_server_stdin_push(int sd, short args, void *cbdata)
