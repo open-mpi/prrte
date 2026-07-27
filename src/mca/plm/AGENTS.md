@@ -63,7 +63,7 @@ plm/
   plm_types.h                 # **job / proc / node / app STATE codes** + PLM command codes (tree-wide!)
   base/
     base.h                    # public base API (state-machine handlers, spawn_response, ...)
-    plm_private.h             # framework-internal API + prte_plm_globals_t + proxy/prted-cmd helpers
+    plm_private.h             # framework-internal API + prte_plm_globals_t + prted-cmd helpers
     plm_base_frame.c          # framework open/close/register; the DEFAULT "local-only" module
     plm_base_select.c         # pick-ONE-component selection (highest priority wins)
     plm_base_receive.c        # the HNP command processor: tools/daemons → HNP (PRTE_RML_TAG_PLM)
@@ -183,7 +183,7 @@ spine of launch:
 | `prte_plm_base_setup_job_complete` | `INIT_COMPLETE` → `ALLOCATE`. |
 | `prte_plm_base_allocation_complete` | `ALLOCATION_COMPLETE` → `LAUNCH_DAEMONS` (the component's handler). Has a bootstrap-DVM special case that stands up the VM directly. |
 | `prte_plm_base_daemons_launched` | `DAEMONS_LAUNCHED` → **deliberately a no-op**; we wait for daemons to phone home rather than advancing. |
-| `prte_plm_base_daemons_reported` | `DAEMONS_REPORTED` → set node slots (unmanaged allocations), compute `total_slots_alloc`, then `VM_READY`. |
+| `prte_plm_base_daemons_reported` | `DAEMONS_REPORTED` → size any node whose slot count was not given (`PRTE_NODE_FLAG_SLOTS_GIVEN`), sum the job's session nodes into `total_slots_alloc`, then `VM_READY`. |
 | `prte_plm_base_vm_ready` | `VM_READY` → check topology limits, preposition files (`filem`), then `MAP`. |
 | `prte_plm_base_mapping_complete` | `MAP_COMPLETE` → `SYSTEM_PREP`. |
 | `prte_plm_base_complete_setup` | `SYSTEM_PREP` → `LAUNCH_APPS`. |
@@ -211,11 +211,32 @@ This is the crux of the whole framework. After a component starts a
 3. Unpacks the **node name** (+ aliases), reconciling it with the
    allocation's name (the daemon's `gethostname` result wins; the
    original becomes an alias). Sets `PRTE_NODE_FLAG_DAEMON_LAUNCHED` and
-   node state `UP`.
+   node state `UP`. The daemon-reported aliases must be **merged** into
+   `node->aliases`, never assigned over it: the HNP has already recorded
+   the allocation's own name (and its non-FQDN form) there, and those
+   are exactly the names a hostfile/`--host` spec uses to refer to the
+   node — dropping them makes `prte_nptr_match` stop matching it.
 4. Unpacks the node **topology** (possibly compressed), de-duplicating
    against `prte_node_topologies` and recording an hwloc diff when it
    matches an existing one. Under `prte_homo_nodes` only daemon rank 1
-   sends a topology and everyone else inherits it.
+   sends a topology and everyone else inherits it — `progress_daemons()`
+   points every other daemon's node at that same `prte_topology_t`
+   (nothing is duplicated; each node takes a **counted reference**, see
+   below). It must come from a **daemon**, never from our own node
+   (`prterun` may be on a login node with a different topology), and rank
+   1 may no longer exist (an elastic shrink can remove it), so the source
+   is the first daemon that *has* a topology — the survivors already
+   inherited rank 1's, so a daemon added by a later grow (which reports
+   none of its own, not being rank 1) still inherits the right one.
+
+   **Topology ownership:** `node->topology` is a reference-counted
+   pointer into the shared `prte_node_topologies` array, never a copy.
+   Assigning one means `PMIX_RETAIN(t)` (and releasing whatever the node
+   held before); `prte_node_destruct` drops the node's reference. That is
+   what lets the topology outlive any individual node — it goes away only
+   when the last node using it, and the array entry, are gone — and it is
+   what makes a node safe to destroy at any point in an elastic
+   shrink/grow.
 5. Bumps `jdatorted->num_reported`. When the count reaches
    `num_procs`, `progress_daemons()` sets the daemon job to
    `DAEMONS_REPORTED` and activates that state for every application job
@@ -275,7 +296,13 @@ base provides the shared pieces:
   relevant `PMIX_MCA_`/`PRTE_MCA_` env var and cmd-line MCA param —
   while **deliberately skipping** the `rmaps`, `ras`, and `plm`
   frameworks (the daemons must not re-run mapping/allocation, and only
-  open the PLM if explicitly told to).
+  open the PLM if explicitly told to). An env var is split at its
+  **first** `=` only: MCA values may themselves contain `=`, and
+  splitting on all of them silently truncates the value. Replicating the
+  environment can be suppressed entirely via
+  `prte_plm_globals.pass_environ_mca_params` (the `ssh` component sets
+  it from `plm_ssh_pass_environ_mca_params`, the documented remedy for
+  `cmd-line-too-long`).
 - **`prte_plm_base_wrap_args(argv)`** — quotes multi-word `...mca`
   argument values so shells/launchers don't split them.
 
@@ -288,13 +315,43 @@ DVM, dynamic spawn (only "added" nodes), unmanaged allocation
 (`-host`/hostfile union), managed allocation (filter the node pool) —
 and for each node needing a daemon it:
 
-- creates a `prte_proc_t`, assigns it the **next available vpid**
-  (`daemons->num_procs`), records the first as `map->daemon_vpid_start`,
-  and bumps `map->num_new_daemons`;
+- creates a `prte_proc_t` and assigns it a vpid — normally the **next
+  available one** (`daemons->num_procs`), but in a **bootstrapped DVM**
+  the node's canonical rank (`node->index`, recorded by `ras/bootstrap`
+  from `prte.conf`). That is not a preference: a bootstrapped daemon
+  computed its own vpid from the same file before it ever contacted the
+  HNP, and `prted_report_launch` looks a reporting daemon up in
+  `daemons->procs` **by the rank it claims for itself**. Assign it a
+  different one and the HNP either attaches the daemon to the wrong node
+  or cannot find it at all. Records the first as
+  `map->daemon_vpid_start` and bumps `map->num_new_daemons`;
+- maintains `daemons->num_procs` as the vpid **span** (grown to cover the
+  vpid just used, which for a sequential assignment is exactly the
+  increment it replaces) — `num_procs` is the count only because vpids
+  are normally consecutive, and it is read tree-wide as the upper bound
+  of the daemon vpid range;
 - links node↔daemon, sets `PRTE_NODE_FLAG_LOC_VERIFIED` iff
   `prte_plm_globals.daemon_nodes_assigned_at_launch` (see below);
 - once daemons are added, recomputes the RML routing tree
   (`prte_rml_compute_routing_tree`) so the HNP can tree-spawn/xcast.
+
+A **grow** (`PRTE_JOB_EXTEND_DVM`) is scoped to the nodes that request
+brought in, and nothing else: an allocation request naming `node4` starts a
+daemon on `node4` alone. Every producer of a grow — the no-scheduler
+`ras_base_insert_node_string`, `ras/slurm`'s extend, and `ras/hosts` for
+`add-host`/`add-hostfile` — marks its nodes `PRTE_NODE_STATE_ADDED` for
+exactly this purpose, and the extend path selects on that mark (as the
+dynamic-spawn path does). Do **not** revert it to scanning the whole node
+pool for nodes lacking a daemon: after a shrink the pool holds exactly such
+a node — the one just removed — and it would be silently dragged back into
+an unrelated grow. `ras_base_node_insert` propagates the mark onto a pool
+entry that already exists, which is what makes re-growing a previously
+shrunk node work at all.
+
+Relatedly, the grow campaign scans **all** its targets for the requestor
+rather than reading `map->daemon_vpid_start`: a target whose session is gone
+would otherwise leave the campaign with no requester, and a successful grow
+would emit no phase-two completion event at all.
 
 `map->num_new_daemons` is the key output: `== 0` means every node
 already has a daemon, so the component fast-forwards to
@@ -374,6 +431,22 @@ placed daemons) or wireup stalls.
   (`PRTE_JOB_PREFIX` / `PRTE_JOB_PMIX_PREFIX`); launchers read it there
   and rewrite `PATH`/`LD_LIBRARY_PATH` (and export `PRTE_PREFIX` /
   `PMIX_PREFIX`) so the remote `prted` and its PMIx can be found.
+- **Launch caddies are owned by the SIGCHLD callback.** A component that
+  hands a caddy to `prte_wait_cb(child, cb, caddy)` still owns it: the
+  `prte_wait_tracker_t` destructor releases only its `child`, never
+  `cbdata`. The callback must `PMIX_RELEASE` the caddy on **every** path
+  (including the success path), or every launched daemon leaks a copy of
+  its full remote command line.
+- **A per-launch failure flag must be re-armed per launch.** Components
+  funnel errors to a `cleanup:` label guarded by a `failed_launch` flag;
+  where that flag is a file-static (because the launcher's `wait_cb`
+  also reads it) it must be set `true` at the *top* of `launch_daemons`,
+  not merely initialized once — otherwise the cleanup path can never
+  report a failure.
+- **`map->nodes` entries may have a NULL `daemon`.** Check
+  `node->daemon` before reading `node->daemon->name.rank` — including in
+  a tree-spawn "is this one of my children?" filter, which runs before
+  the per-node launch checks.
 - **The version macro is `PRTE_PLM_BASE_VERSION_2_0_0`** (`plm` 2.0.0).
 - Standard PRRTE rules still apply: `prte_config.h` first, braces on
   every block, `NULL ==`/constant-on-left comparisons, no new compiler
@@ -398,6 +471,21 @@ progress toward `DAEMONS_REPORTED` — start there when a launch hangs.
 A launch that "hangs at DAEMONS_LAUNCHED" almost always means a daemon
 failed to connect back (firewall, wrong prefix, missing library) — check
 for the `daemon failed to report back` message from `ssh_wait_daemon`.
+
+---
+
+## Testing
+
+Launching daemons needs real nodes, so the coverage is split in three:
+
+| Layer | What it covers |
+|-------|----------------|
+| [`test/unit/plm/test_plm.c`](../../../test/unit/plm/) (`make check`) | Everything the launch path builds *before* it forks: `plm_types.h` state/command-code uniqueness and the UNTERMINATED/TERMINATED/ERROR boundaries, the module vtable contract (default + `ssh`), `prte_plm_base_wrap_args`, `prte_plm_base_setup_prted_cmd` (plain / wrapped / custom agent), the full `prte_plm_base_prted_append_basic_args` command line (vpid template slot, rmaps/ras/plm suppression, `=`-bearing MCA values, the `pass_environ_mca_params` opt-out), and `set_hnp_name`/`create_jobid` nspace assignment. |
+| [`test/offline`](../../../test/offline/) (`make -C test/offline check-offline`) | `setup_virtual_machine` on the `DO_NOT_LAUNCH` path, via the mapper matrix. |
+| [`contrib/dockerswarm`](../../../contrib/dockerswarm/) (`run-tests.sh linux`) | The real launch: radix-2 **tree-spawn** fan-out across 8 nodes (only a multi-level tree proves `remote_spawn` recursed), flat `no_tree_spawn` launch, `num_concurrent=1` throttled launch, an `=`-bearing MCA value surviving onto the prted cmd line, `pass_environ_mca_params 0`, and node-name/alias reconciliation (allocate by IP, then `--host` by both the reported name and the original address). |
+
+Add a new pure/structural check to the unit test; anything that needs a
+daemon to actually come up belongs in the dockerswarm suite.
 
 ---
 

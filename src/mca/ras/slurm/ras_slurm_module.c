@@ -137,8 +137,11 @@ cleanup:
 
     if (PRTE_SUCCESS != err) {
         prte_ras_slurm_modify_release_finalize();
-        PMIX_RELEASE(prte_slurm_session_stack);
-        prte_slurm_session_stack = NULL;
+        prte_ras_slurm_modify_cancel_finalize();
+        if (NULL != prte_slurm_session_stack) {
+            PMIX_RELEASE(prte_slurm_session_stack);
+            prte_slurm_session_stack = NULL;
+        }
     }
 
     return err;
@@ -322,7 +325,10 @@ static int prte_ras_slurm_finalize(void)
 {
     prte_ras_slurm_modify_cancel_finalize();
     prte_ras_slurm_modify_release_finalize();
-    PMIX_RELEASE(prte_slurm_session_stack);
+    if (NULL != prte_slurm_session_stack) {
+        PMIX_RELEASE(prte_slurm_session_stack);
+        prte_slurm_session_stack = NULL;
+    }
     return PRTE_SUCCESS;
 }
 
@@ -450,6 +456,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
     slots = malloc(sizeof(int) * num_nodes);
     if (NULL == slots) {
         PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        PMIx_Argv_free(names);
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
     memset(slots, 0, sizeof(int) * num_nodes);
@@ -458,6 +465,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
     if (NULL == begptr) {
         PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
         free(slots);
+        PMIx_Argv_free(names);
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
 
@@ -499,6 +507,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
             PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
             free(slots);
             free(orig);
+            PMIx_Argv_free(names);
             return PRTE_ERR_BAD_PARAM;
         }
     }
@@ -519,6 +528,7 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         if (NULL == node) {
             PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
             free(slots);
+            PMIx_Argv_free(names);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
         node->name = strdup(names[i]);
@@ -526,6 +536,11 @@ static int prte_ras_slurm_discover(char *regexp, char *tasks_per_node, pmix_list
         node->slots_inuse = 0;
         node->slots_max = 0;
         node->slots = slots[i];
+        /* This count came from the scheduler, so it is authoritative: mark it
+         * given or the launch path will discard it and re-derive the node's
+         * size from its core count, silently handing the job more slots than
+         * SLURM allocated and hiding real oversubscription from the mapper. */
+        PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
         pmix_list_append(nodelist, &node->super);
     }
     free(slots);
@@ -808,7 +823,6 @@ int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_
     }
 
     int err = PRTE_SUCCESS;
-    int pmix_err = PMIX_SUCCESS;
 
     err = prte_ras_slurm_validate_jobid(slurm_jobid);
 
@@ -888,9 +902,10 @@ int prte_ras_slurm_assign_new_session(const char *slurm_jobid, const char *user_
          * a per-Slurm-jobid tracking handle used to identify and release the
          * group later; it is not a reservation. */
         PMIX_RETAIN(node);
-        pmix_err = pmix_pointer_array_add(session->nodes, node);
-        if (0 > pmix_err) {
-            err = prte_pmix_convert_status(pmix_err);
+        /* NOTE: pmix_pointer_array_add returns the assigned INDEX, not a
+         * status - a negative value just means the array could not grow */
+        if (0 > pmix_pointer_array_add(session->nodes, node)) {
+            err = PRTE_ERR_OUT_OF_RESOURCE;
             PMIX_RELEASE(node);
             PRTE_ERROR_LOG(err);
             goto cleanup;

@@ -38,7 +38,7 @@ one yields nodes; if all are empty it returns `PRTE_ERR_TAKE_NEXT_OPTION`
    (and `NO_OVERSUBSCRIBE` unless the user set a subscribe directive) —
    the rankfile *is* the allocation and the mapping.
 2. **Dash-host** (`PRTE_APP_DASH_HOST`), aggregated across all
-   app-contexts via `prte_util_add_dash_host_nodes(..., true)`.
+   app-contexts via `prte_util_add_dash_host_nodes()`.
 3. **Hostfile** (`PRTE_APP_HOSTFILE`), a comma-list per app parsed with
    `prte_util_add_hostfile_nodes`; the result is the UNION across apps.
 4. **Default hostfile** (`prte_default_hostfile`), if set.
@@ -85,7 +85,18 @@ handled something, else `PMIX_ERR_TAKE_NEXT_OPTION`.
   rankfile branch.
 - **`process_hostfile` is deliberately a separate parser** from
   `src/util/hostfile` — it supports the `+N`/`-N` slot-adjust syntax the
-  flex parser can't. Keep the two in sync in spirit.
+  flex parser can't. Keep the two in sync in spirit. Being a hand parser,
+  it owns its own hygiene: every `isspace()` call must cast its argument
+  to `unsigned char` (a plain `char` is UB for bytes ≥ 0x80), and a
+  `slots=+N` match adjusts the **pool** entry in place without appending
+  to the working list — so `total_slots_alloc` is not updated for an
+  adjustment.
+- **`modify()` must validate the info values it splits.** A request can
+  arrive over the wire carrying any type; `PMIX_ADD_HOST`/
+  `PMIX_ADD_HOSTFILE` are checked for `PMIX_STRING` with a non-NULL
+  value before `PMIx_Argv_split`. It also destructs its working list on
+  every error return — `prte_ras_base_node_insert` drains only what it
+  reached.
 - Because this is the lowest-priority component, returning a hard error
   (rather than `TAKE_NEXT_OPTION`) from `allocate` will fail the whole
   allocation — reserve hard errors for genuine parse failures.

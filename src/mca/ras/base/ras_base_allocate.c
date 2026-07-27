@@ -291,6 +291,10 @@ void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist)
     }
 
     nodes = PMIx_Argv_split(nodelist, ';');
+    if (NULL == nodes) {
+        /* the nodelist held nothing we can resolve */
+        return;
+    }
     for (j=0; NULL != nodes[j]; j++) {
         moveon = false;
         for (i=0; i < prte_node_pool->size && !moveon; i++) {
@@ -299,7 +303,11 @@ void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist)
                 continue;
             }
             if (0 == strcmp(nptr->name, nodes[j])) {
-                display_cpus(nptr->topology, jdata, nodes[j]);
+                /* a node that has not yet been launched upon carries no
+                 * topology - there is nothing to display for it */
+                if (NULL != nptr->topology) {
+                    display_cpus(nptr->topology, jdata, nodes[j]);
+                }
                 break;
             }
             if (NULL == nptr->aliases) {
@@ -309,7 +317,9 @@ void prte_ras_base_display_cpus(prte_job_t *jdata, char *nodelist)
             for (m = 0; NULL != nptr->aliases[m]; m++) {
                 if (0 == strcmp(nodes[j], nptr->aliases[m])) {
                     /* this is the node! */
-                    display_cpus(nptr->topology, jdata, nodes[j]);
+                    if (NULL != nptr->topology) {
+                        display_cpus(nptr->topology, jdata, nodes[j]);
+                    }
                     moveon = true;
                     break;
                 }
@@ -350,26 +360,31 @@ void prte_ras_base_allocate(int fd, short args, void *cbdata)
     /* construct a list to hold the results */
     PMIX_CONSTRUCT(&nodes, pmix_list_t);
 
-    /* In an unmanaged allocation, the nodes discovered for the DVM's
-     * initial (daemon-job) allocation constitute the fixed base allocation
-     * for the entire session - exactly as if a scheduler had provided them.
-     * Once that base has been established, a subsequent job (for example,
-     * the child of a PMIx_Spawn) must not re-run discovery: doing so re-reads
-     * the default hostfile and overwrites the established per-node slot counts
-     * while clearing PRTE_NODE_FLAG_SLOTS_GIVEN. That in turn lets the node be
-     * re-sized to its core count, which hides genuine oversubscription from
-     * the mapper and causes spawned processes to be bound on a node that is
-     * actually oversubscribed. The only sanctioned way to change an unmanaged
-     * allocation is an explicit add-host/add-hostfile request, which is
-     * handled separately (prte_ras_base_add_hosts -> prte_ras_base_modify)
-     * before we ever reach this point. So if the base allocation already
-     * exists and this is not the DVM's own daemon job, simply reuse it.
+    /* The nodes discovered for the DVM's initial (daemon-job) allocation
+     * constitute the fixed base allocation for the entire session, whoever
+     * provided them - a scheduler, a hostfile, or -host. Once that base has
+     * been established, a subsequent job (for example, the child of a
+     * PMIx_Spawn) must not re-run discovery. Re-reading a hostfile overwrites
+     * the established per-node slot counts while clearing
+     * PRTE_NODE_FLAG_SLOTS_GIVEN, which lets the node be re-sized to its core
+     * count - hiding genuine oversubscription from the mapper and binding
+     * spawned processes on a node that is actually oversubscribed. Re-reading
+     * a resource manager is no better: an RM component that has already
+     * recorded this allocation has to spend a return code saying so
+     * (ras/slurm answers PRTE_EXISTS to avoid double-inserting the whole
+     * node set), and one that does not would insert it twice.
+     *
+     * The only sanctioned way to change an established allocation is an
+     * explicit add-host/add-hostfile or allocation request, which is handled
+     * separately (prte_ras_base_add_hosts / prte_ras_base_modify) before we
+     * ever reach this point. So if the base allocation already exists and
+     * this is not the DVM's own daemon job, simply reuse it.
      *
      * The "established" test is deliberately independent of whether the HNP
      * node is part of the allocation (prte_ras_base.allocation_established is
      * set when the first allocation completes), so the protection holds even
      * for allocations that exclude the head node. */
-    if (!prte_managed_allocation && prte_ras_base.allocation_established &&
+    if (prte_ras_base.allocation_established &&
         0 != strcmp(jdata->nspace, PRTE_PROC_MY_NAME->nspace)) {
         PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
                              "%s ras:base:allocate reusing established base allocation for job %s",
@@ -477,12 +492,13 @@ DISPLAY:
 
         ret = PMIx_Notify_event(PMIX_NOTIFY_ALLOC_COMPLETE, NULL, PMIX_GLOBAL,
                                 &info, 1, NULL, NULL);
+        PMIX_INFO_DESTRUCT(&info);
         if (PMIX_SUCCESS != ret && PMIX_OPERATION_SUCCEEDED != ret) {
             PMIX_ERROR_LOG(ret);
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
             PMIX_RELEASE(caddy);
+            return;
         }
-        PMIX_INFO_DESTRUCT(&info);
     }
 
     /* set total slots alloc */
@@ -495,7 +511,10 @@ DISPLAY:
             free(hosts);
             for (j=0; NULL != hostlist[j]; j++) {
                 node = prte_node_match(NULL, hostlist[j]);
-                if (NULL == node) {
+                /* a node only acquires a topology once its daemon has
+                 * reported in - a node that is allocated but not yet
+                 * launched upon (e.g. one just added by a grow) has none */
+                if (NULL == node || NULL == node->topology) {
                     continue;
                 }
                 pmix_output(prte_clean_output,
@@ -511,7 +530,7 @@ DISPLAY:
         } else {
             for (j=0; j < prte_node_pool->size; j++) {
                 node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, j);
-                if (NULL == node) {
+                if (NULL == node || NULL == node->topology) {
                     continue;
                 }
                 pmix_output(prte_clean_output,
@@ -553,13 +572,6 @@ void prte_ras_base_release_allocation(prte_session_t *session)
     }
 }
 
-static void localrelease(void *cbdata)
-{
-    prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
-
-    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
-    PMIX_RELEASE(req);
-}
 
 void prte_ras_base_modify(int fd, short args, void *cbdata)
 {
@@ -609,7 +621,7 @@ void prte_ras_base_modify(int fd, short args, void *cbdata)
 
     // execute the callback
     if (NULL != req->infocbfunc) {
-        req->infocbfunc(req->pstatus, req->info, req->ninfo, req->cbdata, localrelease, req);
+        req->infocbfunc(req->pstatus, req->info, req->ninfo, req->cbdata, prte_pmix_server_req_release, req);
         return;
     }
 
@@ -1212,7 +1224,7 @@ static int ras_base_insert_node_string(char *ndstring, prte_session_t *dest)
 
     /* add these nodes to our node pool */
     PMIX_CONSTRUCT(&ndlist, pmix_list_t);
-    ret = prte_util_add_dash_host_nodes(&ndlist, ndstring, true);
+    ret = prte_util_add_dash_host_nodes(&ndlist, ndstring);
     if (PRTE_SUCCESS != ret) {
         PRTE_ERROR_LOG(ret);
         PMIX_LIST_DESTRUCT(&ndlist);
@@ -1226,6 +1238,10 @@ static int ras_base_insert_node_string(char *ndstring, prte_session_t *dest)
      * phase-two completion event). */
     PMIX_LIST_FOREACH(snap, &ndlist, prte_node_t) {
         PMIx_Argv_append_nosize(&rsv_names, snap->name);
+        /* mark as newly added so the DVM extension will include it
+         * despite any static -host filter given when the DVM was
+         * started */
+        snap->state = PRTE_NODE_STATE_ADDED;
     }
 
     ret = prte_ras_base_node_insert(&ndlist, NULL);
@@ -1278,8 +1294,14 @@ static void ras_base_set_alloc_response(prte_pmix_server_req_t *req,
         PMIX_INFO_LOAD(&rinfo[1], PMIX_ALLOC_REQ_ID, dest->user_refid,
                        PMIX_STRING);
     }
-    /* the original req->info is borrowed from the PMIx caller; repoint
-     * to our response array and let the req destructor free it */
+    /* Repoint to our response array and let the req destructor free it.
+     * The original req->info is usually borrowed from the PMIx caller and
+     * needs no action, but a request that already owns its array (one
+     * relayed from a remote peer, or one an RM module replaced with a
+     * scheduler answer) would strand it here. */
+    if (req->copy && NULL != req->info) {
+        PMIX_INFO_FREE(req->info, req->ninfo);
+    }
     req->info = rinfo;
     req->ninfo = rn;
     req->copy = true;
@@ -1291,6 +1313,25 @@ static void ras_base_complete_grow_request(prte_pmix_server_req_t *req)
     pmix_status_t rc;
     size_t n;
     bool found = false;
+
+    /* an add-host/add-hostfile request (from the --add-host and
+     * --add-hostfile cmd line options) grows the DVM's general pool.
+     * The nodes were already inserted by the module that claimed the
+     * request, and there is no reservation to route them to - so all
+     * that remains is to extend the DVM across the new nodes. The
+     * grow must be activated even if the request only adjusted slots
+     * on existing nodes: initiating the request marked the DVM as
+     * not-ready and parked the requesting job in the job cache, and
+     * it is the VM_READY re-entry at the end of the (possibly empty)
+     * daemon launch that marks the DVM ready again and releases the
+     * cached jobs */
+    for (n = 0; n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_ADD_HOST) ||
+            PMIx_Check_key(req->info[n].key, PMIX_ADD_HOSTFILE)) {
+            prte_ras_base_activate_dvm_grow();
+            return;
+        }
+    }
 
     rc = ras_base_prepare_grow(req, &dest);
     if (PMIX_SUCCESS != rc) {

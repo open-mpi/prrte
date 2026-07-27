@@ -59,18 +59,6 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
         return rc;
     }
 
-    /* pack a flag indicating if we are in a managed allocation */
-    if (prte_managed_allocation) {
-        u8 = 1;
-    } else {
-        u8 = 0;
-    }
-    rc = PMIx_Data_pack(PRTE_PROC_MY_NAME, buffer, &u8, 1, PMIX_UINT8);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return rc;
-    }
-
     /* Pack the size of the daemon vpid space, [0, span). This can be larger
      * than the number of live daemons packed below: a DVM shrink leaves a
      * permanent hole in the vpid space (the DVM never reuses a daemon vpid),
@@ -281,19 +269,6 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
         prte_hnp_is_allocated = false;
     }
 
-    /* unpack the flag indicating if we are in managed allocation */
-    cnt = 1;
-    rc = PMIx_Data_unpack(PRTE_PROC_MY_NAME, buf, &u8, &cnt, PMIX_UINT8);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        goto cleanup;
-    }
-    if (1 == u8) {
-        prte_managed_allocation = true;
-    } else {
-        prte_managed_allocation = false;
-    }
-
     /* unpack the size of the daemon vpid space (may exceed the live daemon
      * count when the DVM carries shrunk-out vpid holes - see nidmap_create) */
     cnt = 1;
@@ -447,7 +422,9 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
             nd->aliases = PMIx_Argv_split(aliases[n], ',');
         }
         /* set the topology - always default to homogeneous
-         * as that is the most common scenario */
+         * as that is the most common scenario. Retain it: the node holds a
+         * counted reference so the topology cannot go away underneath it */
+        PMIX_RETAIN(t);
         nd->topology = t;
         /* record the daemon on it */
         proc = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, vpid[n]);
@@ -459,7 +436,8 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
             daemons->num_procs++;
             pmix_pointer_array_set_item(daemons->procs, proc->name.rank, proc);
         }
-        PMIX_RETAIN(nd);
+        /* the node backpointer is borrowed, not retained (see
+         * prte_proc_destruct) */
         proc->node = nd;
         PMIX_RETAIN(proc);
         nd->daemon = proc;

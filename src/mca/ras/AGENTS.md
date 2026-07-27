@@ -166,15 +166,19 @@ pre-empt everything.
 This state callback in `ras_base_allocate.c` is the heart of the
 framework. Its phases:
 
-1. **Reuse guard.** In an *unmanaged* allocation, the DVM's initial
-   (daemon-job) discovery is the fixed base allocation for the whole
-   session. If `prte_ras_base.allocation_established` is set and this is
-   **not** the DVM's own daemon job, the base *reuses* the existing pool
-   and jumps to display — re-running discovery would re-read the default
-   hostfile, overwrite established per-node slot counts, and clear
+1. **Reuse guard.** The DVM's initial (daemon-job) discovery is the
+   fixed base allocation for the whole session, whoever provided it. If
+   `prte_ras_base.allocation_established` is set and this is **not** the
+   DVM's own daemon job, the base *reuses* the existing pool and jumps to
+   display. Re-running discovery would re-read a hostfile, overwrite
+   established per-node slot counts and clear
    `PRTE_NODE_FLAG_SLOTS_GIVEN`, hiding genuine oversubscription from the
-   mapper. (The sanctioned way to grow an unmanaged allocation is
-   add-host/add-hostfile → `prte_ras_base_modify`.)
+   mapper — and re-reading an RM is no better, since a component that has
+   already recorded its allocation must spend a return code saying so
+   (`ras/slurm` answers `PRTE_EXISTS`) and one that does not would insert
+   it twice. (The sanctioned way to grow an allocation is
+   add-host/add-hostfile or an allocation request →
+   `prte_ras_base_modify`.)
 2. **Cycle modules.** Walk `selected_modules` in priority order calling
    `mod->module->allocate(jdata, &nodes)`, honoring the return protocol
    above.
@@ -213,11 +217,32 @@ input list.** Walk it carefully before touching allocation code:
 - **General dedup.** For every other node, an exhaustive `prte_nptr_match`
   scan of the pool decides add-vs-update. `PRTE_NODE_ADD_SLOTS` means
   "adjust the existing slot count" (clamped to `[0, slots_max]`) rather
-  than replace it.
-- **Managed = sacred slots.** Under `prte_managed_allocation` (or when a
-  node arrives with `PRTE_NODE_FLAG_SLOTS_GIVEN`), the base sets
-  `SLOTS_GIVEN` so downstream code treats the slot count as fixed and
-  never recomputes it from core count.
+  than replace it. **On a match the incoming object is released and the
+  loop moves on**: the pool entry is authoritative, so the duplicate must
+  not be added, must not have its slots counted into
+  `total_slots_alloc` a second time, and must not be multiplied. This is
+  the hot path on every elastic **re-grow** — a shrink removes the
+  daemon but leaves the pool entry, so the regrant always arrives as a
+  duplicate. Only `PRTE_NODE_STATE_ADDED` is carried across, because the
+  DVM extension keys off it to decide where to launch.
+- **Pre-assigned pool slots.** A component may choose a node's pool slot
+  by setting `node->index` before handing it over; `node_insert` places
+  it there rather than appending to the lowest free slot (falling back
+  to an append if the slot is occupied). `ras/bootstrap` is the only
+  component that does this, and it needs it — see its guide.
+- **`PRTE_NODE_FLAG_SLOTS_GIVEN` is the slot authority, and it is
+  per node.** The component that supplies a node says whether its count
+  is a given — every RM component sets the flag, the hostfile/dash-host
+  parsers set it for an explicit `slots=`/`:N`, and nobody sets it on
+  the bare local-host fallback. `node_insert` carries the flag into the
+  pool untouched; at launch `plm_base_launch_support` re-sizes only the
+  nodes that lack it (from the topology, as `prte_set_slots` directs)
+  and sums the job's session nodes into `jdata->total_slots_alloc`,
+  which the PMIx server hands out as `PMIX_UNIV_SIZE` and
+  `PMIX_MAX_PROCS`. A component that forgets the flag silently hands the
+  job its nodes' core counts instead of its allocation.
+  `prte_set_slots_override` is the deliberate escape hatch: it re-sizes
+  even the given ones.
 - **FQDN normalization.** `normalize_node()` truncates an FQDN to the
   short name, keeping the full name as `rawname` and an alias (unless
   `prte_keep_fqdn_hostnames` or the name is an IP). Sets
@@ -322,13 +347,25 @@ documented in each component's guide.
   is authoritative. `slots_max = 0` means "no max".
 - **Return `TAKE_NEXT_OPTION`, not an error, when the env is absent** —
   it is what lets `hosts` (and the local-node fallback) run.
-- **The reuse guard is load-bearing** for spawn/child jobs in unmanaged
-  allocations — don't bypass it.
+- **The reuse guard is load-bearing** for spawn/child jobs — don't
+  bypass it.
 - **The framework's `close` hook lives in `ras_base_frame.c`.**
   `prte_ras_base_close` is defined there and wired into the framework
   DECLARE; there is no separate close file. (An orphaned
   `ras_base_close.c` — never in `base/Makefile.am`, referencing
   long-gone `active_module`/`ras_opened` fields — was removed.)
+- **A `prte_node_t` only acquires a `topology` when its daemon reports
+  in.** Any pool walk that dereferences `node->topology` must NULL-check
+  first — the pool routinely holds allocated-but-not-yet-launched nodes
+  (a node just added by a grow, or the whole allocation before
+  `LAUNCH_DAEMONS`). Both `--display-topo` and `--display-cpus` are pool
+  walks.
+- **A parser reading an RM's file or env must tolerate malformed input.**
+  These run on the HNP, so a NULL deref on a blank line takes the whole
+  DVM down. `strtok_r` returns NULL for a short line; `fgets` does not
+  guarantee a trailing newline; and every `ctype.h` call needs its
+  argument cast to `unsigned char` (a plain `char` is UB for any byte
+  with the high bit set).
 - Standard PRRTE rules apply: `prte_config.h` first, braces on every
   block, `NULL ==`/constant-on-left, no new warnings,
   `PRTE_ERROR_LOG`/`PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED)`
@@ -336,17 +373,128 @@ documented in each component's guide.
 
 ---
 
+## `--enable-testbuild-launchers` — compile-only, and it requires a DSO
+
+Several ras components are gated on third-party headers that most
+machines do not have, so they are silently skipped by nearly every
+developer build and every CI job — which is exactly where an edit can sit
+broken indefinitely. `ras/flux` needs Flux *and* jansson; `ras/slurm`
+compiles a ~1000-line `scontrol --json` parser only when jansson is
+found, and **jansson defaults to `--with-jansson=no`**, so the stub is
+what almost everyone builds.
+
+`--enable-testbuild-launchers` builds them anyway, against
+declaration-only stand-ins:
+
+| Header | Stands in for | Used by |
+|--------|---------------|---------|
+| [`base/testbuild_jansson.h`](base/testbuild_jansson.h) | `<jansson.h>` | `ras/slurm` (`ras_slurm_jansson.c`), `ras/flux` |
+| [`flux/testbuild_flux.h`](flux/testbuild_flux.h) | `<flux/core.h>`, `<flux/hostlist.h>`, `<flux/idset.h>` | `ras/flux` |
+| [`lsf/testbuild_lsf.h`](lsf/testbuild_lsf.h) | `<lsf/lsbatch.h>` | `ras/lsf` |
+
+### A stubbed component MUST be a DSO
+
+Nothing behind those declarations is implemented, so the object files
+come out with unresolved `lsb_*`/`flux_*`/`json_*`/`hostlist_*`/`idset_*`
+references. Where they land decides whether the tree even builds:
+
+- **As a run-time loadable plugin** the unresolved references are fine.
+  Creating a shared object does not require them to resolve; the loader
+  refuses the `dlopen` later and the framework simply never sees the
+  component.
+- **Linked statically into `libprrte`** they are fatal. Every PRRTE tool
+  links that library, and the link fails on the first one:
+
+  ```
+  /usr/bin/ld: ../../../src/.libs/libprrte.so: undefined reference to `flux_open_ex'
+  ```
+
+So **every component with a testbuild stub must be in the default
+`--enable-mca-dso` list** in [`config/prte_mca.m4`](../../../config/prte_mca.m4)
+— today `plm-lsf`, `plm-tm`, `ras-lsf`, `ras-flux` and `ras-slurm`
+(`ras/slurm` is on the list because it compiles the jansson parser). That
+is also the right layout regardless of the stubs: it keeps a third-party
+dependency out of `libprrte` and therefore out of every PRRTE tool.
+Adding a stub without adding the component to that list breaks the build
+for everyone.
+
+### It must also not *call* a stub
+
+`dlopen` failing is a Linux-and-friends guarantee, not a universal one.
+On macOS a plugin is a bundle built with a flat namespace: it loads
+happily and the unresolved call becomes a jump to address 0 the moment
+someone makes it. So a stubbed component's `query` must decide whether
+this machine is even its environment **before** it touches the library —
+`getenv("LSB_JOBID")` for `ras/lsf`, `getenv("FLUX_URI")` for `ras/flux`.
+That is the framework convention anyway (see the `allocate()` return
+protocol above); with a stub it is also what keeps `prte_init` from
+segfaulting.
+
+Given both, a tree configured this way builds, links and runs — CI
+depends on that, since every build job configures
+`--enable-testbuild-launchers` and then runs `make check`, `make install`
+and a live `prterun`. What it cannot do is any actual work: nothing is
+parsed and no broker is contacted, so re-check such a tree after touching
+`ras/flux`, `ras/lsf` or `ras_slurm_jansson.c` (a normal build will not
+tell you that you broke them), and do not install one over a good
+installation.
+
+Adding a stub is deliberate work, not boilerplate: declare only what the
+component actually calls, and keep the signatures faithful. A wrong
+prototype here compiles and then mismatches the real library.
+
+---
+
+## Testing
+
+| Layer | What it covers |
+|-------|----------------|
+| [`test/unit/ras/test_ras.c`](../../../test/unit/ras/) (`make check`) | `prte_ras_base_node_insert` (dedup, drain, slot accounting, `ADD_SLOTS` clamping, FQDN normalization, HNP dedup, pre-assigned pool slots), the module vtable contract for every static component, `prte_ras_base_select` priority ordering, `prte_ras_base_flag_string`, and `ras/slurm`'s detect-and-report half — query gating on `SLURM_JOBID` at priority 50, then `allocate()` expanding a compressed `SLURM_NODELIST` and refusing a tainted jobid or an over-length nodelist. That last part is driven **through the framework** (find the component, query it, call the module it returns) rather than by naming its symbols, because `ras-slurm` is a plugin and has none in `libprrte`; keep it that way. It skips with a printed reason when the component is not there to be found. |
+| [`contrib/dockerswarm/run-tests.sh`](../../../contrib/dockerswarm/) (`linux`) | The multi-node paths: grow/shrink/re-grow leaving exactly one daemon per node (a duplicated pool entry launches two), `--add-hostfile` growing a live DVM through `add_hosts → ras/pmix defer → ras/hosts` including the `slots=+N` in-place adjust, and **`ras/slurm`'s whole modify surface** against a faked scheduler (below). |
+| Live RM | PBS/LSF/Flux discovery still needs a real scheduler; there is no substitute. |
+
+**`ras/slurm`'s `modify` surface is covered in `contrib/dockerswarm`, not
+in the unit test.** Extend, release and cancel shell out to
+`sbatch`/`scontrol` and only mean anything across several nodes, and each
+of them returns `PRTE_ERR_NOT_AVAILABLE` outright unless jansson was
+found — so a `make check` build, which by default has no jansson, cannot
+reach a line of it. The harness is multi-node, and its `build.sh` passes
+`--with-jansson` deliberately, so it is the only automated build anywhere
+that even compiles `ras_slurm_jansson.c`. It supplies the scheduler with
+[`fake-slurm.py`](../../../contrib/dockerswarm/fake-slurm.py) — the
+`SLURM_*` environment plus `sbatch`/`scontrol`/`scancel` stubs on `PATH`
+that hand out real container hostnames, so an extend genuinely launches
+daemons and a release genuinely removes them. `validate_hostname`,
+`prte_ras_slurm_drain_cmd_output` and the JSON parser live on that path
+only and come along with it, as do the paths that exist purely to survive
+a misbehaving scheduler (a failing `scancel`, unparsable JSON, a request
+cancelled while its job is still `PENDING`). See
+[dockerswarm AGENTS.md §11](../../../contrib/dockerswarm/AGENTS.md).
+
+The unit test builds the global job/node/session arrays by hand (the
+real ones come from `prte_init()`, which wants a live ESS) — follow that
+pattern rather than trying to bring up a DVM in `make check`.
+
+---
+
 ## Debugging
 
 ```sh
 prte --prtemca ras_base_verbose 5 ...     # trace selection + allocation + node_insert
-prun --display-allocation ...              # print the resulting node pool
+prun --display allocation ...             # print the job's node list
 prte --prtemca ras_base_multiplier 8 ...   # fake an 8x-larger cluster
 ```
 
 Verbosity ≥5 prints the final component priority list, each module's
 allocate attempt, and every node inserted with its slot count — start
 there.
+
+Note that `prun --display allocation` renders the **job's** node list
+(`rmaps_base_support_fns.c`), not the global pool: nodes held in a
+reservation created by an elastic grow are withheld from a general job
+and will not appear. The pool dump proper
+(`prte_ras_base_display_alloc`) only fires on the daemon job under
+`ras_base_verbose > 4`.
 
 ---
 

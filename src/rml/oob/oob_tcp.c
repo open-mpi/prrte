@@ -111,9 +111,6 @@ prte_oob_base_t prte_oob_base = {
     .max_recon_attempts = 0
 };
 
-static void split_and_resolve(char **orig_str, char *name,
-                              char ***interfaces);
-
 int prte_oob_open(void)
 {
     pmix_pif_t *copied_interface, *selected_interface;
@@ -150,12 +147,12 @@ int prte_oob_open(void)
      * subnet+mask
      */
     if (NULL != prte_if_include) {
-        split_and_resolve(&prte_if_include,
-                          "include", &interfaces);
+        prte_oob_split_and_resolve(&prte_if_include,
+                                   "include", &interfaces);
         including = true;
     } else if (NULL != prte_if_exclude) {
-        split_and_resolve(&prte_if_exclude,
-                          "exclude", &interfaces);
+        prte_oob_split_and_resolve(&prte_if_exclude,
+                                   "exclude", &interfaces);
     }
 
     /* if we are the master, then check the interfaces for loopbacks
@@ -685,8 +682,8 @@ cleanup:
  * (a.b.c.d/e), resolve them to an interface name (Currently only
  * supporting IPv4).  If unresolvable, warn and remove.
  */
-static void split_and_resolve(char **orig_str, char *name,
-                              char ***interfaces)
+void prte_oob_split_and_resolve(char **orig_str, char *name,
+                                char ***interfaces)
 {
     pmix_pif_t *selected_interface;
     int i, n, ret, match_count;
@@ -701,6 +698,15 @@ static void split_and_resolve(char **orig_str, char *name,
         return;
     }
 
+    /* If there is no list to collect into, then there is nothing to
+     * resolve against and nothing for the caller to consult afterwards -
+     * just discard the specification */
+    if (NULL == interfaces) {
+        free(*orig_str);
+        *orig_str = NULL;
+        return;
+    }
+
     argv = PMIx_Argv_split(*orig_str, ',');
     if (NULL == argv) {
         return;
@@ -709,9 +715,9 @@ static void split_and_resolve(char **orig_str, char *name,
         if (isalpha(argv[i][0])) {
             /* This is an interface name. If not already in the interfaces array, add it */
             found = false;
-            if (NULL != interfaces) {
-                for (n = 0; NULL != interfaces[n]; n++) {
-                    if (0 == strcmp(argv[i], *interfaces[n])) {
+            if (NULL != *interfaces) {
+                for (n = 0; NULL != (*interfaces)[n]; n++) {
+                    if (0 == strcmp(argv[i], (*interfaces)[n])) {
                         found = true;
                         break;
                     }
@@ -735,7 +741,6 @@ static void split_and_resolve(char **orig_str, char *name,
             pmix_show_help("help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename,
                            tmp, "Invalid specification (missing \"/\")");
-            free(argv[i]);
             free(tmp);
             continue;
         }
@@ -746,7 +751,6 @@ static void split_and_resolve(char **orig_str, char *name,
         ((struct sockaddr*) &argv_inaddr)->sa_family = AF_INET;
         ret = inet_pton(AF_INET, argv[i],
                         &((struct sockaddr_in*) &argv_inaddr)->sin_addr);
-        free(argv[i]);
 
         if (1 != ret) {
             pmix_show_help("help-oob-tcp.txt", "invalid if_inexclude",
@@ -762,14 +766,21 @@ static void split_and_resolve(char **orig_str, char *name,
                             pmix_net_get_hostname((struct sockaddr*) &argv_inaddr),
                             argv_prefix);
 
-        /* Go through all interfaces and see if we can find a match */
+        /* Go through all interfaces and see if we can find a match.
+         *
+         * Compare against each entry's own address, not the one
+         * pmix_ifkindextoaddr() returns for its kernel index: an interface
+         * carrying both an IPv4 and an IPv6 address appears in the list
+         * once per address, and both entries share a kernel index, so that
+         * lookup answers with whichever entry the kernel reported first.
+         * On Linux that is routinely the IPv6 one (loopback always), and
+         * an IPv4 subnet then fails to match the very interface it names.
+         */
         match_count = 0;
         PMIX_LIST_FOREACH(selected_interface, &pmix_if_list, pmix_pif_t) {
-            ret = pmix_ifkindextoaddr(selected_interface->if_kernel_index,
-                                     (struct sockaddr*) &if_inaddr,
-                                     sizeof(if_inaddr));
-            if (PMIX_SUCCESS == ret &&
-                pmix_net_samenetwork((struct sockaddr_storage*) &argv_inaddr,
+            memcpy(&if_inaddr, &selected_interface->if_addr,
+                   MIN(sizeof(if_inaddr), sizeof(selected_interface->if_addr)));
+            if (pmix_net_samenetwork((struct sockaddr_storage*) &argv_inaddr,
                                      (struct sockaddr_storage*) &if_inaddr,
                                      argv_prefix)) {
                 /* We found a match. If it's not already in the interfaces array,
@@ -777,9 +788,9 @@ static void split_and_resolve(char **orig_str, char *name,
                 match_count = match_count + 1;
                 pmix_ifkindextoname(selected_interface->if_kernel_index, if_name, sizeof(if_name));
                 found = false;
-                if (NULL != interfaces) {
-                    for (n = 0; NULL != interfaces[n]; n++) {
-                        if (0 == strcmp(if_name, *interfaces[n])) {
+                if (NULL != *interfaces) {
+                    for (n = 0; NULL != (*interfaces)[n]; n++) {
+                        if (0 == strcmp(if_name, (*interfaces)[n])) {
                             found = true;
                             break;
                         }
@@ -808,13 +819,9 @@ static void split_and_resolve(char **orig_str, char *name,
     }
 
     // cleanup and construct output string
-    free(argv);
+    PMIx_Argv_free(argv);
     free(*orig_str);
-    if (NULL != interfaces) {
-        *orig_str = PMIx_Argv_join(*interfaces, ',');
-    } else {
-        *orig_str = NULL;
-    }
+    *orig_str = PMIx_Argv_join(*interfaces, ',');
     return;
 }
 

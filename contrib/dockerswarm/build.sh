@@ -18,10 +18,24 @@
 #   ./build.sh macos    # build natively on this host into <repo>/vpath-macos
 #   ./build.sh image    # (re)build just the base container image
 #
-# Because a VPATH configure refuses to run while the source tree still has an
-# in-tree build, this script runs `make distclean` (once) at the repo root and
-# then `./autogen.pl`.  After that, ALL builds are out-of-tree and your
-# top-level source dir stays clean.
+# Distcleaning the source tree
+# ----------------------------
+# An out-of-tree build cannot share a source tree with an in-tree build: VPATH
+# configure refuses to run against one, and (worse) automake sets VPATH=srcdir,
+# so an incremental out-of-tree make will happily link objects it finds in the
+# SOURCE tree -- which for a Linux container reading a macOS host tree are not
+# even the same architecture.  So this script distcleans whenever it finds an
+# in-tree build, not just on the first run.
+#
+# That costs you the in-tree build: the next `make check`, `make -C test/offline
+# check-offline` or `make install` has to reconfigure and rebuild first.  If you
+# run those often, keep the host side out of tree too (./build.sh macos) and
+# there is nothing to clean.
+#
+#   --distclean      force it
+#   --no-distclean   skip it (only safe if the tree really is clean)
+#
+# See AGENTS.md, "When a distclean is actually needed".
 #
 # Optional: point PMIX_SRC at a local openpmix checkout to build PMIx from
 # source too (covering both code bases); otherwise the baked-in PMIx (Linux) or
@@ -41,14 +55,57 @@ PMIX_REPO="${PMIX_REPO:-https://github.com/openpmix/openpmix.git}"
 PMIX_SRC="${PMIX_SRC:-}"                # optional openpmix checkout to build
 PMIX_HOME="${PMIX_HOME:-}"              # optional installed PMIx prefix (macOS)
 
-mode="${1:-linux}"
+mode=linux
+distclean=auto                          # auto | always | never
+for arg in "$@"; do
+    case "$arg" in
+        linux|macos|image) mode="$arg" ;;
+        --distclean)       distclean=always ;;
+        --no-distclean)    distclean=never ;;
+        *) echo "usage: $0 [linux|macos|image] [--distclean|--no-distclean]" >&2; exit 2 ;;
+    esac
+done
+
+# Does the source tree hold an in-tree build?  config.status/Makefile are what
+# make a VPATH configure refuse to run, but the object files are the bigger
+# problem -- see prep_srcdir.
+srcdir_has_intree() {
+    [ -f "$root/config.status" ] || [ -f "$root/Makefile" ] || \
+    [ -n "$(find "$root/src" -name '*.lo' -print -quit 2>/dev/null)" ]
+}
 
 # --- make the source tree VPATH-ready (idempotent) --------------------------
 prep_srcdir() {
-    if [ -f "$root/config.status" ] || [ -f "$root/Makefile" ]; then
-        echo ">>> make distclean (source tree had an in-tree build)"
+    if srcdir_has_intree && [ "$distclean" != never ]; then
+        # Two separate reasons, and the second is the one that bites:
+        #
+        #  1. a VPATH configure refuses to run at all while the source tree
+        #     holds an in-tree build; and
+        #  2. even when configure is skipped (incremental rebuild), automake
+        #     sets VPATH = srcdir, so make happily resolves an object target
+        #     out of the SOURCE tree.  An in-tree *.lo / .libs/*.o left there
+        #     is then linked into the out-of-tree build -- and for the Linux
+        #     container against a macOS host tree those objects are not even
+        #     the same architecture, so the build dies with
+        #     "'foo.lo' is not a valid libtool object".
+        #
+        # So this is not a first-run-only cost: any in-tree build present when
+        # an out-of-tree build runs has to go.  The durable fix is to stop
+        # keeping one -- see AGENTS.md, "When a distclean is actually needed".
+        echo ">>> make distclean -- the source tree holds an in-tree build," \
+             "which would poison the out-of-tree build via VPATH"
+        echo ">>> NOTE: this removes your in-tree build; reconfigure before" \
+             "'make check' or 'make -C test/offline check-offline'"
+        echo ">>>       (or build the host side out-of-tree too: ./build.sh macos)"
         make -C "$root" distclean >/dev/null 2>&1 || true
+        # distclean leaves the *.lo behind if the tree was already half-cleaned
+        find "$root/src" -name '*.lo' -delete 2>/dev/null || true
+        find "$root/src" -name '.libs' -type d -exec rm -rf {} + 2>/dev/null || true
+    elif srcdir_has_intree; then
+        echo ">>> WARNING: --no-distclean, but the source tree holds an in-tree" \
+             "build; the out-of-tree build may pick up its objects via VPATH"
     fi
+
     if [ ! -x "$root/configure" ] || [ "$root/configure.ac" -nt "$root/configure" ]; then
         echo ">>> autogen.pl"
         ( cd "$root" && ./autogen.pl )
@@ -70,9 +127,11 @@ build_image() {
 
 # --- Linux build (in a builder container, into the shared volume) -----------
 build_linux() {
-    prep_srcdir
+    # image and volume first: prep_srcdir asks them whether the out-of-tree
+    # build has already been configured before deciding to distclean
     build_image
     docker volume create "$VOLUME" >/dev/null
+    prep_srcdir linux
 
     local pmix_mount=()
     [ -n "$PMIX_SRC" ] && pmix_mount=(-v "$(cd "$PMIX_SRC" && pwd)":/pmix-src:ro)
@@ -89,7 +148,8 @@ build_linux() {
                 echo ">>>> PMIx from bind-mounted /pmix-src -> $PMIX_PREFIX"
                 mkdir -p /opt/prte/vpath-linux-pmix && cd /opt/prte/vpath-linux-pmix
                 [ -f config.status ] || /pmix-src/configure --prefix="$PMIX_PREFIX"
-                make -j"$jobs" && make install
+                make -j"$jobs"
+                make install
             else
                 PMIX_PREFIX=/usr/local
                 echo ">>>> PMIx: using baked $PMIX_PREFIX"
@@ -97,14 +157,42 @@ build_linux() {
 
             echo ">>>> PRRTE VPATH build -> /opt/prte/prte"
             mkdir -p /opt/prte/vpath-linux && cd /opt/prte/vpath-linux
+            # --with-jansson is deliberate: it is off by default, and without
+            # it ras/slurm compiles ras_slurm_jansson_stub.c instead of the
+            # real ras_slurm_jansson.c -- so the ~1000 lines that parse
+            # "scontrol --json" (the whole elastic extend/release surface) are
+            # never even compiled.  libjansson-dev is baked into the image.
             [ -f config.status ] || /prrte-src/configure \
-                --prefix=/opt/prte/prte --with-pmix="$PMIX_PREFIX" --enable-debug
-            make -j"$jobs" && make install
+                --prefix=/opt/prte/prte --with-pmix="$PMIX_PREFIX" \
+                --with-jansson --enable-debug
+            # show_help GOLDEN RULE: prte_show_help_content.c embeds every
+            # help-*.txt in the tree, but its make rule depends only on the
+            # converter script -- so an edited help file is NOT picked up by an
+            # incremental build, and the daemons serve stale (or missing) text
+            # while the .txt looks correct.  This build dir persists in the
+            # volume across runs, so drop the generated file every time.
+            rm -f src/util/prte_show_help_content.c src/util/prte_show_help_content.lo
+            make -j"$jobs"
+            make install
 
             echo ">>>> elastic test client"
             gcc -O0 -g -o /opt/prte/prte/bin/elastic \
                 /prrte-src/contrib/dockerswarm/elastic.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -lpmix
+
+            # The fake SLURM control plane, installed under its own prefix --
+            # NOT into the install bin/, which the node entrypoint symlinks
+            # onto the default PATH of every node. ras/slurm gates on SLURM_JOBID,
+            # so a stray scontrol on PATH is harmless, but a test that has to
+            # opt in by prepending this directory is the one that cannot
+            # perturb any other test in the suite.
+            echo ">>>> fake SLURM stubs -> /opt/prte/fakeslurm/bin"
+            mkdir -p /opt/prte/fakeslurm/bin
+            install -m 0755 /prrte-src/contrib/dockerswarm/fake-slurm.py \
+                /opt/prte/fakeslurm/bin/fake-slurm
+            for t in sbatch scontrol scancel; do
+                ln -sf fake-slurm /opt/prte/fakeslurm/bin/$t
+            done
 
             # runtime env for login shells (node-entrypoint handles ld.so)
             printf "export PATH=/opt/prte/prte/bin:\$PATH\nexport LD_LIBRARY_PATH=/opt/prte/prte/lib:%s/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\n" \
@@ -117,7 +205,7 @@ build_linux() {
 
 # --- macOS build (native, on this host) -------------------------------------
 build_macos() {
-    prep_srcdir
+    prep_srcdir macos
     local pmix_arg=""
     if [ -n "$PMIX_SRC" ]; then
         local psrc pfx
@@ -127,7 +215,8 @@ build_macos() {
         ( cd "$psrc" && { [ -x configure ] || ./autogen.pl; } )
         mkdir -p "$root/vpath-macos-pmix" && cd "$root/vpath-macos-pmix"
         [ -f config.status ] || "$psrc/configure" --prefix="$pfx"
-        make -j"$(sysctl -n hw.ncpu)" && make install
+        make -j"$(sysctl -n hw.ncpu)"
+        make install
         pmix_arg="--with-pmix=$pfx"
     elif [ -n "$PMIX_HOME" ]; then
         pmix_arg="--with-pmix=$PMIX_HOME"
@@ -141,17 +230,41 @@ build_macos() {
     #   EXTRA_CONFIGURE_ARGS="--with-libevent=... --with-hwloc=..."
     # (values with spaces, like an -isysroot in CFLAGS, should be exported as
     # CFLAGS/CPPFLAGS in the environment instead -- configure inherits them.)
+    #
+    # Reconfigure whenever those arguments change. An incremental build that
+    # silently keeps an older configuration is worse than a slow one: PRRTE
+    # uses PMIx internals, so a tree left pointing at a different PMIx than
+    # you asked for builds cleanly and then dies at startup, which reads as
+    # "this host is flaky" rather than "you built against the wrong PMIx".
+    local cfg_args="--prefix=$root/vpath-macos/install $pmix_arg --enable-debug ${EXTRA_CONFIGURE_ARGS:-}"
+    if [ -f config.status ] && [ "$(cat .prte-configure-args 2>/dev/null)" != "$cfg_args" ]; then
+        echo ">>> configure arguments changed - reconfiguring"
+        rm -f config.status
+    fi
     # shellcheck disable=SC2086
-    [ -f config.status ] || "$root/configure" \
-        --prefix="$root/vpath-macos/install" $pmix_arg --enable-debug ${EXTRA_CONFIGURE_ARGS:-}
-    make -j"$(sysctl -n hw.ncpu)" && make install
+    if [ ! -f config.status ]; then
+        "$root/configure" $cfg_args
+        printf '%s' "$cfg_args" > .prte-configure-args
+    fi
+    # show_help GOLDEN RULE -- see the note in build_linux
+    rm -f src/util/prte_show_help_content.c src/util/prte_show_help_content.lo
+    make -j"$(sysctl -n hw.ncpu)"
+    make install
     echo ">>> macOS build complete: $root/vpath-macos/install"
+    # Report what the tools actually resolved against. A mismatch here is the
+    # first thing to check when the macOS suite starts skipping everything.
+    if command -v otool >/dev/null 2>&1; then
+        echo ">>> linked dependencies:"
+        otool -L "$root/vpath-macos/install/bin/prted" 2>/dev/null \
+            | grep -iE "libpmix|libevent|libhwloc" | sed 's/^/>>>>   /'
+    fi
     echo ">>> next: ./run-tests.sh macos"
 }
 
 case "$mode" in
     linux) build_linux ;;
     macos) build_macos ;;
-    image) prep_srcdir; build_image force ;;
-    *) echo "usage: $0 [linux|macos|image]" >&2; exit 2 ;;
+    # the image is built from contrib/dockerswarm alone and never reads the
+    # source tree, so it needs no distclean at all
+    image) build_image force ;;
 esac

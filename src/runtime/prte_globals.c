@@ -148,7 +148,6 @@ char **prte_launch_environ = NULL;
 
 bool prte_hnp_is_allocated = false;
 bool prte_allocation_required = false;
-bool prte_managed_allocation = false;
 char *prte_set_slots = NULL;
 bool prte_set_slots_override = false;
 bool prte_nidmap_communicated = false;
@@ -872,12 +871,24 @@ static void prte_node_destruct(prte_node_t *node)
     for (i = 0; i < node->procs->size; i++) {
         if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(node->procs, i))) {
             pmix_pointer_array_set_item(node->procs, i, NULL);
+            /* the proc borrows its backpointer to us, so clear it before we
+             * go away - a proc can outlive its node (its job holds a
+             * reference too) */
+            if (proc->node == node) {
+                proc->node = NULL;
+            }
             PMIX_RELEASE(proc);
         }
     }
     PMIX_RELEASE(node->procs);
 
-    /* do NOT destroy the topology */
+    /* release our reference to the topology - the topology object itself
+     * lives until the last node pointing at it (and the entry in
+     * prte_node_topologies) has been released */
+    if (NULL != node->topology) {
+        PMIX_RELEASE(node->topology);
+        node->topology = NULL;
+    }
 
     // release any diffs
     if (NULL != node->topodiff) {
@@ -917,10 +928,14 @@ static void prte_proc_construct(prte_proc_t *proc)
 
 static void prte_proc_destruct(prte_proc_t *proc)
 {
-    if (NULL != proc->node) {
-        PMIX_RELEASE(proc->node);
-        proc->node = NULL;
-    }
+    /* proc->node is a BORROWED backpointer - the node is owned by
+     * prte_node_pool (and by any job map that retained it), and it is
+     * cleared by prte_node_destruct on the procs it knows about. Retaining
+     * it here would form a reference cycle with node->daemon /
+     * node->procs, which both hold real references: neither object could
+     * then ever reach a zero count, so neither destructor would run and
+     * every node and proc would leak. */
+    proc->node = NULL;
     if (NULL != proc->cpuset) {
         free(proc->cpuset);
         proc->cpuset = NULL;
@@ -994,13 +1009,11 @@ static void tcon(prte_topology_t *t)
 }
 static void tdes(prte_topology_t *t)
 {
-    hwloc_obj_t root;
-
     if (NULL != t->topo) {
-        root = hwloc_get_root_obj(t->topo);
-        if (NULL != root->userdata) {
-            PMIX_RELEASE(root->userdata);
-        }
+        /* the root carries a topology summary, but placement also attaches
+         * a counter object to every object it considers - all of them have
+         * to go back before hwloc frees the objects holding them */
+        prte_hwloc_base_release_userdata(t->topo);
         hwloc_topology_destroy(t->topo);
     }
 }
@@ -1063,10 +1076,14 @@ static void session_des(prte_session_t *s)
     }
     PMIX_RELEASE(s->nodes);
 
+    /* Unlike the node array, s->jobs holds BORROWED references: a job is
+     * added to it without a retain and removed from it without a release
+     * when the job terminates. A job's lifetime is governed by the global
+     * job pool, not by the session it ran in, so releasing here would drop
+     * a reference this session never took. */
     for (n=0; n < s->jobs->size; n++) {
         job = (prte_job_t*)pmix_pointer_array_get_item(s->jobs, n);
         if (NULL != job) {
-            PMIX_RELEASE(job);
             pmix_pointer_array_set_item(s->jobs, n, NULL);
         }
     }

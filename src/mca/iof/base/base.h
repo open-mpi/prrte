@@ -238,16 +238,27 @@ static inline bool prte_iof_base_fd_always_ready(int fd)
         }                                                                                     \
     } while (0);
 
-PRTE_EXPORT int prte_iof_base_flush(void);
-
 PRTE_EXPORT extern int prte_iof_base_output_limit;
 
 /* base functions */
+
+/* Queue "numbytes" of "data" for writing to the given channel, breaking
+ * it across as many chunks as required, and arm the write event if it is
+ * not already pending. Passing zero bytes queues the sentinel that flushes
+ * any preceding data and then closes the channel. Returns the resulting
+ * number of queued chunks (zero if "channel" is NULL) so the caller can
+ * detect back-pressure.
+ */
 PRTE_EXPORT int prte_iof_base_write_output(const pmix_proc_t *name, prte_iof_tag_t stream,
                                            const unsigned char *data, int numbytes,
                                            prte_iof_write_event_t *channel);
 PRTE_EXPORT void prte_iof_base_write_handler(int fd, short event, void *cbdata);
 
+/* Emit "string" as though it were output from "source" on the given channel.
+ * NOTE: this takes ownership of "string" - it must be a heap allocation, and
+ * it is free'd once the output has been delivered. Callers must not free it
+ * themselves.
+ */
 PRTE_EXPORT void prte_iof_base_output(const pmix_proc_t *source,
                                       pmix_iof_channel_t channel,
                                       char *string);

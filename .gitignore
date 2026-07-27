@@ -62,6 +62,14 @@ test/unit/grpcomm/Makefile
 test/unit/grpcomm/test_grpcomm
 test/unit/odls/Makefile
 test/unit/odls/test_odls
+test/unit/iof/Makefile
+test/unit/iof/test_iof
+test/unit/plm/Makefile
+test/unit/plm/test_plm
+test/unit/rml/Makefile
+test/unit/rml/test_rml
+test/unit/ras/Makefile
+test/unit/ras/test_ras
 static-components.h
 static-components.h.new.extern
 static-components.h.new.struct

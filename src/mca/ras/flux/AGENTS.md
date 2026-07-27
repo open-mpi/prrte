@@ -11,9 +11,20 @@ Component guide for `src/mca/ras/flux/`. Read the
 and fetching the job's resource set. It is an **optional build**: its
 `configure.m4` requires both Flux (`PRTE_CHECK_FLUX`) and Jansson
 (`PRTE_CHECK_JANSSON`); if either is missing the component is not built.
-Its `query` actually opens a Flux handle (`flux_open_ex`) to test
-availability, selecting at the configurable priority `ras_flux_priority`
-(default **100**) when a broker answers.
+It is also a **run-time loadable plugin** — it is in the default
+`--enable-mca-dso` list in
+[`config/prte_mca.m4`](../../../../config/prte_mca.m4), which keeps
+`libflux-core` and `libjansson` out of `libprrte` and hence out of every
+PRRTE tool. Do not take it off that list: it is what makes
+`--enable-testbuild-launchers` viable (see the framework guide).
+
+`query` gates on `FLUX_URI` (or an explicitly-set `ras_flux_broker_uri`)
+and only then opens a handle (`flux_open_ex`) to confirm a broker is
+really there, selecting at the configurable priority `ras_flux_priority`
+(default **100**) when one answers. The env check is not just an
+optimization — it is what stops the component from calling into a stub
+library in a testbuild tree, and outside a Flux instance the open could
+not have succeeded anyway.
 
 Files:
 
@@ -56,6 +67,18 @@ with `slots = nslots`. Errors map to `PRTE_ERR_NOT_AVAILABLE`.
   `configure.m4` gate so non-Flux builds still compile the tree.
 - Only R **version 1** is parsed; a different version is a clean
   `PRTE_ERR_NOT_AVAILABLE`, not a crash — preserve that.
-- The parser carefully frees `hostinfo`/`hostlist` on every exit path;
-  mind the `err:` cleanup when adding branches.
+- The parser frees `hostinfo`/`hostlist` on every exit path; mind the
+  `err:` cleanup when adding branches. **Declare anything the cleanup
+  block touches at the top of the function**: `root` was originally
+  declared mid-body, so every early `goto err` jumped over its
+  initializer and the cleanup decref'd an indeterminate pointer.
+- **Use `s?o`, not `s?O`, in `json_unpack_ex`** unless you decref the
+  result — the capital form takes a reference. `scheduling` is unpacked
+  purely to satisfy the format string and is never used.
+- `hostinfo_append_ranks` reports into a caller-supplied buffer rather
+  than allocating, because the caller's `error_str` also holds string
+  literals; a mixed-ownership error pointer can be neither freed nor
+  safely leaked. It returns a **count**, so a caller treating `<= 0` as
+  failure must also set `ret` — falling through to `err:` with `ret`
+  still `PRTE_SUCCESS` returns a partially-built node list as success.
 </content>

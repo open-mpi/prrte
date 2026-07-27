@@ -207,7 +207,7 @@ static int rte_init(int argc, char **argv)
     PMIX_LOAD_PROCID(&proc->name, PRTE_PROC_MY_NAME->nspace, PRTE_PROC_MY_NAME->rank);
     proc->pid = prte_process_info.pid;
     proc->state = PRTE_PROC_STATE_RUNNING;
-    PMIX_RETAIN(node); /* keep accounting straight */
+    /* the node backpointer is borrowed, not retained */
     proc->node = node;
     pmix_pointer_array_set_item(jdata->procs, PRTE_PROC_MY_NAME->rank, proc);
 
@@ -361,6 +361,8 @@ static int rte_init(int argc, char **argv)
     t = PMIX_NEW(prte_topology_t);
     t->topo = prte_hwloc_topology;
     t->index = pmix_pointer_array_add(prte_node_topologies, t);
+    /* the node holds a counted reference to the topology */
+    PMIX_RETAIN(t);
     node->topology = t;
     node->available = prte_hwloc_base_filter_cpus(prte_hwloc_topology);
     if (15 < pmix_output_get_verbosity(prte_ess_base_framework.framework_output)) {
