@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2024-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -15,6 +15,7 @@
 #include "constants.h"
 #include "src/runtime/prte_globals.h"
 #include "src/mca/rmaps/base/base.h"
+#include "src/mca/rmaps/base/rmaps_private.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/hwloc/hwloc-internal.h"
 #include "src/util/attr.h"
@@ -129,28 +130,68 @@ int test_policy_parse(void)
     CHECK("mapby ppr:2:core: policy=PPR", PRTE_MAPPING_PPR == PRTE_GET_MAPPING_POLICY(u16));
     PMIX_RELEASE(app);
 
-    /* --- rejected: OVERSUBSCRIBE --- */
+    /* --- the qualifiers that span the whole job ---
+     * These describe the job, not the app, but they are accepted in a per-app
+     * spec and recorded there: on a multi-app command line there is no other
+     * place to write them, since it takes two mapping directives to make the
+     * mapping per-app at all.  The hoist below is what moves them to the job
+     * and holds the apps to agreeing about them.
+     */
+    /* --- OVERSUBSCRIBE --- */
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "core:oversubscribe");
-    CHECK("mapby OVERSUBSCRIBE: rejected", PRTE_ERR_BAD_PARAM == rc);
+    CHECK("mapby OVERSUBSCRIBE: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby OVERSUBSCRIBE: given", PRTE_MAPPING_SUBSCRIBE_GIVEN & u16);
+    CHECK("mapby OVERSUBSCRIBE: allowed", !(PRTE_MAPPING_NO_OVERSUBSCRIBE & u16));
     PMIX_RELEASE(app);
 
-    /* --- rejected: NOOVERSUBSCRIBE --- */
+    /* --- NOOVERSUBSCRIBE --- */
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "core:nooversubscribe");
-    CHECK("mapby NOOVERSUBSCRIBE: rejected", PRTE_ERR_BAD_PARAM == rc);
+    CHECK("mapby NOOVERSUBSCRIBE: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby NOOVERSUBSCRIBE: given", PRTE_MAPPING_SUBSCRIBE_GIVEN & u16);
+    CHECK("mapby NOOVERSUBSCRIBE: denied", PRTE_MAPPING_NO_OVERSUBSCRIBE & u16);
     PMIX_RELEASE(app);
 
-    /* --- rejected: INHERIT --- */
+    /* --- a spec that is nothing but a job-level qualifier.  It names no
+     * policy, so it used to be discarded without a word --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, ":oversubscribe");
+    CHECK("mapby :OVERSUBSCRIBE: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby :OVERSUBSCRIBE: given", PRTE_MAPPING_SUBSCRIBE_GIVEN & u16);
+    CHECK("mapby :OVERSUBSCRIBE: no policy", 0 == PRTE_GET_MAPPING_POLICY(u16));
+    PMIX_RELEASE(app);
+
+    /* --- INHERIT --- */
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "core:inherit");
-    CHECK("mapby INHERIT: rejected", PRTE_ERR_BAD_PARAM == rc);
+    CHECK("mapby INHERIT: rc", PRTE_SUCCESS == rc);
+    CHECK("mapby INHERIT: flag", get_bool(&app->attributes, PRTE_JOB_INHERIT));
     PMIX_RELEASE(app);
 
-    /* --- rejected: NOINHERIT --- */
+    /* --- NOINHERIT --- */
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "core:noinherit");
-    CHECK("mapby NOINHERIT: rejected", PRTE_ERR_BAD_PARAM == rc);
+    CHECK("mapby NOINHERIT: rc", PRTE_SUCCESS == rc);
+    CHECK("mapby NOINHERIT: flag", get_bool(&app->attributes, PRTE_JOB_NOINHERIT));
+    PMIX_RELEASE(app);
+
+    /* --- contradicting yourself within one spec is still refused.
+     * PRTE_ERR_SILENT, not BAD_PARAM, because the parser has already told the
+     * user why - BAD_PARAM is reserved for a qualifier it does not recognize,
+     * and the caller turns that into a "check for a typo" message this must
+     * not attract. --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "core:oversubscribe:nooversubscribe");
+    CHECK("mapby OVERSUB+NOOVERSUB: rejected", PRTE_ERR_SILENT == rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "core:inherit:noinherit");
+    CHECK("mapby INHERIT+NOINHERIT: rejected", PRTE_ERR_SILENT == rc);
     PMIX_RELEASE(app);
 
     /* --- NULL spec is a no-op --- */
@@ -182,6 +223,72 @@ int test_policy_parse(void)
     u16 = get_u16(&app->attributes, PRTE_APP_RANKBY);
     CHECK("rankby fill: policy", PRTE_RANK_BY_FILL == PRTE_GET_RANKING_POLICY(u16));
     PMIX_RELEASE(app);
+
+    /* --- an abbreviated qualifier keeps its value.  The matcher accepts any
+     * unambiguous prefix, so reading the value at an offset fixed to the full
+     * spelling ("PE=", "FILE=", "LIMIT=") silently truncated or zeroed it --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "slot:P=2");
+    CHECK("mapby slot:P=2: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_PES_PER_PROC);
+    CHECK("mapby slot:P=2: pes", 2 == u16);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "seq:F=/tmp/myfile");
+    CHECK("mapby seq:F=path: rc", PRTE_SUCCESS == rc);
+    sval = get_str(&app->attributes, PRTE_APP_MAP_FILE);
+    CHECK("mapby seq:F=path: whole path", NULL != sval && 0 == strcmp(sval, "/tmp/myfile"));
+    free(sval);
+    PMIX_RELEASE(app);
+
+    /* --- pe-list is a per-app directive too.  Which cpus one app of an MPMD
+     * job may use is as much its own business as which object it maps by,
+     * and a multi-app command line has nowhere else to say it --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "pe-list=0-3,6");
+    CHECK("mapby pe-list: rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
+    CHECK("mapby pe-list: policy", PRTE_MAPPING_PELIST == PRTE_GET_MAPPING_POLICY(u16));
+    sval = get_str(&app->attributes, PRTE_APP_CPUSET);
+    CHECK("mapby pe-list: cpuset", NULL != sval && 0 == strcmp(sval, "0-3,6"));
+    free(sval);
+    PMIX_RELEASE(app);
+
+    /* the value is validated here, not left for the mapper to trip over */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "pe-list=0-3-5");
+    CHECK("mapby pe-list bad range: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "pe-list=zero");
+    CHECK("mapby pe-list non-numeric: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "pe-list");
+    CHECK("mapby pe-list with no value: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* --- and it survives resolution into the per-app options struct, which
+     * is what actually reaches the mapper --- */
+    {
+        prte_rmaps_options_t opts;
+        app = PMIX_NEW(prte_app_context_t);
+        prte_rmaps_base_set_app_mapping_policy(app, "pe-list=2-3");
+        memset(&opts, 0, sizeof(opts));
+        opts.map = PRTE_MAPPING_BYSLOT;
+        opts.app_idx = 0;
+        rc = prte_rmaps_base_resolve_app_options(NULL, app, &opts);
+        CHECK("resolve pe-list: rc", PRTE_SUCCESS == rc);
+        CHECK("resolve pe-list: map", PRTE_MAPPING_PELIST == opts.map);
+        CHECK("resolve pe-list: maptype", HWLOC_OBJ_MACHINE == opts.maptype);
+        CHECK("resolve pe-list: cpuset", NULL != opts.cpuset
+              && 0 == strcmp(opts.cpuset, "2-3"));
+        free(opts.cpuset);
+        PMIX_RELEASE(app);
+    }
 
     /* --- binding policy: "core" --- */
     app = PMIX_NEW(prte_app_context_t);

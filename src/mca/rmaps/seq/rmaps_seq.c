@@ -88,6 +88,79 @@ PMIX_CLASS_INSTANCE(seq_node_t, pmix_list_item_t, sn_con, sn_des);
 static int process_file(char *path, pmix_list_t *list);
 
 /*
+ * Bind a proc to the cpu list its sequence entry named.
+ *
+ * A sequence file line is "hostname [cpuset [numa mempolicy]]", so an entry
+ * may say not just which node a rank goes on but which cpus it gets there.
+ * That list is the binding for that rank - it is not a hint the object-based
+ * binder then refines - so this mirrors what the rankfile mapper does with a
+ * slot list: parse it against this node's topology, hand the result to the
+ * proc, and take those cpus out of what the node has left so the next rank
+ * does not get them too.
+ *
+ * The locale (proc->obj) is deliberately left NULL: a cpu list may span
+ * several objects, so there is no single one to point at.
+ */
+static int bind_to_entry_cpuset(prte_job_t *jdata, prte_proc_t *proc,
+                                prte_node_t *node, char *cpuset,
+                                prte_rmaps_options_t *options)
+{
+    hwloc_cpuset_t bits;
+    char *avail = NULL, *overlap = NULL;
+    hwloc_cpuset_t missing;
+    int rc;
+    PRTE_HIDE_UNUSED_PARAMS(jdata);
+
+    if (NULL == node->topology || NULL == node->topology->topo) {
+        /* without a topology there is nothing to resolve the list against */
+        pmix_show_help("help-prte-rmaps-base.txt", "rmaps:no-topology", true, node->name);
+        return PRTE_ERR_SILENT;
+    }
+
+    bits = hwloc_bitmap_alloc();
+    rc = prte_hwloc_base_cpu_list_parse(cpuset, node->topology->topo,
+                                        options->use_hwthreads, bits);
+    if (PRTE_SUCCESS != rc) {
+        char *tmp = prte_hwloc_base_cset2str(hwloc_topology_get_allowed_cpuset(node->topology->topo),
+                                             false, false, node->topology->topo);
+        pmix_show_help("help-prte-rmaps-seq.txt", "seq:bad-cpuset", true,
+                       cpuset, node->name, tmp);
+        free(tmp);
+        hwloc_bitmap_free(bits);
+        return PRTE_ERR_SILENT;
+    }
+
+    /* the cpus have to actually be free on this node, unless the job said
+     * it was content to overload them */
+    if (!options->overload && !hwloc_bitmap_isincluded(bits, node->available)) {
+        missing = hwloc_bitmap_alloc();
+        hwloc_bitmap_andnot(missing, bits, node->available);
+        hwloc_bitmap_list_asprintf(&avail, node->available);
+        hwloc_bitmap_list_asprintf(&overlap, missing);
+        pmix_show_help("help-prte-rmaps-seq.txt", "seq:cpuset-not-available", true,
+                       PRTE_NAME_PRINT(&proc->name), node->name, cpuset, avail, overlap);
+        free(avail);
+        free(overlap);
+        hwloc_bitmap_free(missing);
+        hwloc_bitmap_free(bits);
+        return PRTE_ERR_SILENT;
+    }
+
+    if (NULL != proc->cpuset) {
+        free(proc->cpuset);
+    }
+    hwloc_bitmap_list_asprintf(&proc->cpuset, bits);
+    /* consume them so the next entry naming the same node cannot reuse them */
+    hwloc_bitmap_andnot(node->available, node->available, bits);
+    hwloc_bitmap_free(bits);
+
+    pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
+                        "mca:rmaps:seq: bound proc %s on node %s to entry cpus <%s>",
+                        PRTE_NAME_PRINT(&proc->name), node->name, proc->cpuset);
+    return PRTE_SUCCESS;
+}
+
+/*
  * Sequentially map the ranks according to the placement in the
  * specified hostfile
  */
@@ -104,11 +177,16 @@ static int prte_rmaps_seq_map(prte_job_t *jdata,
     int32_t num_nodes;
     int rc;
     pmix_list_t default_seq_list;
-    pmix_list_t node_list, *seq_list, sq_list;
+    /* seq_list points at either the shared default list or this app's own
+     * sq_list; NULL until one has been built, so the error path knows
+     * whether there is a per-app list to hand back */
+    pmix_list_t node_list, *seq_list = NULL, sq_list;
     prte_proc_t *proc;
     pmix_mca_base_component_t *c = &prte_mca_rmaps_seq_component;
     char *hosts = NULL;
     bool match;
+    prte_binding_policy_t savebind;
+    char *savecpuset;
 
     PMIX_OUTPUT_VERBOSE((1, prte_rmaps_base_framework.framework_output,
                          "%s rmaps:seq called on job %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
@@ -223,6 +301,7 @@ static int prte_rmaps_seq_map(prte_job_t *jdata,
             hosts = NULL;
             if (PRTE_SUCCESS != rc) {
                 PRTE_ERROR_LOG(rc);
+                PMIX_LIST_DESTRUCT(&node_list);
                 goto error;
             }
             /* transfer the list to a seq_node_t list */
@@ -324,6 +403,19 @@ process:
             sq = (seq_node_t *) pmix_list_get_first(seq_list);
         }
         for (n = 0; n < app->num_procs; n++) {
+            /* the sequence has to be long enough to hold every rank. It is
+             * checked against num_nodes above, but the shared default list is
+             * entered at the cursor a previous app left behind, so there may
+             * be fewer entries left than that count promises - and walking off
+             * the end would read the list's sentinel as if it were an entry */
+            if (NULL == sq || pmix_list_get_end(seq_list) == &sq->super) {
+                /* "n" entries were consumed getting this far, so that is how
+                 * many the sequence turned out to be worth to this app */
+                pmix_show_help("help-prte-rmaps-seq.txt", "seq:not-enough-resources", true,
+                               (int) app->num_procs, n);
+                rc = PRTE_ERR_SILENT;
+                goto error;
+            }
             /* find this node on the global array - this is necessary so
              * that our mapping gets saved on that array as the objects
              * returned by the hostfile function are -not- on the array
@@ -353,17 +445,48 @@ process:
                 rc = PRTE_ERR_SILENT;
                 goto error;
             }
-            if (!prte_rmaps_base_check_avail(jdata, app, node, seq_list, NULL, options)) {
+            /* NULL node list: seq_list holds seq_node_t entries, not the
+             * prte_node_t we are placing on, so check_avail must not try to
+             * drop the node from it */
+            if (!prte_rmaps_base_check_avail(jdata, app, node, NULL, NULL, options)) {
+                /* This entry's node cannot take a proc. Step to the next
+                 * entry and try the same rank there rather than dropping it:
+                 * re-offering the same entry to every remaining rank got
+                 * nowhere, and giving up on the rank left the job claiming
+                 * more procs than the map holds - a count the launch message
+                 * packer and unpacker then disagree about. The sentinel check
+                 * at the top of the loop bounds the retry. */
+                sq = (seq_node_t *) pmix_list_get_next(&sq->super);
+                --n;
                 continue;
             }
 
-            /* map the proc */
+            /* map the proc. When the sequence entry names the cpus for this
+             * rank, that list IS the binding - so keep the ordinary binder
+             * out of it and apply the list ourselves below, the way the
+             * rankfile mapper applies a slot list. Otherwise the proc would
+             * be bound twice: once by policy and once by the file. */
+            savebind = options->bind;
+            savecpuset = options->cpuset;
+            if (NULL != sq->cpuset) {
+                options->bind = PRTE_BIND_TO_NONE;
+                options->cpuset = NULL;
+            }
             proc = prte_rmaps_base_setup_proc(jdata, i, node, NULL, options);
+            options->bind = savebind;
+            options->cpuset = savecpuset;
             if (NULL == proc) {
                 pmix_show_help("help-prte-rmaps-seq.txt", "proc-failed-to-map", true,
                                sq->hostname, app->app);
                 rc = PRTE_ERR_SILENT;
                 goto error;
+            }
+            if (NULL != sq->cpuset) {
+                rc = bind_to_entry_cpuset(jdata, proc, node, sq->cpuset, options);
+                if (PRTE_SUCCESS != rc) {
+                    PMIX_RELEASE(proc);
+                    goto error;
+                }
             }
             proc->name.rank = vpid;
             vpid++;
@@ -396,10 +519,14 @@ process:
         /* cleanup the node list if it came from this app_context */
         if (seq_list != &default_seq_list) {
             PMIX_LIST_DESTRUCT(seq_list);
+            seq_list = NULL;
         } else {
             save = sq;
         }
     }
+    /* the default list was built from the default hostfile for this map and
+     * is of no use to anyone afterwards */
+    PMIX_LIST_DESTRUCT(&default_seq_list);
     /* compute local/app ranks - in per-app dispatch mode (app_idx >= 0)
      * the base computes the ranks with the correct cross-app numbering,
      * so skip it here */
@@ -409,6 +536,9 @@ process:
     return rc;
 
 error:
+    if (NULL != seq_list && seq_list != &default_seq_list) {
+        PMIX_LIST_DESTRUCT(seq_list);
+    }
     PMIX_LIST_DESTRUCT(&default_seq_list);
     if (NULL != hosts) {
         free(hosts);

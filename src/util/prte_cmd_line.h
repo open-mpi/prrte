@@ -256,6 +256,34 @@ BEGIN_C_DECLS
 #define PRTE_CLI_RAW        "raw"
 #define PRTE_CLI_PATTERN    "pattern"
 
+/*
+ * The value of a qualifier declared above with a trailing '=' - PE=2,
+ * FILE=path, LIMIT=4 - is read with pmix_cli_qualifier_value(), which comes
+ * from PMIx alongside PMIX_CHECK_CLI_OPTION: the two belong together,
+ * because the matcher accepts any unambiguous prefix of a qualifier's name
+ * and the caller therefore cannot know how long the name it matched was.
+ * Never index past the qualifier's full spelling to reach its value.
+ *
+ * Older PMIx installations do not have it.  PRRTE still supports building
+ * against those, so supply it here when the installed PMIx does not.
+ */
+#if !PRTE_PMIX_HAVE_CLI_QUAL_VALUE
+static inline char *prte_cli_qualifier_value_compat(char *qual)
+{
+    char *ptr;
+
+    if (NULL == qual) {
+        return NULL;
+    }
+    ptr = strchr(qual, '=');
+    if (NULL == ptr || '\0' == *(ptr + 1)) {
+        return NULL;
+    }
+    return ptr + 1;
+}
+#    define pmix_cli_qualifier_value(q) prte_cli_qualifier_value_compat(q)
+#endif
+
 END_C_DECLS
 
 #endif /* PRTE_CMD_LINE_H */

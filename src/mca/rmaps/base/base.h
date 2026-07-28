@@ -111,20 +111,9 @@ PMIX_CLASS_DECLARATION(prte_rmaps_base_selected_module_t);
  */
 PRTE_EXPORT void prte_rmaps_base_map_job(int sd, short args, void *cbdata);
 
-/**
- * Utility routines to get/set vpid mapping for the job
- */
-
-PRTE_EXPORT int prte_rmaps_base_get_vpid_range(pmix_nspace_t jobid, pmix_rank_t *start,
-                                               pmix_rank_t *range);
-PRTE_EXPORT int prte_rmaps_base_set_vpid_range(pmix_nspace_t jobid, pmix_rank_t start,
-                                               pmix_rank_t range);
-
 /* pretty-print functions */
 PRTE_EXPORT char *prte_rmaps_base_print_mapping(prte_mapping_policy_t mapping);
 PRTE_EXPORT char *prte_rmaps_base_print_ranking(prte_ranking_policy_t ranking);
-
-PRTE_EXPORT int prte_rmaps_base_prep_topology(hwloc_topology_t topo);
 
 PRTE_EXPORT int prte_rmaps_base_filter_nodes(prte_app_context_t *app, pmix_list_t *nodes,
                                              bool remove);
@@ -138,6 +127,13 @@ PRTE_EXPORT int prte_rmaps_base_set_app_ranking_policy(prte_app_context_t *app,
                                                         char *spec);
 PRTE_EXPORT int prte_rmaps_base_set_app_binding_policy(prte_app_context_t *app,
                                                         char *spec);
+
+/* move the qualifiers that describe the whole job off the apps that carried
+ * them, holding the apps to agreeing about them. The agreed oversubscription
+ * directive is returned for the caller to apply once the job's mapping policy
+ * has been resolved */
+PRTE_EXPORT int prte_rmaps_base_hoist_job_directives(prte_job_t *jdata,
+                                                     prte_mapping_policy_t *oversubscribe);
 
 PRTE_EXPORT int prte_rmaps_base_set_default_ranking(prte_job_t *jdata,
                                                     prte_rmaps_options_t *options);
