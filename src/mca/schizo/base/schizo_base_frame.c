@@ -29,6 +29,7 @@
 #include "src/mca/errmgr/errmgr.h"
 #include "src/runtime/prte_globals.h"
 
+#include "src/common/pmix_iof.h"
 #include "src/mca/schizo/base/base.h"
 /*
  * The following file was created by configure.  It contains extern
@@ -155,6 +156,12 @@ void prte_schizo_base_expose(char *param, char *prefix)
     char *value, *pm;
 
     value = strchr(param, '=');
+    if (NULL == value) {
+        /* pmix_cmd_line_parse always hands us "name=value" for an MCA option,
+         * so this cannot happen from the CLI path - but the function is
+         * exported, and a bare name has nothing to expose */
+        return;
+    }
     *value = '\0';
     ++value;
     pmix_asprintf(&pm, "%s%s", prefix, param);
@@ -348,6 +355,15 @@ static char *limits[] = {
     NULL
 };
 
+/* The options in limits[] carry exactly one value apiece.  Repeating one on
+ * a command line does not override the earlier value - pmix_cmd_line_parse
+ * appends every occurrence to the same instance's value array, and every
+ * consumer of these keys reads values[0] - so the second and subsequent
+ * values are silently discarded.  Reject that rather than guess which one
+ * the user meant.  MPMD is not affected: prte_parse_locals() splits the
+ * command line at each ':' and parses/sanity-checks one app segment at a
+ * time, so a per-app --np/--wdir/--path is a single value in its own
+ * result set. */
 static int check_ndirs(pmix_cli_item_t *opt)
 {
     int n, count;
@@ -356,10 +372,11 @@ static int check_ndirs(pmix_cli_item_t *opt)
     for (n=0; NULL != limits[n]; n++) {
         if (0 == strcmp(opt->key, limits[n])) {
             count = PMIx_Argv_count(opt->values);
-            if (1 > count) {
+            if (1 < count) {
                 param = PMIx_Argv_join(opt->values, ' ');
                 pmix_show_help("help-schizo-base.txt", "too-many-instances", true,
                                param, opt->key, count, 1);
+                free(param);
                 return PRTE_ERR_SILENT;
             }
         }
@@ -457,6 +474,7 @@ int prte_schizo_base_sanity(pmix_cli_result_t *cmd_line)
         PRTE_CLI_COPY,
         PRTE_CLI_NOCOPY,
         PRTE_CLI_RAW,
+        PRTE_CLI_PATTERN,
         NULL
     };
 
@@ -667,10 +685,12 @@ int prte_schizo_base_parse_display(pmix_cli_item_t *opt, void *jinfo)
                     } else {
                         pmix_show_help("help-prte-rmaps-base.txt", "unrecognized-qualifier", true,
                                        "display", cptr, "PARSEABLE,PARSABLE");
+                        PMIx_Argv_free(quals);
                         PMIx_Argv_free(targv);
                         return PRTE_ERR_FATAL;
                     }
                 }
+                PMIx_Argv_free(quals);
             }
 
             if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_ALLOC)) {
@@ -753,22 +773,32 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
 {
     char *outdir=NULL;
     char *outfile=NULL;
-    char **targv, *ptr, *cptr, **options;
+    char **targv = NULL, *ptr, *cptr, **options = NULL;
     int m, n, idx;
-    pmix_status_t ret;
+    pmix_status_t ret = PRTE_SUCCESS;
     bool fileonly = true;
     bool copyqualgiven = false;
+    bool patternqualgiven = false;
 
     for (n=0; NULL != opt->values[n]; n++) {
-        targv = PMIx_Argv_split(opt->values[0], ',');
+        /* every value on this option is a directive list of its own - the
+         * user may repeat "--output" as well as comma-delimit within one
+         * instance, and both spellings have to be honored */
+        targv = PMIx_Argv_split(opt->values[n], ',');
         for (idx = 0; NULL != targv[idx]; idx++) {
             /* check for qualifiers */
             cptr = strchr(targv[idx], ':');
             if (NULL != cptr) {
                 *cptr = '\0';
                 ++cptr;
-                /* could be multiple qualifiers, so separate them */
-                options = PMIx_Argv_split(cptr, ',');
+                /* could be multiple qualifiers, and a qualifier is separated
+                 * from the directive - and from its fellows - by a ':'.  The
+                 * ',' that separates directives has already been consumed
+                 * above, so splitting on ',' here would hand the whole
+                 * ':'-joined run to the matcher as one token; that token
+                 * prefix-matches only its FIRST qualifier, and every
+                 * qualifier after it is silently dropped */
+                options = PMIx_Argv_split(cptr, ':');
                 for (m=0; NULL != options[m]; m++) {
 
                     if (PMIX_CHECK_CLI_OPTION(options[m], PRTE_CLI_NOCOPY)) {
@@ -776,9 +806,7 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                             // cannot give both copy and nocopy
                             pmix_show_help("help-schizo-output.txt", "copy-nocopy", true, cptr);
                             ret = PRTE_ERR_SILENT;
-                            PMIx_Argv_free(options);
-                            PMIx_Argv_free(targv);
-                            return ret;
+                            goto cleanup;
                         }
                         fileonly = true;
                         copyqualgiven = true;
@@ -788,33 +816,36 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                             // cannot give both copy and nocopy
                             pmix_show_help("help-schizo-output.txt", "copy-nocopy", true, cptr);
                             ret = PRTE_ERR_SILENT;
-                            PMIx_Argv_free(options);
-                            PMIx_Argv_free(targv);
-                            return ret;
+                            goto cleanup;
                         }
                         fileonly = false;
                         copyqualgiven = true;
 
                     } else if (PMIX_CHECK_CLI_OPTION(options[m], PRTE_CLI_PATTERN)) {
-                        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_FILE_PATTERN, NULL, PMIX_BOOL);
-                        if (PMIX_SUCCESS != ret) {
-                            PMIX_ERROR_LOG(ret);
-                            PMIx_Argv_free(targv);
-                            PMIx_Argv_free(options);
-                            return ret;
-                        }
+#if PRTE_PMIX_IOF_FILE_PATTERN
+                        /* only record it here - the key is emitted with the
+                         * filename it qualifies, since it means nothing
+                         * without one */
+                        patternqualgiven = true;
+#else
+                        /* expanding the pattern is PMIx's job, and this one
+                         * cannot do it - say so rather than accept a
+                         * qualifier that would be silently ignored */
+                        pmix_show_help("help-schizo-output.txt", "pattern-unsupported", true);
+                        ret = PRTE_ERR_SILENT;
+                        goto cleanup;
+#endif
 
                     } else if (PMIX_CHECK_CLI_OPTION(options[m], PRTE_CLI_RAW)) {
                         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_OUTPUT_RAW, NULL, PMIX_BOOL);
                         if (PMIX_SUCCESS != ret) {
                             PMIX_ERROR_LOG(ret);
-                            PMIx_Argv_free(targv);
-                            PMIx_Argv_free(options);
-                            return ret;
+                            goto cleanup;
                         }
                     }
                 }
                 PMIx_Argv_free(options);
+                options = NULL;
             }
             if (0 == strlen(targv[idx])) {
                 // only qualifiers were given
@@ -829,56 +860,49 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_TAG_OUTPUT, NULL, PMIX_BOOL);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_TAG_DET)) {
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_TAG_DETAILED_OUTPUT, NULL, PMIX_BOOL);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_TAG_FULL)) {
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_TAG_FULLNAME_OUTPUT, NULL, PMIX_BOOL);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_RANK)) {
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_RANK_OUTPUT, NULL, PMIX_BOOL);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_TIMESTAMP)) {
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_TIMESTAMP_OUTPUT, NULL, PMIX_BOOL);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_XML)) {
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_XML_OUTPUT, NULL, PMIX_BOOL);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_MERGE_ERROUT)) {
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_MERGE_STDERR_STDOUT, NULL, PMIX_BOOL);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_DIR)) {
@@ -886,14 +910,13 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                     pmix_show_help("help-prte-rmaps-base.txt",
                                    "missing-qualifier", true,
                                    "output", "directory", "directory");
-                    PMIx_Argv_free(targv);
-                    return PRTE_ERR_FATAL;
+                    ret = PRTE_ERR_FATAL;
+                    goto cleanup;
                 }
                 if (NULL != outfile) {
                     pmix_show_help("help-prted.txt", "both-file-and-dir-set", true, outfile, ptr);
-                    PMIx_Argv_free(targv);
-                    free(outfile);
-                    return PRTE_ERR_FATAL;
+                    ret = PRTE_ERR_FATAL;
+                    goto cleanup;
                 }
                 /* If the given filename isn't an absolute path, then
                  * convert it to one so the name will be relative to
@@ -902,8 +925,8 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                 if (!pmix_path_is_absolute(ptr)) {
                     char cwd[PRTE_PATH_MAX];
                     if (NULL == getcwd(cwd, sizeof(cwd))) {
-                        PMIx_Argv_free(targv);
-                        return PRTE_ERR_FATAL;
+                        ret = PRTE_ERR_FATAL;
+                        goto cleanup;
                     }
                     outdir = pmix_os_path(false, cwd, ptr, NULL);
                 } else {
@@ -912,8 +935,7 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_OUTPUT_TO_DIRECTORY, outdir, PMIX_STRING);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
                 }
 
             } else if (PMIX_CHECK_CLI_OPTION(targv[idx], PRTE_CLI_FILE)) {
@@ -921,13 +943,13 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                     pmix_show_help("help-prte-rmaps-base.txt",
                                    "missing-qualifier", true,
                                    "output", "filename", "filename");
-                    PMIx_Argv_free(targv);
-                    return PRTE_ERR_FATAL;
+                    ret = PRTE_ERR_FATAL;
+                    goto cleanup;
                 }
                 if (NULL != outdir) {
                     pmix_show_help("help-prted.txt", "both-file-and-dir-set", true, ptr, outdir);
-                    PMIx_Argv_free(targv);
-                    return PRTE_ERR_FATAL;
+                    ret = PRTE_ERR_FATAL;
+                    goto cleanup;
                 }
                 /* If the given filename isn't an absolute path, then
                  * convert it to one so the name will be relative to
@@ -936,31 +958,70 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                 if (!pmix_path_is_absolute(ptr)) {
                     char cwd[PRTE_PATH_MAX];
                     if (NULL == getcwd(cwd, sizeof(cwd))) {
-                        PMIx_Argv_free(targv);
-                        return PRTE_ERR_FATAL;
+                        ret = PRTE_ERR_FATAL;
+                        goto cleanup;
                     }
                     outfile = pmix_os_path(false, cwd, ptr, NULL);
                 } else {
                     outfile = strdup(ptr);
                 }
+#if PRTE_PMIX_IOF_FILE_PATTERN
+                if (patternqualgiven) {
+                    /* the name is a pattern the user composed, so check its
+                     * conversions now - while they are still looking at the
+                     * command line they typed.  PMIx owns the expansion, so
+                     * it owns the definition of what is valid; asking it
+                     * here is what keeps the two answers the same. */
+                    char *badconv = NULL;
+                    ret = pmix_iof_check_pattern(outfile, &badconv);
+                    if (PMIX_SUCCESS != ret) {
+                        pmix_show_help("help-schizo-output.txt", "bad-pattern", true,
+                                       ptr, (NULL == badconv) ? "(none)" : badconv);
+                        if (NULL != badconv) {
+                            free(badconv);
+                        }
+                        ret = PRTE_ERR_SILENT;
+                        goto cleanup;
+                    }
+                }
+#endif
                 PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_OUTPUT_TO_FILE, outfile, PMIX_STRING);
                 if (PMIX_SUCCESS != ret) {
                     PMIX_ERROR_LOG(ret);
-                    PMIx_Argv_free(targv);
-                    return ret;
+                    goto cleanup;
+                }
+                if (patternqualgiven) {
+                    PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_FILE_PATTERN, NULL, PMIX_BOOL);
+                    if (PMIX_SUCCESS != ret) {
+                        PMIX_ERROR_LOG(ret);
+                        goto cleanup;
+                    }
                 }
                 if (copyqualgiven) {
                     PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_IOF_FILE_ONLY, &fileonly, PMIX_BOOL);
                     if (PMIX_SUCCESS != ret) {
                         PMIX_ERROR_LOG(ret);
-                        PMIx_Argv_free(targv);
-                        return ret;
+                        goto cleanup;
                     }
                 }
             }
         }
         PMIx_Argv_free(targv);
+        targv = NULL;
     }
+    if (patternqualgiven && NULL == outfile) {
+        /* "pattern" says how to name an output FILE.  Given without one it
+         * has nothing to qualify, and silently ignoring it would leave the
+         * user believing they had asked for something */
+        pmix_show_help("help-schizo-output.txt", "pattern-needs-file", true);
+        ret = PRTE_ERR_SILENT;
+        goto cleanup;
+    }
+    ret = PRTE_SUCCESS;
+
+cleanup:
+    PMIx_Argv_free(options);
+    PMIx_Argv_free(targv);
     if (NULL != outdir) {
         free(outdir);
     }
@@ -968,7 +1029,7 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
         free(outfile);
     }
 
-    return PRTE_SUCCESS;
+    return ret;
 }
 
 PMIX_CLASS_INSTANCE(prte_schizo_base_active_module_t,

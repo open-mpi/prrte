@@ -596,6 +596,14 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
             prte_set_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_NOCOPY, PRTE_ATTR_GLOBAL,
                                &flag, PMIX_BOOL);
 
+        } else if (PMIX_CHECK_KEY(info, PMIX_IOF_FILE_PATTERN)) {
+            /* the output filename is the requestor's to compose - carry the
+             * flag through to the nspace registration, which is what puts it
+             * in front of the PMIx IOF that opens the file */
+            flag = PMIX_INFO_TRUE(info);
+            prte_set_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_FILE_PATTERN, PRTE_ATTR_GLOBAL,
+                               &flag, PMIX_BOOL);
+
             /***   MERGE STDERR TO STDOUT   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_IOF_MERGE_STDERR_STDOUT) ||
                    PMIX_CHECK_KEY(info, PMIX_MERGE_STDERR_STDOUT)) {
@@ -694,10 +702,6 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
             }
             prte_set_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT,
                                PRTE_ATTR_GLOBAL, &rc, PMIX_INT);
-
-        } else if (PMIX_CHECK_KEY(info, PMIX_TIMEOUT)) {
-            prte_set_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT, PRTE_ATTR_GLOBAL,
-                               &info->value.data.integer, PMIX_INT);
 
         } else if (PMIX_CHECK_KEY(info, PMIX_JOB_TIMEOUT)) {
             if (PMIX_STRING == info->value.type) {
@@ -815,7 +819,10 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                     /* get the cwd */
                     if (PRTE_SUCCESS != (rc = pmix_getcwd(cwd, sizeof(cwd)))) {
                         pmix_show_help("help-prted.txt", "cwd", true, "spawn", rc);
-                        PMIX_RELEASE(jdata);
+                        /* jdata belongs to our caller - it constructed it and
+                         * will dispose of it on our error return.  Releasing
+                         * it here would leave the caller with a dangling
+                         * pointer it goes on to use and release again */
                         return rc;
                     }
                     /* construct the absolute path */
@@ -848,7 +855,7 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                 ck = PMIx_Argv_split(info->value.data.string, ':');
                 if (3 > PMIx_Argv_count(ck)) {
                     PMIx_Argv_free(ck);
-                    return PMIX_ERR_BAD_PARAM;
+                    return PRTE_ERR_BAD_PARAM;
                 }
                 if (0 == strcasecmp(ck[0], "ppr")) {
                     ppn =  strtoul(ck[1], NULL, 10);
@@ -899,62 +906,62 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_SET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_SET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_ADD_ENVAR)) {
                 envar.envar = info->value.data.envar.envar;
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_ADD_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_ADD_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_ADD_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_ADD_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_UNSET_ENVAR)) {
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           info->value.data.string, PMIX_STRING);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          info->value.data.string, PMIX_STRING);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_UNSET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           info->value.data.string, PMIX_STRING);
+                    prte_append_attribute(&app->attributes, PRTE_APP_UNSET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          info->value.data.string, PMIX_STRING);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_PREPEND_ENVAR)) {
                 envar.envar = info->value.data.envar.envar;
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_PREPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_PREPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_PREPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_PREPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_APPEND_ENVAR)) {
                 envar.envar = info->value.data.envar.envar;
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_APPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_APPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_APPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_APPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
 
             } else if (PMIX_CHECK_KEY(info, PMIX_PSET_NAME)) {
@@ -1007,6 +1014,21 @@ static void interim(int sd, short args, void *cbdata)
     if (NULL == jdata->personality) {
         /* use the default */
         jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(NULL);
+    }
+    if (NULL == jdata->schizo) {
+        /* the requestor named a personality no component claims. Every later
+         * use of jdata->schizo (starting with set_default_rto just below) is
+         * an unchecked dereference, so reject the request here - a bad
+         * personality string in a spawn request must not take down the DVM */
+        char *prsn = (NULL == jdata->personality)
+                     ? NULL : PMIx_Argv_join(jdata->personality, ',');
+        pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename,
+                       (NULL == prsn) ? "NULL" : prsn);
+        if (NULL != prsn) {
+            free(prsn);
+        }
+        rc = PRTE_ERR_NOT_FOUND;
+        goto complete;
     }
 
     /* transfer the apps across */
@@ -1061,7 +1083,14 @@ static void interim(int sd, short args, void *cbdata)
     return;
 
 complete:
-    if (NULL != cd->spcbfunc) {
+    if (NULL == cd->spcbfunc) {
+        /* nobody to answer - discard the partially-built job rather than
+         * leaking it */
+        PMIX_RELEASE(jdata);
+        PMIX_RELEASE(cd);
+        return;
+    }
+    {
         pmix_status_t prc;
         pmix_nspace_t nspace;
         PMIX_LOAD_NSPACE(nspace, NULL);

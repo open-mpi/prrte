@@ -170,6 +170,23 @@ int prte_prepend_attribute(pmix_list_t *attributes, prte_attribute_key_t key, bo
     return PRTE_SUCCESS;
 }
 
+int prte_append_attribute(pmix_list_t *attributes, prte_attribute_key_t key, bool local,
+                          void *data, pmix_data_type_t type)
+{
+    prte_attribute_t *kv;
+    int rc;
+
+    kv = PMIX_NEW(prte_attribute_t);
+    kv->key = key;
+    kv->local = local;
+    if (PRTE_SUCCESS != (rc = prte_attr_load(kv, data, type))) {
+        PMIX_RELEASE(kv);
+        return rc;
+    }
+    pmix_list_append(attributes, &kv->super);
+    return PRTE_SUCCESS;
+}
+
 void prte_remove_attribute(pmix_list_t *attributes, prte_attribute_key_t key)
 {
     prte_attribute_t *kv;
@@ -501,6 +518,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "EXEC-AGENT";
         case PRTE_JOB_NOAGG_HELP:
             return "DO-NOT-AGGREGATE-HELP";
+        case PRTE_JOB_REPORT_CHILD_SEP:
+            return "REPORT-CHILD-JOBS-SEPARATELY";
         case PRTE_JOB_COLOCATE_PROCS:
             return "COLOCATE PROCS";
         case PRTE_JOB_COLOCATE_NPERPROC:
@@ -557,6 +576,9 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "DO_NOT_SPAWN";
         case PRTE_JOB_SPAWN_TARGET:
             return "SPAWN_TARGET";
+
+        case PRTE_JOB_OUTPUT_FILE_PATTERN:
+            return "JOB-OUTPUT-FILE-PATTERN";
 
         case PRTE_PROC_NOBARRIER:
             return "PROC-NOBARRIER";

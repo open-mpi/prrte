@@ -41,7 +41,8 @@ It is **not** a Docker Swarm in the orchestration sense — just ten plain
 | `Dockerfile` | Base image: toolchain, a baked PMIx, SSH wiring, and a node entrypoint. It does **not** contain PRRTE. |
 | `docker-compose.yml` | The ten nodes `prte-node1`..`prte-node10`, each mounting the shared `prte-build` volume. |
 | `elastic.c` | The elastic test client (`elastic` in the install): issues a PMIx allocation request and waits for the phase-two completion event. |
-| `fake-slurm.py` | A stand-in SLURM control plane (`sbatch`/`scontrol`/`scancel`) so `ras/slurm`'s elastic modify surface can be exercised. See §11. |
+| *(no file here)* | `build.sh` also compiles [`examples/dynamic.c`](../../examples/dynamic.c) from the main tree as `dynamic` — the only client in this harness that calls `PMIx_Spawn`, and so the only way to get a **parent/child job pair**. See §11. |
+| `fake-slurm.py` | A stand-in SLURM control plane (`sbatch`/`scontrol`/`scancel`) so `ras/slurm`'s elastic modify surface can be exercised. See §12. |
 
 ## 2. How it works
 
@@ -99,6 +100,27 @@ bites:
 So `build.sh` distcleans whenever it finds in-tree artifacts, and says
 so. `--no-distclean` skips it (only safe if the tree really is clean);
 `--distclean` forces it.
+
+**Do not try to narrow this to "only when configure has to run."** It is
+the obvious optimization — an incremental out-of-tree build already has
+every object of its own, so VPATH is never searched for one — and it has
+been tried and measured. It fails on `prte_config.h`:
+`src/include/constants.h` does `#include "prte_config.h"`, and *both files
+live in `src/include`*, so the compiler's "search the directory of the
+including file first" rule for quoted includes picks up the **source**
+tree's stale copy before any `-I` or `-iquote` path. Nothing in `CPPFLAGS`
+can override that. (`configure.ac` does now put the build tree ahead of the
+source tree, which is correct and fixes every file that includes
+`prte_config.h` directly — it just cannot reach this case.) The symptom is
+an `"OAC_HAVE_APPLE" redefined` error when the two trees were configured
+for different platforms; the quiet and far worse version is same-platform
+with a different `--with-pmix`.
+
+The only way to stop paying for the distclean is to stop keeping an
+in-tree build (below). Removing the destructive step entirely would mean
+building from a *snapshot* of the source inside the volume rather than a
+bind mount of the live tree — a real change to how this harness works, not
+a smarter trigger.
 
 **The cost, and how to avoid paying it repeatedly.** A distclean destroys
 *your* in-tree build, so the next `make check`, `make -C test/offline
@@ -278,6 +300,83 @@ with `--prtemca prte_rml_radix 2`, the daemon tree is 3–4 deep, so the
 routing/relay is broken the fence hangs to the 60s timeout instead of
 completing.
 
+**Personalities and CLI translation (`schizo`, `test_schizo`)**: schizo is
+a front-end framework, so most of it is covered by `test/unit/schizo`
+with no DVM at all. Three things are only observable across daemons, and
+those are what this phase asserts:
+
+- the **envar directives** (`-x`, `--set/prepend/append/unset-env`) are
+  applied by `odls`' `process_envars()` on the `prted` that forks the
+  process, not by the tool — so the probe runs on node2/node3 and prints
+  its own environment. They must take effect **in the order the user gave
+  them** (`--prepend-env FOO[:] x --set-env FOO=1` leaves `FOO=1`; the
+  reverse leaves `FOO=x:1`), and each exactly once — they used to be
+  applied twice, which duplicated every entry prepended onto `PATH`.
+- **`--output file=…`** is written per-daemon, and its `:`-delimited
+  qualifiers (`raw`, `copy`/`nocopy`) decide whether the output is *also*
+  copied back over the wire. Both qualifier orders must behave the same;
+  they did not when the qualifier run was split on the wrong delimiter.
+  The `pattern` qualifier is checked here too: its `%` conversions may
+  appear in the **directory** part of the name (`%h/rank-%R`), so each
+  daemon creates the directory its own expansion names — which is exactly
+  what one host cannot show.
+- a job's **personality is resolved again on every daemon** (`odls` calls
+  `detect_proxy` with the job's personality list), so a personality
+  nobody claims must be refused with a diagnostic — and, on a persistent
+  DVM, refused without taking the HNP down.
+
+**The daemon body and the PMIx server host module (`src/prted`,
+`test_prted`)**: `src/prted` is where the DVM actually lives, and almost
+none of it means anything on one node. This phase asserts the three things
+that need a second daemon, plus two cheap startup-hardening cases:
+
+- a **cross-job job-level query** — a client asks for another job's
+  `PMIX_JOB_SIZE` from a node that hosts none of that job's procs. The
+  probe is `jobinfo`, a bare PMIx client that `build.sh` compiles the same
+  way it compiles `elastic`. Note the honest scope comment in the test: the
+  local PMIx server may satisfy this from its own cache without upcalling
+  into `dmodex_req`, so treat it as coverage of the query working across
+  nodes rather than as a guaranteed reproducer for the request-tracker
+  mix-up it was written for.
+- **job-scoped signal delivery**. `PRTE_DAEMON_SIGNAL_LOCAL_PROCS` carries
+  the target job's nspace, and the daemon used to ignore it and signal
+  every local child — so in a persistent DVM running two jobs, signalling
+  one killed both. It takes two jobs whose procs land on the *same* daemon,
+  which means a persistent DVM and more than one node. This case does catch
+  the regression: against the unfixed daemon both jobs die.
+- a **malformed `--singleton`** and a **`--prefix /`**. Both are startup
+  paths that used to fault (the first inside PMIx, the second by
+  overrunning a two-byte heap allocation), and both are one line to check
+  once a swarm is up.
+
+Two harness notes if you extend this phase. A live `prun` holds its own
+`pmix.*` rendezvous file, so any case that leaves one running in the
+background must point every later tool at the DVM explicitly — the helpers
+`prted_dvm_start`/`PRUN`/`PRUN_BG` do that with `--report-uri` and
+`--dvm-uri`. And `cleanup_swarm` reaps daemons and tools but not the
+application processes they left behind, so a case that counts procs on a
+node should clear strays first.
+
+### The install persists too, so a failed build is silently testable
+
+Same shape as the sticky-configure-args trap below, one level up. The
+install lives in the shared volume and outlives any one `build.sh` run, so
+a build that dies part-way — `configure` rejecting the baked PMIx because
+it predates a capability PRRTE now requires is the everyday case — leaves
+the **previous** install standing. `run-tests.sh`'s "tools on PATH" check
+passes, the whole suite runs, and every failure it reports is really
+"you are testing something else".
+
+`build.sh` now deletes `/opt/prte/.build-stamp` before it starts and
+rewrites it only after `make install` succeeds; `run-tests.sh`'s preflight
+prints the stamp and refuses to run without one. If you see
+`no build stamp in the volume`, re-run `build.sh` and **read its exit
+status** — a redirected `./build.sh > log 2>&1; echo rc=$?` reports the
+`echo`'s status if you are not careful, which is how this was missed.
+
+If your PMIx is the thing `configure` rejected, build PMIx from source in
+the same container: `PMIX_SRC=/path/to/openpmix ./build.sh`.
+
 ### The build dirs persist, so configure arguments are sticky
 
 The VPATH build dirs live in the shared volume and outlive any one run.
@@ -395,7 +494,42 @@ at `/opt/prte`, where `build.sh` installs PRRTE (`/opt/prte/prte`) and writes
 `/opt/prte/env.sh`. To add or remove nodes, copy or delete a service block in
 `docker-compose.yml` (and adjust the `seq 1 10` loops to match).
 
-## 11. Faking a SLURM environment (`ras/slurm`)
+## 11. Spawning a child job (`dynamic`)
+
+Some behavior only exists between a **primary** job and a job it spawned —
+`report-child-jobs-separately`, which decides whether a child's exit status
+reaches the launcher's, is the reason this was added. No amount of
+single-job testing can show it.
+
+`build.sh` compiles the tree's own `PMIx_Spawn` example,
+[`examples/dynamic.c`](../../examples/dynamic.c), into the install as
+`dynamic`. Two things about it drive how a test is written:
+
+- **Rank 0 spawns `client` from its own cwd** (`$PWD/client`, an absolute
+  path built with `getcwd()`). So you choose what the child *is*, and what
+  it exits with, by putting an executable at that path and running the
+  parent from that directory.
+- **`/tmp` is per-container.** The spawn names an absolute path, and the
+  child is mapped by the normal policy across the DVM, so the file has to
+  exist on *every node the child could land on* — not just the head node.
+  A missing file shows up as `PMIX_ERR_JOB_FAILED_TO_LAUNCH`, and too few
+  slots as `PMIX_ERR_JOB_FAILED_TO_MAP` (the child asks for 2 procs on top
+  of the parent, so allocate at least 3 slots).
+
+```sh
+for n in 1 2 3; do
+    docker exec prte-node$n bash -lc 'mkdir -p /tmp/dyn &&
+        printf "#!/bin/sh\nexit 7\n" > /tmp/dyn/client && chmod +x /tmp/dyn/client'
+done
+$RUN '. /opt/prte/env.sh; cd /tmp/dyn &&
+      prterun --host node1:2,node2:2,node3:2 -np 1 dynamic'   # -> exits 7
+```
+
+Always assert that `Spawn success` appears before asserting on the exit
+code: a spawn that failed to map or launch also produces a non-zero status,
+and would otherwise read as the child's.
+
+## 12. Faking a SLURM environment (`ras/slurm`)
 
 `ras/slurm` is the only ras component with a full elastic **modify** surface,
 and everything past initial discovery is a shell-out: `sbatch` to grow,

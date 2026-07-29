@@ -264,6 +264,11 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_DO_NOT_SPAWN               (PRTE_JOB_START_KEY + 123) // bool - do not spawn app procs
 #define PRTE_JOB_SPAWN_TARGET               (PRTE_JOB_START_KEY + 124) // char* - comma-delimited list of PMIX_ALLOC_ID strings naming the
                                                                        // allocations (sessions) this job may map onto; empty token = default session
+#define PRTE_JOB_OUTPUT_FILE_PATTERN        (PRTE_JOB_START_KEY + 125) // bool - treat PRTE_JOB_OUTPUT_TO_FILE as a name pattern the user
+                                                                       // controls instead of annotating it with nspace and rank
+#define PRTE_JOB_REPORT_CHILD_SEP           (PRTE_JOB_START_KEY + 126) // bool - report the exit status of child jobs separately: return the
+                                                                       // primary job's status only, rather than the first non-zero status
+                                                                       // returned by the primary job or any job it spawned
 
 #define PRTE_JOB_MAX_KEY (PRTE_JOB_START_KEY + 200)
 
@@ -348,8 +353,20 @@ PRTE_EXPORT void prte_remove_attribute(pmix_list_t *attributes, prte_attribute_k
 PRTE_EXPORT prte_attribute_t *prte_fetch_attribute(pmix_list_t *attributes, prte_attribute_t *prev,
                                                    prte_attribute_key_t key);
 
+/* Add an attribute to the front of a list, keeping any prior entry with the
+ * same key - use for the multi-valued attributes (the envar directives) when
+ * the new entry must be applied BEFORE the ones already there.  Note that
+ * prepending a block of entries one at a time reverses that block: walk the
+ * source in reverse if its internal order matters. */
 PRTE_EXPORT int prte_prepend_attribute(pmix_list_t *attributes, prte_attribute_key_t key,
                                        bool local, void *data, pmix_data_type_t type);
+
+/* Add an attribute to the end of a list, keeping any prior entry with the
+ * same key.  This is what preserves the order a set of multi-valued
+ * attributes was generated in - which, for the envar directives, is the
+ * order the user gave them on the command line. */
+PRTE_EXPORT int prte_append_attribute(pmix_list_t *attributes, prte_attribute_key_t key,
+                                      bool local, void *data, pmix_data_type_t type);
 
 PRTE_EXPORT int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type);
 
