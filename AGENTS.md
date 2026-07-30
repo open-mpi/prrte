@@ -100,7 +100,17 @@ The three central data structures — `prte_job_t`, `prte_node_t`, and
 `prte_proc_t` — are defined in `src/runtime/prte_globals.h` and carry
 all runtime state for a running job.  Code throughout the tree reaches
 for these; understand them before touching launch, mapping, or error
-handling paths.
+handling paths.  [`src/runtime/AGENTS.md`](src/runtime/AGENTS.md) covers
+the object model, who owns whom (several of those references are
+deliberately *borrowed*, not counted), the three-stage init, and the
+global registries.
+
+Topology is the other thing code all over the tree reaches for.
+[`src/hwloc/AGENTS.md`](src/hwloc/AGENTS.md) covers the hwloc integration:
+why NUMA is counted through PRRTE's own wrappers rather than hwloc's, the
+data PRRTE caches on hwloc `userdata` pointers, the binding-policy word,
+and the fact that in the HNP almost every topology in play belongs to some
+*other* machine.
 
 ---
 
@@ -301,6 +311,20 @@ Removing the stale generated file forces `make` to re-run the converter
 and pick up your help-text changes.  Skipping this step leaves the binary
 serving the old (or missing) messages even though the `.txt` source looks
 correct.
+
+The same converter also **cross-checks each tool's help file against that
+tool's `schizo` command-line option table** and fails the build when they
+disagree — a help file that documents an option the parser rejects, or a
+help topic for an option the tool does not accept.  Because of the
+dependency gap above, that check cannot rely on the generation rule
+firing, so it also runs on every `make check`.  If you add or remove a
+command-line option, expect to touch both the option table and the
+matching `help-*.txt`; run the check directly with:
+
+```sh
+python3 src/util/prte-convert-help.py --root . --check-only \
+    --cppflags="$(pkg-config --cflags-only-I pmix)"
+```
 
 ### Unique numeric values for status and state codes
 

@@ -77,6 +77,12 @@ static void display_cpus(prte_topology_t *t,
         hwloc_bitmap_and(avail, obj->cpuset, allowed);
         if (hwloc_bitmap_iszero(avail)) {
             pmix_asprintf(&tmp2, "%s            <package id=\"%d\" cpus=\"%s\"/>\n", tmp1, pkg, "NONE");
+            /* fall through to the accumulate step below rather than
+             * continuing: skipping it both dropped this package from the
+             * output and leaked the string just built for it */
+            free(tmp1);
+            tmp1 = tmp2;
+            tmp2 = NULL;
             continue;
         }
         if (bits_as_cores) {
@@ -186,7 +192,7 @@ void prte_job_print(char **output, prte_job_t *src)
  */
 void prte_node_print(char **output, prte_job_t *jdata, prte_node_t *src)
 {
-    char *tmp, *tmp1, *tmp2, *tmp3;
+    char *tmp, *tmp1 = NULL, *tmp2, *tmp3;
     int32_t i,j;
     prte_proc_t *proc;
     prte_topology_t *t;
@@ -349,14 +355,20 @@ void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src)
     physical = prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_PHYSICAL_CPUS, NULL, PMIX_BOOL);
 
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT, NULL, PMIX_BOOL)) {
-        if (NULL != src->cpuset && NULL != src->node->topology &&
-            NULL != src->node->topology->topo) {
+        if (NULL != src->cpuset && NULL != src->node &&
+            NULL != src->node->topology && NULL != src->node->topology->topo) {
             mycpus = hwloc_bitmap_alloc();
             hwloc_bitmap_list_sscanf(mycpus, src->cpuset);
 
             npus = prte_hwloc_base_get_nbobjs_by_type(src->node->topology->topo, HWLOC_OBJ_PU);
-            /* assuming each "core" xml element will take 20 characters. There could be at most npus such elements */
-            int sz = sizeof(char) * npus * 20;
+            /* There can be one element per PU, and each is 20 spaces of
+             * indent plus "<core>%d</core>\n" - 34 characters for a
+             * single-digit index and more as the index grows. The estimate
+             * used to be 20 per element, so a process bound to more than
+             * about half the cores of a non-SMT node had its site list
+             * silently truncated (and, before the writes were bounded,
+             * overran this buffer outright). */
+            int sz = sizeof(char) * (npus * 48 + 64);
             cores = (char*)malloc(sz);
             if (NULL == cores) {
                 pmix_asprintf(&tmp, "\n%*c<MemoryError/>\n", 8, xmlsp);
@@ -385,8 +397,8 @@ void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src)
     }
 
     if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, NULL, PMIX_BOOL)) {
-        if (NULL != src->cpuset && NULL != src->node->topology
-            && NULL != src->node->topology->topo) {
+        if (NULL != src->cpuset && NULL != src->node
+            && NULL != src->node->topology && NULL != src->node->topology->topo) {
             mycpus = hwloc_bitmap_alloc();
             hwloc_bitmap_list_sscanf(mycpus, src->cpuset);
             str = prte_hwloc_base_cset2str(mycpus, use_hwthread_cpus, physical,
@@ -419,12 +431,20 @@ void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src)
     free(tmp);
     tmp = tmp3;
 
-    if (NULL != src->cpuset) {
+    /* the topology has to be reachable to render a cpuset: a proc that was
+     * never mapped (or whose node has already been torn down - the node
+     * clears the backpointer on the procs it knows about) has no node, and
+     * this path had none of the guards its two siblings above carry */
+    if (NULL != src->cpuset && NULL != src->node &&
+        NULL != src->node->topology && NULL != src->node->topology->topo) {
         mycpus = hwloc_bitmap_alloc();
         hwloc_bitmap_list_sscanf(mycpus, src->cpuset);
         tmp2 = prte_hwloc_base_cset2str(mycpus, use_hwthread_cpus,
                                         physical, src->node->topology->topo);
         hwloc_bitmap_free(mycpus);
+        if (NULL == tmp2) {
+            tmp2 = strdup("UNBOUND");
+        }
     } else {
         tmp2 = strdup("UNBOUND");
     }

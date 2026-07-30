@@ -201,11 +201,46 @@ wider by mistake:
   A table entry missing from the second list is a live bug; a converter
   branch missing from the first is merely dead code (prte carries a few:
   `amca`, `am`, `bind-to-socket`).
+- **The option tables and the `help-*.txt` files are cross-checked by the
+  build.** They are maintained by hand in separate files, so they drift:
+  `--forward-signals` was documented for `prun`, implemented in
+  `prun_common.c`, and simply missing from `prunoptions` — the help said
+  the option existed and the parser said it did not
+  ([#2569](https://github.com/openpmix/prrte/issues/2569)),
+  `--tmpdir`/`--test-suicide` were documented for tools whose tables
+  never had them, and `--show-progress`/`--report-child-jobs-separately`
+  were documented as current options when they are deprecated spellings
+  of runtime options. `src/util/prte-convert-help.py` now compares each
+  tool's `[usage]` table against the table that tool's `parse_cli`
+  selects and **errors** on either mismatch — a documented option the
+  parser rejects, or a help topic for an option the tool does not accept.
+  It also **warns** about an option the table accepts that the help file
+  never mentions (a real gap; there are a few dozen today). It runs under
+  `--purge` when the show_help content is generated, and on every
+  `make check` (`check-local` in `src/util/Makefile.am`), because the
+  generation rule depends only on the converter script and so does not
+  re-run when you edit a table or a help file. Run it directly with:
+
+  ```sh
+  python3 src/util/prte-convert-help.py --root . --check-only \
+      --cppflags="$(pkg-config --cflags-only-I pmix)"
+  ```
 - **Mirror in `ompi` when it's a shared concept.** Placement, output,
   and runtime-option changes usually need the ompi table/handler updated
   too, or the two personalities drift.
 - **Edit the matching `help-*.txt`** for any user-visible option change,
   then follow the GOLDEN RULE (`rm src/util/prte_show_help_content.*`
   and rebuild) or the binary serves stale help.
+- **An option whose only consumer is a runtime option converts, it does
+  not get its own consumer.** `--show-progress` and
+  `--report-child-jobs-separately` are deprecated standalone spellings
+  of runtime options: they belong in the **deprecated** section of the
+  option tables, are converted to `--rtos <directive>` by
+  `convert_deprecated_cli` with the component's `warn` flag, and are
+  **not** listed in the `help-*.txt` usage tables — a deprecated option
+  is accepted for compatibility, not advertised. (`--runtime-options
+  show-progress` is what the docs point users to.) The same pair lives
+  in ompi's deprecated section, documented under "Deprecated command
+  line options" in `schizo-ompi-cli.rstxt`.
 - **`warned` is one-shot per process.** Deprecation warnings fire once;
   don't rely on repeated warnings in a single tool invocation.

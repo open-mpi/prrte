@@ -32,10 +32,12 @@ AC_DEFUN([PRTE_CONFIG_FILES],[
         test/offline/Makefile
         test/unit/Makefile
         test/unit/rmaps/Makefile
+        test/unit/runtime/Makefile
         test/unit/errmgr/Makefile
         test/unit/ess/Makefile
         test/unit/filem/Makefile
         test/unit/grpcomm/Makefile
+        test/unit/hwloc/Makefile
         test/unit/odls/Makefile
         test/unit/iof/Makefile
         test/unit/plm/Makefile
@@ -44,5 +46,7 @@ AC_DEFUN([PRTE_CONFIG_FILES],[
         test/unit/ras/Makefile
         test/unit/schizo/Makefile
         test/unit/state/Makefile
+        test/unit/tools/Makefile
+        test/unit/util/Makefile
     ])
 ])

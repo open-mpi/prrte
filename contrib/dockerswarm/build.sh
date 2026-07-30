@@ -92,6 +92,45 @@ srcdir_has_intree() {
     [ -n "$(find "$root/src" -name '*.lo' -print -quit 2>/dev/null)" ]
 }
 
+# --- generate the flex output the builder cannot generate itself ------------
+# In a pristine checkout a *.l has no companion *.c: automake produces it at
+# build time, and ylwrap writes it into the SOURCE directory next to the .l --
+# but the builder mounts both source trees READ-ONLY, so the build dies with
+#
+#     config/ylwrap: line 204: .../keyval_lex.c: Read-only file system
+#
+# A tree that has been built in place at least once already carries the file,
+# which is why this only ever bites a *fresh* clone -- precisely what PMIX_SRC
+# usually points at.  Generate it here on the host the way automake would; the
+# -P symbol prefix lives in the sibling Makefile.am AM_LFLAGS.  These are
+# git-ignored maintainer files, so writing them into the checkout is exactly
+# what building it normally does.
+gen_lex() {
+    local tree="$1" lfile cfile prefix
+    while IFS= read -r lfile; do
+        [ -n "$lfile" ] || continue
+        cfile="${lfile%.l}.c"
+        if [ -f "$cfile" ]; then
+            continue
+        fi
+        if ! command -v flex >/dev/null 2>&1; then
+            echo ">>> WARNING: $lfile has no generated .c and flex is not" \
+                 "installed; the read-only builder cannot make one"
+            return 0
+        fi
+        prefix="$(sed -n 's/^AM_LFLAGS *= *-P//p' "$(dirname "$lfile")/Makefile.am" \
+                  2>/dev/null | head -1)"
+        echo ">>> flex $lfile (the builder mounts this tree read-only)"
+        if [ -n "$prefix" ]; then
+            flex "-P$prefix" -o "$cfile" "$lfile"
+        else
+            flex -o "$cfile" "$lfile"
+        fi
+    done <<EOF
+$(find "$tree" -name '*.l' 2>/dev/null)
+EOF
+}
+
 # --- make the source tree VPATH-ready (idempotent) --------------------------
 prep_srcdir() {
     if srcdir_has_intree && [ "$distclean" != never ]; then
@@ -128,6 +167,8 @@ prep_srcdir() {
         echo ">>> autogen.pl"
         ( cd "$root" && ./autogen.pl )
     fi
+
+    gen_lex "$root"
 }
 
 # --- (re)build the base image if needed -------------------------------------
@@ -152,7 +193,10 @@ build_linux() {
     prep_srcdir linux
 
     local pmix_mount=()
-    [ -n "$PMIX_SRC" ] && pmix_mount=(-v "$(cd "$PMIX_SRC" && pwd)":/pmix-src:ro)
+    if [ -n "$PMIX_SRC" ]; then
+        gen_lex "$(cd "$PMIX_SRC" && pwd)"
+        pmix_mount=(-v "$(cd "$PMIX_SRC" && pwd)":/pmix-src:ro)
+    fi
 
     echo ">>> building PRRTE (and PMIx if PMIX_SRC set) into volume $VOLUME"
     docker run --rm \
@@ -229,10 +273,19 @@ build_linux() {
             make -j"$jobs"
             make install
 
+            # NOTE the -Wl,-rpath on every helper below.  An application
+            # launched onto a NON-head node gets an EMPTY LD_LIBRARY_PATH --
+            # the head node inherits the login shell that sourced env.sh, the
+            # others do not -- so without an rpath these binaries load the
+            # PMIx baked into the image (/usr/local/lib) instead of the one
+            # this script just built.  That is silent: same soname, same
+            # version, different code.  Anything testing a PMIx change would
+            # pass on node1 and quietly test the wrong library everywhere
+            # else.
             echo ">>>> elastic test client"
             gcc -O0 -g -o /opt/prte/prte/bin/elastic \
                 /prrte-src/contrib/dockerswarm/elastic.c \
-                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -lpmix
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
             # jobinfo: a bare PMIx client used to drive the direct-modex
             # paths in the daemon.  A job-level (wildcard) Get of data
@@ -243,7 +296,28 @@ build_linux() {
             echo ">>>> jobinfo (direct-modex) test client"
             gcc -O0 -g -o /opt/prte/prte/bin/jobinfo \
                 /prrte-src/contrib/dockerswarm/jobinfo.c \
-                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -lpmix
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
+            # dataserver: a bare PMIx client for the publish/lookup service
+            # in src/runtime/data_server.  The store is a single array on
+            # the HNP and every client reaches it through its own daemon, so
+            # the publisher proxy vs requestor proxy distinction that
+            # PMIX_RANGE_LOCAL turns on only exists across nodes.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> dataserver (publish/lookup) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/dataserver \
+                /prrte-src/contrib/dockerswarm/dataserver.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
+            # slowcat: a deliberately slow stdin reader (no PMIx at all).  The
+            # stdin bugs in iof live in the back-pressure path, and a normal
+            # "cat" drains its pipe as fast as the daemon fills it, so the
+            # daemon short-write path is never taken.  slowcat keeps the pipe
+            # saturated so every write the daemon attempts is a partial one.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> slowcat (slow stdin reader) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/slowcat \
+                /prrte-src/contrib/dockerswarm/slowcat.c
 
             # examples/dynamic.c is the PMIx_Spawn example shipped in this
             # tree: rank 0 spawns "client" from its cwd as a CHILD JOB.  It
@@ -256,7 +330,7 @@ build_linux() {
             echo ">>>> dynamic (PMIx_Spawn) test client"
             gcc -O0 -g -o /opt/prte/prte/bin/dynamic \
                 /prrte-src/examples/dynamic.c -I/prrte-src/examples \
-                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -lpmix
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
             # The fake SLURM control plane, installed under its own prefix --
             # NOT into the install bin/, which the node entrypoint symlinks

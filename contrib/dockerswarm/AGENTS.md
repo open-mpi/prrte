@@ -42,6 +42,8 @@ It is **not** a Docker Swarm in the orchestration sense — just ten plain
 | `docker-compose.yml` | The ten nodes `prte-node1`..`prte-node10`, each mounting the shared `prte-build` volume. |
 | `elastic.c` | The elastic test client (`elastic` in the install): issues a PMIx allocation request and waits for the phase-two completion event. |
 | *(no file here)* | `build.sh` also compiles [`examples/dynamic.c`](../../examples/dynamic.c) from the main tree as `dynamic` — the only client in this harness that calls `PMIx_Spawn`, and so the only way to get a **parent/child job pair**. See §11. |
+| `dataserver.c` | A bare PMIx client for the publish/lookup service (`dataserver` in the install): publish/lookup/lookupwait/lookup2/unpublish. Drives `src/runtime/data_server`. See §13. |
+| `slowcat.c` | A deliberately **slow** stdin reader (`slowcat` in the install, no PMIx dependency): copies stdin to a file in small reads with a pause between them, so the daemon feeding it keeps hitting *partial* writes. That is the only way to reach the iof short-write path. |
 | `fake-slurm.py` | A stand-in SLURM control plane (`sbatch`/`scontrol`/`scancel`) so `ras/slurm`'s elastic modify surface can be exercised. See §12. |
 
 ## 2. How it works
@@ -274,6 +276,24 @@ is never exercised. The payload is deliberately far larger than the 4096-byte
 read fragment and the 8192-byte write chunk. A companion case pipes a short
 line with `--stdin all` to check the wildcard/xcast delivery.
 
+**Slow-reader stdin (`iof`)**: the same payload again, but read by `slowcat`
+instead of `cat` — and this is the case that finds real bugs, because volume
+alone does not reach the interesting code. `cat` drains its stdin pipe as
+fast as the daemon can fill it, so the daemon's non-blocking `write(2)`
+essentially always completes in full and the **short-write** path is never
+taken. `slowcat` keeps the pipe saturated, so once the input passes the pipe
+capacity (64 KB on Linux) nearly every write is partial. That is the state
+in which [#2579](https://github.com/openpmix/prrte/issues/2579) lived for
+years behind a passing 256 KB `cat` test: re-basing a queued chunk without
+also decrementing its count re-sent the tail of the chunk on every retry, so
+the application received its input **duplicated** — measured here as 354 KB
+in, 37 MB out, and then a hang, since the backlog could never drain. The
+assertion is therefore on the byte count first (`SLOWCAT-BYTES` must equal
+what was piped in) and the md5 second. It runs twice, once with the rank on
+node2 and once on node1, because the HNP and the daemon carry **separate**
+copies of the write handler — the HNP copy was fixed upstream in 2025 and
+the daemon copy was missed.
+
 **Grow** (`elastic grow node2:2,node3:2`): phase-1 `PMIX_SUCCESS`, then phase-2
 `PMIX_DVM_IS_READY`, and `prted` now running on node2 and node3.
 
@@ -324,6 +344,55 @@ those are what this phase asserts:
   `detect_proxy` with the job's personality list), so a personality
   nobody claims must be refused with a diagnostic — and, on a persistent
   DVM, refused without taking the HNP down.
+
+**Topology handling (`src/hwloc`, `test_hwloc`)**: `src/hwloc` is a library
+of pure functions over a topology, so `test/unit/hwloc` covers nearly all of
+it against synthetic topologies. What it cannot reach is the case PRRTE
+actually runs in — the topology being queried or rendered arrived from
+*another* machine as XML and sits in the HNP alongside nine others. This
+phase asserts:
+
+- a **remote node's binding is rendered from its own topology**. The map is
+  built by the HNP from what each daemon shipped it, so `--display map` (not
+  `--display bind`, whose per-rank line comes from the daemon's own stderr
+  and is not forwarded here) is what exercises the path.
+- a **package-wide binding does not overrun the element buffer**. These
+  containers are 8 cores, one package, **no SMT, and no NUMA node in sysfs**
+  — which is exactly the shape that trips it: `--display map:parseable`
+  writes one `<core>N</core>` element per bound core into a buffer its caller
+  sizes at 20 bytes per PU, while each element needs ~34. The corruption
+  lands in the HNP, which is holding every node's topology, so the symptom is
+  a crash somewhere unrelated. Do not "simplify" this case onto one node.
+- **`--map-by numa` against topologies the HNP never sensed**. The NUMA count
+  comes from a cutoff cached on each topology's root object; a topology that
+  arrived from a daemon only has that cache if someone built it, and the
+  answer when it is missing used to be a silent zero.
+- a **DVM cpu-set constrains every node, not just the first**. The expansion
+  runs against each node's topology in turn and rewrites the process-wide
+  list as it goes, so one node cannot show whether the second got the same
+  answer.
+- a **malformed cpu-set is refused without taking the HNP down**. An
+  unresolvable entry came back as a NULL cpuset that nothing checked, so the
+  diagnostic was followed by a segfault inside hwloc.
+- **`--display topo` over several topologies at once** — the only place that
+  traversal runs against more than one.
+
+Two harness notes. The cpu-set case is written as a **range** (`0-1`) on
+purpose: PMIx's command-line parser used to reject any MCA value whose second
+character was a dash as `not-enough-arguments`, so that spelling was
+unusable, and the case is now the end-to-end regression test for the fix as
+much as for the per-node expansion. If it is ever run against a PMIx that
+predates the fix it **skips** with a message saying so rather than failing —
+the harness bakes PMIx into the image, so an old image is a real possibility.
+Build with `PMIX_SRC=<checkout>` to test against a local PMIx.
+
+And the cpu-set case checks **both** binding levels — to a core and to a
+package — because a cpu-set used to be honored only at the core level, where
+the object sits inside the set anyway; a rank bound to a package came back
+owning every core of it. Note that an assertion on a binding has to match the
+**whole** bracketed site list: a rank bound to `core:L0-7` starts with a `0`
+and slips past a pattern that only looks at the first number, which is
+exactly how that defect stayed hidden behind a passing test.
 
 **The daemon body and the PMIx server host module (`src/prted`,
 `test_prted`)**: `src/prted` is where the DVM actually lives, and almost
@@ -376,6 +445,100 @@ status** — a redirected `./build.sh > log 2>&1; echo rc=$?` reports the
 
 If your PMIx is the thing `configure` rejected, build PMIx from source in
 the same container: `PMIX_SRC=/path/to/openpmix ./build.sh`.
+
+### The containers persist too, so a rebuilt image does not reach them
+
+The third instance of the same shape, and the nastiest, because the stale
+thing is not in the volume at all. The ten nodes are long-lived containers.
+Rebuilding the base image — which is how the **baked PMIx** gets updated —
+changes `prte-swarm:latest` but leaves the running containers on the image
+they were created from. `build.sh` then compiles PRRTE inside a *new*
+container (so, against the new PMIx) and installs it into the volume the
+*old* containers read, and the daemons load the old PMIx. What you see is
+an undefined symbol from `libprrte` in whichever case first reaches a new
+PMIx entry point — `undefined symbol: pmix_iof_check_pattern` was the real
+one — and nothing in the message mentions containers.
+
+`run-tests.sh`'s preflight now compares each container's image ID against
+`prte-swarm:latest` and refuses to run when they differ. The fix is
+
+```sh
+docker compose up -d --force-recreate
+```
+
+**and it matters where you run that from.** The compose project name
+defaults to the *directory* name, `dockerswarm` — which is also the name of
+openpmix's identical harness directory. Run from the wrong place (or with a
+project name that does not match the containers you have) and compose
+adopts the other project: it stopped the `pmix-node*` swarm, renamed our
+own containers out from under themselves, failed on the name collision, and
+left the ten `prte-node*` containers running the previous image. That is
+exactly how the state above was reached. `docker-compose.yml` now pins
+`name: prteswarm`, so a plain `docker compose` from this directory always
+means this swarm. Verify with:
+
+```sh
+docker inspect prte-node1 --format '{{.Image}}'
+docker images --no-trunc --format '{{.ID}}' prte-swarm:latest
+```
+
+### Rebuilding the image really does need `--no-cache`
+
+`./build.sh image` alone is often not enough. The Dockerfile builds the
+baked PMIx from
+
+```dockerfile
+RUN git clone --recursive --depth=1 -b "$PMIX_REF" "$PMIX_REPO" /src/pmix
+```
+
+and docker caches that layer by its *text*, not by what the remote now
+contains — so a rebuild "succeeds" in seconds and bakes exactly the same
+PMIx you were trying to get away from. To actually move the baked PMIx
+forward:
+
+```sh
+docker build --no-cache --build-arg PMIX_REF=master -t prte-swarm:latest .
+docker run --rm -v prte-build:/opt/prte prte-swarm:latest \
+    rm -rf /opt/prte/vpath-linux /opt/prte/vpath-linux-pmix \
+           /opt/prte/pmix /opt/prte/prte /opt/prte/.build-stamp
+./build.sh                        # rebuild against the new PMIx
+docker compose up -d --force-recreate
+```
+
+The volume wipe is not optional: `build.sh` reconfigures when the configure
+*arguments* change, and they do not change when only the image's PMIx does
+(see the sticky-arguments trap above).
+
+The `PMIX_SRC=/path/to/openpmix` route avoids all of this, but the checkout
+it names must be **autogen'd and not itself configured in-tree**: `build.sh`
+runs `/pmix-src/configure` from a VPATH directory over a read-only bind
+mount, so a tree with its own `config.status` is refused ("source directory
+already configured") and a fresh `git clone` has no `configure` at all.
+
+A `git worktree` off an existing clone is the clean way to get one (and it
+keeps you out of a tree another session may be building in). Two things it
+needs beyond `autogen.pl`:
+
+```sh
+git -c submodule.config/oac.url=<clone>/config/oac submodule update --init config/oac
+```
+
+because openpmix's `.gitmodules` points `config/oac` at a local path that
+will not exist on your machine — and nothing else, because **`build.sh` now
+pre-generates the flex output itself**. That was the other trap: a pristine
+checkout has a `*.l` with no generated `*.c`, automake produces it at build
+time *in the source directory*, and the builder mounts the source
+read-only, so the build died with
+
+```
+config/ylwrap: line 204: .../keyval_lex.c: Read-only file system
+```
+
+A tree that has been built in place once already carries the file, which is
+why this only ever bit a fresh clone — exactly what `PMIX_SRC` is usually
+pointed at. `gen_lex` in `build.sh` runs `flex` on the host for any missing
+one (taking the `-P` symbol prefix from the sibling `Makefile.am`), for the
+PRRTE tree as well as the PMIx one.
 
 ### The build dirs persist, so configure arguments are sticky
 
@@ -443,7 +606,7 @@ safe.
 | pick up a PRRTE source edit | `./build.sh` (incremental into the volume) |
 | pick up an openpmix edit | `PMIX_SRC=/path/to/openpmix ./build.sh` |
 | force a clean PRRTE rebuild | `docker volume rm prte-build && ./build.sh` |
-| rebuild the base image (new baked PMIx) | `./build.sh image` (or `PMIX_REF=v6.1.0 ./build.sh image`) |
+| rebuild the base image (new baked PMIx) | `docker build --no-cache --build-arg PMIX_REF=master -t prte-swarm:latest .` — `./build.sh image` reuses docker's cached `git clone`; then wipe the volume's VPATH dirs and recreate the containers (see "The containers persist too") |
 | tear down the swarm | `docker compose down` (the `prte-build` volume persists) |
 
 ## 9. Grow after a shrink
@@ -607,3 +770,104 @@ separates a parser error from whatever the launch path later does with the
 number. The pool is asserted too, separately — a node whose count came
 from the scheduler must still carry that count at mapping time
 (`PRTE_NODE_FLAG_SLOTS_GIVEN`).
+
+## 13. The data server (`dataserver`, `test_runtime`)
+
+Most of [`src/runtime`](../../src/runtime/AGENTS.md) needs no DVM and is
+covered by `test/unit/runtime`. Two things are not, and they are what the
+`test_runtime` phase asserts.
+
+**The publish/lookup data server is a single store on the HNP** that every
+client reaches over the RML through its own daemon. That shape is what makes
+it a multi-node subject:
+
+- **`PMIX_RANGE_LOCAL` compares the publisher's proxy against the
+  requestor's proxy** — the daemons that relayed the two requests. On one
+  node those are the same object no matter what the code does, so the check
+  cannot be wrong there. (It was: neither object's constructor initialized
+  `proxy`, and `PMIX_NEW` does not zero its allocation.)
+- **A `PMIX_WAIT` lookup parks in the store** until a later publish
+  satisfies it. The publish arrives from one daemon and the reply goes back
+  out through another, so the parked request has to carry the requestor's
+  proxy and room number across the gap. That path also has to *dispose of*
+  the answer buffer it was handed and will never send.
+- **A partial lookup** (two keys, one published) has to return the half it
+  found alongside `PMIX_ERR_PARTIAL_SUCCESS`. It used to return the status
+  and drop both the values and the buffer holding them.
+
+The probe is `dataserver`, compiled by `build.sh` the same way as `elastic`
+and `jobinfo`:
+
+```sh
+dataserver publish <key> <value> [session|namespace|local|proc-local|global] [secs]
+dataserver lookup <key> [secs]           # no wait
+dataserver lookupwait <key> [secs]       # PMIX_WAIT -- parks in the store
+dataserver lookup2 <key1> <key2> [secs]  # the partial-success shape
+dataserver unpublish <key> [secs]        # publish, confirm, unpublish, confirm gone
+```
+
+`publish` and `lookupwait` stay alive for their `secs` argument and print a
+marker line (`PUBLISHED`, `WAITING`) as soon as they reach that state, so a
+test runs them with `PRUN_BG` and greps the capture file rather than
+sleeping blind.
+
+**The second thing** is that the object destructors — and the ownership
+rules in `src/runtime/AGENTS.md` they encode — only run for real at
+teardown. `prte_session_t` had been registered against the wrong parent
+class, and the symptom (an assert inside `pmix_list_item_destruct` reading
+the middle of the session's own data) fires only when a session is actually
+*released*. So the phase ends by running jobs and then taking the DVM down,
+asserting `pterm` succeeds, that nothing on the way out looks like an assert
+or a fault, and that no daemon survived.
+
+Note that the harness image builds a debug PMIx. That matters here: the
+class-hierarchy check that catches this is `#if PMIX_ENABLE_DEBUG` only, so
+against a release PMIx the same bug is silent memory corruption instead.
+
+## 14. A remote app gets an EMPTY environment, and that hides a stale PMIx
+
+Two related traps, same root cause, and the second one is genuinely nasty.
+
+**The root cause.** An application launched onto a node other than node1
+does *not* inherit the head node's login environment. Concretely, for a
+proc on node4:
+
+```
+$ prun --host node4:1,node1:1 -n 2 --map-by node sh -c 'echo $(hostname) LDLP=$LD_LIBRARY_PATH'
+node4 LDLP=
+node1 LDLP=/opt/prte/prte/lib:/opt/prte/pmix/lib:...
+```
+
+`-x LD_LIBRARY_PATH` does not change that. node1 works only because its
+apps inherit from the HNP, which *was* started from a shell that sourced
+`env.sh`.
+
+**Trap 1 — PATH.** The node entrypoint symlinks the install's `bin` into
+`/usr/local/bin` when the **container** starts, so anything added by a later
+`build.sh` is not on a remote app's PATH. A bare name then fails with
+`PMIX_ERR_JOB_FAILED_TO_LAUNCH` and *no diagnostic*. Use an absolute path
+for helpers in new cases (`DS=/opt/prte/prte/bin/dataserver`); the older
+`jobinfo`/`elastic` cases work only because the entrypoint happened to link
+them.
+
+**Trap 2 — the wrong libpmix, silently.** `/usr/local/lib/libpmix.so.2` is
+the PMIx baked into the *image*. With no `LD_LIBRARY_PATH`, that is what a
+remote app loads — same soname, same version string, different code — so
+every PMIx-linking helper on nodes 2-10 was running the image's PMIx rather
+than the one `PMIX_SRC=... ./build.sh` had just built. Nothing announces
+this. A change spanning both code bases passes on node1 and quietly tests
+the wrong library everywhere else; that is exactly how the partial-lookup
+case (§13) looked broken after it had been fixed.
+
+`build.sh` now links every helper with `-Wl,-rpath,$PMIX_PREFIX/lib` so the
+binary finds the right PMIx regardless of environment. **Any new helper must
+carry that too.** To check one:
+
+```sh
+docker exec prte-node4 sh -c 'ldd /opt/prte/prte/bin/<helper> | grep pmix'
+# must say /opt/prte/pmix/lib, NOT /usr/local/lib
+```
+
+The daemons themselves are fine — `prted` is launched with the right
+environment and loads the volume's PMIx on every node. It is only the
+application processes they fork that lose it.

@@ -1384,6 +1384,221 @@ PRUN_BG() {
         prte-node1 bash -lc ". /opt/prte/env.sh;
             prun --dvm-uri file:$PRTED_URI $* > $outf 2>&1"
 }
+########################################################################
+# src/runtime -- the object model, the global registries, and the
+# publish/lookup data server.  Most of src/runtime is covered without a DVM
+# by test/unit/runtime; what lands here is what only exists between real
+# daemons.
+########################################################################
+# Absolute path, deliberately.  The node entrypoint symlinks the install bin
+# into /usr/local/bin when the CONTAINER starts, and an app launched into the
+# DVM inherits the daemon PATH -- which does not contain the install bindir.
+# So a helper added since the containers came up is not on the app PATH, and a
+# bare name fails with PMIX_ERR_JOB_FAILED_TO_LAUNCH and no diagnostic.
+DS=/opt/prte/prte/bin/dataserver
+# ...and the same for the slow stdin reader, for the same reason.
+SC=/opt/prte/prte/bin/slowcat
+
+test_runtime() {
+    local out n rc
+
+    banner "runtime/data_server: publish on one node, look it up from another"
+    # The store is a SINGLE pointer array living on the HNP.  Every client
+    # reaches it over the RML through its own daemon, so a publish on node2
+    # and a lookup on node3 is the only shape that exercises the real path:
+    # PMIx -> prted -> RML(PRTE_RML_TAG_DATA_SERVER) -> HNP -> ds_publish,
+    # and the reply back out through a DIFFERENT daemon.  On one node the
+    # whole thing collapses into the local PMIx server.
+    cleanup_swarm
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the data-server tests"
+    else
+        PRUN_BG /tmp/ds-pub.out "--host node2:1 -n 1 $DS publish prte.test.k1 hello session 90"
+        sleep 8
+        if ! RUN 'grep -q "^PUBLISHED prte.test.k1" /tmp/ds-pub.out'; then
+            bad "publisher never published: $(RUN 'cat /tmp/ds-pub.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        else
+            ok "a proc on node2 published into the HNP store"
+            out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.k1 20" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.k1 hello' \
+                && ok "a proc on node3 looked it up and got the value back" \
+                || bad "cross-node lookup failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            # ...and the answer names the publisher, which is the "data owner"
+            # field ds_publish packs ahead of every returned value
+            echo "$out" | grep -q 'from .*:0)' \
+                && ok "...and the reply carried the publisher's identity" \
+                || bad "the reply did not name the data owner: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+            banner "runtime/data_server: a key nobody published is NOT_FOUND, not a hang"
+            # A miss travels the same path and has to come back as a status.
+            # ds_lookup used to have exits that returned without sending
+            # anything AND without releasing the answer buffer.
+            out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.nosuchkey 15" 2>&1)
+            echo "$out" | grep -qE 'STATUS .*(NOT.FOUND|NOT_FOUND)' \
+                && ok "a missing key came back as not-found" \
+                || bad "a missing key did not report not-found: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+            banner "runtime/data_server: a partial lookup is reported as partial"
+            # Two keys, one published.  ds_lookup used to set
+            # PMIX_ERR_PARTIAL_SUCCESS and then fall straight through to
+            # "return rc" without sending anything, so the caller relayed a
+            # bare error, the values that HAD been found were dropped, and
+            # the buffer holding them leaked.  It now packs the status and
+            # the payload and sends them like any other answer.
+            #
+            # It takes BOTH halves of the round trip to be right, which is
+            # why this asserts on the value and not just the status.  The
+            # PMIx client used to discard the payload too - answering the
+            # lookup callback with (ret, NULL, 0) for any status that was not
+            # PMIX_SUCCESS, even though the layer immediately above it
+            # explicitly handles PMIX_ERR_PARTIAL_SUCCESS as data-carrying -
+            # so a correct server still produced an empty answer.  Needs a
+            # PMIx built from source (PMIX_SRC=... ./build.sh).
+            out=$(PRUN "--host node4:1 -n 1 $DS lookup2 prte.test.k1 prte.test.absent 15" 2>&1)
+            echo "$out" | grep -q 'STATUS PMIX_ERR_PARTIAL_SUCCESS' \
+                && ok "a half-satisfiable lookup came back as PARTIAL_SUCCESS" \
+                || bad "a partial lookup did not report itself as partial: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            echo "$out" | grep -q '^FOUND prte.test.k1 hello' \
+                && ok "...carrying the key that did exist, not an empty answer" \
+                || bad "a partial lookup lost the data it found: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            echo "$out" | grep -q '^FOUND prte.test.absent' \
+                && bad "a key nobody published was reported as found" \
+                || ok "...and the absent key was not invented"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "runtime/data_server: a waiting lookup is satisfied by a later publish"
+    # PMIX_WAIT parks the request on prte_data_store.pending until somebody
+    # publishes the key.  The publish arrives from one daemon and the reply
+    # goes back out through another, so the parked request has to carry the
+    # requestor's proxy and room number across the gap.  The park side also
+    # has to dispose of the answer buffer it was handed but will never send
+    # -- otherwise every waiting lookup leaks one on the HNP.
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the waiting-lookup test"
+    else
+        PRUN_BG /tmp/ds-wait.out "--host node3:1 -n 1 $DS lookupwait prte.test.later 60"
+        sleep 8
+        if ! RUN 'grep -q "^WAITING" /tmp/ds-wait.out'; then
+            skp "the waiting lookup never started; the next case is weaker"
+        else
+            ok "a lookup on node3 is parked waiting for a key"
+            # nothing may have been answered yet
+            RUN 'grep -q "^FOUND" /tmp/ds-wait.out' \
+                && bad "the parked lookup answered before anything was published" \
+                || ok "...and it has not been answered yet"
+        fi
+        PRUN_BG /tmp/ds-late.out "--host node2:1 -n 1 $DS publish prte.test.later worldwide session 40"
+        sleep 12
+        RUN 'grep -q "^FOUND prte.test.later worldwide" /tmp/ds-wait.out' \
+            && ok "the publish from node2 satisfied the lookup parked from node3" \
+            || bad "a parked lookup was never satisfied: $(RUN 'cat /tmp/ds-wait.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        # a fully-resolved parked request must report SUCCESS, not
+        # PARTIAL_SUCCESS: ds_publish derived that by counting req->keys,
+        # which by then holds only the keys still UNresolved (i.e. none), so
+        # a complete answer was reported as partial
+        RUN 'grep -qE "^STATUS SUCCESS|^STATUS .*(PMIX_SUCCESS)" /tmp/ds-wait.out' \
+            && ok "...and reported it as a complete, not partial, result" \
+            || bad "a fully satisfied lookup was reported as partial: $(RUN 'grep "^STATUS" /tmp/ds-wait.out' 2>&1 | tr -d '\r')"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "runtime/data_server: unpublish removes the data"
+    # Only the publisher may unpublish its own keys, so this runs in one
+    # process: publish, confirm, unpublish, confirm gone.
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2'; then
+        bad "could not start a DVM for the unpublish test"
+    else
+        out=$(PRUN "--host node2:1 -n 1 $DS unpublish prte.test.gone 15" 2>&1)
+        echo "$out" | grep -q '^FOUND prte.test.gone' \
+            && ok "the key was there before the unpublish" \
+            || bad "the key was never findable: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q '^UNPUBLISHED prte.test.gone' \
+            && ok "unpublish was accepted" \
+            || bad "unpublish was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        n=$(echo "$out" | grep -c '^FOUND prte.test.gone')
+        [ "$n" = 1 ] \
+            && ok "...and the key was gone afterwards" \
+            || bad "the key survived the unpublish (FOUND $n times)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "runtime/data_server: PMIX_RANGE_LOCAL data does not leave its node"
+    # A LOCAL-range publish is not sent to the HNP at all: the daemon routes
+    # it to its OWN data server instance (pmix_server_pub.c picks
+    # target = PRTE_PROC_MY_NAME for that range), so the item lives in the
+    # store of the daemon that relayed it.  A lookup has to carry the same
+    # range to be routed to the same place.
+    #
+    # That is the property worth asserting across nodes, and one host cannot
+    # show it: with a single daemon "the local store" and "the HNP store"
+    # are the same object, so LOCAL data confined to a node and LOCAL data
+    # leaking everywhere look identical.  (The proxy comparison in
+    # prte_data_server_check_range that backs this up - and that was reading
+    # an uninitialized field - is covered directly in test/unit/runtime.)
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2'; then
+        bad "could not start a DVM for the range test"
+    else
+        PRUN_BG /tmp/ds-loc.out "--host node2:1 -n 1 $DS publish prte.test.loc mine local 60"
+        sleep 8
+        if ! RUN 'grep -q "^PUBLISHED prte.test.loc" /tmp/ds-loc.out'; then
+            bad "the LOCAL-range publish never happened: $(RUN 'cat /tmp/ds-loc.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        else
+            ok "a LOCAL-range key was published from node2"
+            # a peer behind the SAME daemon may see it
+            out=$(PRUN "--host node2:1 -n 1 $DS lookup prte.test.loc 15 local" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.loc mine' \
+                && ok "a peer on the same node can see it" \
+                || bad "a LOCAL-range key was hidden from its own node: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            # ...and the same LOCAL-range lookup from another node reaches
+            # THAT node's daemon, which has never seen the key
+            out=$(PRUN "--host node3:1 -n 1 $DS lookup prte.test.loc 15 local" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.loc' \
+                && bad "a LOCAL-range key leaked to another node" \
+                || ok "a client on another node cannot see it, as LOCAL range requires"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "runtime: a DVM tears down cleanly with jobs and sessions built"
+    # The object destructors -- and the ownership rules they encode -- only
+    # run for real at teardown.  prte_session_t was registered against the
+    # wrong parent class, and the destructor that exposed it (an assert
+    # inside pmix_list_item_destruct reading the middle of the session's own
+    # data) fires only when a session is actually RELEASED.  Run some jobs,
+    # then take the DVM down and check it went quietly.
+    if ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the teardown test"
+    else
+        PRUN '--host node2:1,node3:1 -n 2 --map-by node hostname' >/dev/null 2>&1
+        PRUN '--host node4:2 -n 2 hostname' >/dev/null 2>&1
+        out=$(RUN 'timeout -k 5 30 pterm' 2>&1); rc=$?
+        [ "$rc" = 0 ] \
+            && ok "the DVM shut down cleanly after running jobs" \
+            || bad "pterm failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -qiE 'assert|signal|segmentation|abort' \
+            && bad "teardown produced a crash diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+            || ok "...with no assert or fault on the way out"
+        n=$(prted_count 1 2 3 4)
+        [ "$n" = 0 ] && ok "no daemons survived the teardown" \
+                     || bad "$n daemons still running after pterm"
+    fi
+    cleanup_swarm
+}
+
 test_prted() {
     local out rc ns n bpid
 
@@ -1477,10 +1692,12 @@ test_prted() {
         bad "could not start a DVM for the job-scoped signal test"
     else
         # SIGUSR1 is in the default forwarded-signal set (ess_base_frame.c),
-        # so no --forward-signals is needed -- and prun would reject it: the
-        # option is only in the prte/prterun tables.
-        PRUN_BG /tmp/jobA.out '--host node2:1 -n 1 sleep 120'
-        PRUN_BG /tmp/jobB.out '--host node2:1 -n 1 sleep 120'
+        # but name it explicitly: --forward-signals used to be documented in
+        # help-prun.txt and missing from prunoptions, so prun rejected the
+        # very option its own help advertised (issue #2569).  Naming the
+        # signal here keeps a live check on that path.
+        PRUN_BG /tmp/jobA.out '--forward-signals SIGUSR1 --host node2:1 -n 1 sleep 120'
+        PRUN_BG /tmp/jobB.out '--forward-signals SIGUSR1 --host node2:1 -n 1 sleep 120'
         sleep 10
         n=$(ON 2 'pgrep -c -x sleep' 2>/dev/null | tr -d ' \r')
         if [ "$n" = 2 ]; then
@@ -1539,6 +1756,147 @@ test_prted() {
 }
 
 ########################################################################
+# src/tools -- the executables themselves
+########################################################################
+#
+# The tools are main() around a library, so almost nothing in src/tools can
+# be unit tested (what could be is in test/unit/tools).  What is left is
+# behavior that only shows up when there is more than one node or more than
+# one DVM to be wrong about:
+#
+#   * prte-info describing the build that is actually installed on each node
+#     -- a swarm running a stale install on some nodes is otherwise a launch
+#     failure with no obvious cause
+#   * pterm picking the DVM it was told to pick, out of several, and leaving
+#     the others alone.  With one DVM every selector "works"
+#   * a rejected command line not being allowed to disturb a running DVM
+#   * an appfile spreading its app contexts over different nodes
+#   * a job's exit status coming back from a proc that ran somewhere else
+test_tools() {
+    local out rc n uri1 uri2 pid1 pid2
+
+    banner "tools: prte-info reports the same build on every node"
+    # Cheap, and it catches the single most confusing swarm failure: some
+    # nodes reading an older install out of the shared volume.
+    cleanup_swarm
+    # the version banner starts with a blank line - take the first line
+    # that has anything on it
+    out=$(RUN 'prte-info --version' 2>&1 | awk 'NF{print; exit}')
+    if [ -z "$out" ]; then
+        bad "prte-info produced no version on node1"
+    else
+        n=0
+        for i in $(seq 2 10); do
+            [ "$(ON "$i" 'prte-info --version' 2>/dev/null | awk 'NF{print; exit}')" = "$out" ] && n=$((n+1))
+        done
+        [ "$n" = 9 ] && ok "prte-info agrees on all 10 nodes ($out)" \
+                     || bad "prte-info version differs on $((9-n)) node(s); node1 says '$out'"
+    fi
+    # ...and it must not need a DVM, a socket, or an argument
+    RUN 'prte-info --all >/dev/null 2>&1'  && ok "prte-info --all runs with no DVM" \
+                                           || bad "prte-info --all failed with no DVM"
+    RUN 'prte-info bogusarg >/dev/null 2>&1'
+    rc=$?
+    [ "$rc" != 0 ] && ok "prte-info rejects a stray argument (rc=$rc)" \
+                   || bad "prte-info accepted a stray argument"
+
+    banner "tools: pterm --pid terminates the DVM it names and no other"
+    # Two DVMs on the same head node, each with daemons of its own.  This is
+    # the case that makes --pid mean anything -- and the case where a --pid
+    # that was silently ignored used to kill whichever DVM was found first.
+    cleanup_swarm
+    RUN "rm -f /tmp/dvm1.uri /tmp/dvm2.uri /tmp/dvm1.pid /tmp/dvm2.pid" >/dev/null 2>&1
+    RUN "timeout -k 5 60 prte --daemonize --report-uri /tmp/dvm1.uri \
+             --report-pid /tmp/dvm1.pid --host node1:2,node2:2" >/dev/null 2>&1
+    RUN "timeout -k 5 60 prte --daemonize --report-uri /tmp/dvm2.uri \
+             --report-pid /tmp/dvm2.pid --host node1:2,node3:2" >/dev/null 2>&1
+    sleep 5
+    pid1=$(RUN 'cat /tmp/dvm1.pid' 2>/dev/null | tr -d " \r")
+    pid2=$(RUN 'cat /tmp/dvm2.pid' 2>/dev/null | tr -d " \r")
+    if [ -z "$pid1" ] || [ -z "$pid2" ] || [ "$pid1" = "$pid2" ]; then
+        bad "could not start two distinguishable DVMs (pids '$pid1' '$pid2')"
+    else
+        ok "two DVMs are running (pids $pid1, $pid2)"
+
+        # a --pid that is not a PID at all must be refused, not acted on
+        RUN 'timeout -k 5 30 pterm --pid not-a-pid >/dev/null 2>&1'
+        rc=$?
+        n=$(RUN "kill -0 $pid1 2>/dev/null && echo up" | tr -d " \r")
+        if [ "$rc" != 0 ] && [ "$n" = up ]; then
+            ok "pterm rejects a malformed --pid and leaves both DVMs alone"
+        else
+            bad "pterm acted on a malformed --pid (rc=$rc, dvm1 '$n')"
+        fi
+
+        # ...and a real one, given through a file, must take down exactly
+        # the DVM it names
+        RUN "timeout -k 5 30 pterm --pid file:/tmp/dvm2.pid" >/dev/null 2>&1
+        sleep 3
+        n=$(RUN "kill -0 $pid2 2>/dev/null && echo up" | tr -d " \r")
+        [ -z "$n" ] && ok "pterm --pid file: terminated the DVM it named" \
+                    || bad "pterm --pid file: did not terminate DVM 2"
+        n=$(RUN "kill -0 $pid1 2>/dev/null && echo up" | tr -d " \r")
+        [ "$n" = up ] && ok "...and left the other DVM running" \
+                      || bad "pterm --pid file: took down the wrong DVM"
+
+        # the survivor must still be usable -- a DVM that lost its daemons
+        # to another DVM's pterm would still answer, so launch through it
+        out=$(RUN "timeout -k 5 60 prun --dvm-uri file:/tmp/dvm1.uri --host node2:1 -n 1 hostname" 2>&1)
+        echo "$out" | grep -q '^node2$' \
+            && ok "...and the survivor still launches on its own nodes" \
+            || bad "surviving DVM cannot launch: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        RUN "timeout -k 5 30 pterm --pid file:/tmp/dvm1.pid" >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "tools: a rejected command line does not disturb the DVM"
+    # Every tool must be able to say no without taking the runtime with it.
+    # A prun that fails to parse used to be able to drive a phantom job
+    # through the state machine of the HNP.
+    if ! prted_dvm_start 'node1:2,node2:2,node3:2'; then
+        bad "could not start a DVM for the bad-command-line test"
+    else
+        RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --no-such-option hostname" >/dev/null 2>&1
+        RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --map-by no-such-policy hostname" >/dev/null 2>&1
+        RUN "timeout -k 5 30 pterm --dvm-uri file:$PRTED_URI no-such-argument" >/dev/null 2>&1
+        RUN "timeout -k 5 30 prte-info no-such-argument" >/dev/null 2>&1
+        # everything above should have been refused; the DVM must still work
+        out=$(PRUN '--host node3:1 -n 1 hostname' 2>&1)
+        echo "$out" | grep -q '^node3$' \
+            && ok "the DVM survived four rejected command lines" \
+            || bad "a rejected command line disturbed the DVM: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+        banner "tools: an appfile spreads its app contexts across nodes"
+        # --app is read by prun after its own command line has been parsed,
+        # and each line becomes a separate app context.  One node cannot tell
+        # a working appfile from one that collapsed into a single app.
+        RUN "printf -- '--host node2:1 -n 1 hostname\n--host node3:1 -n 1 hostname\n' > /tmp/appfile" >/dev/null 2>&1
+        out=$(PRUN '--app /tmp/appfile' 2>&1)
+        n=$(echo "$out" | grep -cE '^node[23]$')
+        if [ "$n" = 2 ] && echo "$out" | grep -q '^node2$' && echo "$out" | grep -q '^node3$'; then
+            ok "the appfile ran one app context on each named node"
+        else
+            bad "appfile did not spread over both nodes: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        fi
+
+        banner "tools: the exit status of a remote proc reaches prun"
+        # The status has to travel proc -> its daemon -> HNP -> prun.  On one
+        # node that whole chain is inside a single process.
+        PRUN '--host node3:1 -n 1 false' >/dev/null 2>&1
+        rc=$?
+        [ "$rc" != 0 ] && ok "a failing remote proc gives prun a non-zero status (rc=$rc)" \
+                       || bad "prun reported success for a proc that exited non-zero"
+        PRUN '--host node3:1 -n 1 true' >/dev/null 2>&1
+        rc=$?
+        [ "$rc" = 0 ] && ok "...and a succeeding one gives zero" \
+                      || bad "prun reported failure (rc=$rc) for a proc that exited 0"
+
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+}
+
+########################################################################
 # src/rml -- routing tree, relay, and the TCP transport
 ########################################################################
 #
@@ -1560,6 +1918,365 @@ test_prted() {
 #   * interface selection actually binding and connecting, not just parsing
 #   * a daemon dying under a live DVM, which is what prte_rml_route_lost and
 #     the peer teardown exist for
+test_util() {
+    local out n rc c hf
+
+    # src/util is a library of helpers, so almost all of it is pinned down by
+    # test/unit/util. What that test CANNOT reach is the multi-node meaning of
+    # the two parsers: a hostfile or a -host list is a statement about a set of
+    # machines, and every defect below was a defect in which machines came out
+    # of it. With one node in the pool they all look correct.
+
+    banner "util: -host slot specifications do not leak between tokens"
+    # "nodeA:*,nodeB" - the auto-detect marker on the first token used to
+    # carry over to the second, which read it as "this node has no slots",
+    # so nodeB was allocated zero. Two nodes are the minimum to see it.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:*,node3 -n 2 --map-by node hostname' 2>&1)
+    if echo "$out" | grep -q '^node3$'; then
+        ok "a plain host following a ':*' host still got its slot"
+    else
+        bad "':*' on the first -host token starved the second: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    cleanup_swarm
+
+    banner "util: -host tokens after a '+e:N' are not dropped"
+    # parse_dash_host() scanned the node pool with the SAME loop index it was
+    # using to walk the comma-separated tokens, so it came back with that
+    # index past the end and every token after a "+e:N" was silently
+    # discarded. Needs a DVM whose pool is bigger than the request.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --host node1:1,node2:1,node3:1,node4:1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        # one empty node plus an explicitly named one: the named node must
+        # appear, which it cannot if the token was thrown away
+        out=$(RUN 'timeout 30 prun --host +e:1,node4 -n 2 --map-by node hostname' 2>&1)
+        if echo "$out" | grep -q '^node4$'; then
+            ok "an explicit host named after '+e:1' was honored"
+        else
+            bad "the token after '+e:1' was dropped: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the '+e:N' token test"
+    fi
+    cleanup_swarm
+
+    banner "util: a hostfile '^host' line excludes that host"
+    # The exclusion syntax has always been implemented in hostfile.c, and the
+    # lexer has always rejected it: the '^' was only allowed on the
+    # "user@host" form, so a bare "^node3" fell through to the catch-all and
+    # the WHOLE hostfile was refused as a parse error. Both halves show here -
+    # the file has to parse at all, and node3 must not be in the result.
+    cleanup_swarm
+    hf=/tmp/util_exclude.txt
+    RUN "printf 'node2 slots=1\nnode3 slots=1\nnode4 slots=1\n^node3\n' > $hf"
+    out=$(RUN "timeout 90 prterun --hostfile $hf -n 2 --map-by node hostname" 2>&1)
+    rc=$?
+    if [ "$rc" != 0 ] || echo "$out" | grep -qi 'parse error'; then
+        bad "a hostfile with a '^host' line was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    else
+        ok "a hostfile with a '^host' line parses"
+        if echo "$out" | grep -q '^node3$'; then
+            bad "the excluded host was used anyway: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        else
+            ok "the excluded host was not used"
+        fi
+        n=$(echo "$out" | grep -cE '^node[24]$')
+        [ "$n" = 2 ] && ok "both remaining hosts were used" \
+                     || bad "$n/2 procs landed on the remaining hosts: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    RUN "rm -f $hf" >/dev/null 2>&1
+    cleanup_swarm
+
+    banner "util: a hostfile parse error does not poison the next parse"
+    # The parser's FILE* and flex buffer are process globals, and the error
+    # path used to skip both the fclose() and the lex_destroy(). A prterun
+    # that reads a bad hostfile and then a good one is the shortest way to
+    # see it: the second parse resumed inside the first.
+    cleanup_swarm
+    RUN "printf 'node2 slots=notanumber\n' > /tmp/util_bad.txt"
+    RUN "printf 'node2 slots=2\nnode3 slots=2\n' > /tmp/util_good.txt"
+    RUN 'timeout 60 prterun --hostfile /tmp/util_bad.txt -n 1 hostname' >/dev/null 2>&1
+    rc=$?
+    [ "$rc" != 0 ] && ok "a malformed hostfile is refused (rc=$rc)" \
+                   || bad "a malformed hostfile was accepted"
+    out=$(RUN 'timeout 90 prterun --hostfile /tmp/util_good.txt -n 4 --map-by node hostname' 2>&1)
+    c=$(echo "$out" | grep -cE '^node[23]$')
+    [ "$c" = 4 ] && ok "the next hostfile parsed correctly after the failure" \
+                 || bad "the parse after a failed one produced $c/4 procs: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    RUN 'rm -f /tmp/util_bad.txt /tmp/util_good.txt' >/dev/null 2>&1
+    cleanup_swarm
+
+    banner "util: node names are compared by content, not by length"
+    # prte_util_compare_name_fields() compared namespaces by LENGTH, so two
+    # jobs of the same DVM ("<dvm>@1" and "<dvm>@2") had identical names as
+    # far as it was concerned. iof/prted uses it to find the proc whose
+    # output it is holding, so two concurrent jobs on the same node is the
+    # case that shows it: each job's output must carry its own tag.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --host node2:2,node3:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        # two jobs at once, each tagging its output with its own namespace
+        out=$(RUN 'timeout 60 sh -c "
+                  prun --tag-output -n 2 echo JOBA > /tmp/a.out 2>&1 &
+                  prun --tag-output -n 2 echo JOBB > /tmp/b.out 2>&1 &
+                  wait; cat /tmp/a.out /tmp/b.out"' 2>&1)
+        n=$(echo "$out" | grep -c 'JOBA')
+        c=$(echo "$out" | grep -c 'JOBB')
+        if [ "$n" = 2 ] && [ "$c" = 2 ]; then
+            ok "two concurrent jobs each got their own output back"
+        else
+            bad "concurrent job output crossed over (JOBA=$n JOBB=$c): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        # ...and the tags name two DIFFERENT namespaces
+        # This also guards an IOF race that only two concurrent jobs expose.
+        # A tool parses its spawn's --output directives before the request
+        # goes out, but could only record them against the namespace once the
+        # reply named it - so output from a proc that wrote and exited before
+        # the reply arrived had nowhere to look for its format and came out
+        # UNTAGGED. One prun almost always wins that race; two contending for
+        # the same HNP did not, and this assertion failed about one run in
+        # three. See pmix_globals.spawn_iof_flags.
+        n=$(echo "$out" | sed -n 's/^\[\([^,]*\),.*/\1/p' | sort -u | wc -l | tr -d ' ')
+        [ "$n" = 2 ] && ok "the two jobs are distinguishable by namespace" \
+                     || bad "the two jobs' output carried $n distinct namespace tag(s)"
+        n=$(echo "$out" | grep -cE '^JOB[AB]$')
+        [ "$n" = 0 ] && ok "every line was tagged" \
+                     || bad "$n line(s) came back untagged"
+        RUN 'rm -f /tmp/a.out /tmp/b.out' >/dev/null 2>&1
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the concurrent-job test"
+    fi
+    cleanup_swarm
+
+    banner "util: an unrecognized system limit is refused, not applied as zero"
+    # prte_setlimit() fed a non-numeric value to strtol(), got zero, and
+    # LOWERED the limit to it -- a daemon that cannot open a file. Refusing
+    # the request has to happen before any daemon is launched.
+    cleanup_swarm
+    RUN 'timeout 60 prterun --prtemca prte_set_max_sys_limits openfiles:many \
+             -n 1 hostname' >/dev/null 2>&1
+    rc=$?
+    [ "$rc" != 0 ] && ok "a non-numeric system limit is refused (rc=$rc)" \
+                   || bad "a non-numeric system limit was accepted"
+    # ...while a real one still works and does not stop the launch
+    out=$(RUN 'timeout 90 prterun --prtemca prte_set_max_sys_limits openfiles:max \
+                   --host node2:1,node3:1 -n 2 --map-by node hostname' 2>&1)
+    n=$(echo "$out" | grep -cE '^node[23]$')
+    [ "$n" = 2 ] && ok "a valid system limit is applied and the launch proceeds" \
+                 || bad "a valid system limit broke the launch: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    cleanup_swarm
+}
+
+test_hwloc() {
+    local out rc n c bad_cores
+
+    # src/hwloc is a library of pure functions over a topology, so nearly all
+    # of it is pinned down by test/unit/hwloc against synthetic topologies.
+    # What that test cannot reach is the case PRRTE actually runs in: the
+    # topology being rendered or queried arrived from ANOTHER machine, as XML
+    # over the wire, and lives in the HNP alongside nine others. Every case
+    # below is a defect that only shows there.
+    #
+    # These containers are the right shape for it on purpose: 8 cores, one
+    # package, no SMT, and no NUMA node in sysfs.
+
+    banner "hwloc: a remote node's binding is rendered from its own topology"
+    # cset2str() runs in the HNP against the topology the daemon shipped it,
+    # not against the HNP's own. Its package loop dereferenced each package
+    # object unchecked, and the range builder it calls appended to a 2048-byte
+    # stack buffer with memcpy() and no bound. A proc on a remote node is the
+    # only way to exercise that path with a topology the HNP did not sense.
+    # --display map (not --display bind): the map is rendered BY THE HNP from
+    # the topology each daemon shipped it, which is the path under test. The
+    # per-rank "Rank N bound to" line comes from the daemon's own stderr and
+    # is not forwarded here.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:2,node3:2 -n 4 --map-by node \
+                   --bind-to core --display map hostname' 2>&1)
+    n=$(echo "$out" | grep -cE 'Process rank: [0-9]+ Bound: package\[[0-9]+\]\[core:L')
+    [ "$n" = 4 ] && ok "all 4 remote ranks rendered a package/core binding" \
+                 || bad "$n/4 remote ranks rendered a binding: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # ...and the renders are not a constant - bind-to core gives each rank on
+    # a node its own core
+    c=$(echo "$out" | sed -n 's/.*\[core:L\([0-9-]*\)\].*/\1/p' | sort -u | wc -l | tr -d ' ')
+    [ "$c" -ge 2 ] && ok "the rendered cores differ between ranks" \
+                   || bad "every rank rendered the same core ($c distinct)"
+    cleanup_swarm
+
+    banner "hwloc: a wide binding renders without corrupting the HNP's heap"
+    # THE overflow. prte_hwloc_get_binding_info() writes one
+    # "<core>N</core>\n" element per bound core, each 20 spaces of indent plus
+    # ~14 characters, into a buffer its caller sizes at 20 bytes PER PU. The
+    # element loop advanced its write pointer through a run of set bits without
+    # ever charging those bytes against the budget it handed snprintf, so a
+    # process bound to more than about half the cores wrote past the end.
+    #
+    # These nodes have 8 cores and no SMT, so "--bind-to package" is exactly
+    # that shape: 8 elements (~270 bytes) into 160 bytes. The corruption lands
+    # in the HNP, which is holding every node's topology, so the failure is a
+    # crash somewhere unrelated - which is why this asserts on the whole run
+    # completing as well as on the output.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:1,node3:1 -n 2 --map-by node \
+                   --bind-to package --display map:parseable hostname' 2>&1)
+    rc=$?
+    [ "$rc" = 0 ] && ok "a package-wide binding on 2 nodes completed (rc=0)" \
+                  || bad "a package-wide binding run failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # every core of both nodes has to appear, 8 per rank
+    n=$(echo "$out" | grep -cE '<core>[0-9]+</core>')
+    [ "$n" = 16 ] && ok "all 16 bound cores were rendered (8 per rank)" \
+                  || bad "$n/16 <core> elements were rendered: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # the package id is computed, not left as whatever was on the stack
+    bad_cores=$(echo "$out" | sed -n 's/.*<package id="\(-\?[0-9]*\)">.*/\1/p' \
+                | grep -vcE '^[0-9]$' || true)
+    [ "$bad_cores" = 0 ] && ok "every rendered package id is a small non-negative number" \
+                         || bad "$bad_cores rendered package id(s) were not plausible: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # ...and the XML is still well formed, which it is not once the writes run
+    # off the end of the element buffer
+    n=$(echo "$out" | grep -c '</binding>')
+    c=$(echo "$out" | grep -c '<binding>')
+    [ "$n" = "$c" ] && [ "$n" = 2 ] && ok "the parseable map is balanced (2 bindings)" \
+                                    || bad "parseable map is malformed (<binding>=$c </binding>=$n)"
+    cleanup_swarm
+
+    banner "hwloc: --map-by numa works against topologies the HNP never sensed"
+    # The NUMA count and lookup both read a cutoff cached on the topology's
+    # root, and used to answer "this node has no NUMA domains" whenever that
+    # cache had not been built yet - a silent zero that a map-by numa job
+    # believes, so it places nothing. The HNP's OWN topology always has the
+    # cache (it is built when the topology is sensed); a topology that arrived
+    # from a daemon only has it if someone remembered, which is the case that
+    # can regress.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:2,node3:2,node4:2 -n 3 \
+                   --map-by numa hostname' 2>&1)
+    n=$(echo "$out" | grep -cE '^node[234]$')
+    [ "$n" = 3 ] && ok "map-by numa placed all 3 procs across the remote nodes" \
+                 || bad "map-by numa placed $n/3 procs: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    cleanup_swarm
+
+    banner "hwloc: a DVM cpu-set constrains every node, not just the first"
+    # filter_cpus() expands the DVM's cpu-set against each node's topology in
+    # turn, and REWRITES the process-wide list with the expansion as it goes.
+    # One node cannot show whether the second node got the same answer.
+    cleanup_swarm
+    # The cpu-set is written as a RANGE ("0-1") on purpose. PMIx's
+    # command-line parser used to reject any MCA value whose second character
+    # was a dash as "not-enough-arguments", so this exact spelling was
+    # unusable; it is the regression test for that fix as much as for the
+    # per-node expansion. Bind to core: that is the level at which a cpu-set
+    # is honored today (see the note at the end of this case).
+    out=$(RUN 'timeout 90 prterun --prtemca hwloc_default_cpu_list 0-1 \
+                   --host node2:2,node3:2,node4:2 -n 6 --map-by node \
+                   --bind-to core --display map hostname' 2>&1)
+    rc=$?
+    if echo "$out" | grep -q 'not-enough-arguments'; then
+        skp "this PMIx predates the command-line fix for dash-bearing MCA values (pmix_cmd_line.c) -- rebuild the image or build with PMIX_SRC"
+    elif [ "$rc" != 0 ]; then
+        bad "a DVM cpu-set run failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    else
+        ok "a DVM cpu-set given as a range was accepted and applied"
+        # the expansion is reported back in the map header
+        echo "$out" | grep -q 'Cpu set: *0,1' \
+            && ok "the range was expanded to the individual cpus" \
+            || bad "the cpu-set header did not show the expansion: $(echo "$out" | grep -m1 'Cpu set:')"
+        # Every rank on every node must be inside the set. Match the WHOLE
+        # bracketed site list, not just its first number: a rank bound to
+        # "core:L0-7" starts with a 0 and would sail past a looser pattern.
+        bad_cores=$(echo "$out" | sed -n 's/.*\[core:L\([0-9,-]*\)\].*/\1/p' \
+                    | grep -vcE '^(0|1|0-1)$' || true)
+        [ "$bad_cores" = 0 ] && ok "no rank was bound outside the cpu-set on any node" \
+                             || bad "$bad_cores rank(s) were bound outside cores 0-1: $(echo "$out" | grep -o '\[core:L[0-9,-]*\]' | tr '\n' ' ')"
+        n=$(echo "$out" | grep -c 'Bound: package')
+        [ "$n" = 6 ] && ok "all 6 ranks reported a binding" \
+                     || bad "$n/6 ranks reported a binding"
+    fi
+    # ...and the same must hold when binding to an object WIDER than a core.
+    # A rank bound to a package used to come back owning every core of it,
+    # cpu-set or no cpu-set - the constraint was honored at the core level
+    # only, which is the one level that made the defect invisible. The
+    # documented intent is the cpu_list comment in src/hwloc/hwloc.c.
+    out=$(RUN 'timeout 90 prterun --prtemca hwloc_default_cpu_list 0-1 \
+                   --host node2:2,node3:2 -n 4 --map-by node \
+                   --bind-to package --display map hostname' 2>&1)
+    rc=$?
+    if echo "$out" | grep -q 'not-enough-arguments'; then
+        skp "package binding under a cpu-set: PMIx predates the command-line fix"
+    elif [ "$rc" != 0 ]; then
+        bad "package binding under a cpu-set failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    else
+        ok "a package-wide binding under a cpu-set completed"
+        bad_cores=$(echo "$out" | sed -n 's/.*\[core:L\([0-9,-]*\)\].*/\1/p' \
+                    | grep -vcE '^0-1$' || true)
+        [ "$bad_cores" = 0 ] \
+            && ok "a package-wide binding is confined to the cpu-set" \
+            || bad "$bad_cores rank(s) got cores outside the cpu-set: $(echo "$out" | grep -o '\[core:L[0-9,-]*\]' | tr '\n' ' ')"
+        n=$(echo "$out" | grep -c 'Bound: package')
+        [ "$n" = 4 ] && ok "all 4 ranks reported a package binding" \
+                     || bad "$n/4 ranks reported a binding"
+    fi
+    cleanup_swarm
+
+    banner "hwloc: a malformed cpu-set is refused before anything launches"
+    # The cpu ids went through a bare strtoul(), which reports 0 for "foo" -
+    # so a typo did not fail, it confined the ENTIRE DVM to cpu 0 on every
+    # node. Refusing it has to happen before any daemon is launched, and the
+    # message has to name the offending entry.
+    cleanup_swarm
+    out=$(RUN 'timeout 60 prterun --prtemca hwloc_default_cpu_list 0,foo \
+                   --host node2:1,node3:1 -n 2 hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && ok "a non-numeric cpu-set entry is refused (rc=$rc)" \
+                   || bad "a non-numeric cpu-set entry was accepted"
+    echo "$out" | grep -q 'could not be resolved' \
+        && ok "the refusal names the unresolvable entry" \
+        || bad "no cpu-set diagnostic was printed: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    echo "$out" | grep -qE '^node[23]$' \
+        && bad "procs launched anyway on a refused cpu-set" \
+        || ok "nothing was launched"
+    # ...and it is a REFUSAL, not a crash. The unresolved cpu-set came back as
+    # a NULL cpuset and nothing between here and the mapper checked it, so the
+    # diagnostic was followed by a segfault in the HNP inside hwloc.
+    echo "$out" | grep -qE 'Segmentation fault|Bus error|signal' \
+        && bad "the HNP crashed after refusing the cpu-set: $(echo "$out" | tr '\n' ' ' | tail -c 300)" \
+        || ok "the refusal did not take the HNP down"
+    # an id past the end of the topology is the same class of mistake
+    out=$(RUN 'timeout 60 prterun --prtemca hwloc_default_cpu_list 0,99 \
+                   --host node2:1 -n 1 hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && ok "a cpu-set naming cpus the node does not have is refused (rc=$rc)" \
+                   || bad "a cpu-set of 0,99 was accepted on an 8-core node"
+    echo "$out" | grep -qE 'Segmentation fault|Bus error|signal' \
+        && bad "the HNP crashed on an out-of-range cpu-set: $(echo "$out" | tr '\n' ' ' | tail -c 300)" \
+        || ok "an out-of-range cpu-set did not take the HNP down"
+    cleanup_swarm
+
+    banner "hwloc: every node's topology can be printed"
+    # --display topo runs prte_hwloc_print() over each node's topology in the
+    # HNP. It rendered each object's cpuset into a 1024-byte buffer while
+    # telling hwloc the buffer was 2048 - a stack overflow waiting for a wide
+    # enough machine. These nodes are not wide enough to trip it, but the
+    # traversal is exercised here for all of them at once, which is the only
+    # place it runs against more than one topology.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:1,node3:1,node4:1 -n 3 \
+                   --map-by node --display topo hostname' 2>&1)
+    rc=$?
+    [ "$rc" = 0 ] && ok "--display topo completed for 3 nodes (rc=0)" \
+                  || bad "--display topo failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    n=$(echo "$out" | grep -c 'Type: Machine')
+    [ "$n" -ge 1 ] && ok "at least one machine-level topology was rendered ($n)" \
+                   || bad "no topology was rendered: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # a rendered cpuset has to be intact, not truncated mid-word
+    echo "$out" | grep -q 'Cpuset:  0x' \
+        && ok "object cpusets were rendered" \
+        || bad "no cpuset was rendered in the topology dump"
+    cleanup_swarm
+}
+
 test_rml() {
     local out rc n c
 
@@ -1760,6 +2477,28 @@ test_linux() {
         return
     fi
 
+    # ...and the same question about the CONTAINERS. They are long-lived, so a
+    # rebuilt image (which is how the baked PMIx gets updated) does not reach
+    # them until they are recreated.  build.sh then compiles PRRTE against the
+    # NEW image's PMIx while the daemons run the old one, and the symptom is an
+    # undefined symbol from libprrte in whichever test first uses a new PMIx
+    # entry point -- nothing points at the container.
+    banner "preflight: containers are running the current image"
+    imgid=$(docker images --no-trunc --format '{{.ID}}' "$IMAGE" 2>/dev/null | head -1)
+    stalenodes=""
+    for imgn in $(seq 1 10); do
+        cimg=$(docker inspect "prte-node$imgn" --format '{{.Image}}' 2>/dev/null)
+        [ "$cimg" = "$imgid" ] || stalenodes="$stalenodes node$imgn"
+    done
+    if [ -z "$stalenodes" ]; then
+        ok "all 10 containers are on the current $IMAGE"
+    else
+        bad "containers predate $IMAGE:$stalenodes"
+        echo "     Recreate them: docker compose up -d --force-recreate" >&2
+        echo "     (from contrib/dockerswarm, so the pinned project name applies)" >&2
+        return
+    fi
+
     banner "prterun (non-elastic, one-shot) -- local"
     out=$(RUN 'prterun -np 4 hostname'); rc=$?
     [ "$rc" = 0 ] && [ "$(echo "$out" | grep -c node1)" = 4 ] \
@@ -1860,7 +2599,50 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
             && ok "wildcard stdin (--stdin all) reached the HNP-local and the remote proc" \
             || bad "wildcard stdin reached $n/2 procs (rc=$rc): $(echo "$out" | tr '\n' ' ')"
 
-        RUN 'rm -f /tmp/iof_stdin_in.txt /tmp/iof_stdin_out.txt /tmp/iof_stdin_err.txt' >/dev/null 2>&1
+        # Same wire, different consumer: a proc that reads its stdin SLOWLY.
+        # "cat" above drains the pipe as fast as the daemon can fill it, so
+        # the daemon non-blocking write(2) nearly always completes in full and
+        # the short-write path is never taken -- which is why a 256 KB "cat"
+        # test passed for years while piping a large file into a real
+        # application corrupted it (issue #2579).  slowcat keeps the pipe
+        # saturated, so once the input passes the pipe capacity (64 KB on
+        # Linux) essentially every write the daemon attempts is partial.
+        #
+        # The failure mode is DUPLICATION, not loss: re-basing the queued
+        # chunk data without also decrementing its count left the tail of the
+        # chunk holding bytes that had already gone out, and each retry sent
+        # them again -- the reporter measured a 2,064-line input arriving as
+        # 1,089,247 lines.  So the assertion is on the byte count first: the
+        # app must receive exactly what was piped in, no more.
+        insum=$(RUN 'md5sum < /tmp/iof_stdin_in.txt' | awk '{print $1}')
+        insz=$(RUN 'wc -c < /tmp/iof_stdin_in.txt' | tr -d ' ')
+        out=$(RUN 'cd /tmp && timeout 180 prun --host node2:1 -n 1 \
+                     '"$SC"' /tmp/iof_slow_out.txt 256 1000 < iof_stdin_in.txt \
+                     2>iof_slow_err.txt; echo "rc=$?"')
+        rc=$(echo "$out" | sed -n 's/^rc=//p')
+        got=$(echo "$out" | sed -n 's/^SLOWCAT-BYTES //p')
+        outsum=$(ON 2 'md5sum < /tmp/iof_slow_out.txt 2>/dev/null' | awk '{print $1}')
+        [ "$rc" = 0 ] && [ -n "$got" ] && [ "$got" = "$insz" ] && [ "$insum" = "$outsum" ] \
+            && ok "large stdin ($insz bytes) survived a SLOW remote reader (short writes)" \
+            || bad "slow-reader stdin corrupted (rc=$rc, sent=$insz received=$got, md5 $insum vs $outsum): $(RUN 'head -c 200 /tmp/iof_slow_err.txt')"
+        ON 2 'rm -f /tmp/iof_slow_out.txt' >/dev/null 2>&1
+
+        # And the same slow reader on the HNP node, where push_stdin writes
+        # into the proc sink directly instead of going out over the RML: the
+        # HNP and the daemon carry separate copies of the write handler, so a
+        # short-write fix in one says nothing about the other.
+        out=$(RUN 'cd /tmp && timeout 180 prun --host node1:1 -n 1 \
+                     '"$SC"' /tmp/iof_slow_out.txt 256 1000 < iof_stdin_in.txt \
+                     2>iof_slow_err.txt; echo "rc=$?"')
+        rc=$(echo "$out" | sed -n 's/^rc=//p')
+        got=$(echo "$out" | sed -n 's/^SLOWCAT-BYTES //p')
+        outsum=$(RUN 'md5sum < /tmp/iof_slow_out.txt 2>/dev/null' | awk '{print $1}')
+        [ "$rc" = 0 ] && [ -n "$got" ] && [ "$got" = "$insz" ] && [ "$insum" = "$outsum" ] \
+            && ok "large stdin ($insz bytes) survived a SLOW HNP-local reader (short writes)" \
+            || bad "slow-reader stdin corrupted on the HNP (rc=$rc, sent=$insz received=$got, md5 $insum vs $outsum): $(RUN 'head -c 200 /tmp/iof_slow_err.txt')"
+
+        RUN 'rm -f /tmp/iof_stdin_in.txt /tmp/iof_stdin_out.txt /tmp/iof_stdin_err.txt \
+                   /tmp/iof_slow_out.txt /tmp/iof_slow_err.txt' >/dev/null 2>&1
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     else
         bad "could not start a DVM for the stdin tests"
@@ -2275,6 +3057,14 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     test_state
 
     test_prted
+
+    test_tools
+
+    test_util
+
+    test_hwloc
+
+    test_runtime
 
     test_rml
 

@@ -94,9 +94,6 @@ option to the help request as "--help <option>".
 |                      | include "NOCOPY" (do not copy the output to   |
 |                      | the stdout/stderr streams).                   |
 +----------------------+-----------------------------------------------+
-| "--report-child-     | Return the exit status of the primary job     |
-| jobs-separately"     | only                                          |
-+----------------------+-----------------------------------------------+
 | "--xterm <ranks>"    | Create a new xterm window and display output  |
 |                      | from the specified ranks there                |
 +----------------------+-----------------------------------------------+
@@ -163,11 +160,6 @@ option to the help request as "--help <option>".
 |                      | context is specified ("key" is the parameter  |
 |                      | name; "value" is the parameter value)         |
 +----------------------+-----------------------------------------------+
-| "--gpmixmca <key>    | Pass global PMIx MCA parameters that are      |
-| <value>"             | applicable to all contexts ("key" is the      |
-|                      | parameter name; "value" is the parameter      |
-|                      | value)                                        |
-+----------------------+-----------------------------------------------+
 | "--app-pmix-prefix <dir>" | Prefix to be used by app procs to look   |
 |                      | for their PMIx installation on remote nodes.  |
 |                      | This is the location of the top-level         |
@@ -199,9 +191,6 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 | "--set-cwd-to-       | Set the working directory of the started      |
 | session-dir"         | processes to their session directory          |
-+----------------------+-----------------------------------------------+
-| "--show-progress"    | Output a brief periodic report on launch      |
-|                      | progress                                      |
 +----------------------+-----------------------------------------------+
 | "--wd <dir>"         | Synonym for "--wdir"                          |
 +----------------------+-----------------------------------------------+
@@ -266,8 +255,6 @@ option to the help request as "--help <option>".
 | "--system-server-    | Connect only to a system-level server         |
 | only"                |                                               |
 +----------------------+-----------------------------------------------+
-| "--tmpdir <dir>"     | Set the root for the session directory tree   |
-+----------------------+-----------------------------------------------+
 | "--wait-to-connect   | Delay specified number of seconds before      |
 | <seconds>`"          | trying to connect                             |
 +----------------------+-----------------------------------------------+
@@ -286,15 +273,15 @@ option to the help request as "--help <option>".
 | "--allow-run-as-     | Allow execution as root (**STRONGLY           |
 | root"                | DISCOURAGED**)                                |
 +----------------------+-----------------------------------------------+
-| "--forward-signals   | Comma-delimited list of additional signals    |
-| <signals>"           | (names or integers) to forward to application |
-|                      | processes ["none" => forward nothing].        |
-|                      | Signals provided by default include           |
+| "--forward-signals   | Comma-delimited list of the signals (names or |
+| <signals>"           | integers) to be forwarded to application      |
+|                      | processes, replacing the default set ["none"  |
+|                      | => forward nothing]. The default set is       |
 |                      | "SIGTSTP", "SIGUSR1", "SIGUSR2", "SIGABRT",   |
 |                      | "SIGALRM", and "SIGCONT"                      |
 +----------------------+-----------------------------------------------+
 
-Report bugs to %s
+%s
 #
 [dvm-uri]
 
@@ -321,13 +308,6 @@ First look for a system server and connect to it if found
 [system-server-only]
 
 Connect only to a system-level server - abort if one is not found
-#
-[tmpdir]
-
-Define the root location for the PRRTE session directory tree
-
-See the "Session directory" HTML documentation for additional details
-about the PRRTE session directory.
 #
 [wait-to-connect]
 
@@ -397,6 +377,13 @@ Printout PID on stdout [-], stderr [+], or a file [anything else]
 [report-uri]
 
 Printout URI on stdout [-], stderr [+], or a file [anything else]
+#
+[forward-signals]
+
+Comma-delimited list of the signals (names or integers) to be forwarded
+to application processes ("none" = forward nothing). The list replaces
+the default set, which is SIGTSTP, SIGUSR1, SIGUSR2, SIGABRT, SIGALRM,
+and SIGCONT.
 #
 [map-by]
 
@@ -711,51 +698,51 @@ error on node %s. More information may be available above.
 #
 [prun:ompi-server-filename-bad]
 
-%s was unable to parse the filename where contact info for the prte-
+%s was unable to parse the filename where contact info for the pubsub-
 server was to be found. The option we were given was:
 
-   --prte-server %s
+   --pubsub-server %s
 
 This appears to be missing the required ':' following the keyword
 "file". Please remember that the correct format for this command line
 option is:
 
-   --prte-server file:path-to-file
+   --pubsub-server file:path-to-file
 
 where path-to-file can be either relative to the cwd or absolute.
 #
 [prun:ompi-server-filename-missing]
 
-%s was unable to parse the filename where contact info for the prte-
+%s was unable to parse the filename where contact info for the pubsub-
 server was to be found. The option we were given was:
 
-   --prte-server %s
+   --pubsub-server %s
 
 This appears to be missing a filename following the ':'. Please
 remember that the correct format for this command line option is:
 
-   --prte-server file:path-to-file
+   --pubsub-server file:path-to-file
 
 where path-to-file can be either relative to the cwd or absolute.
 #
 [prun:ompi-server-filename-access]
 
-%s was unable to access the filename where contact info for the prte-
+%s was unable to access the filename where contact info for the pubsub-
 server was to be found. The option we were given was:
 
-   --prte-server %s
+   --pubsub-server %s
 
 Please remember that the correct format for this command line option
 is:
 
-   --prte-server file:path-to-file
+   --pubsub-server file:path-to-file
 
 where path-to-file can be either relative to the cwd or absolute, and
 that you must have read access permissions to that file.
 #
 [prun:ompi-server-file-bad]
 
-%s was unable to read the prte-server's contact info from the given
+%s was unable to read the pubsub-server's contact info from the given
 filename. The filename we were given was:
 
 FILE: %s
@@ -763,13 +750,13 @@ FILE: %s
 Please remember that the correct format for this command line option
 is:
 
---prte-server file:path-to-file
+--pubsub-server file:path-to-file
 
 where path-to-file can be either relative to the cwd or absolute, and
 that the file must have a single line in it that contains the PRTE uri
-for the prte-server. Note that this is *not* a standard uri, but a
+for the pubsub-server. Note that this is *not* a standard uri, but a
 special format used internally by PRTE for communications. It can best
-be generated by simply directing the prte-server to put its uri in a
+be generated by simply directing the pubsub-server to put its uri in a
 file, and then giving %s that filename.
 #
 [prun:multiple-paffinity-schemes]

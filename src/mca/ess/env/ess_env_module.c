@@ -41,7 +41,6 @@
 #include "src/mca/base/pmix_base.h"
 #include "src/mca/mca.h"
 #include "src/util/pmix_argv.h"
-#include "src/util/malloc.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_show_help.h"
 
@@ -51,7 +50,6 @@
 #include "src/mca/grpcomm/base/base.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/plm/base/base.h"
-#include "src/mca/ras/base/base.h"
 #include "src/rml/rml.h"
 
 #include "src/mca/filem/base/base.h"

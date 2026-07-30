@@ -87,9 +87,6 @@ option to the help request as "--help <option>".
 |                      | actually launch it (usually used to test      |
 |                      | mapping patterns)                             |
 +----------------------+-----------------------------------------------+
-| "--test-suicide      | Suicide instead of clean abort after          |
-| <arg0>"              | specified delay                               |
-+----------------------+-----------------------------------------------+
 
 +----------------------+-----------------------------------------------+
 |                      | Output Options                                |
@@ -98,9 +95,6 @@ option to the help request as "--help <option>".
 |======================|===============================================|
 | "--output <arg0>"    | Comma-delimited list of options that control  |
 |                      | how output is generated.                      |
-+----------------------+-----------------------------------------------+
-| "--report-child-     | Return the exit status of the primary job     |
-| jobs-separately"     | only                                          |
 +----------------------+-----------------------------------------------+
 | "--xterm <ranks>"    | Create a new xterm window for each of the     |
 |                      | comma-delimited ranges of application process |
@@ -179,11 +173,6 @@ option to the help request as "--help <option>".
 |                      | context is specified ("key" is the parameter  |
 |                      | name; "value" is the parameter value)         |
 +----------------------+-----------------------------------------------+
-| "--gpmixmca <key>    | Pass global PMIx MCA parameters that are      |
-| <value>"             | applicable to all contexts ("key" is the      |
-|                      | parameter name; "value" is the parameter      |
-|                      | value)                                        |
-+----------------------+-----------------------------------------------+
 | "--preload-files     | Preload the comma separated list of files to  |
 | <files>"             | the remote machines current working directory |
 |                      | before starting the remote process.           |
@@ -209,9 +198,6 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 | "--set-cwd-to-       | Set the working directory of the started      |
 | session-dir"         | processes to their session directory          |
-+----------------------+-----------------------------------------------+
-| "--show-progress"    | Output a brief periodic report on launch      |
-|                      | progress                                      |
 +----------------------+-----------------------------------------------+
 | "--wd <dir>"         | Synonym for "--wdir"                          |
 +----------------------+-----------------------------------------------+
@@ -263,9 +249,10 @@ option to the help request as "--help <option>".
 | "--prtemca <key>     | Pass context-specific PRRTE MCA parameters to |
 | <value>"             | the DVM                                       |
 +----------------------+-----------------------------------------------+
-| "--forward-signals   | Comma-delimited list of additional signals    |
-| <signals>"           | (names or integers) to forward to application |
-|                      | processes ["none" => forward nothing].        |
+| "--forward-signals   | Comma-delimited list of the signals (names or |
+| <signals>"           | integers) to be forwarded to application      |
+|                      | processes, replacing the default set ["none"  |
+|                      | => forward nothing]                           |
 +----------------------+-----------------------------------------------+
 | "--keepalive <arg0>" | Pipe to monitor — DVM will terminate upon     |
 |                      | closure                                       |
@@ -275,8 +262,6 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 | "--max-vm-size       | Number of daemons to start                    |
 | <num>"               |                                               |
-+----------------------+-----------------------------------------------+
-| "--no-ready-msg"     | Do not print a DVM ready message              |
 +----------------------+-----------------------------------------------+
 | "--system-server"    | Start prterun and its daemons as the system   |
 |                      | server on their nodes                         |
@@ -304,10 +289,6 @@ option to the help request as "--help <option>".
 | "--set-sid"          | Direct the DVM daemons to separate from the   |
 |                      | current session                               |
 +----------------------+-----------------------------------------------+
-| "--singleton <id>"   | ID of the singleton process that started us   |
-+----------------------+-----------------------------------------------+
-| "--tmpdir <dir>"     | Set the root for the session directory tree   |
-+----------------------+-----------------------------------------------+
 | "--tune <files>"     | File(s) containing MCA params for tuning DVM  |
 |                      | operations                                    |
 +----------------------+-----------------------------------------------+
@@ -325,7 +306,7 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 
 
-Report bugs to %s
+%s
 #
 [dvm]
 
@@ -399,15 +380,6 @@ Pass a PMIx MCA parameter
 Syntax: "--pmixmca <key> <value>", where "key" is the parameter name
 and "value" is the parameter value.
 #
-[gpmixmca]
-
-Syntax: "--gpmixmca <key> <value>"
-
-where "key" is the parameter name and "value" is the parameter value.
-The "g" prefix indicates that this PMIx parameter is to be applied to
-_all_ application contexts and not just the one in which the directive
-appears.
-#
 [tune]
 
 Comma-delimited list of one or more files containing PRRTE and PMIx
@@ -442,17 +414,6 @@ Printout prterun's PID on stdout ("-"), stderr ("+"), or a file
 
 Printout prterun's URI on stdout ("-"), stderr ("+"), or a file
 (anything else).
-#
-[test-suicide]
-
-Test DVM cleanup upon daemon failure by having one daemon suicide
-after delay
-#
-[singleton]
-
-"prterun" is being started by a singleton process (i.e., one not
-started by prterun) — the argument must be the PMIx ID of the
-singleton process that started us
 #
 [keepalive]
 
@@ -496,13 +457,6 @@ for this option is to ensure that the daemon output streams (i.e.,
 stdout and stderr) remain open after launch, thus allowing the user to
 see any daemon-generated error messages. Otherwise, the daemon will
 "daemonize" itself upon launch, thereby closing its output streams.
-#
-[tmpdir]
-
-Define the root location for the PRRTE session directory tree
-
-See the "Session directory" HTML documentation for additional details
-about the PRRTE session directory.
 #
 [prefix]
 
@@ -598,10 +552,10 @@ LD_LIBRARY_PATH=foo/lib:$LD_LIBRARY_PATH
 #
 [forward-signals]
 
-Comma-delimited list of additional signals (names or integers) to
-forward to application processes ("none" = forward nothing). Signals
-provided by default include SIGTSTP, SIGUSR1, SIGUSR2, SIGABRT,
-SIGALRM, and SIGCONT.
+Comma-delimited list of the signals (names or integers) to be forwarded
+to application processes ("none" = forward nothing). The list replaces
+the default set, which is SIGTSTP, SIGUSR1, SIGUSR2, SIGABRT, SIGALRM,
+and SIGCONT.
 #
 [allow-run-as-root]
 
@@ -627,10 +581,6 @@ protection by providing one of the following:
      * "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1"
 
 Again, we recommend this only be done if absolutely necessary.
-#
-[report-child-jobs-separately]
-
-Return the exit status of the primary job only
 #
 [timeout]
 
@@ -720,10 +670,6 @@ directory
 [path]
 
 Path to be used to look for executables to start processes
-#
-[show-progress]
-
-Output a brief periodic report on launch progress
 #
 [pset]
 
