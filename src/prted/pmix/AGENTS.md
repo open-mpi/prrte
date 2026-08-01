@@ -40,7 +40,7 @@ upcall; each file below implements a related group of them.
 | `pmix_server_register_fns.c` | Turning a `prte_job_t` into the info arrays PMIx needs (`PMIx_server_register_nspace`, `register_client`, tool registration). |
 | `pmix_server_dyn.c` | `spawn` — plus `prte_pmix_xfer_job_info()`/`prte_pmix_xfer_app()`, the translators from PMIx directives to PRRTE job/app attributes. Also `connect`/`disconnect`. |
 | `pmix_server_queries.c` | `query` — namespaces, proc tables, psets, groups, allocations. |
-| `pmix_server_gen.c` | `abort`, `client_finalized`, `client_connected2`, `tool_connected`, `iof_pull`, `push_stdin`, `log`. |
+| `pmix_server_gen.c` | `abort`, `client_finalized`, `client_connected2`, `tool_connected`, `iof_pull`, `push_stdin`, `log`. `client_finalized` is how a **tool**'s departure is learned as well — see below. |
 | `pmix_server_fence.c` | `fence_nb` and `direct_modex`. |
 | `pmix_server_pub.c` | `publish`/`lookup`/`unpublish` (relayed to the data server). |
 | `pmix_server_notify.c` | `notify_event` (up), and the RML receive that fans a peer's event out to local clients (down). |
@@ -243,6 +243,34 @@ onto PRRTE job and app attributes. Notes for extending them:
 
 ---
 
+## A tool's departure
+
+`_client_finalized()` is the **only** notice a daemon gets that a tool has
+gone. A tool is not a child, so no waitpid fires for it, and the connection
+it drops afterwards raises no `PMIX_ERR_LOST_CONNECTION` either — PMIx
+suppresses that event for a peer it has already marked finalized. So the
+handler retires the tool's job object itself
+(`PRTE_ACTIVATE_PROC_STATE(..., PRTE_PROC_STATE_TERMINATED)` when the job
+carries `PRTE_JOB_FLAG_TOOL`), which is what drives the tool's namespace
+through the state machine and, with it, the inheritance disposition of any
+allocation the tool reserved (see
+[`../../mca/ras/AGENTS.md`](../../mca/ras/AGENTS.md)). PMIx delivers this
+upcall for a tool only from `PMIX_CAP_TOOL_FINALIZED` onwards; before that
+the tool's job object, and anything it held, simply accumulated for the
+life of the DVM.
+
+`lost_connection_hdlr()` in `pmix_server.c` is the other half — the
+*abnormal* departure — and it is registered at the end of
+`pmix_server_init()`. Watch what precedes that registration: an early
+`return` anywhere above it silently costs the daemon this handler and the
+allocation-timeout relay. That happened, and was invisible from both ends,
+because the blocking form of `PMIx_server_register_resources()` reports
+success as `PMIX_OPERATION_SUCCEEDED` and `prte_pmix_convert_status()` maps
+that onto `PRTE_SUCCESS`. **Any PMIx call in this file whose completion
+callback is `NULL` can return `PMIX_OPERATION_SUCCEEDED`; test for both.**
+
+---
+
 ## Locally-originated notifications
 
 The top-level `AGENTS.md` has the full rule; the short version, because
@@ -265,10 +293,22 @@ it is enforced here:
 - **PMIx status vs. PRRTE status.** Functions reachable from an upcall
   must return `pmix_status_t`; functions in the PRRTE half return `int`
   PRRTE codes. They are *different numbering schemes* that happen to
-  agree on 0. Convert with `prte_pmix_convert_rc()` /
+  agree on 0 — and, worse, that **overlap** everywhere else, so a code
+  used in the wrong space is not obviously foreign, it is some other
+  real code. Convert with `prte_pmix_convert_rc()` /
   `prte_pmix_convert_status()` at the boundary, and log with
   `PMIX_ERROR_LOG` or `PRTE_ERROR_LOG` to match. Mixing them silently
-  reports the wrong error to the application.
+  reports the wrong error to the application. See
+  [`../../pmix/AGENTS.md`](../../pmix/AGENTS.md) for the table of what
+  collides with what.
+  - **Converting the wrong *direction* is the easy version of this
+    mistake**, because it type-checks and the success case still works
+    (both spaces call success 0). `pmix_server_queries.c` ran the result
+    of `PRTE_MODEX_RECV_VALUE_OPTIONAL` — which yields a **PMIx**
+    status — through `prte_pmix_convert_rc()`, the PRRTE→PMIx direction,
+    so every failure of the `PMIX_SERVER_URI` query reached the tool as a
+    bare `PMIX_ERROR`. Before converting, ask which space the value is
+    already in.
 - **A helper must not answer for its caller.** `process_directive()` in
   `pmix_server_session.c` used to invoke `req->infocbfunc` itself on an
   error and then return to a caller that also invokes it — a double

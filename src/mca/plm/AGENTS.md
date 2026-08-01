@@ -94,7 +94,7 @@ codes). A few load-bearing boundaries and values:
 | Proc state | `UNTERMINATED = 15`; `RUNNING = 4`, `REGISTERED = 5`; `TERMINATED = 20`; `ERROR = 50` (error codes are offsets from it — `FAILED_TO_START = ERROR+3`, `COMM_FAILED = ERROR+6`, `ABORTED = ERROR+2`, …). Anything `< UNTERMINATED` means still-running. |
 | Job state | `LAUNCH_DAEMONS = 8`, `DAEMONS_LAUNCHED = 9`, `DAEMONS_REPORTED = 10`, `VM_READY = 11`, `RUNNING = 14`; `UNTERMINATED = 30`, `TERMINATED = 31`; `ERROR = 50` (`FAILED_TO_START = ERROR+3`, `NEVER_LAUNCHED = ERROR+10`, `MAP_FAILED = ERROR+19`, …). |
 | Node state | `UP = 3`, `DOWN = 2`, `DO_NOT_USE = 5`, `NOT_INCLUDED = 6`, `ADDED = 7`. |
-| PLM commands | `LAUNCH_JOB_CMD = 1`, `UPDATE_PROC_STATE = 2`, `REGISTERED_CMD = 3`, `TOOL_ATTACHED_CMD = 4`, `READY_FOR_DEBUG_CMD = 5`, `LOCAL_LAUNCH_COMP_CMD = 6`. |
+| PLM commands | `LAUNCH_JOB_CMD = 1`, `UPDATE_PROC_STATE = 2`, `REGISTERED_CMD = 3`, `TOOL_ATTACHED_CMD = 4`, `READY_FOR_DEBUG_CMD = 5`, `LOCAL_LAUNCH_COMP_CMD = 6`, `TOOL_DEPARTED_CMD = 7`. |
 
 Note the sequences deliberately **skip** some offsets (e.g. job error
 `ERROR+15`) — do not reuse a gap assuming it is free.
@@ -196,6 +196,40 @@ spine of launch:
 (tool via PMIx event, or another daemon via `PRTE_RML_TAG_LAUNCH_RESP`)
 that the job launched.
 
+It is also **the only chance to tell the requestor *why* a launch failed.**
+A response carrying an error status is what releases the requestor from
+`PMIx_Spawn`, and it leaves immediately — before the job-end event that
+normally carries the diagnostic is ever raised, and without an nspace to
+register a handler against. So this function reports the failure ahead of
+the response, by whichever route the requestor can actually receive on:
+
+- **`prterun`** is both the DVM and the tool, so the message is rendered
+  here and written as the failed job's stderr through
+  `PMIx_server_IOF_deliver`.
+- **A separate tool** (`prun`) has no IOF sink for the job yet — PMIx does
+  not raise one until the spawn reply names the nspace — so a
+  `PMIX_ERR_JOB_FAILED_TO_LAUNCH` event is custom-ranged to that one tool.
+  `prun_common.c` registers a handler for that **concrete code before it
+  spawns**; do not "simplify" it to rely on the default handler, which a
+  PMIx server drops when it holds no default entry yet.
+
+**Send the facts, not the prose.** Every one of these messages opens with
+`prte_tool_basename`, which is per-process — so a message rendered on the
+HNP tells a `prun` user that *`prte`* was unable to launch their
+application. The event therefore carries the failing rank, node, executable,
+working directory and error code, and the tool composes the sentence itself
+with the same `prte_render_launch_failure()` (`src/runtime/prte_quit.c`) the
+DVM uses. That helper deliberately takes values rather than
+`prte_job_t`/`prte_proc_t`/`prte_app_context_t`, precisely so a tool — which
+has none of them — can call it.
+
+Both deliveries use the blocking form on purpose: the write has to be queued
+before the response, or the requestor is gone when it arrives. The report is
+single-shot (`PRTE_JOB_FLAG_ERR_REPORTED`, claimed here so the later job-end
+path cannot repeat it in the DVM's voice), and a job that launched and
+*then* failed never reaches this path at all — its response was already sent,
+so the early `PRTE_JOB_SPAWN_NOTIFIED` return catches it.
+
 ### The daemon callback / wireup — the "report back"
 
 This is the crux of the whole framework. After a component starts a
@@ -278,6 +312,14 @@ thread-safe on the progress thread) and switches on
   procs launched (pid + state); advances to `STARTED` on the first and
   `RUNNING` when `num_launched == num_procs`.
 - **`PRTE_PLM_TOOL_ATTACHED_CMD`** — register a connecting tool as a job.
+- **`PRTE_PLM_TOOL_DEPARTED_CMD`** — the partner of the above: a tool the
+  master registered has gone. Only the master holds a tool's job object, so
+  a daemon the tool connected *through* has nothing local to retire and
+  reports the departure instead. The master vets the namespace's
+  `PRTE_JOB_FLAG_TOOL` before acting — the reporting daemon can only say
+  "this peer was not a client of mine", and a namespace that turns out to be
+  an application job must not be terminated on the strength of that. An
+  unknown namespace is not an error; the DVM may have discarded it already.
 
 ### orted command-line construction
 

@@ -112,6 +112,17 @@ data PRRTE caches on hwloc `userdata` pointers, the binding-policy word,
 and the fact that in the HNP almost every topology in play belongs to some
 *other* machine.
 
+Two small directories underpin everything above them.
+[`src/event/AGENTS.md`](src/event/AGENTS.md) covers the event API — why
+`prte_event_base` and `prte_sync_event_base` are deliberately the *same*
+object, and why `prte_event_alloc()` must return zeroed storage.  PRRTE
+builds against **Libevent only**; the libev alternative is gone, because
+PRRTE shares an event base with PMIx and PMIx is Libevent-only.
+[`src/include/AGENTS.md`](src/include/AGENTS.md) covers the constants and
+the portability layer — in particular that the error codes must stay based
+at `PMIX_EXTERNAL_ERR_BASE`, the range PMIx reserves for projects built on
+it.
+
 ---
 
 ## MCA Frameworks
@@ -172,6 +183,18 @@ Include paths for these symbols come from PMIx's installed headers (found
 via `pkg-config` or `--with-pmix=`).  The shim at `src/pmix/pmix-internal.h`
 and `src/pmix/pmix.c` is PRRTE's integration point — consult it before
 reaching for PMIx symbols elsewhere.
+[`src/pmix/AGENTS.md`](src/pmix/AGENTS.md) covers it, and in particular the
+one rule that governs every crossing of this boundary: **PRRTE's codes and
+PMIx's are different numbering schemes**, so convert at the boundary with
+`prte_pmix_convert_rc()` / `prte_pmix_convert_status()`, and never spell a
+proc state as a bare integer.
+
+PRRTE's *error codes* are now based at `PMIX_EXTERNAL_ERR_BASE`, the range
+PMIx reserves for projects layered on it, so an unconverted one at least
+lands somewhere PMIx will never assign.  That was not true until recently —
+46 PRRTE codes had the value of a live PMIx status meaning something else —
+and it is still **not** true of the *proc and job states*, which share PMIx's
+numbering by design.  Convert; do not rely on a bad value looking wrong.
 
 ### Check capability flags
 
@@ -334,7 +357,9 @@ duplicate silently makes two distinct codes compare equal and is a
 miserable bug to track down.
 
 - Error/return codes live in [`src/include/constants.h`](src/include/constants.h),
-  numbered as offsets from `PRTE_ERR_BASE` and `PRTE_ERR_SPLIT`.
+  numbered as offsets from `PRTE_ERR_BASE` — which **must** stay defined as
+  `PMIX_EXTERNAL_ERR_BASE`, the range PMIx reserves for projects built on
+  it.  See [`src/include/AGENTS.md`](src/include/AGENTS.md).
 - Job and process states live in
   [`src/mca/plm/plm_types.h`](src/mca/plm/plm_types.h), numbered as
   offsets from `PRTE_JOB_STATE_ERROR` and `PRTE_PROC_STATE_ERROR` (note
@@ -391,10 +416,12 @@ This must be re-run whenever `configure.ac` or any `*.m4` file under
 `config/` is modified or added.  Editing a `Makefile.am` does **not** require the
 full `autogen.pl` + `./configure` cycle — PRRTE builds in maintainer
 mode, so a plain `make` regenerates the affected `Makefile[.in]` files and
-completes the build.  After `autogen.pl`:
+completes the build.  After `autogen.pl`, build **out of tree** (see the
+golden rule below):
 
 ```sh
-./configure [options]
+mkdir build && cd build
+../configure [options]
 make -j$(nproc)
 make install
 ```
@@ -416,26 +443,72 @@ Common configure options:
 
 Version requirements: PMIx ≥ 6.1.0, hwloc ≥ 2.1.0, libevent ≥ 2.0.21.
 
-### GOLDEN RULE: build with `make` from the repository root — never try to short-circuit the build
+### GOLDEN RULE: build with `make` from the top of your build tree — never try to short-circuit the build
 
 Do not waste effort trying to compile a single `.c` file by hand or
 otherwise short-circuit the build system (invoking the compiler
 directly, replaying a compile command, building one object in
-isolation).  Just go to the repository root and run `make` — it is
-quick, it only rebuilds what changed, and it always builds what you
-need.
+isolation).  Just go to the top of your build tree and run
+`make -j$(nproc)` — it is quick, it only rebuilds what changed, and it
+always builds what you need.
 
-Build from the repository root with `make -j$(nproc)`.  Running `make`
-from the root is what respects the generated headers and the per-target
-compiler flags; building from deep inside a subdirectory can miss a
-regenerated header and give you a misleading result.
+Running `make` from the top is what respects the generated headers and
+the per-target compiler flags; building from deep inside a subdirectory
+can miss a regenerated header and give you a misleading result.
 
 If you configured with `--enable-mca-dso` (components built as separate
 DSOs rather than statically linked into the tools), you can rebuild a
 single component after editing it by running `make install` in that
 component's build directory — you do not have to relink every tool.  In
 the default static build, a component change requires a normal
-root-level `make` so the tools are relinked.
+top-level `make` so the tools are relinked.
+
+### GOLDEN RULE: build out of tree — the source tree holds sources, not objects
+
+**Do not run `./configure` or `make` at the repository root.**  Configure
+from a separate build directory, and the source tree stays exactly what
+its name says.  This is a rule, not a preference for tidiness — an
+in-tree build actively costs you two things:
+
+- **It is destroyed the moment you use the container harness.**
+  [`contrib/dockerswarm/build.sh`](contrib/dockerswarm/) compiles your
+  live tree out of tree, and automake sets `VPATH = srcdir`, so an
+  incremental out-of-tree `make` will happily resolve an object target
+  from a stale in-tree `src/**/*.lo` — and pick up the source tree's
+  stale `prte_config.h` ahead of the one configure just wrote.  So
+  `build.sh` distcleans any in-tree build it finds, every time.  Keeping
+  one means every multi-node test run wipes it and costs you a full
+  reconfigure and rebuild.  See
+  [`contrib/dockerswarm/AGENTS.md`](contrib/dockerswarm/AGENTS.md),
+  "When a distclean is actually needed", for why that cannot be
+  narrowed.
+- **It puts you in maintainer mode's way.**  A root-level `make` against
+  stale timestamps can kick off the partial in-tree Autotools
+  regeneration described in the next section, which frequently fails and
+  leaves the tree unbuildable — recoverable only with the full
+  `autogen.pl` + `configure` cycle.
+
+Out of tree, neither happens, several builds coexist from one pristine
+checkout (a debug build and a release build, or a macOS host build and a
+Linux container build), and the tree is always ready to hand to the
+harness:
+
+```sh
+./autogen.pl
+mkdir -p build/debug && cd build/debug
+../../configure --enable-debug [options]
+make -j$(nproc)
+make check
+make -C test/offline check-offline
+```
+
+If you work with the container harness, its `build.sh` will set the host
+side up for you — `./build.sh macos` builds into `vpath-macos/` and
+installs into `vpath-macos/install`, and `make -C vpath-macos check` runs
+the unit tests from there.
+
+`vpath-*/` and `build/` are git-ignored.  Whatever you name your build
+directory, keep it out of the source tree's way and never commit it.
 
 ### Modifying the configure / build system
 
@@ -451,12 +524,18 @@ reconfigure explicitly:
 
 ```sh
 ./autogen.pl
-./configure <same options as the original configure>
+cd <your build dir> && ../<path>/configure <same options as before>
 make -j
 ```
 
-Recover the original configure invocation options from the existing tree
-with `./config.status --config` (or read the header of `config.log`).
+Recover the original configure invocation options from the existing build
+directory with `./config.status --config` (or read the header of
+`config.log`).
+
+Note this failure is not confined to build-system edits: a stale set of
+timestamps is enough to make an ordinary `make` attempt the regeneration
+and wedge on it.  An out-of-tree build (see the golden rule above) keeps
+you clear of it, which is one of the reasons that rule exists.
 This process is slow but mandatory after any build-system source change —
 there is no safe shortcut.  As noted above, editing a `Makefile.am` alone
 is the exception: a plain `make` regenerates the relevant `Makefile[.in]`

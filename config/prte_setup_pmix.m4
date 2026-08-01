@@ -269,6 +269,46 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
                        [$prte_pmix_iof_file_pattern],
                        [Whether PMIx can expand an output-file name pattern])
 
+    dnl The environment directives (--set-env, --prepend-env, --append-env,
+    dnl --unset-env, -x) edit each other, so the order the user gave them in
+    dnl is the value the process ends up with.  Recovering that order from a
+    dnl parse result requires PMIx to have recorded where each value was
+    dnl given: the result groups every occurrence of an option onto that
+    dnl option's single instance, so an option repeated after another has
+    dnl intervened cannot be placed from the grouped view alone.  Without the
+    dnl stamps we fall back to that view, which is right for every command
+    dnl line that does not interleave repeats.
+    AC_MSG_CHECKING([for PMIx command-line occurrence order])
+    PRTE_CHECK_PMIX_CAP([CLI_ORDER],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_cli_order=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_cli_order=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_CLI_ORDER],
+                       [$prte_pmix_cli_order],
+                       [Whether PMIx records where each command line option occurred])
+
+    dnl A tool can attach to any daemon, not just the DVM master, and the
+    dnl output of the job it launches has to reach it there.  The master is
+    dnl the only process that sees all of a job's output, so it relays a
+    dnl copy to the daemon hosting the tool - but that daemon must hand the
+    dnl copy to its PMIx server WITHOUT emitting it, since the daemon that
+    dnl actually hosts those processes has already written whatever the
+    dnl output directives called for.  Two servers writing one --output file
+    dnl is the failure that guards against.  PMIx has to be able to be told
+    dnl that per delivery; without it we cannot relay safely and a tool on a
+    dnl non-master daemon sees only the output of processes its own daemon
+    dnl happens to host.
+    AC_MSG_CHECKING([for PMIx per-delivery IOF local-output control])
+    PRTE_CHECK_PMIX_CAP([IOF_DELIVER_LOCAL],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_iof_deliver_local=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_iof_deliver_local=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_IOF_DELIVER_LOCAL],
+                       [$prte_pmix_iof_deliver_local],
+                       [Whether PMIx honors PMIX_IOF_LOCAL_OUTPUT on an IOF delivery])
+
     AC_MSG_CHECKING([for LTO compatibility])
     PRTE_CHECK_PMIX_CAP([LTO],
                         [PRTE_PMIX_LTO_CAPABILITY=1

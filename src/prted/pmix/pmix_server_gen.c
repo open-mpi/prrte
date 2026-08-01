@@ -45,7 +45,6 @@
 #include "src/mca/iof/iof.h"
 #include "src/mca/plm/base/plm_private.h"
 #include "src/mca/plm/plm.h"
-#include "src/mca/plm/base/plm_private.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/mca/schizo/schizo.h"
@@ -194,6 +193,58 @@ pmix_status_t pmix_server_client_connected2_fn(const pmix_proc_t *proc,
     return PRTE_SUCCESS;
 }
 
+/* Report that a tool has left us.
+ *
+ * On the DVM master the tool's job object is right here, so drive its proc
+ * into TERMINATED and let the state machine retire the namespace. Anywhere
+ * else there is nothing local to drive: a daemon relays a tool connection to
+ * the master and keeps no job object of its own, so the departure has to
+ * travel the same way the connection did. It goes as its own command rather
+ * than as a proc-state update because only the master can tell a tool from
+ * anything else it holds - it checks the job's TOOL flag before acting on
+ * this, and an update naming a namespace it could not vet would be a way to
+ * terminate somebody else's job.
+ *
+ * Getting this wrong is quiet rather than loud: the master is told the tool
+ * arrived and never told it left, so the tool's job object - and any
+ * allocation it reserved - outlives it by the life of the DVM.
+ */
+void prte_pmix_server_tool_departed(pmix_proc_t *tool)
+{
+    pmix_data_buffer_t *alert;
+    prte_plm_cmd_flag_t cmd = PRTE_PLM_TOOL_DEPARTED_CMD;
+    prte_job_t *jdata;
+    pmix_status_t ret;
+    int rc;
+
+    if (PRTE_PROC_IS_MASTER) {
+        jdata = prte_get_job_data_object(tool->nspace);
+        if (NULL != jdata && PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+            PRTE_ACTIVATE_PROC_STATE(tool, PRTE_PROC_STATE_TERMINATED);
+        }
+        return;
+    }
+
+    PMIX_DATA_BUFFER_CREATE(alert);
+    ret = PMIx_Data_pack(NULL, alert, &cmd, 1, PMIX_UINT8);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
+        PMIX_DATA_BUFFER_RELEASE(alert);
+        return;
+    }
+    ret = PMIx_Data_pack(NULL, alert, tool, 1, PMIX_PROC);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
+        PMIX_DATA_BUFFER_RELEASE(alert);
+        return;
+    }
+    PRTE_RML_RELIABLE_SEND(rc, PRTE_PROC_MY_HNP->rank, alert, PRTE_RML_TAG_PLM);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(alert);
+    }
+}
+
 static void _client_finalized(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
@@ -203,11 +254,27 @@ static void _client_finalized(int sd, short args, void *cbdata)
     PMIX_ACQUIRE_OBJECT(cd);
 
     if (NULL != cd->server_object) {
-        /* we were passed back the prte_proc_t */
+        /* we were passed back the prte_proc_t - so this is a process we
+         * launched, and the ODLS will see it go away. Nothing more to do:
+         * its termination is driven by waitpid and IOF completion, and
+         * declaring it terminated here would do so before either. */
         p = (prte_proc_t *) cd->server_object;
         PRTE_FLAG_SET(p, PRTE_PROC_FLAG_HAS_DEREG);
+        goto release;
     }
 
+    /* No server object means we did not register this peer as a client of
+     * ours - it attached as a tool. A tool that finalized cleanly gets us
+     * here and nowhere else: it is not a child, so no waitpid fires for it,
+     * and the connection drop that follows raises no lost-connection event
+     * either, because PMIx has already marked the peer finalized. Nothing
+     * else would ever retire the tool's job object - and with it the
+     * inheritance disposition that hangs off the owning namespace
+     * terminating, which is what hands the nodes of an allocation the tool
+     * reserved back to the general pool. */
+    prte_pmix_server_tool_departed(&cd->proc);
+
+release:
     /* release the caller */
     if (NULL != cd->cbfunc) {
         cd->cbfunc(PMIX_SUCCESS, cd->cbdata);
@@ -444,6 +511,7 @@ static void _toolconn(int sd, short args, void *cbdata)
     prte_pmix_server_req_t *cd = (prte_pmix_server_req_t *) cbdata;
     int rc;
     char *tmp;
+    uint32_t u32;
     size_t n;
     pmix_data_buffer_t *buf;
     prte_plm_cmd_flag_t command = PRTE_PLM_TOOL_ATTACHED_CMD;
@@ -631,6 +699,20 @@ static void _toolconn(int sd, short args, void *cbdata)
     }
     // and the pid
     rc = PMIx_Data_pack(NULL, buf, &cd->pid, 1, PMIX_PID);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+    }
+    // and who is running it - the master records this on the tool's job so a
+    // reservation the tool creates can be reached by another command the same
+    // user runs. Only the master keeps a job object for a tool, so this is the
+    // only chance to tell it.
+    u32 = (uint32_t) cd->uid;
+    rc = PMIx_Data_pack(NULL, buf, &u32, 1, PMIX_UINT32);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+    }
+    u32 = (uint32_t) cd->gid;
+    rc = PMIx_Data_pack(NULL, buf, &u32, 1, PMIX_UINT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
     }
@@ -1011,19 +1093,42 @@ static void pmix_server_stdin_push(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
     pmix_byte_object_t *bo = (pmix_byte_object_t *) cd->server_object;
-    size_t n;
+    uint8_t *bytes;
+    size_t nbytes, n;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    /* a client that pushed no data at all leaves us no byte object - PMIx
+     * frees it rather than handing us an empty one - and that is precisely
+     * how a tool signals end-of-input, so treat it as the zero-length push
+     * it is rather than dereferencing it */
+    if (NULL == bo) {
+        bytes = NULL;
+        nbytes = 0;
+    } else {
+        bytes = (uint8_t *) bo->bytes;
+        nbytes = bo->size;
+    }
+
+    /* the vtable slot is optional, so a module that left it unset would
+     * otherwise take the daemon down with a NULL call - which is what used
+     * to happen on every daemon but the master, killing the very daemon the
+     * requesting tool was attached to */
+    if (NULL == prte_iof.push_stdin) {
+        cd->cbfunc(PMIX_ERR_NOT_SUPPORTED, cd->cbdata);
+        PMIX_RELEASE(cd);
+        return;
+    }
 
     for (n = 0; n < cd->nprocs; n++) {
         PMIX_OUTPUT_VERBOSE((1, prte_pmix_server_globals.output,
                              "%s pmix_server_stdin_push to dest %s: size %zu",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                              PRTE_NAME_PRINT(&cd->procs[n]),
-                             bo->size));
-        prte_iof.push_stdin(&cd->procs[n], (uint8_t *) bo->bytes, bo->size);
+                             nbytes));
+        prte_iof.push_stdin(&cd->procs[n], bytes, nbytes);
     }
 
-    if (NULL == bo->bytes || 0 == bo->size) {
+    if (NULL == bytes || 0 == nbytes) {
         cd->cbfunc(PMIX_ERR_IOF_COMPLETE, cd->cbdata);
     } else {
         cd->cbfunc(PMIX_SUCCESS, cd->cbdata);

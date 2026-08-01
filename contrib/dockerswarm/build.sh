@@ -18,6 +18,10 @@
 #   ./build.sh macos    # build natively on this host into <repo>/vpath-macos
 #   ./build.sh image    # (re)build just the base container image
 #
+# Two clones on one host: set PRTE_SWARM (see below) in the whole shell, and
+# each gets its own containers, volume, and network.  The macOS build is
+# already per-clone -- it lives in <repo>/vpath-macos.
+#
 # Distcleaning the source tree
 # ----------------------------
 # An out-of-tree build cannot share a source tree with an in-tree build: VPATH
@@ -51,7 +55,9 @@
 # there is nothing to clean.
 #
 #   --distclean      force it
-#   --no-distclean   skip it (only safe if the tree really is clean)
+#   --no-distclean   skip it -- an assertion that the tree really is clean.
+#                    If it is not, this script STOPS rather than building a
+#                    tree it has just been told to poison.
 #
 # See AGENTS.md, "When a distclean is actually needed".
 #
@@ -66,8 +72,32 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(git -C "$here" rev-parse --show-toplevel)"
 
+# Which swarm this is.  Every global name the harness claims -- the compose
+# project, the ten container names, the build volume, the docker network --
+# is derived from it, so two clones on one host can each drive their own
+# swarm without touching the other's containers, install, or /tmp.  Unset, it
+# is "prte" and every name is what it has always been.  Set it for the whole
+# shell, because `docker compose` interpolates docker-compose.yml itself:
+#
+#   export PRTE_SWARM=alt
+#   ./build.sh && docker compose up -d && ./run-tests.sh linux
+#
+# The image is deliberately NOT per-swarm (see docker-compose.yml).
+PRTE_SWARM="${PRTE_SWARM:-prte}"
+# Rejected here rather than left to docker.  Filtering through LC_ALL=C tr,
+# not a shell [a-z] range: in a UTF-8 locale that range follows collation
+# order and matches 'B', so the obvious form of this test accepts names
+# docker then refuses.  Same reason the leading-character check is a literal
+# set.
+case "$PRTE_SWARM" in [_-]*) PRTE_SWARM="" ;; esac
+if [ -z "$PRTE_SWARM" ] || \
+   [ "$PRTE_SWARM" != "$(printf '%s' "$PRTE_SWARM" | LC_ALL=C tr -cd 'a-z0-9_-')" ]; then
+    echo "PRTE_SWARM must be lowercase [a-z0-9_-] and start with a letter or digit" >&2
+    exit 2
+fi
+
 IMAGE="${IMAGE:-prte-swarm:latest}"
-VOLUME="${VOLUME:-prte-build}"
+VOLUME="${VOLUME:-$PRTE_SWARM-build}"
 PMIX_REF="${PMIX_REF:-master}"          # baked-image PMIx branch
 PMIX_REPO="${PMIX_REPO:-https://github.com/openpmix/openpmix.git}"
 PMIX_SRC="${PMIX_SRC:-}"                # optional openpmix checkout to build
@@ -159,8 +189,22 @@ prep_srcdir() {
         find "$root/src" -name '*.lo' -delete 2>/dev/null || true
         find "$root/src" -name '.libs' -type d -exec rm -rf {} + 2>/dev/null || true
     elif srcdir_has_intree; then
-        echo ">>> WARNING: --no-distclean, but the source tree holds an in-tree" \
-             "build; the out-of-tree build may pick up its objects via VPATH"
+        # Refuse rather than warn.  --no-distclean asserts "the tree really is
+        # clean"; it is not, so the assertion is false and proceeding builds
+        # exactly the poisoned tree everything above exists to prevent.  The
+        # cheap failure is stopping here.  The expensive one is a build that
+        # succeeds -- same platform, different --with-pmix -- and quietly
+        # tests a library nobody chose, with nothing in the output to say so.
+        # A warning does not stop that, because the run continues and the next
+        # thing anyone reads is the test results.
+        echo ">>> ERROR: --no-distclean, but the source tree holds an in-tree" \
+             "build." >&2
+        echo ">>>        VPATH=srcdir means this build would link objects out" \
+             "of the SOURCE tree, and pick up its stale prte_config.h ahead of" \
+             "the one configure just wrote." >&2
+        echo ">>>        Drop --no-distclean, or clean the tree yourself" \
+             "(make distclean at $root)." >&2
+        exit 2
     fi
 
     if [ ! -x "$root/configure" ] || [ "$root/configure.ac" -nt "$root/configure" ]; then
@@ -211,12 +255,27 @@ build_linux() {
             # reuses the arguments of whatever run created them.  Point
             # PMIX_SRC at a checkout after a plain build and PRRTE keeps the
             # baked PMIx, with nothing in the output to say so -- a build
-            # that looks like it tested your change and did not.  Stamp the
-            # arguments and reconfigure when they differ.
-            reconfigure_needed() {   # $1 = build dir, $2 = argument string
+            # that looks like it tested your change and did not.
+            #
+            # $1 = build dir, $2 = argument string, $3 = srcdir
+            #
+            # Three ways a persistent build dir can be stale:
+            #   - never configured at all;
+            #   - configured with different arguments (the PMIX_SRC trap
+            #     above);
+            #   - configured before the build system was regenerated.
+            #     Editing configure.ac or a config/*.m4 and re-running
+            #     autogen.pl leaves configure and Makefile.in newer than the
+            #     config.status here, and an incremental make then walks into
+            #     maintainer-mode regeneration INSIDE the container -- which
+            #     needs the exact aclocal/automake version the host used, and
+            #     dies with "aclocal-N.NN: command not found", leaving the
+            #     PREVIOUS install standing with no build stamp.
+            reconfigure_needed() {
                 [ -f "$1/config.status" ] || return 0
                 [ -f "$1/.configure-args" ] || return 0
                 [ "$(cat "$1/.configure-args")" = "$2" ] || return 0
+                [ "$3/configure" -nt "$1/config.status" ] && return 0
                 return 1
             }
 
@@ -225,7 +284,7 @@ build_linux() {
                 echo ">>>> PMIx from bind-mounted /pmix-src -> $PMIX_PREFIX"
                 mkdir -p /opt/prte/vpath-linux-pmix && cd /opt/prte/vpath-linux-pmix
                 pmix_args="--prefix=$PMIX_PREFIX"
-                if reconfigure_needed . "$pmix_args"; then
+                if reconfigure_needed . "$pmix_args" /pmix-src; then
                     echo ">>>> (re)configuring PMIx: $pmix_args"
                     /pmix-src/configure $pmix_args
                     echo "$pmix_args" > .configure-args
@@ -249,7 +308,7 @@ build_linux() {
             # "scontrol --json" (the whole elastic extend/release surface) are
             # never even compiled.  libjansson-dev is baked into the image.
             prte_args="--prefix=/opt/prte/prte --with-pmix=$PMIX_PREFIX --with-jansson --enable-debug"
-            if reconfigure_needed . "$prte_args"; then
+            if reconfigure_needed . "$prte_args" /prrte-src; then
                 echo ">>>> (re)configuring PRRTE: $prte_args"
                 /prrte-src/configure $prte_args
                 echo "$prte_args" > .configure-args
@@ -309,6 +368,30 @@ build_linux() {
                 /prrte-src/contrib/dockerswarm/dataserver.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
+            # proctable: a bare PMIx client that queries the proc table and
+            # the server URI.  Those two queries are the only callers of
+            # prte_pmix_convert_state(), and the local-vs-global proc table
+            # split plus a hostname-qualified server URI have no meaning at
+            # all on a single host.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> proctable (query/state translation) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/proctable \
+                /prrte-src/contrib/dockerswarm/proctable.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
+            # groupcon: a bare PMIx client that drives a group construct and
+            # destruct.  The interesting half of a group collective runs in
+            # grp_release on EVERY daemon: it registers the result with its
+            # own PMIx server and only then releases the local participants.
+            # On one host there is one daemon and it is also the HNP, so the
+            # down-tree release and the per-daemon registration are never
+            # exercised against a daemon that merely received the broadcast.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> groupcon (group construct/destruct) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/groupcon \
+                /prrte-src/contrib/dockerswarm/groupcon.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
             # slowcat: a deliberately slow stdin reader (no PMIx at all).  The
             # stdin bugs in iof live in the back-pressure path, and a normal
             # "cat" drains its pipe as fast as the daemon fills it, so the
@@ -361,7 +444,17 @@ build_linux() {
             echo ">>>> done: install in /opt/prte/prte"
         '
     echo ">>> Linux build complete."
-    echo ">>> next: docker compose up -d && ./run-tests.sh linux"
+    if [ "$PRTE_SWARM" = prte ]; then
+        echo ">>> next: docker compose up -d && ./run-tests.sh linux"
+    else
+        # Say it with the variable: compose reads PRTE_SWARM from the
+        # environment of the compose command, and a `docker compose up -d`
+        # without it brings up the DEFAULT swarm against the default volume,
+        # leaving this build sitting in $VOLUME unused.
+        echo ">>> next: PRTE_SWARM=$PRTE_SWARM docker compose up -d &&" \
+             "PRTE_SWARM=$PRTE_SWARM ./run-tests.sh linux"
+        echo ">>>       (swarm '$PRTE_SWARM': containers $PRTE_SWARM-node1..10, volume $VOLUME)"
+    fi
 }
 
 # --- macOS build (native, on this host) -------------------------------------

@@ -39,10 +39,13 @@ It is **not** a Docker Swarm in the orchestration sense — just ten plain
 | `build.sh` | Builds PRRTE (and optionally PMIx) from your **live** tree via VPATH: into a shared volume for the Linux swarm, or natively for macOS. Start here. |
 | `run-tests.sh` | Runs the test suite and reports PASS/FAIL: the full multi-node suite on Linux, a single-host subset on macOS. |
 | `Dockerfile` | Base image: toolchain, a baked PMIx, SSH wiring, and a node entrypoint. It does **not** contain PRRTE. |
-| `docker-compose.yml` | The ten nodes `prte-node1`..`prte-node10`, each mounting the shared `prte-build` volume. |
+| `docker-compose.yml` | The ten nodes `prte-node1`..`prte-node10`, each mounting the shared `prte-build` volume. Every one of those names derives from `$PRTE_SWARM`, so two clones can each run a swarm — see §4. |
 | `elastic.c` | The elastic test client (`elastic` in the install): issues a PMIx allocation request and waits for the phase-two completion event. |
 | *(no file here)* | `build.sh` also compiles [`examples/dynamic.c`](../../examples/dynamic.c) from the main tree as `dynamic` — the only client in this harness that calls `PMIx_Spawn`, and so the only way to get a **parent/child job pair**. See §11. |
 | `dataserver.c` | A bare PMIx client for the publish/lookup service (`dataserver` in the install): publish/lookup/lookupwait/lookup2/unpublish. Drives `src/runtime/data_server`. See §13. |
+| `jobinfo.c` | A bare PMIx client for the **direct-modex** paths (`jobinfo` in the install): `publish`/`fetch`/`fetchkey`. Drives `src/prted/pmix/pmix_server_fence.c` from a daemon that hosts none of the target job's procs. |
+| `proctable.c` | A bare PMIx client for the **proc-table and server-URI queries** (`proctable` in the install): `procs`/`localprocs`/`serveruri`. Those are the only callers of `prte_pmix_convert_state()`, and the local-vs-global proc-table split has no meaning on one host. Drives `src/pmix`. |
+| `groupcon.c` | A bare PMIx client that drives a **group construct/destruct** (`groupcon` in the install): every rank contributes a local cid, asks for a context id, constructs, reads every peer's contribution back, destructs. Drives `grpcomm/direct`'s `grp_release` on daemons that merely *received* the broadcast. See §15. |
 | `slowcat.c` | A deliberately **slow** stdin reader (`slowcat` in the install, no PMIx dependency): copies stdin to a file in small reads with a pause between them, so the daemon feeding it keeps hitting *partial* writes. That is the only way to reach the iof short-write path. |
 | `fake-slurm.py` | A stand-in SLURM control plane (`sbatch`/`scontrol`/`scancel`) so `ras/slurm`'s elastic modify surface can be exercised. See §12. |
 
@@ -100,8 +103,22 @@ bites:
    incremental rebuild.
 
 So `build.sh` distcleans whenever it finds in-tree artifacts, and says
-so. `--no-distclean` skips it (only safe if the tree really is clean);
-`--distclean` forces it.
+so. `--distclean` forces it. `--no-distclean` skips the *detection* — it
+is an assertion that the tree really is clean, and if it is not,
+`build.sh` **stops with an error** rather than building the tree it has
+just been told to poison. That is deliberate: it used to warn and carry
+on, but nobody reads a warning scrolled off the top of a build whose test
+results come out looking fine. The failure mode it was hiding is the
+quiet one — same platform, different `--with-pmix`, a suite that passes
+against a library nobody chose.
+
+Note what this means for who decides. It is tempting to move the call to
+the caller entirely ("the person running it knows whether a distclean is
+needed"), and that is wrong: the trigger is *"does the source tree hold
+an in-tree build right now"*, which is a property of the tree, not of
+your intent. Another worktree, another agent, or your own previous
+session may have put one there. `build.sh` can look; you can only guess,
+and the two ways of being wrong cost wildly different amounts.
 
 **Do not try to narrow this to "only when configure has to run."** It is
 the obvious optimization — an incremental out-of-tree build already has
@@ -131,11 +148,38 @@ whole tree first. That failure is easy to misread, because a distcleaned
 tree does not announce itself — `make check` just says *"No rule to make
 target `check'"* and `make` at the root exits 0 having done nothing.
 
-If you run the host-side suites often, **stop keeping an in-tree build**:
-build the host side out of tree too (`./build.sh macos`, which installs
-into `vpath-macos/install`) and run `make check` from `vpath-macos`. Then
-the source tree stays pristine, both builds coexist exactly as this
-harness intends, and there is never anything to clean.
+### Build both sides out of tree — that is the intended workflow
+
+**Do not keep an in-tree build.** Build the host side out of tree too and
+the whole problem above stops existing:
+
+```sh
+./build.sh macos                    # -> <repo>/vpath-macos, install in vpath-macos/install
+make -C vpath-macos check           # unit tests
+make -C vpath-macos/test/offline check-offline
+./build.sh                          # -> /opt/prte/vpath-linux in the volume
+```
+
+Then the source tree is never configured at all: `srcdir_has_intree` is
+never true, the distclean never fires, nothing you built gets destroyed,
+and the tree is always ready to hand to the swarm without a reconfigure
+first. Both builds coexist from the same pristine sources, which is
+exactly what this harness was built to do.
+
+The habit worth forming is: **the source tree is sources.** If you find
+yourself running `./configure` or `make` at the repo root, you are
+setting up the next distclean and the next twenty-minute rebuild. That is
+now stated project-wide — see the top-level
+[`AGENTS.md`](../../AGENTS.md), "GOLDEN RULE: build out of tree" — and it
+sits alongside, not against, the golden rule about running `make` from
+the top of your build tree: that one is about not hand-compiling single
+files or building from deep inside a subdirectory, and VPATH only changes
+*which* directory the top is.
+
+The trap to know about if you *do* end up with an in-tree build that gets
+cleaned: a distcleaned tree does not announce itself. `make check` says
+*"No rule to make target `check'"* and a root-level `make` exits 0 having
+done nothing.
 
 ## 3. Prerequisites
 
@@ -153,16 +197,23 @@ harness intends, and there is never anything to clean.
 # from this directory (contrib/dockerswarm/)
 
 # ---- Linux swarm ----
-./build.sh                 # autogen (+ distclean only if a VPATH configure
-                           #   must run), build image, build PRRTE into the
-                           #   shared volume from your live tree
+./build.sh                 # autogen (+ distclean if the source tree holds an
+                           #   in-tree build -- see §2), build image, build
+                           #   PRRTE into the shared volume from your live tree
 docker compose up -d       # start prte-node1 .. prte-node10
 ./run-tests.sh linux       # full suite: prterun, elastic grow/shrink, relay
 
 # ---- native macOS (single host) ----
 ./build.sh macos           # native VPATH build into <repo>/vpath-macos
 ./run-tests.sh macos       # build + single-host launch smoke
+
+# ---- and run the host-side suites from that build, not the source tree ----
+make -C ../../vpath-macos check
+make -C ../../vpath-macos/test/offline check-offline
 ```
+
+Keeping the host side out of tree as well is the intended workflow, not
+an optimization for heavy users — see §2, "Build both sides out of tree".
 
 **On macOS, say which dependencies to build against.** Unlike the container,
 this host is whatever you have installed, and the two knobs are:
@@ -186,6 +237,52 @@ exactly this — a build against a stale second PMIx.)
 Rebuild after editing PRRTE: just rerun `./build.sh` (incremental). No image
 rebuild, no `docker compose` restart needed — the nodes read the shared volume.
 To also test an openpmix change, add `PMIX_SRC=/path/to/openpmix`.
+
+### Two clones on one host: `PRTE_SWARM`
+
+Every global name this harness claims — the compose project, the ten container
+names, the build volume, the docker network — is derived from `$PRTE_SWARM`,
+so a second clone (or a second agent) can drive its own swarm:
+
+```sh
+export PRTE_SWARM=alt      # for the WHOLE shell; see the warning below
+./build.sh                 # -> volume alt-build
+docker compose up -d       # -> project altswarm, containers alt-node1..10
+./run-tests.sh linux       #    on network altswarm_dvm
+```
+
+Unset, it is `prte` and every name is exactly what it has always been:
+project `prteswarm`, containers `prte-node1..10`, volume `prte-build`.
+
+Both swarms contain a container whose **hostname is `node1`**, and that is
+fine: each user-defined bridge network runs its own embedded DNS serving only
+the containers attached to it, so `node2` inside a swarm can only ever mean
+that swarm's node2. The tests need no changes — `--host node2:2` means the
+right machine in either.
+
+> **Export it, don't prefix one command.** `docker compose` interpolates
+> `docker-compose.yml` itself, so `PRTE_SWARM` has to be in *that* command's
+> environment. A `docker compose up -d` without it quietly brings up the
+> **default** swarm instead, against the default volume, and your build sits
+> in `alt-build` unused. `run-tests.sh` says which swarm it looked for when it
+> finds nothing, and `build.sh` prints the exact next command including the
+> variable.
+
+**What is still shared, and what that costs.** The base image
+(`prte-swarm:latest`) is read-only to a running swarm and expensive to build,
+so both instances use the same one — but `./build.sh image` (or a
+`docker build`) replaces it under the other swarm's feet, and that swarm's
+containers then fail the "containers are running the current image" preflight
+until they are recreated. Nothing else crosses: separate containers, separate
+`/tmp`, separate install, separate network.
+
+**The macOS subset needs no such knob** — its install is already per-clone
+(`<repo>/vpath-macos`), and it isolates the two things that are not: it starts
+every tool by absolute path out of its own install and matches on that path
+when it reaps strays (a bare `pkill -x prte` would kill the other clone's DVM,
+and a bare `pgrep -x prte` would *report the other clone's DVM as its own* and
+pass a case on it), and it runs PRRTE under a private `TMPDIR` it creates and
+removes, so no session dir it deletes was ever anyone else's.
 
 ## 5. Driving the DVM by hand
 
@@ -297,17 +394,39 @@ the daemon copy was missed.
 **Grow** (`elastic grow node2:2,node3:2`): phase-1 `PMIX_SUCCESS`, then phase-2
 `PMIX_DVM_IS_READY`, and `prted` now running on node2 and node3.
 
-> The grown nodes join the **reservation** created by the request, so a plain
-> `prun -n 3 --map-by node hostname` still lands only on node1 — its default job
-> allocation is node1's base pool, not the reservation. Confirm a grow by
-> `prted` presence on the targets and the `PMIX_DVM_IS_READY` event, not by
-> plain-`prun` placement.
+> The grown nodes join the **reservation** created by the request, and for as
+> long as the requesting tool is alive they belong to it alone: a plain
+> `prun -n 3 --map-by node hostname` still lands only on node1, because its
+> default job allocation is node1's base pool, not the reservation. While the
+> tool is running, confirm a grow by `prted` presence on the targets and the
+> `PMIX_DVM_IS_READY` event, not by plain-`prun` placement.
 >
-> To actually **run something on a grown node**, spawn into the reservation:
-> `elastic grow node4:2 -- <cmd>` takes the `PMIX_ALLOC_ID` the request handed
-> back and spawns `<cmd>` with `PMIX_SPAWN_TARGET` naming it. The grow and the
-> spawn must happen in one `elastic` invocation — the HNP only lets a namespace
-> target a reservation it owns, and the owner is the tool that created it.
+> To **run something on a grown node while the reservation is still held**,
+> spawn into it: `elastic grow node4:2 -- <cmd>` takes the `PMIX_ALLOC_ID` the
+> request handed back and spawns `<cmd>` with `PMIX_SPAWN_TARGET` naming it.
+> A **later** command of the same user can reach it too:
+> `prun --alloc-id <id>` spawns into the reservation from a separate tool.
+> Ownership is namespace *and* user — the namespace test is what keeps other
+> jobs in the DVM out, and the uid is what keeps the allocation usable after
+> the one-shot tool that created it has gone. An allocation the DVM does not
+> know is still `PMIX_ERR_NOT_FOUND`, and a job whose namespace is not an
+> owner is refused with `PMIX_ERR_NO_PERMISSIONS` (`PRTE_ERR_PERM`) — the two
+> answers are deliberately distinct, so "you may not" cannot be read as
+> "there is no such allocation".
+>
+> **Once that tool exits, the reservation is gone.** Its inheritance
+> disposition fires — by default "unreserve into the general pool" — so the
+> nodes it grew become ordinary pool members and a plain `prun --host node4`
+> reaches them with no allocation directive at all. This needs a PMIx defining
+> `PMIX_CAP_TOOL_FINALIZED`: a tool that finalizes cleanly is reported to the
+> host by nothing else (it is not a child, so no waitpid; and the connection
+> drop that follows raises no lost-connection event, because the peer is
+> already marked finalized). Against an older PMIx the DVM never learns the
+> tool went away, the disposition never runs, and the grown nodes stay
+> stranded for the life of the DVM — outside the general pool and unreachable
+> through the reservation too, since the only namespace allowed to name it no
+> longer exists. `run-tests.sh` skips the cases that assert the released-pool
+> behavior when the capability is absent (`pmix_cap`).
 
 **Shrink** (`elastic shrink node3`): phase-1 `PMIX_SUCCESS`, then phase-2
 `PMIX_DVM_IS_READY`, plus a **"PRRTE has lost communication with a remote
@@ -393,6 +512,58 @@ owning every core of it. Note that an assertion on a binding has to match the
 **whole** bracketed site list: a rank bound to `core:L0-7` starts with a `0`
 and slips past a pattern that only looks at the first number, which is
 exactly how that defect stayed hidden behind a passing test.
+
+**The PRRTE/PMIx translation shim (`src/pmix`, `test_pmix`)**: everything in
+`src/pmix/pmix.c` is a pure integer mapping and is covered exhaustively,
+without a DVM, by `test/unit/pmix`. What this phase adds is the one thing a
+table test cannot show — that the mapping is actually *reached*, with real
+proc states, on a daemon that is not the one you are standing on. The probe
+is `proctable`, and it asserts:
+
+- `PMIX_QUERY_PROC_TABLE` over a job spread across four nodes returns every
+  proc, the table spans more than one node, and **no proc reports
+  `PMIX_PROC_STATE_UNDEF`**. That last one is the whole point:
+  `prte_pmix_convert_state()` was written with bare integer cases against a
+  state space that does not number like PMIx's, so several real PRRTE states
+  fell through to `UNDEF` — a legal answer, so nothing anywhere logged an
+  error and the proc simply had no state.
+- `PMIX_QUERY_LOCAL_PROC_TABLE` returns *some but not all* of a job's procs.
+  On one host "local" and "all" are the same set, so this case cannot exist
+  there.
+- **every daemon serves every node's `PMIX_SERVER_URI`**. The consumer here
+  is a **tool**, not a daemon — daemons reach each other over the RML and
+  never form PMIx connections to one another; see `examples/tool.c --uri
+  <nodename>`. Each daemon ships its own server URI to the master in its
+  `PRTED_CALLBACK` rollup, and the master puts the whole set into the
+  `WIREUP` xcast alongside the nidmap, so the answer does not depend on
+  which daemon the tool attached to. (Before that the query asked for a key
+  nobody published and answered `NOT_FOUND` for every node but the one being
+  asked — the producing half of commit `6e481fbb95` was never written.)
+
+  The case asks a **non-master** daemon about three other nodes — the case
+  that needs the xcast rather than just the rollup — and requires three
+  **distinct** URIs, so an implementation that echoed the local server back
+  would not pass. It then checks the master and a non-master agree on a
+  third node's URI. An unknown node must come back with a specific status,
+  never the generic `PMIX_ERROR` that the wrong-direction conversion used to
+  manufacture out of every failure on this path.
+
+- a served URI is **actually reachable**. With `--prtemca
+  pmix_remote_connections 1` the servers bind a routable interface, and the
+  URI served for a *remote* node must carry that node's own address — not
+  loopback, and not the master's. Off (the default) every server binds
+  loopback, so the answer is truthful but only usable by a tool on that
+  node. This is the assertion that says the feature is worth having, and one
+  host cannot make it.
+
+- the URIs **follow the DVM across a grow and a shrink**. `vm_ready()` runs
+  on every `VM_READY` and re-sends the whole set, so a grow redistributes
+  with no code of its own — asserted rather than assumed. A shrink needs
+  nothing: the query resolves hostname → node → `node->daemon` and a shrink
+  NULLs that, so a departed node cannot be answered for at all. The case
+  shrinks node3 and requires its URI to stop being served while node2's is
+  unaffected, so that stays true rather than being an accident of the
+  current teardown order.
 
 **The daemon body and the PMIx server host module (`src/prted`,
 `test_prted`)**: `src/prted` is where the DVM actually lives, and almost
@@ -557,6 +728,24 @@ depends on a configure-time decision, check that line rather than assuming.
 This is the same shape as the `show_help` staleness trap below: a
 persistent build dir plus a "only if missing" rule.
 
+**Arguments are not the only thing that goes stale.** A build dir configured
+before the build system was *regenerated* is stale too, and it fails in a way
+that points nowhere near the cause. Edit `configure.ac` or a `config/*.m4`,
+re-run `./autogen.pl` on the host, and `configure`/`Makefile.in` are now newer
+than the volume's `config.status`. An incremental `make` inside the container
+then walks into maintainer-mode regeneration — and the container does not have
+the exact `aclocal`/`automake` the host used:
+
+```
+/prrte-src/config/missing: line 85: aclocal-1.18: command not found
+make: *** [Makefile:730: /prrte-src/aclocal.m4] Error 127
+```
+
+`build.sh` dies there, so the **previous** install stays in the volume and the
+stamp is gone — which at least makes `run-tests.sh` refuse to run rather than
+test it. `reconfigure_needed` now also reconfigures when `configure` is newer
+than `config.status`, which is the condition that matters.
+
 ### Writing a case that asserts on an error message
 
 **`show_help` emits a given message once per HNP.** A test that probes with
@@ -585,19 +774,44 @@ running straight away produced twenty-one failures with nothing in them
 pointing at the cause — the first launch simply came back killed.
 
 If you drive things by hand, clear stale state on **every** node between
-DVM runs:
+DVM runs — the same sweep `cleanup_swarm` does:
 
 ```sh
 for n in $(seq 1 10); do
-  docker exec prte-node$n sh -c 'pkill -9 -x prted; pkill -9 -x prte;
-    rm -rf /tmp/prte.* /tmp/prun.session.*; true'
+  docker exec prte-node$n sh -c '
+    for t in prted prte prterun prun pterm; do pkill -9 -x $t; done
+    rm -rf /tmp/prte.* /tmp/prted.* /tmp/prtrn.* /tmp/prun.* /tmp/ompi.* /tmp/pmix.*
+    find /tmp -maxdepth 2 -name "pmix.*" -prune -exec rm -rf {} +
+    true'
 done
 ```
+
+**Every tool has its own session-dir prefix, and one missed prefix is enough.**
+`prte.<pid>` is the HNP, `prtrn.<pid>` is `prterun`, `prted.<pid>` is a
+bootstrapped daemon standing on its own, `prun.<pid>` is `prun` itself, and
+`ompi.<pid>` is anything run under the ompi personality. Each of them holds a
+`pmix.*` server rendezvous file, a system-level server drops `pmix.sys.<host>`
+straight into `/tmp`, and any one left behind makes the next tool report
+*"multiple possible servers … connection handles have been read from files
+named pmix.\*"* and fail to find the DVM. That is why the sweep ends with a
+`find`: it catches the rendezvous file of a session dir whose prefix this list
+has not heard of. Leaving `pmix.*` out of `cleanup_swarm` is
+[#2526](https://github.com/openpmix/prrte/issues/2526) — a hand-driven
+`prterun` before a suite run made the elastic block fail for reasons that had
+nothing to do with the code.
+
+The tools are killed, not just the daemons: a live `prun` or `pterm` is
+holding a rendezvous file of its own, and reaping it is the point of a
+teardown.
 
 A detached `prted --daemonize` **survives an HNP kill**; orphans on other nodes
 make the next DVM trip over stale rendezvous files ("multiple possible
 servers"). `pterm` is the clean shutdown; still run the loop afterward to be
 safe.
+
+If you are running a second swarm (`PRTE_SWARM`, §4), the loop above is
+per-swarm — use that swarm's container names. Nothing in it can reach the
+other swarm's `/tmp`, because the containers are different containers.
 
 ## 8. Rebuilding / resetting
 
@@ -608,6 +822,7 @@ safe.
 | force a clean PRRTE rebuild | `docker volume rm prte-build && ./build.sh` |
 | rebuild the base image (new baked PMIx) | `docker build --no-cache --build-arg PMIX_REF=master -t prte-swarm:latest .` — `./build.sh image` reuses docker's cached `git clone`; then wipe the volume's VPATH dirs and recreate the containers (see "The containers persist too") |
 | tear down the swarm | `docker compose down` (the `prte-build` volume persists) |
+| run a second, independent swarm | `export PRTE_SWARM=alt` and repeat the quick start — see §4. Every command in this table then names that swarm's volume (`alt-build`) and containers (`alt-node*`), and **a `docker compose down` without the variable takes down the *default* swarm** |
 
 ## 9. Grow after a shrink
 
@@ -652,10 +867,15 @@ not complete otherwise wedges the whole suite rather than failing one case.
 | `prte-node1` | node1 | head node (HNP) — start `prte` here, run all tools here |
 | `prte-node2`..`prte-node10` | node2..node10 | DVM nodes (grow/shrink targets) |
 
-Network: bridge `dvm`. All nodes mount the shared `prte-build` volume read-only
-at `/opt/prte`, where `build.sh` installs PRRTE (`/opt/prte/prte`) and writes
-`/opt/prte/env.sh`. To add or remove nodes, copy or delete a service block in
-`docker-compose.yml` (and adjust the `seq 1 10` loops to match).
+Network: bridge `prteswarm_dvm`. All nodes mount the shared `prte-build`
+volume read-only at `/opt/prte`, where `build.sh` installs PRRTE
+(`/opt/prte/prte`) and writes `/opt/prte/env.sh`. To add or remove nodes, copy
+or delete a service block in `docker-compose.yml` (and adjust the `seq 1 10`
+loops to match).
+
+The container, volume, and network names above are the `PRTE_SWARM=prte`
+default; under another name they all shift together (§4). The **hostnames**
+never do — `node1`..`node10` is what the tests name, in every swarm.
 
 ## 11. Spawning a child job (`dynamic`)
 
@@ -871,3 +1091,117 @@ docker exec prte-node4 sh -c 'ldd /opt/prte/prte/bin/<helper> | grep pmix'
 The daemons themselves are fine — `prted` is launched with the right
 environment and loads the volume's PMIx on every node. It is only the
 application processes they fork that lose it.
+
+## 15. Group collectives (`groupcon`, `test_grpcomm`)
+
+`PMIx_Group_construct` is a two-phase collective — an up-tree rollup to
+the HNP, then an xcast of the assembled result back down — and the half
+worth testing across nodes is the **down-tree** one. `grp_release()` runs
+on *every* daemon: it takes the broadcast, hands the group's context id,
+group info and endpoint data to its **own** local PMIx server via
+`PMIx_server_register_resources()`, and only then releases the local
+participants of the collective. On one host there is exactly one daemon
+and it is also the HNP, so a daemon that merely *received* the release is
+never exercised at all.
+
+That registration used to be waited on, parking the daemon's whole event
+loop on every construct; it is now a continuation
+(`grp_release_regcbfunc` → `grp_release_resume` →
+`grp_release_complete`). **That continuation is what this phase guards.**
+Lose the caddy anywhere between issuing the registration and resuming and
+the local participants are never released — the construct does not fail,
+it *hangs*, on every daemon at once. Deleting the thread-shift and
+re-running turns 7 of the phase's 10 assertions red, which is how the
+teeth were confirmed rather than assumed.
+
+The probe is `groupcon`, compiled by `build.sh` the same way as
+`elastic`/`dataserver`/`proctable`:
+
+```sh
+groupcon <groupID> [secs]
+```
+
+Every rank contributes `PMIX_GROUP_LOCAL_CID` = 1234 + rank as
+`PMIX_GROUP_INFO`, requests `PMIX_GROUP_ASSIGN_CONTEXT_ID`, constructs,
+reads **every** rank's local cid back, and destructs. Output is one
+grep-friendly `GRP <rank> <what> …` line per step.
+
+**One thing this phase deliberately does not claim.** The read-back runs
+with no fence after the construct returns, which looks like an assertion
+that the daemon registered the group with its PMIx server before
+releasing its clients. It is not, and saying so would be wrong: the
+construct hands the same group info back to the client in its *results*,
+so the client library answers those reads out of its own cache —
+skipping `PMIx_server_register_resources` entirely still passes them
+(measured). What the reads are good for is checking that the membership
+and group info each daemon returned are complete and identical, which is
+a genuinely per-daemon property.
+
+The other two assertions in the phase are shape checks worth keeping: the
+group must actually span more than one node (or the case is a
+single-host test wearing a hat), and three back-to-back constructs
+followed by a plain job must all succeed — a caddy leak or a tracker that
+is never deleted shows up as drift across runs rather than as one bad
+one.
+
+## 16. The event base and the constants (`test_event`, `test_include`)
+
+Two phases for two directories that are almost entirely covered without a
+DVM — [`src/event`](../../src/event/AGENTS.md) by `test/unit/event` and
+[`src/include`](../../src/include/AGENTS.md) by `test/unit/include`. What
+lands here is only what a single process cannot show.
+
+**`test_event`.** Three things, all of which need an event on one machine to
+have a consequence on another:
+
+- **A job timeout fires, and takes the job with it.** `--timeout` arms a
+  `prte_event_evtimer` on the HNP; when it fires, the HNP has to reach
+  processes it does not host. The case requires both a non-zero exit *and*
+  no surviving application process on any of the three nodes.
+- **A job that beats its timeout is not killed by it.** The other half, and
+  the one a broken `prte_event_evtimer_del()` breaks: a pending timer that
+  is not deleted fires afterwards against a job that has already finished.
+  A generous timeout over a fast job must produce a clean result with no
+  timeout reported.
+- **A signal caught on one node is re-raised on another.** `prun` catches
+  the signal on its own event base (a `PRTE_EV_SIGNAL` event on a
+  `prte_event_list_item_t`), reads the number back with
+  `PRTE_EVENT_SIGNAL()`, and relays it over the RML; the daemon holding the
+  process re-raises it locally. `test_prted` already covers the *job
+  scoping* of that path with both jobs on one node — what only exists
+  across nodes is the relay, so this case puts the launcher on node1 and the
+  process on node4.
+- **The DVM tears its event base down cleanly on every node.**
+  `prte_finalize()` closes the event base — it frees `prte_sync_event_base`
+  and clears both globals. Nothing called that function until recently: it
+  existed, had no callers, and left both globals pointing at freed memory.
+  A base freed while something still holds a registered event, or freed
+  before the last PMIx server upcall has drained, shows up here as a daemon
+  that crashes or hangs instead of exiting. Only a real shutdown runs that
+  code. The case gives eight daemons real work first, then requires `pterm`
+  to return 0 with no crash text, every daemon gone, and no session
+  directory left behind.
+
+Note the unit test deliberately does **not** assert that raising a signal
+runs its callback. Whether a signal raised before the loop is entered is
+reported at all is a property of the event library backend — libevent's
+kqueue backend on macOS does not report it, and a three-line program using
+`event_assign`/`event_add`/`raise` hangs in `event_base_loop()` the same
+way. That assertion belongs here, where the signal arrives at a running
+process.
+
+**`test_include`.** PRRTE's error codes were renumbered onto
+`PMIX_EXTERNAL_ERR_BASE` — they used to sit on top of PMIx's own statuses,
+46 of them exactly, and the second half of the list was *positive*. A
+renumbering does not break the build. It breaks a real failure path into
+"Unknown error", or into somebody else's error. Those paths run on the
+daemon that hosts the process, so the phase provokes genuine failures on a
+**remote** node — a missing executable, a missing working directory, an
+impossible slot request — and requires each to come back named, never as
+"Unknown error" and never as a bare number.
+
+The byte-order helpers (`prte_hton64`/`prte_ntoh64`) need no case of their
+own: every message between daemons runs its header epoch through them, so
+every other phase in this suite exercises them already. What no container
+swarm can cover is the case they exist for — a **heterogeneous** DVM, where
+the two ends disagree about endianness.

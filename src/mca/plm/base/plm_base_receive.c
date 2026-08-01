@@ -221,6 +221,8 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
     prte_app_context_t *app, *child_app;
     pmix_proc_t name, *nptr = NULL;
     pid_t pid;
+    uid_t tooluid = PRTE_INVALID_UID;
+    gid_t toolgid = PRTE_INVALID_GID;
     bool debugging, found;
     int i, room, *rmptr = &room;
     char *tmp;
@@ -314,11 +316,31 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
                 free(tmp);
                 goto CLEANUP;
             }
+            // and who is running it
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                free(tmp);
+                goto CLEANUP;
+            }
+            tooluid = (uid_t) ui32;
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                free(tmp);
+                goto CLEANUP;
+            }
+            toolgid = (gid_t) ui32;
 
             // need to add the tool job
             jdata = PMIX_NEW(prte_job_t);
             PMIX_LOAD_NSPACE(jdata->nspace, name.nspace);
             PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
+            /* record who is running the tool - see prte_session_is_owned_by */
+            jdata->uid = tooluid;
+            jdata->gid = toolgid;
             rc = prte_set_job_data_object(jdata);
             app = PMIX_NEW(prte_app_context_t);
             if (NULL != tmp) {
@@ -418,6 +440,17 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
             rc = PRTE_ERR_NOT_FOUND;
             goto ANSWER_LAUNCH;
+        }
+
+        /* The job belongs to whoever asked for it. Identity descends the job
+         * tree from the tool that started it, so an allocation an application
+         * requests is recorded against the user who launched that application
+         * - not left anonymous because the job itself never presented
+         * credentials. */
+        parent = prte_get_job_data_object(nptr->nspace);
+        if (NULL != parent) {
+            jdata->uid = parent->uid;
+            jdata->gid = parent->gid;
         }
 
         /* A spawn-target list takes precedence and may name multiple sessions
@@ -612,6 +645,20 @@ moveon:
                              "%s plm:base:receive - error on launch: %d",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), rc));
 
+        /* Capture the requester's room number *before* we dispose of the job
+         * object below - it lives on that object, and it is the only handle
+         * the requester has on this request. Without it,
+         * pmix_server_launch_resp() cannot match the response to anything and
+         * simply drops it, leaving the requester (e.g., prun) waiting for a
+         * completion that will never come. We may have no job object at all
+         * here - e.g., if the request failed to unpack. */
+        found = false;
+        if (NULL != jdata &&
+            prte_get_attribute(&jdata->attributes, PRTE_JOB_ROOM_NUM,
+                               (void **) &rmptr, PMIX_INT)) {
+            found = true;
+        }
+
         /* release the launch proxy procID if we retrieved one */
         if (NULL != nptr) {
             PMIX_PROC_RELEASE(nptr);
@@ -630,8 +677,13 @@ moveon:
         /* setup the response */
         PMIX_DATA_BUFFER_CREATE(answer);
 
-        /* pack the error code to be returned */
-        rc = PMIx_Data_pack(NULL, answer, &rc, 1, PMIX_INT32);
+        /* Pack the error code to be returned. The requester hands this
+         * straight to PMIx (see pmix_server_notify_spawn), and every other
+         * producer of a spawn response passes a PMIx status, so convert out
+         * of PRRTE's numbering scheme here - the two overlap, so an
+         * unconverted code arrives at the tool as some other, real error. */
+        ret = prte_pmix_convert_rc(rc);
+        rc = PMIx_Data_pack(NULL, answer, &ret, 1, PMIX_INT32);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
         }
@@ -643,10 +695,8 @@ moveon:
             PMIX_ERROR_LOG(rc);
         }
 
-        /* pack the room number of the request - note that we may not have a
-         * job object at all here (e.g., if it failed to unpack) */
-        if (NULL != jdata &&
-            prte_get_attribute(&jdata->attributes, PRTE_JOB_ROOM_NUM, (void **) &rmptr, PMIX_INT)) {
+        /* pack the room number of the request, if we were able to recover it */
+        if (found) {
             rc = PMIx_Data_pack(NULL, answer, &room, 1, PMIX_INT);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
@@ -858,6 +908,32 @@ moveon:
         }
         if (jdata->num_reported == jdata->num_procs) {
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_REGISTERED);
+        }
+        break;
+
+    case PRTE_PLM_TOOL_DEPARTED_CMD:
+        /* The partner of TOOL_ATTACHED above. A daemon other than the master
+         * holds no job object for a tool that connected to it, so it cannot
+         * retire one - it tells us instead, and we drive the tool's proc into
+         * TERMINATED here. Vet the namespace before doing so: the daemon is
+         * reporting a peer it could not identify beyond "not a client of
+         * mine", and acting on one that turns out to be an application job
+         * would terminate that job. Nothing is wrong with a namespace we no
+         * longer know - the DVM may already have discarded it - so that is
+         * not an error either. */
+        count = 1;
+        rc = PMIx_Data_unpack(NULL, buffer, &name, &count, PMIX_PROC);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            goto CLEANUP;
+        }
+        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                             "%s plm:base:receive tool %s departed (reported by %s)",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&name),
+                             PRTE_NAME_PRINT(sender)));
+        jdata = prte_get_job_data_object(name.nspace);
+        if (NULL != jdata && PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+            PRTE_ACTIVATE_PROC_STATE(&name, PRTE_PROC_STATE_TERMINATED);
         }
         break;
 

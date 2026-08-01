@@ -98,6 +98,122 @@ static char *key_string(pmix_info_t *iptr, size_t ninfo, const char *key)
     return NULL;
 }
 
+/* Hand a set of per-app-segment contributions to the hoist and report both
+ * its rc and what the option ended up holding in the parse result. */
+static int run_hoist(const char *key, char **contributions,
+                     char **existing, char **merged)
+{
+    pmix_cli_result_t results;
+    pmix_cli_item_t *opt;
+    char **contrib = NULL;
+    int n, rc;
+
+    *merged = NULL;
+    PMIX_CONSTRUCT(&results, pmix_cli_result_t);
+    if (NULL != existing) {
+        /* what the tool's own parse of the command line saw - which is
+         * always the FIRST app segment's contribution, since that parse
+         * stops at the first executable */
+        schizo_test_add(&results, key, existing[0], NULL);
+    }
+    for (n = 0; NULL != contributions[n]; n++) {
+        PMIx_Argv_append_nosize(&contrib, contributions[n]);
+    }
+
+    rc = prte_schizo_base_hoist_job_option(&results, key, contrib);
+    if (PRTE_SUCCESS == rc) {
+        opt = pmix_cmd_line_get_param(&results, key);
+        if (NULL != opt && NULL != opt->values) {
+            *merged = PMIx_Argv_join(opt->values, '|');
+        }
+    }
+    PMIx_Argv_free(contrib);
+    PMIX_DESTRUCT(&results);
+    return rc;
+}
+
+/*
+ * prte_schizo_base_hoist_job_option() - "--output", "--display" and
+ * "--rtos" describe the JOB, so they may be written in any app segment of
+ * an MPMD command line.  The tool's own parse stops at the first
+ * executable and cannot see a later one; these are what put it back.
+ */
+static int test_hoist(void)
+{
+    int failures = 0, rc;
+    char *merged = NULL;
+    char *one[] = {"tag", NULL};
+    char *two[] = {"tag", "timestamp", NULL};
+    char *same[] = {"tag", "tag", NULL};
+    char *explicit_agree[] = {"tag", "tag=1", NULL};
+    char *contradict[] = {"tag", "tag=0", NULL};
+    char *copies[] = {"file=/tmp/a:copy", ":nocopy", NULL};
+    char *files[] = {"file=/tmp/a", "file=/tmp/b", NULL};
+    char *samefile[] = {"file=/tmp/a", "file=/tmp/a", NULL};
+    char *timeouts[] = {"timeout=60", "timeout=30", NULL};
+    char *empty[] = {NULL};
+
+    /* the ordinary MPMD case: the option was written in one segment, and
+     * that segment may be any of them */
+    rc = run_hoist(PRTE_CLI_OUTPUT, one, one, &merged);
+    CHECK("hoist:one-rc", PRTE_SUCCESS == rc);
+    CHECK("hoist:one-value", NULL != merged && 0 == strcmp(merged, "tag"));
+    free(merged);
+
+    /* two segments, two different directives - both belong to the job */
+    rc = run_hoist(PRTE_CLI_OUTPUT, two, NULL, &merged);
+    CHECK("hoist:two-rc", PRTE_SUCCESS == rc);
+    CHECK("hoist:two-value",
+          NULL != merged && 0 == strcmp(merged, "tag,timestamp"));
+    free(merged);
+
+    /* saying the same thing twice is agreement, not conflict */
+    rc = run_hoist(PRTE_CLI_OUTPUT, same, NULL, &merged);
+    CHECK("hoist:same-rc", PRTE_SUCCESS == rc);
+    free(merged);
+    rc = run_hoist(PRTE_CLI_OUTPUT, explicit_agree, NULL, &merged);
+    CHECK("hoist:explicit-agree-rc", PRTE_SUCCESS == rc);
+    free(merged);
+    rc = run_hoist(PRTE_CLI_OUTPUT, samefile, NULL, &merged);
+    CHECK("hoist:same-file-rc", PRTE_SUCCESS == rc);
+    free(merged);
+
+    /* opposite answers cannot both be honored */
+    fprintf(stderr, "--- expected error output follows (hoist: tag vs tag=0) ---\n");
+    rc = run_hoist(PRTE_CLI_OUTPUT, contradict, NULL, &merged);
+    CHECK("hoist:contradict", PRTE_SUCCESS != rc);
+
+    /* "copy" and "nocopy" are one question spelled two ways */
+    fprintf(stderr, "--- expected error output follows (hoist: copy vs nocopy) ---\n");
+    rc = run_hoist(PRTE_CLI_OUTPUT, copies, NULL, &merged);
+    CHECK("hoist:copy-nocopy", PRTE_SUCCESS != rc);
+
+    /* a directive that carries a VALUE differs when its values differ */
+    fprintf(stderr, "--- expected error output follows (hoist: two files) ---\n");
+    rc = run_hoist(PRTE_CLI_OUTPUT, files, NULL, &merged);
+    CHECK("hoist:two-files", PRTE_SUCCESS != rc);
+
+    /* ...and "60" and "30" are two different lengths of time, however
+     * alike they look to a truth test */
+    fprintf(stderr, "--- expected error output follows (hoist: two timeouts) ---\n");
+    rc = run_hoist(PRTE_CLI_RTOS, timeouts, NULL, &merged);
+    CHECK("hoist:two-timeouts", PRTE_SUCCESS != rc);
+
+    /* no segment wrote the option: whatever the global parse holds is the
+     * whole of it, and must not be disturbed */
+    rc = run_hoist(PRTE_CLI_DISPLAY, empty, one, &merged);
+    CHECK("hoist:empty-rc", PRTE_SUCCESS == rc);
+    CHECK("hoist:empty-untouched",
+          NULL != merged && 0 == strcmp(merged, "tag"));
+    free(merged);
+
+    /* an option that is not job-level does not belong here at all */
+    CHECK("hoist:not-job-level",
+          PRTE_SUCCESS != run_hoist(PRTE_CLI_MAPBY, one, NULL, &merged));
+
+    return failures;
+}
+
 int test_output(void)
 {
     int failures = 0, rc;
@@ -116,6 +232,15 @@ int test_output(void)
     char *dvals3[] = {"map:parseable", NULL};
     char *dvals4[] = {"topo=node1;node2", NULL};
     char *dvals5[] = {"map:bogus", NULL};
+    char *bvals1[] = {"tag=0", NULL};
+    char *bvals2[] = {"tag=1,timestamp=false", NULL};
+    char *bvals3[] = {"tag=maybe", NULL};
+    char *bvals4[] = {"tag", "tag=0", NULL};
+    char *bvals5[] = {"file=/tmp/prte-schizo-test:raw=0", NULL};
+    char *bvals6[] = {"dir=/tmp/prte-schizo-testdir:copy", NULL};
+    char *dbvals1[] = {"map=0,bind", NULL};
+    char *dbvals2[] = {"map:parseable=no", NULL};
+    char *dbvals3[] = {"map:parseable=perhaps", NULL};
 
     /*** comma-delimited directives in ONE value ***/
     rc = run_parser(prte_schizo_base_parse_output, PRTE_CLI_OUTPUT, vals1,
@@ -221,6 +346,83 @@ int test_output(void)
     rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dvals5,
                     &iptr, &ninfo);
     CHECK("display:bad-qual", PRTE_SUCCESS != rc);
+
+    /*** THE VALUE FORM.
+     ***
+     *** Every boolean directive may be written bare or with a truth value.
+     *** "tag=0" has to leave the key ABSENT, because every consumer of
+     *** these keys tests them by presence - emitting a false one reads as
+     *** ENABLED everywhere.  Before this existed, "--output tag=0" parsed
+     *** happily and applied the tag. ***/
+    rc = run_parser(prte_schizo_base_parse_output, PRTE_CLI_OUTPUT, bvals1,
+                    &iptr, &ninfo);
+    CHECK("output:false-rc", PRTE_SUCCESS == rc);
+    CHECK("output:false-absent", !has_key(iptr, ninfo, PMIX_IOF_TAG_OUTPUT));
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    rc = run_parser(prte_schizo_base_parse_output, PRTE_CLI_OUTPUT, bvals2,
+                    &iptr, &ninfo);
+    CHECK("output:mixed-rc", PRTE_SUCCESS == rc);
+    CHECK("output:mixed-tag", has_key(iptr, ninfo, PMIX_IOF_TAG_OUTPUT));
+    CHECK("output:mixed-timestamp",
+          !has_key(iptr, ninfo, PMIX_IOF_TIMESTAMP_OUTPUT));
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    /* a value that is neither true nor false is refused, not read as false */
+    fprintf(stderr, "--- expected error output follows (non-boolean value) ---\n");
+    rc = run_parser(prte_schizo_base_parse_output, PRTE_CLI_OUTPUT, bvals3,
+                    &iptr, &ninfo);
+    CHECK("output:non-boolean", PRTE_SUCCESS != rc);
+
+    /* the whole list has its say before anything is emitted, so the last
+     * writing of a directive is the one that counts */
+    rc = run_parser(prte_schizo_base_parse_output, PRTE_CLI_OUTPUT, bvals4,
+                    &iptr, &ninfo);
+    CHECK("output:last-wins-rc", PRTE_SUCCESS == rc);
+    CHECK("output:last-wins", !has_key(iptr, ninfo, PMIX_IOF_TAG_OUTPUT));
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    /* the qualifiers take a value too */
+    rc = run_parser(prte_schizo_base_parse_output, PRTE_CLI_OUTPUT, bvals5,
+                    &iptr, &ninfo);
+    CHECK("output:raw-false-rc", PRTE_SUCCESS == rc);
+    CHECK("output:raw-false-file", has_key(iptr, ninfo, PMIX_IOF_OUTPUT_TO_FILE));
+    CHECK("output:raw-false", !has_key(iptr, ninfo, PMIX_IOF_OUTPUT_RAW));
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    /* "copy"/"nocopy" says whether the output also reaches the terminal, so
+     * it qualifies a directory of files exactly as it qualifies one file -
+     * it used to be applied only alongside "file=" */
+    rc = run_parser(prte_schizo_base_parse_output, PRTE_CLI_OUTPUT, bvals6,
+                    &iptr, &ninfo);
+    CHECK("output:dir-copy-rc", PRTE_SUCCESS == rc);
+    val = key_is_true(iptr, ninfo, PMIX_IOF_FILE_ONLY, &found);
+    CHECK("output:dir-copy-present", found);
+    CHECK("output:dir-copy-false", !val);
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    /*** the same, for --display ***/
+    rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dbvals1,
+                    &iptr, &ninfo);
+    CHECK("display:false-rc", PRTE_SUCCESS == rc);
+    CHECK("display:false-map", !has_key(iptr, ninfo, PMIX_DISPLAY_MAP));
+    CHECK("display:false-bind", has_key(iptr, ninfo, PMIX_REPORT_BINDINGS));
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dbvals2,
+                    &iptr, &ninfo);
+    CHECK("display:qual-false-rc", PRTE_SUCCESS == rc);
+    CHECK("display:qual-false-map", has_key(iptr, ninfo, PMIX_DISPLAY_MAP));
+    CHECK("display:qual-false",
+          !has_key(iptr, ninfo, PMIX_DISPLAY_PARSEABLE_OUTPUT));
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    fprintf(stderr, "--- expected error output follows (non-boolean qualifier) ---\n");
+    rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dbvals3,
+                    &iptr, &ninfo);
+    CHECK("display:qual-non-boolean", PRTE_SUCCESS != rc);
+
+    failures += test_hoist();
 
 #if PRTE_PMIX_IOF_FILE_PATTERN
     /*** the "pattern" qualifier hands the naming of the output files to the

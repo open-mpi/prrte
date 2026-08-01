@@ -30,7 +30,15 @@ behind almost every DVM-wide action:
 
 - The `plm`/`state` code broadcasts launch messages, wireup (nidmap), and
   DAEMON commands with `prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, …)` /
-  `PRTE_RML_TAG_WIREUP`.
+  `PRTE_RML_TAG_WIREUP`. The receive side of the wireup lives here, in
+  `process_wireup()` (`direct/grpcomm_direct_xcast.c`): after the nidmap it
+  reads a **three-field record per daemon** — name, `PMIX_PROC_URI`
+  (RML contact info), `PMIX_SERVER_URI` (that node's PMIx server
+  rendezvous, redistributed only so any daemon can answer a tool's query;
+  PRRTE never connects to it). The sender is `vm_ready()` in `state/dvm`.
+  The loop skips storing what it already knows, so mind the invariant:
+  **every field of a record must be unpacked before any `continue`**, or
+  the next iteration reads the leftover string as a `pmix_proc_t`.
 - The PMIx server shim satisfies `PMIx_Fence` /
   `PMIx_server_register_resources` for local clients via
   `prte_grpcomm.fence(...)` (see `src/prted/pmix/pmix_server_fence.c`).
@@ -250,6 +258,14 @@ starts at `UINT32_MAX`, and every signature/tracker/caddy class
 constructs with the documented defaults (all rollup counters zero, the
 group tracker's info-lists opened) and destructs without leaking or
 crashing. Extend it when you add a class or change a constructor default.
+
+The live collectives are covered by the
+[dockerswarm harness](../../../contrib/dockerswarm/AGENTS.md): `xcast`
+and `fence` fall out of nearly every phase, and `test_grpcomm` drives
+`PMIx_Group_construct`/`_destruct` across four nodes with the `groupcon`
+client. That phase exists because `grp_release()` runs on **every**
+daemon, and a daemon that merely *received* the down-tree broadcast —
+rather than originating it as the HNP — does not exist on one host.
 
 ---
 
