@@ -36,13 +36,21 @@ The comment at the top of `prte_job_pack` is the important one:
 
 So this is **not** serialization of a `prte_job_t`. It is the launch
 message. `job->map` is packed for the policies it carries, not for the nodes
-it mapped (`prte_map_pack` sends `req_mapper`/`last_mapper`/mapping/ranking/
-binding/`num_nodes` and nothing else). Node procs, topologies, session
+it mapped (`prte_map_pack` sends mapping/ranking/binding/`num_nodes` and
+nothing else - deliberately no mapper name: mapping happens only on the HNP,
+so the identity of the component that did it was read by nothing at the far
+end). Node procs, topologies, session
 backpointers, the session dir, `cli`, and the counters are all left behind.
 
 The two sides are hand-written mirrors with no format version and no
-self-description. **Every field added to the packer must be added to the
-unpacker in the same position, in the same PMIx type.** There is nothing
+self-description. That is workable only because **mixed-version DVMs are
+strictly forbidden** — every process in a DVM comes from the same build, so
+the two sides are always the same source (see the top-level
+[`AGENTS.md`](../../../AGENTS.md) and [`docs/versions.rst`](../../../docs/versions.rst)).
+It also means you may freely add, remove or retype a field, and need keep
+nothing for compatibility — but **every field added to the packer must be
+added to the unpacker in the same position, in the same PMIx type, in the
+same commit.** There is nothing
 that will catch a mismatch for you: a type of the same width (`PMIX_INT32`
 against `PMIX_UINT32`) silently produces wrong values, and a type of a
 different width desynchronizes everything after it.
@@ -109,13 +117,22 @@ none of the three checked `src->node` itself, which is NULL for an unmapped
 proc and for a proc that outlived its node.
 
 The XML arm sizes a buffer for `prte_hwloc_get_binding_info()` itself, and
-has to size it from the **element** it will hold, not from a round number:
-each is 20 spaces of indent plus `<core>%d</core>\n`, so ~34 bytes for a
-single-digit core index and more as indices grow. The estimate used to be 20
-bytes per PU, which silently truncated the site list for any process bound to
-more than about half the cores of a non-SMT node — and, before `src/hwloc`
-bounded its writes, overran the buffer outright. See
-[`src/hwloc/AGENTS.md`](../../hwloc/AGENTS.md), "Rendering a binding".
+has to size it from the **elements** it will hold, not from a round number:
+each site is 20 spaces of indent plus `<core>%d</core>\n`, so ~34 bytes for a
+single-digit core index and more as indices grow, and each package the
+process touches costs an opening and a closing element on top. The estimate
+used to be 20 bytes per PU and nothing per package, which silently truncated
+the site list for any process bound to more than about half the cores of a
+non-SMT node — and, before `src/hwloc` bounded its writes, overran the buffer
+outright. See [`src/hwloc/AGENTS.md`](../../hwloc/AGENTS.md), "a cpuset's
+bits are PU OS indices".
+
+**The `<package>` elements come from the renderer, not from here.** This arm
+used to wrap the returned site list in a single `<package id="%d">` built
+from a `pkgnum` out parameter, which meant a process bound across two
+packages was reported as belonging to one — the short form of the same
+binding (`prte_hwloc_base_cset2str`) named both. Emit what the renderer
+returns verbatim.
 
 The string building is `pmix_asprintf`-and-free chaining: `tmp` always owns
 the accumulated string, each step builds `tmp2` from it, frees `tmp`, and

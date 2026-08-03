@@ -31,9 +31,10 @@ is the property to preserve.
 | Caller | What it wants |
 |--------|---------------|
 | `ess/hnp`, `plm/base` | `prte_hwloc_base_get_topology()`, `_filter_cpus()`, `_setup_summary()` — acquiring the local topology and receiving remote ones |
-| `rmaps/*` | `_get_nbobjs_by_type()`, `_get_obj_by_type()`, `_get_npus()`, `_generate_cpuset()`, `_cpu_list_parse()`, `_reset_counters()`, `prte_hwloc_obj_data_t` |
+| `rmaps/*` | `_get_nbobjs_by_type()`, `_get_obj_by_type()`, `_generate_cpuset()`, `_cpu_list_parse()`, `_reset_counters()`, `_has_cores()`/`_core_cpus()`, `prte_hwloc_obj_data_t` |
+| `ras/simulator` | `_get_npus()`, `_filter_cpus()` — the only caller of `_get_npus()`, which fabricates a node's slot count from a synthetic topology |
 | `odls/base` | `prte_hwloc_base_map` / `_mbfa` (the memory-policy globals) and `_cset2str()` |
-| `runtime/data_type_support`, `ras/base` | `_cset2str()`, `prte_hwloc_get_binding_info()`, `prte_hwloc_print()`, `prte_hwloc_build_map()` — every `--display` variant |
+| `runtime/data_type_support`, `ras/base` | `_cset2str()`, `_cpuset2ranges()`, `prte_hwloc_get_binding_info()`, `prte_hwloc_print()` — every `--display` variant |
 | `schizo`, `tools` | `_set_binding_policy()`, `_print_binding()` |
 
 ---
@@ -103,6 +104,45 @@ Consequences:
   expressed in OS indices.
 - **`numa_cutoff` must never be left at `UINT_MAX`,** on any error path.
   The consumers scan `0..cutoff`.
+- **`prte_hwloc_base_setup_summary()` can fail to allocate the summary.**
+  Both lookups re-read the root's `userdata` after asking for it and cope
+  with a `NULL`; the builder itself has to as well, rather than
+  dereferencing what `PMIX_NEW` just failed to give it.
+
+---
+
+## GOLDEN RULE: an hwloc object has four child lists, and `children[]` is one
+
+The same fact bites a second way, away from the counting wrappers. In
+hwloc 2.x an object's children are split across **four** separate lists:
+
+| List | Head | Count | Holds |
+|------|------|-------|-------|
+| normal | `obj->children[]` | `obj->arity` | packages, caches, cores, PUs, groups |
+| memory | `obj->memory_first_child` | `obj->memory_arity` | **NUMA nodes**, memcaches |
+| I/O | `obj->io_first_child` | `obj->io_arity` | bridges, PCI and OS devices |
+| Misc | `obj->misc_first_child` | `obj->misc_arity` | annotations |
+
+So **a recursive walk over `obj->children[0..arity)` visits no NUMA node
+and no device** — the same blind spot as a depth loop, wearing different
+clothes. `prte_hwloc_print()` — the whole of `--display topo` — was written
+that way, so it rendered a topology with no NUMA domains in it at all, on a
+runtime whose `--map-by numa` is usually the reason a user asked to see the
+topology in the first place. It also dropped every I/O object, which this
+directory goes out of its way to *keep* (`topology_set_flags()` asks hwloc
+for `HWLOC_TYPE_FILTER_KEEP_IMPORTANT`), so the network and GPU devices a
+user is looking for when they want to reason about locality were never
+shown either.
+
+**Use `hwloc_get_next_child()`** — it walks normal, then memory, then I/O,
+then Misc — and if you report a child *count*, sum all four arities:
+`obj->arity` alone makes a package holding a NUMA node read as though it
+held only its cores.
+
+Note that this is orthogonal to the `userdata` sweep below: nothing
+attaches PRRTE data to an I/O or Misc object, so
+`prte_hwloc_base_release_userdata()` is right to cover the normal depths
+plus `HWLOC_TYPE_DEPTH_NUMANODE` and no more.
 
 ---
 
@@ -115,17 +155,43 @@ PRRTE stores two *different* PMIx objects on hwloc `userdata` pointers:
 | the topology's **root** object | `prte_hwloc_topo_data_t` (the summary: `computed`, `numa_cutoff`) | `prte_hwloc_base_setup_summary()` |
 | any other object | `prte_hwloc_obj_data_t` (the per-object `nprocs` placement counter) | `rmaps/base/rmaps_base_binding.c` |
 
+**Who owns the local topology.** `prte_hwloc_topology` is the process's own
+topology, but it is **not** freed by the code that senses it. Its only two
+producers - `ess/hnp` and the shared daemon bring-up - each immediately wrap
+it in a `prte_topology_t` and add that to `prte_node_topologies`, and that
+object's destructor is what releases the userdata and calls
+`hwloc_topology_destroy()`. So **`prte_node_topologies` owns every topology
+it holds, the local one included, and the global is a borrowed alias of one
+of its entries.**
+
+That is what `prte_hwloc_base_close()` had got wrong. It destroyed the
+topology too, which is a double free whichever side of the array release it
+runs on — and so it ended up with **no callers anywhere in the tree** while
+still being documented, and tested, as if it ran. The consequence was not
+just dead code: `prte_init()` calls `prte_hwloc_base_open()`, so the base was
+opened and never closed, and `prte_hwloc_default_cpu_list` leaked on every
+run that used `--cpu-set`. `prte_hwloc_base_close()` now clears the alias
+rather than destroying it — correct in either order — and `prte_finalize()`
+calls it once the array is gone.
+
 hwloc does not know these pointers are ours, so:
 
 - **`prte_hwloc_base_release_userdata()` must run before
-  `hwloc_topology_destroy()`.** `prte_hwloc_base_close()` and
-  `prte_topology_t`'s destructor both do it. So does the XML-loading path,
-  which replaces the local topology.
+  `hwloc_topology_destroy()`.** `prte_topology_t`'s destructor does it, and
+  so does the XML-loading path, which replaces the local topology.
 - **`prte_hwloc_base_reset_counters()` starts at depth 1, not depth 0.**
   Depth 0 is the root, whose `userdata` is a `prte_hwloc_topo_data_t`;
   reinterpreting it as a counter would scribble on `numa_cutoff`. Release
   code can treat both uniformly (`PMIX_RELEASE` is correct for either), but
   anything that *reads a field* cannot.
+- **`prte_hwloc_base_reset_counters()` must sweep the special NUMA depth
+  too, for the same reason `release_userdata()` does.** It walked only
+  `1..get_depth()` and carried a `HWLOC_OBJ_NUMANODE != type` test that
+  could never fire, so a counter attached to a NUMA node was never cleared:
+  `--bind-to numa:limit=N` accumulated `nprocs` for the life of the DVM and
+  the *second* such job found every domain already at its limit and could
+  not be bound. Any new sweep over "the objects binding touches" has to
+  visit both places.
 - `prte_hwloc_base_reset_counters()` walks `prte_node_topologies`, which is
   NULL until `prte_init()`.
 
@@ -170,36 +236,157 @@ index past a qualifier's name to find its `=value`** — use
 `pmix_cli_qualifier_value()`. `limit=N` lands in a `uint16_t` attribute, so
 a value that does not fit has to be rejected rather than truncated.
 
+**Three lists have to agree about what a `--bind-to` qualifier is**, and
+they did not:
+
+| Where | What it is |
+|-------|------------|
+| `bndquals[]` in `schizo/base/schizo_base_frame.c` | the front-door whitelist — a name missing here never reaches a parser |
+| `prte_hwloc_base_set_binding_policy()` (here) | the job-level parser |
+| `prte_rmaps_base_set_app_binding_policy()` (`rmaps/base/rmaps_base_frame.c`) | the per-app parser |
+
+`report` was implemented only in the job-level parser and was missing from
+the whitelist, so no command line could reach it — including the `show_help`
+that same arm produces when it is given at DVM scope, which tells the user
+"you can provide this modifier on a per-job basis". It is in the whitelist
+now. It stays out of the per-app parser deliberately: the only attribute
+behind it is `PRTE_JOB_REPORT_BINDINGS`, and there is no per-app
+counterpart, so `report` describes the whole job or nothing.
+
+Two ordering rules the parser now encodes:
+
+- **`pmix_check_cli_option()` compares only `min(strlen(a), strlen(b))`
+  characters, so an empty string matches whatever it is tested against
+  first.** The policy word is empty for the `--bind-to :qualifier` form,
+  and that form used to fall straight into the first arm of the chain —
+  `none` — silently disabling binding *and* dragging the default mapping
+  policy from `BYCORE` down to `BYSLOT` with it. A qualifier with no policy
+  means "the binding I would otherwise have got, plus this qualifier",
+  exactly as `--map-by :OVERSUBSCRIBE` does; leave the policy bits at zero
+  so `PRTE_SET_DEFAULT_BINDING_POLICY` can fill them in around the
+  qualifiers later. Any new empty-string-versus-option test here needs the
+  same guard.
+- **Resolve the policy word before applying any qualifier**, because
+  `report` and `limit=N` write to `jdata->attributes`. Parsed the other way
+  round, `--bind-to sockets:report` recorded report-bindings on the job and
+  *then* rejected the request. The same rule reaches the `jdata->map ==
+  NULL` check, which is what says whether there is anywhere to *put* the
+  answer: it runs before the parse now, because running it last left
+  `PRTE_JOB_REPORT_BINDINGS` on a job whose binding was never set. **Any
+  new reason to refuse a spec belongs above the parsing, not below it.**
+
+### `bindto` is a real parameter, not a suggestion
+
+Two things had to be true before the DVM-wide `bindto` parameter meant what
+it documents, and neither was. Both are the same shape: the MCA spelling of
+a request was answered differently from the command-line spelling.
+
+- **A `bindto` value the parser refuses is fatal.** The whole point of
+  `prte_hwloc_base_open()` is to validate it, and `prte_init()` used to
+  discard the return — so `--prtemca bindto bogus` printed "the specified
+  binding policy is not recognized" and then launched the job anyway with
+  the default binding. `--bind-to bogus` has always been fatal. `open()`
+  converts its failure to `PRTE_ERR_SILENT` so `prte_init()` does not stack
+  a generic "internal failure" report on top of a diagnostic the parser has
+  already produced; the sibling parameters in `_register()`
+  (`mem_alloc_policy`, `mem_bind_failure_action`) already worked this way.
+- **A `bindto` value coarser than a core has to reach the mapping
+  decision.** "Binding given, mapping not given" means *map by the binding
+  object* (`prte_rmaps_base_set_default_mapping()`), and that test reads
+  `jdata->map->binding` — which `rmaps_base_map_job.c` did not populate from
+  `prte_hwloc_default_binding_policy` until long after the mapping had been
+  settled. So `--prtemca bindto package` mapped `BYCORE` and was then
+  refused outright by the bind-upwards check, while `--bind-to package`
+  mapped `BYPACKAGE` and worked. Five of the eight values `bindto`
+  documents were unusable. The two *inheritance* arms (parent's binding,
+  MCA default) now run before the mapping is derived; deriving a binding
+  *from* the mapping necessarily still runs after it. If you add a third
+  source of a binding, ask which side of that line it belongs on.
+
 ---
 
-## Rendering a binding: three functions, three buffer contracts
+## GOLDEN RULE: a cpuset's bits are PU OS indices; a cpu *number* is not
 
-This is where the sharp edges are, because the output is built into
-fixed-size buffers whose size the *caller* chooses.
+Every rendering in PRRTE starts from an `hwloc_cpuset_t`, and the bits of
+one are always **PU OS indices** — the kernel's cpu numbers. What PRRTE
+shows a user is a list of **cores** (or of hwthreads, when the job treats
+hwthreads as cpus), and every PRRTE grammar that *accepts* such a list —
+`--cpu-set`, the rankfile slot lists — resolves it as an hwloc **logical**
+index. Those three numbering schemes coincide only by luck.
 
-| Function | Output | Buffer |
-|----------|--------|--------|
-| `prte_hwloc_base_cset2str()` | `package[0][core:L0,2-3]` | allocates and returns; internally builds through a 2048-byte scratch |
-| `prte_hwloc_get_binding_info()` | one `<core>N</core>` element per bound core, plus the package number | **caller's** buffer and size |
-| `prte_hwloc_print()` | the whole topology as indented text | allocates and returns |
+So: **resolve each bit to the object it belongs to and take that object's
+index.** `prte_hwloc_base_cpuset2ranges()` is the one place that does it,
+and everything that renders cpu numbers goes through it:
 
-Rules that were all being broken:
+| Function | Output |
+|----------|--------|
+| `prte_hwloc_base_cpuset2ranges()` | `0,2-3` — the primitive; allocates and returns |
+| `prte_hwloc_base_cset2str()` | `package[0][core:L0,2-3]` — one element per package; allocates |
+| `prte_hwloc_get_binding_info()` | `<package id="N">` per package, each holding one `<core>N</core>` per site, into the **caller's** buffer |
+| `prte_hwloc_print()` | the whole topology as indented text; allocates |
+
+**The two binding renderers have to agree.** `_cset2str()` (the `--display
+map` short form) and `_get_binding_info()` (the `--display map:parseable`
+XML) describe the same `proc->cpuset`, and they must describe all of it.
+`_get_binding_info()` used to render only the *sites*, into a single
+`<package>` element its caller wrapped around them, and report the package
+number through an out parameter — so a process bound across two packages had
+each package overwrite the previous one from the top of the buffer, and came
+out naming the last package with every earlier one's cores dropped. That is
+not incomplete output, it is *wrong* output, and it is the machine-readable
+half of the pair. It is reachable, too: PRRTE refuses cross-package
+placement in the ordinary mappers and its own diagnostic points the user at
+the rankfile mapper, where a slot list of `P0:0;P1:0` produces exactly this.
+The renderer now emits the `<package>` elements itself and there is no
+`pkgnum`. If you add a third rendering, render every package.
+
+Three renderers used to short-cut this whenever the bits "already were
+cores" (`npus == ncores`) or the job was in hwthreads, and print the raw
+bit numbers under a `core:L`/`hwt:L` label. That is wrong on exactly the
+machines where it matters — any SMT node viewed in hwthreads, and any node
+whose firmware interleaves cpu numbers across packages — and it is worse
+than cosmetic, because the user reads the number back out and hands it to
+`--cpu-set`. The `physical` flag was also simply ignored on those paths.
+`--display cpus` in both `ras/base` and `runtime/data_type_support` carried
+its own copy of the same three-branch short cut; both now call
+`cpuset2ranges()`.
+
+There is no `bits_as_cores` special case left. Do not reintroduce one:
+`cpuset2ranges()` produces the identical answer when the indices happen to
+agree, and the correct one when they do not.
+
+The rule reaches past the display code. A **diagnostic** that names cpu
+numbers is subject to it too, and three mappers were breaking it in the
+same message: `rmaps/seq`, `rmaps/rank_file` and `rmaps/lsf` print
+"requested / available / overlapping" cpu sets when a slot list collides
+with cpus already in use, and rendered them straight off the bitmap while
+quoting the user's own logical slot list beside them — three numbering
+schemes in one message. They call `cpuset2ranges()` now.
+
+The one place a raw `hwloc_bitmap_list_asprintf()` is **correct** is
+`prte_proc_t.cpuset`: that is a wire format, read back with
+`hwloc_bitmap_list_sscanf()`, and it must stay in OS indices. Never show
+it to a user unrendered.
+
+Other rules here, all of which were being broken:
 
 - **Charge every byte written against the remaining room.** The XML element
   writer advanced its cursor through a run of set bits without reducing the
   budget it handed `snprintf`, so a process bound to more than a few cores
   wrote past the end of the caller's buffer — in the HNP, which is holding
   every node's topology, so the corruption surfaced as a crash somewhere
-  unrelated.
+  unrelated. `bounded_append()` is the one way to add to that buffer: it
+  clamps rather than subtracts, because the running total legitimately
+  exceeds the buffer length once anything has been truncated.
 - **A caller sizing a buffer per PU must use the real element size.** Each
-  element is 20 spaces of indent plus `<core>%d</core>\n` — about 34 bytes
-  for a single-digit index, more as indices grow. The one caller in
-  `runtime/data_type_support/prte_dt_print_fns.c` budgeted 20.
+  site element is 20 spaces of indent plus `<core>%d</core>\n` — about 34
+  bytes for a single-digit index, more as indices grow — and each package
+  costs an opening and a closing element on top. The one caller in
+  `runtime/data_type_support/prte_dt_print_fns.c` budgeted 20 per PU and
+  nothing per package.
 - **`hwloc_bitmap_snprintf()` gets `sizeof(buf)`, not a constant that
   happens to be nearby.** `print_hwloc_obj()` declared 1024 bytes and
   claimed 2048.
-- **`*pkgnum` is always set.** Its only caller declares it uninitialized
-  and prints it.
 - **`hwloc_bitmap_isfull()` is never true for a topology's cpuset.** It
   means "infinitely set". A dead `isequal(cpuset, avail) && isfull(avail)`
   "unbound" test lived in two of these functions for years. Deciding a
@@ -244,6 +431,12 @@ wraps it and is what produces `prte_node_t.available`.
 user input too, and every lookup can legitimately fail — `--cpu-set P99`
 used to be a segfault.
 
+**A core id in `package:core` notation is relative to that package**, so
+resolve it with `hwloc_get_obj_inside_cpuset_by_type()` against the
+package's cpuset. It used to be turned into a global index by adding
+"objects per package × package id", which names an object in the wrong
+package as soon as two packages hold different numbers of them.
+
 ---
 
 ## The print-buffer ring
@@ -276,13 +469,40 @@ same thread has cycled through the other 15 — never store one.
   topic.** Two call sites passed one argument to a two-`%s` message, and one
   passed a `char **` where the format wanted a `char *`.
 - **A failure path that has destroyed the topology must NULL
-  `prte_hwloc_topology`.** `prte_hwloc_base_close()` tests it for NULL and
-  destroys it again otherwise.
+  `prte_hwloc_topology`.** Anything that later reads the global - the
+  XML-loading path replaces whatever is there, and `prte_hwloc_base_close()`
+  clears it - has no way to tell a live handle from a freed one.
+- **An imported topology reports no binding support, and
+  `hwloc_use_topo_file` has to say otherwise.** hwloc zeroes every bit of
+  `hwloc_topology_get_support()` for a topology it read from XML — it has no
+  way to know what the described machine can do — and
+  `prte_rmaps_base_check_support()` refuses any *explicitly requested*
+  binding when those bits are clear. So `--prtemca hwloc_use_topo_file X
+  --bind-to core` came back "at least one node does NOT support binding
+  processes to cpus" on a machine that supports it perfectly, leaving the
+  option usable only with `--bind-to none`. `set_topology()` asserts the
+  bits itself. **After `hwloc_topology_load()`, not before** — hwloc's own
+  header says the support structure "only contains valid information after"
+  the load, so the assertion that used to sit before it was filled in and
+  wiped by the load and had quietly never done anything.
+  `HWLOC_TOPOLOGY_FLAG_IMPORT_SUPPORT` is a different question (what the
+  *exporting* machine could do) and was deliberately abandoned once before.
 - **`hwloc_bitmap_first()`/`_last()` return `-1` for an empty bitmap.**
   Do not feed that to `hwloc_bitmap_isset()`. `hwloc_bitmap_weight()` is
   what you want for "how many" and "exactly one".
 - **Comparing unsigneds by subtracting into an `int`** gets the order wrong
   for values far apart. `compare_unsigned()` learned this.
+- **A validator whose answer nobody reads is not a validator.**
+  `prte_hwloc_base_open()` exists to check the `bindto` parameter and
+  `prte_init()` threw its return away, so the check ran, printed, and
+  changed nothing. If you add a function here whose whole job is to say
+  "no", check that its one caller is listening — the failure mode is a
+  user who is told their request was refused and then watches it run.
+- **Anything labelled "parseable" gets checked with a parser, not a grep.**
+  Both this directory's binding renderer and the `--display cpus` copy in
+  `ras/base` emitted documents that no XML reader would accept
+  (`<EMPTY CPUSET/>`, `<pkg=0 cpus=0-7>`), for years, under passing tests
+  that matched on substrings.
 - **Warnings are errors.** Debug builds imply `--enable-devel-check`.
 
 ---
@@ -298,9 +518,22 @@ summary-not-yet-built case), `_get_npus()` in core and hwthread terms,
 `_cpu_list_parse()` grammar including every id that does not exist,
 `_cset2str()` range collapsing, `prte_hwloc_get_binding_info()` against a
 **guarded** buffer (a canary past `sz` — this is how the element-writer
-overflow is pinned), `prte_hwloc_build_map()`, the print-buffer ring, the
-`--bind-to` parser, and userdata release across the normal hierarchy *and*
-the special NUMA depth.
+overflow is pinned) including a cpuset spanning two packages,
+`_cpuset2ranges()`, the print-buffer ring, the
+`--bind-to` parser, userdata release across the normal hierarchy *and* the
+special NUMA depth, `_reset_counters()` at both of those places, and
+`prte_hwloc_print()` — which levels reach the output (NUMA nodes are the
+ones that used to be missing) and whether the child count it prints
+accounts for every child list.
+
+One case cannot be built synthetically: hwloc's synthetic generator always
+makes `os_index` and `logical_index` agree, so **the logical-vs-physical
+divergence is driven from a hand-written XML topology embedded in the test**
+(`interleaved_xml`: two packages whose PU OS indices interleave, 0/2/4/6 and
+1/3/5/7). That is the only way to prove a renderer reports the basis it
+claims. If you write more XML there, note that hwloc's importer segfaults —
+it does not diagnose — on an object missing `complete_cpuset`/`nodeset`/
+`complete_nodeset`; copy the attribute set from an existing object.
 
 Add to it rather than around it. If a change here is not reachable from a
 synthetic topology plus a string, say why in the test file.
@@ -318,9 +551,24 @@ buffer — those containers are 8 cores, one package, no SMT, no sysfs NUMA
 node, which is exactly the shape that trips it), `--map-by numa` against
 topologies the HNP never sensed, a DVM cpu-set applied to every node rather
 than just the first, a malformed cpu-set being refused without taking the
-HNP down, and `--display topo` over several topologies at once.
+HNP down, `--display topo` over several topologies at once, the
+print-then-accept round trip (`--display cpus` → `--cpu-set` → the same set
+back), both spellings of the index basis, that every value the DVM-wide
+`bindto` parameter documents both maps and binds rather than being refused
+as "binding above the map" (and that one it does *not* document is fatal
+rather than diagnosed-and-ignored), and — the one case that needs a
+**persistent** DVM, because `prterun` takes the stale state down with its
+HNP — three successive `--bind-to numa:limit=1` jobs all binding.
 
-**Not covered anywhere:** `prte_hwloc_base_get_topology()`'s sensing path
+The unit test also drives `prte_hwloc_base_get_topology()`'s **file** path
+(`hwloc_use_topo_file`), by writing the embedded XML to a temp file: that it
+loads, that a malformed file is refused without leaving a handle behind, and
+that the binding-support bits come back asserted. The offline harness runs
+that same path 1180 times, which is why a regression in it does not show up
+as a mapping failure — the harness passes `--rtos donotlaunch`, and
+`prte_rmaps_base_check_support()` is skipped for donotlaunch.
+
+**Not covered anywhere:** `prte_hwloc_base_get_topology()`'s *sensing* path
 (it reads the real machine), and `prte_hwloc_print()` against a machine wide
 enough to fill its cpuset buffer — a few thousand PUs.
 
@@ -348,8 +596,29 @@ enough to fill its cpuset buffer — a few thousand PUs.
   `_check_on_coprocessor()`), along with the topology-signature builder,
   `_single_cpu()`, `_get_obj_idx()` and `_topology_export_xmlbuffer()` —
   none had callers.
-- **`prte_hwloc_get_binding_info()`'s output is undefined for a process
-  bound across more than one package.** It renders the last matching package
-  and reports that package's number. The caller wraps the result in a single
-  `<package>` element, so the shape of the fix is an API change, not a
-  one-liner.
+- **`prte_hwloc_build_map()` is gone**, and with it the "the bits already
+  are cores" short cut its three callers wrapped it in. It produced a
+  *bitmap* of core indices, which is a lossy shape for the job — a caller
+  then printed that bitmap with `hwloc_bitmap_list_snprintf()`, mixing two
+  index bases in one string. `prte_hwloc_base_cpuset2ranges()` replaces it
+  and answers the question the callers were actually asking.
+- **`prte_hwloc_get_binding_info()` no longer has a `pkgnum` out
+  parameter**, and no longer produces undefined output for a process bound
+  across more than one package. It emits the `<package id="N">` elements
+  itself, one per package the cpuset touches. See "The two binding renderers
+  have to agree" above; the caller's job is now to emit the result verbatim
+  inside its `<binding>` element.
+- **`_cset2str()` and `_get_binding_info()` iterate packages, so a topology
+  with no `HWLOC_OBJ_PACKAGE` level renders as nothing at all** (`cset2str`
+  returns NULL, and its callers print `UNBOUND`). Every real machine has
+  packages; the shape that would not is the same museum piece that has no
+  cores. `_cpuset2ranges()` does not have this problem — reach for it if you
+  need a rendering that does not presuppose packages. Fixing the other two
+  means changing the `package[N][...]` output form and the `<package>`
+  element its caller wraps around it.
+- **A topology with PUs but no cores is rendered in hwthreads**, and says
+  so (`hwt:L` rather than `core:L`). hwloc does not find cores on every
+  platform — PPC64 on old Linux kernels reported only NUMA nodes and PUs —
+  and `prte_hwloc_base_get_pu()` has always allowed for it. The renderers
+  did not: a core-based lookup resolved nothing and every binding on such a
+  machine came back `UNBOUND`.

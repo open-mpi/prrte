@@ -67,8 +67,11 @@ typedef uint8_t prte_app_context_flags_t;
 #define PRTE_APP_PSET_NAME          23 // string - user-assigned name for the process
                                        //          set containing the given process
 #define PRTE_APP_PES_PER_PROC       24 // uint16_t - number of cpus to be assigned to each process
-#define PRTE_APP_PPR                25 // uint16_t - number of procs to place on the resource specified
-                                       //           in the job ppr string
+#define PRTE_APP_PPR                25 // string - this app's ppr pattern, "N:object", in the same
+                                       //          spelling as the job-level PRTE_JOB_PPR. The object
+                                       //          is part of the pattern: an app that asks for
+                                       //          "2:package" is not asking for the job's object
+                                       //          twice per node
 #define PRTE_APP_MAPBY              26 /* uint16_t mapping policy enum */
 #define PRTE_APP_RANKBY             27 /* uint16_t ranking policy enum */
 #define PRTE_APP_BINDTO             28 /* uint16_t binding policy enum */
@@ -84,6 +87,11 @@ typedef uint8_t prte_app_context_flags_t;
 #define PRTE_APP_RESOLVED_MAPBY     35 /* uint16_t resolved mapping policy */
 #define PRTE_APP_RESOLVED_RANKBY    36 /* uint16_t resolved ranking policy */
 #define PRTE_APP_RESOLVED_BINDTO    37 /* uint16_t resolved binding policy */
+/* the mapping component that placed this app, recorded by the rmaps base once
+ * a mapper accepts it. There is no matching "which mapper to use" key: the
+ * mapping policy is the choice of mapper. Local to the HNP - never
+ * packed/sent. */
+#define PRTE_APP_LAST_MAPPER        38 /* char* mapping component that placed this app */
 
 #define PRTE_APP_MAX_KEY 100
 
@@ -120,6 +128,8 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_FLAG_FORWARD_OUTPUT    0x0020 // forward output from the apps
 #define PRTE_JOB_FLAG_DO_NOT_MONITOR    0x0040 // do not monitor apps for termination
 #define PRTE_JOB_FLAG_FORWARD_COMM      0x0080 //
+#define PRTE_JOB_FLAG_SUSPENDED         0x0100 // job's procs have been stopped by a session
+                                               // pause/preempt directive and await a resume/restore
 #define PRTE_JOB_FLAG_RESTART           0x0200 //
 #define PRTE_JOB_FLAG_PROCS_MIGRATING   0x0400 // some procs in job are migrating from one node to another
 #define PRTE_JOB_FLAG_OVERSUBSCRIBED    0x0800 // at least one node in the job is oversubscribed
@@ -330,6 +340,20 @@ typedef uint16_t prte_proc_flags_t;
 typedef uint16_t prte_session_flags_t;
 #define PRTE_SESSION_FLAG_DYNAMIC       0x0001 // session was dynamically allocated
 #define PRTE_SESSION_FLAG_RESERVED      0x0002 // nodes withheld from default pool
+#define PRTE_SESSION_FLAG_DETACHED      0x0004 // session lifetime is independent of its owning
+                                               // namespace (PMIX_SESSION_SEP) - the inheritance
+                                               // disposition is not fired when that namespace ends
+#define PRTE_SESSION_FLAG_PAUSED        0x0008 // every job in the session has been stopped by a
+                                               // PMIX_SESSION_PAUSE directive
+#define PRTE_SESSION_FLAG_SCHEDULER     0x0010 // session was instantiated by the scheduler via
+                                               // PMIx_Session_control, so its completion must be
+                                               // reported back to the scheduler
+#define PRTE_SESSION_FLAG_TERMINATING   0x0020 // a PMIX_SESSION_TERMINATE is in flight - the
+                                               // session is reclaimed once its jobs have retired
+#define PRTE_SESSION_FLAG_AUTO_COMPLETE 0x0040 // the session exists to run the jobs it was
+                                               // instantiated with, so it is reclaimed when the
+                                               // last of them retires rather than persisting
+                                               // until an explicit terminate
 
 
 /*** FLAG OPS ***/

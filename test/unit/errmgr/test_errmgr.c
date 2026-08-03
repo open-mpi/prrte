@@ -26,8 +26,10 @@
 
 #include "prte_config.h"
 #include <stdio.h>
+#include <string.h>
 
 #include "constants.h"
+#include "src/runtime/prte_globals.h"
 #include "src/mca/base/pmix_base.h"
 #include "src/mca/errmgr/base/base.h"
 #include "src/runtime/runtime.h"
@@ -156,6 +158,94 @@ static int test_errmgr_base_log(void)
     return failures;
 }
 
+/*
+ * Stand up a synthetic prte_local_children array.  The errmgr handlers all
+ * consult this global to decide whether this node still has work on it, so a
+ * test can pose that question by populating it directly.
+ */
+static prte_proc_t *add_child(const char *nspace, pmix_rank_t rank, bool alive)
+{
+    prte_proc_t *p = PMIX_NEW(prte_proc_t);
+
+    PMIX_LOAD_PROCID(&p->name, nspace, rank);
+    p->pid = 1000 + rank;
+    p->state = alive ? PRTE_PROC_STATE_RUNNING : PRTE_PROC_STATE_TERMINATED;
+    p->exit_code = alive ? 0 : (int32_t) rank;
+    if (alive) {
+        PRTE_FLAG_SET(p, PRTE_PROC_FLAG_ALIVE);
+    }
+    pmix_pointer_array_add(prte_local_children, p);
+    return p;
+}
+
+static void reset_children(void)
+{
+    int i;
+    prte_proc_t *p;
+
+    if (NULL == prte_local_children) {
+        prte_local_children = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_local_children, 8, INT32_MAX, 8);
+        return;
+    }
+    for (i = 0; i < prte_local_children->size; i++) {
+        p = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+        if (NULL != p) {
+            pmix_pointer_array_set_item(prte_local_children, i, NULL);
+            PMIX_RELEASE(p);
+        }
+    }
+}
+
+/*
+ * prte_errmgr_base_any_live_children is how every handler answers "is this
+ * node empty yet".  It used to be spelled out inline at each call site, and
+ * one of those inline scans reused the variable holding the proc whose error
+ * was being handled - so a surviving sibling was reported to the HNP as the
+ * failed proc.  Now there is one implementation, and this pins its answers.
+ */
+static int test_any_live_children(void)
+{
+    int failures = 0;
+
+    reset_children();
+
+    /* nobody home */
+    CHECK("empty: any job", !prte_errmgr_base_any_live_children(NULL));
+    CHECK("empty: named job", !prte_errmgr_base_any_live_children("jobA"));
+
+    /* one dead child of jobA */
+    add_child("jobA", 0, false);
+    CHECK("dead only: any job", !prte_errmgr_base_any_live_children(NULL));
+    CHECK("dead only: jobA", !prte_errmgr_base_any_live_children("jobA"));
+
+    /* a live child of jobB - visible to the wildcard and to jobB, but the
+     * question "does jobA still have anyone" must stay false */
+    add_child("jobB", 0, true);
+    CHECK("live jobB: any job", prte_errmgr_base_any_live_children(NULL));
+    CHECK("live jobB: jobB", prte_errmgr_base_any_live_children("jobB"));
+    CHECK("live jobB: jobA unaffected", !prte_errmgr_base_any_live_children("jobA"));
+
+    /* a live child of jobA, added after the dead one, must still be found -
+     * the scan has to cover the whole array, not stop at the first entry */
+    add_child("jobA", 1, true);
+    CHECK("live jobA", prte_errmgr_base_any_live_children("jobA"));
+
+    /* a hole in the middle of the array must not end the scan */
+    reset_children();
+    add_child("jobA", 0, false);
+    pmix_pointer_array_set_item(prte_local_children, 1, NULL);
+    add_child("jobA", 2, true);
+    CHECK("live after hole", prte_errmgr_base_any_live_children("jobA"));
+
+    reset_children();
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_any_live_children\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -171,14 +261,15 @@ int main(void)
                                       PMIX_MCA_BASE_OPEN_DEFAULT);
     if (PRTE_SUCCESS != rc) {
         fprintf(stderr, "errmgr framework open failed: %d\n", rc);
-        (void) pmix_mca_base_framework_close(&prte_errmgr_base_framework);
-    prte_finalize();
+        prte_finalize();
         return 1;
     }
 
     failures += test_errmgr_modules();
     failures += test_errmgr_base_log();
+    failures += test_any_live_children();
 
+    (void) pmix_mca_base_framework_close(&prte_errmgr_base_framework);
     prte_finalize();
 
     if (0 == failures) {

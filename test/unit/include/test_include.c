@@ -80,6 +80,11 @@
 #include "constants.h"
 #include "types.h"
 
+/* PMIx's printf replacements -- the four names prte_config_bottom.h maps a
+ * missing libc printf onto. prte_config_bottom.h includes this itself, but
+ * only on a platform that needs it. */
+#include "src/util/pmix_printf.h"
+
 #include "src/include/prte_stdatomic.h"
 #include "src/runtime/runtime.h"
 
@@ -91,12 +96,18 @@
         }                                                     \
     } while (0)
 
-/* Where the two documentation groups in constants.h start and end. Kept up
- * to date by hand -- but unlike a table of code *names*, going stale here
- * only weakens the sweep, it cannot make it wrong. */
+/* Where the two documentation groups in constants.h start and end. The
+ * group boundaries are a convention for readers and are stated by hand; the
+ * *end* of the list is not, because a hand-written end goes stale silently.
+ * This one used to read "155 / PRTE_ERR_SLURM_SHRINK_FAILURE" and stayed
+ * that way when PRTE_ERR_PRELOAD_CONFLICT was appended at offset 156, so the
+ * sweep below stopped one short of the newest code -- the code most likely
+ * to be wrong. It now comes from PRTE_ERR_MAX, which lives in constants.h
+ * next to the append site and which test/unit/util fails on if it is
+ * stale. */
 #define GROUP1_LAST  72  /* PRTE_OPERATION_SUCCEEDED */
 #define GROUP2_FIRST 101 /* PRTE_ERR_RECV_LESS_THAN_POSTED */
-#define GROUP2_LAST  155 /* PRTE_ERR_SLURM_SHRINK_FAILURE */
+#define GROUP2_LAST  (PRTE_ERR_BASE - PRTE_ERR_MAX - 1)
 
 /* ------------------------------------------------------------------ */
 /* error code numbering                                               */
@@ -137,10 +148,15 @@ static int test_error_code_numbering(void)
     CHECK("the last code is negative", (PRTE_ERR_BASE - GROUP2_LAST) < 0);
 
     CHECK("PRTE_ERROR is the first code", (PRTE_ERR_BASE - 1) == PRTE_ERROR);
-    CHECK("the last code is where the header says",
-          (PRTE_ERR_BASE - GROUP2_LAST) == PRTE_ERR_SLURM_SHRINK_FAILURE);
     CHECK("the second group starts where the header says",
           (PRTE_ERR_BASE - GROUP2_FIRST) == PRTE_ERR_RECV_LESS_THAN_POSTED);
+
+    /* PRTE_ERR_MAX is one past the end, so it must sit below every code and
+     * must not itself be one. The check that it is not stale -- that the
+     * offset just inside it is a real, named code -- needs prte_strerror()
+     * and lives in test/unit/util; here we only pin the arithmetic. */
+    CHECK("the bound is below the last code", PRTE_ERR_MAX < PRTE_ERR_PRELOAD_CONFLICT);
+    CHECK("the bound is one past the end", (PRTE_ERR_MAX + 1) == PRTE_ERR_PRELOAD_CONFLICT);
 
     /* PRTE_ERROR must NOT be PMIX_ERROR any more. They were both -1, which
      * made a PRRTE code handed to PMIx unconverted invisible in the one
@@ -274,12 +290,27 @@ static int test_config_bottom(void)
     CHECK("PRTE_MAXHOSTNAMELEN is usable", PRTE_MAXHOSTNAMELEN > 64);
     CHECK("PRTE_PATH_SEP is a separator", 0 == strcmp("/", PRTE_PATH_SEP));
 
-    /* PRIsize_t is picked by comparing SIZEOF_SIZE_T against SIZEOF_LONG and
-     * SIZEOF_LONG_LONG. Get it wrong and every verbose message using it is
-     * undefined behavior rather than a compile error, because the format
-     * string is assembled by concatenation. */
+    /* PRIsize_t is used in verbose output across the tree. Get it wrong and
+     * every message using it is undefined behavior rather than a compile
+     * error, because the format string is assembled by concatenation.
+     *
+     * It is now unconditionally "zu" -- C11 is a hard requirement, so "z" is
+     * always available and is the only spelling correct by definition rather
+     * than by a size coincidence. It used to be a ladder whose "zu" arm was
+     * guarded on ACCEPT_C99, a symbol PRRTE's configure has never defined,
+     * so every build fell through to comparing SIZEOF_SIZE_T against
+     * SIZEOF_LONG and SIZEOF_LONG_LONG -- landing on a working answer for
+     * the usual data models and on "u" for any where it did not. */
     snprintf(buf, sizeof(buf), "%" PRIsize_t, val);
     CHECK("PRIsize_t formats a size_t", 0 == strcmp("1234567", buf));
+
+    /* prte_stdint.h picks intptr_t/uintptr_t by walking SIZEOF_VOID_P
+     * against SIZEOF_INT/LONG/LONG_LONG when the system does not supply
+     * them. The entire point of that ladder is that a pointer fits, and it
+     * is a #error if none of the three match -- but nothing checked the
+     * arm it lands on. */
+    CHECK("an intptr_t holds a pointer", sizeof(intptr_t) >= sizeof(void *));
+    CHECK("a uintptr_t holds a pointer", sizeof(uintptr_t) >= sizeof(void *));
 
     /* PRTE_ENABLE_IPV6 is narrowed in prte_config_bottom.h from what
      * configure asked for to what the platform can honor. It must come out
@@ -303,6 +334,46 @@ static int test_config_bottom(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the printf fallbacks                                               */
+/* ------------------------------------------------------------------ */
+
+/* prte_config_bottom.h maps asprintf/snprintf/vasprintf/vsnprintf onto PMIx
+ * replacements on any platform whose libc is missing one. PRRTE has no
+ * printf replacements of its own and never had -- all four come from PMIx's
+ * src/util/pmix_printf.h.
+ *
+ * One of the four named prte_vsnprintf, a symbol that exists in neither
+ * tree, so a platform without vsnprintf() would have failed to link every
+ * tool. Nothing caught it because the mapping is compiled only where the
+ * libc function is absent, which is nowhere anyone builds.
+ *
+ * Be honest about what this proves: it cannot exercise the mapping itself
+ * on a platform that does not need it. What it does do is take the address
+ * of each of the four names the mapping resolves to, so they have to exist
+ * and be linkable here -- which catches both a typo of the kind above and
+ * PMIx dropping or renaming one out from under us. PRRTE builds against
+ * PMIx's *internal* headers, so the latter is a live risk, not a
+ * hypothetical.
+ */
+static int test_printf_fallbacks(void)
+{
+    int failures = 0;
+    const void *fns[4];
+
+    fns[0] = (const void *) (uintptr_t) pmix_asprintf;
+    fns[1] = (const void *) (uintptr_t) pmix_snprintf;
+    fns[2] = (const void *) (uintptr_t) pmix_vasprintf;
+    fns[3] = (const void *) (uintptr_t) pmix_vsnprintf;
+
+    CHECK("the asprintf replacement exists", NULL != fns[0]);
+    CHECK("the snprintf replacement exists", NULL != fns[1]);
+    CHECK("the vasprintf replacement exists", NULL != fns[2]);
+    CHECK("the vsnprintf replacement exists", NULL != fns[3]);
+
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void)
 {
@@ -317,6 +388,7 @@ int main(void)
     failures += test_rank_types();
     failures += test_byte_order();
     failures += test_config_bottom();
+    failures += test_printf_fallbacks();
 
     if (0 == failures) {
         fprintf(stdout, "PASSED all include unit tests\n");

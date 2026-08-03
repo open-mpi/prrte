@@ -34,17 +34,41 @@
  *    dereferenced the result of a package lookup without checking it: a
  *    cpu-set naming a package that does not exist was a segfault.
  *
- *  - bitmap_list_snprintf_exp() (reached through
- *    prte_hwloc_get_binding_info()) advanced its write pointer inside a run
- *    of set bits without charging those bytes against the remaining buffer,
- *    so a wide binding wrote past the end of the caller's buffer. The caller
- *    sizes that buffer at 20 bytes per PU while each element needs ~34.
+ *  - the XML element writer (reached through prte_hwloc_get_binding_info())
+ *    advanced its write pointer inside a run of set bits without charging
+ *    those bytes against the remaining buffer, so a wide binding wrote past
+ *    the end of the caller's buffer. The caller sizes that buffer at 20
+ *    bytes per PU while each element needs ~34.
  *
- *  - prte_hwloc_get_binding_info() never set *pkgnum when the cpuset matched
- *    no package, and its only caller prints it uninitialized.
+ *  - prte_hwloc_get_binding_info() rendered only the *sites*, into a single
+ *    <package> element its caller wrapped around them, and reported the
+ *    package number through an out parameter. A process bound across two
+ *    packages therefore had each package overwrite the previous one from the
+ *    top of the buffer: the output named the last package and dropped every
+ *    earlier one's cores, disagreeing with what _cset2str() reports for the
+ *    same binding. It emits the <package> elements itself now.
  *
- *  - build_map() (reached through prte_hwloc_base_cset2str()) appended to
- *    the caller's buffer with memcpy() and no bound at all.
+ *  - prte_hwloc_print() walked obj->children[] only, and hwloc 2.x keeps
+ *    NUMA nodes on a separate memory-child list - so "--display topo"
+ *    rendered a topology with no NUMA domains in it at all.
+ *
+ *  - prte_hwloc_base_set_default_binding()'s PPR arm has to reach a policy
+ *    for every object ppr_object() can produce; a hole leaves the binding
+ *    word at zero, which is not a value in the policy space.
+ *
+ *  - the package:core parser recorded a failed element in "rc" and carried
+ *    on, so a later "*" element assigned PRTE_SUCCESS over the top of it.
+ *
+ *  - the range builder behind prte_hwloc_base_cset2str() appended to the
+ *    caller's buffer with memcpy() and no bound at all.
+ *
+ *  - every renderer short-cut to printing the raw cpuset bits -- PU *OS*
+ *    indices -- whenever npus == ncores or the job used hwthreads, while
+ *    labelling them logical, and ignored "physical" outright. --cpu-set
+ *    resolves logically, so the numbers PRRTE printed were not numbers it
+ *    would accept back. This is what test_index_basis() pins, and it needs a
+ *    hand-written XML topology: hwloc's synthetic generator always makes
+ *    os_index and logical_index agree.
  *
  *  - prte_hwloc_base_print_binding() handed back a pointer into a ring of
  *    per-thread buffers but never advanced the ring, so two calls in one
@@ -70,6 +94,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "constants.h"
 #include "types.h"
@@ -342,6 +368,7 @@ static int test_cpu_list_parse(void)
     int failures = 0;
     hwloc_topology_t topo;
     hwloc_cpuset_t mask;
+    hwloc_obj_t pkg;
     int rc;
 
     topo = make_topo("package:2 core:4 pu:2");
@@ -384,9 +411,36 @@ static int test_cpu_list_parse(void)
     CHECK("package wildcard parses", PRTE_SUCCESS == rc);
     CHECK("package wildcard covers the package", 8 == hwloc_bitmap_weight(mask));
 
+    /* A core id in "package:core" notation is relative to that package. The
+     * lookup used to reach it by adding "cores per package times package id"
+     * to a GLOBAL index, which names a core in the wrong package as soon as
+     * two packages hold different numbers of them - so assert not just how
+     * many cpus came back but that they lie inside the package asked for. */
     rc = prte_hwloc_base_cpu_list_parse("P1:0", topo, false, mask);
     CHECK("package:core parses", PRTE_SUCCESS == rc);
     CHECK("package:core covers one core", 2 == hwloc_bitmap_weight(mask));
+    pkg = prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_PACKAGE, 1);
+    CHECK("package 1 resolves", NULL != pkg);
+    if (NULL != pkg) {
+        CHECK("package:core stays inside the package named",
+              hwloc_bitmap_isincluded(mask, pkg->cpuset));
+    }
+
+    rc = prte_hwloc_base_cpu_list_parse("P1:0-2", topo, false, mask);
+    CHECK("package:core-range parses", PRTE_SUCCESS == rc);
+    CHECK("package:core-range covers three cores", 6 == hwloc_bitmap_weight(mask));
+    if (NULL != pkg) {
+        CHECK("package:core-range stays inside the package named",
+              hwloc_bitmap_isincluded(mask, pkg->cpuset));
+    }
+
+    rc = prte_hwloc_base_cpu_list_parse("P1:0,2", topo, false, mask);
+    CHECK("package:core-list parses", PRTE_SUCCESS == rc);
+    CHECK("package:core-list covers two cores", 4 == hwloc_bitmap_weight(mask));
+    if (NULL != pkg) {
+        CHECK("package:core-list stays inside the package named",
+              hwloc_bitmap_isincluded(mask, pkg->cpuset));
+    }
 
     /* Everything below is a user-supplied name for something that does not
      * exist. Each of these used to reach an unchecked dereference of the
@@ -409,6 +463,21 @@ static int test_cpu_list_parse(void)
     rc = prte_hwloc_base_cpu_list_parse("999", topo, false, mask);
     CHECK("unknown bare core is an error", PRTE_SUCCESS != rc);
 
+    /* A bad element must not be forgiven by a good one after it. The
+     * package:core loop recorded the failure and kept going, so a later "*"
+     * element assigned PRTE_SUCCESS over the top of it and "P0:99:*" came
+     * back as "every cpu on package 0" - the nonexistent core silently
+     * dropped. The same shape with a plain core after the bad one kept
+     * accumulating bits into a mask the caller was about to throw away. */
+    rc = prte_hwloc_base_cpu_list_parse("P0:99:*", topo, false, mask);
+    CHECK("a wildcard after an unknown core does not excuse it", PRTE_SUCCESS != rc);
+
+    rc = prte_hwloc_base_cpu_list_parse("P0:99:0", topo, false, mask);
+    CHECK("a good core after an unknown one does not excuse it", PRTE_SUCCESS != rc);
+
+    rc = prte_hwloc_base_cpu_list_parse("P0:0:99", topo, false, mask);
+    CHECK("an unknown core after a good one is still an error", PRTE_SUCCESS != rc);
+
     hwloc_bitmap_free(mask);
     free_topo(topo);
     return failures;
@@ -422,6 +491,20 @@ static int test_cpu_list_parse(void)
  * it may write. Any write past "sz" lands in it. */
 #define GUARD_LEN 64
 #define GUARD_BYTE 0x5a
+
+/* how many times "needle" occurs in "hay" */
+static int count_substr(const char *hay, const char *needle)
+{
+    const char *p = hay;
+    size_t len = strlen(needle);
+    int n = 0;
+
+    while (NULL != (p = strstr(p, needle))) {
+        ++n;
+        p += len;
+    }
+    return n;
+}
 
 static bool guard_intact(const char *buf, int sz)
 {
@@ -441,7 +524,7 @@ static int test_binding_info(void)
     hwloc_topology_t topo;
     hwloc_cpuset_t cpuset;
     char *buf;
-    int pkgnum, sz;
+    int sz;
 
     topo = make_topo("package:2 core:32 pu:1");
     if (NULL == topo) {
@@ -450,28 +533,29 @@ static int test_binding_info(void)
     }
     cpuset = hwloc_bitmap_alloc();
 
-    /* An empty cpuset says so, and leaves pkgnum at a value the caller can
-     * recognize. *pkgnum used to be left untouched here, and the only caller
-     * declares it uninitialized and prints it. */
+    /* An empty cpuset says so rather than rendering nothing at all. */
     sz = 256;
     buf = malloc(sz + GUARD_LEN);
     memset(buf + sz, GUARD_BYTE, GUARD_LEN);
-    pkgnum = 12345;
-    prte_hwloc_get_binding_info(cpuset, false, topo, &pkgnum, buf, sz);
-    CHECK("empty cpuset says so", NULL != strstr(buf, "EMPTY CPUSET"));
-    CHECK("empty cpuset reports no package", -1 == pkgnum);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
+    /* the element name carries no space - this lands in the document
+     * "--display map:parseable" produces, and "<EMPTY CPUSET/>" does not
+     * parse as one */
+    CHECK("empty cpuset says so", NULL != strstr(buf, "<empty_cpuset/>"));
     CHECK("empty cpuset stays in bounds", guard_intact(buf, sz));
     free(buf);
 
-    /* A cpuset that matches no package likewise has to leave pkgnum set. */
+    /* A cpuset that matches no package renders no package element - and
+     * still comes back NUL-terminated, because the caller emits it verbatim */
     hwloc_bitmap_zero(cpuset);
     hwloc_bitmap_set(cpuset, 4096);
     sz = 256;
     buf = malloc(sz + GUARD_LEN);
     memset(buf + sz, GUARD_BYTE, GUARD_LEN);
-    pkgnum = 12345;
-    prte_hwloc_get_binding_info(cpuset, false, topo, &pkgnum, buf, sz);
-    CHECK("cpuset outside every package reports no package", -1 == pkgnum);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
+    CHECK("cpuset outside every package renders no package",
+          NULL == strstr(buf, "<package"));
+    CHECK("cpuset outside every package is NUL terminated", sz > (int) strlen(buf));
     CHECK("cpuset outside every package stays in bounds", guard_intact(buf, sz));
     free(buf);
 
@@ -481,10 +565,10 @@ static int test_binding_info(void)
     sz = 256;
     buf = malloc(sz + GUARD_LEN);
     memset(buf + sz, GUARD_BYTE, GUARD_LEN);
-    pkgnum = 12345;
-    prte_hwloc_get_binding_info(cpuset, false, topo, &pkgnum, buf, sz);
-    CHECK("single core reports its package", 0 == pkgnum);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
+    CHECK("single core names its package", NULL != strstr(buf, "<package id=\"0\">"));
     CHECK("single core is rendered", NULL != strstr(buf, "<core>0</core>"));
+    CHECK("single core closes its package", NULL != strstr(buf, "</package>"));
     CHECK("single core stays in bounds", guard_intact(buf, sz));
     free(buf);
 
@@ -499,9 +583,8 @@ static int test_binding_info(void)
     sz = 32 * 20;
     buf = malloc(sz + GUARD_LEN);
     memset(buf + sz, GUARD_BYTE, GUARD_LEN);
-    pkgnum = 12345;
-    prte_hwloc_get_binding_info(cpuset, false, topo, &pkgnum, buf, sz);
-    CHECK("wide binding reports its package", 0 == pkgnum);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
+    CHECK("wide binding names its package", NULL != strstr(buf, "<package id=\"0\">"));
     CHECK("wide binding stays in bounds", guard_intact(buf, sz));
     CHECK("wide binding is NUL terminated", sz > (int) strlen(buf));
     free(buf);
@@ -510,21 +593,43 @@ static int test_binding_info(void)
     sz = 8192;
     buf = malloc(sz + GUARD_LEN);
     memset(buf + sz, GUARD_BYTE, GUARD_LEN);
-    pkgnum = 12345;
-    prte_hwloc_get_binding_info(cpuset, false, topo, &pkgnum, buf, sz);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
     CHECK("wide binding renders the first core", NULL != strstr(buf, "<core>0</core>"));
     CHECK("wide binding renders a middle core", NULL != strstr(buf, "<core>17</core>"));
     CHECK("wide binding renders the last core", NULL != strstr(buf, "<core>31</core>"));
     CHECK("wide binding with room stays in bounds", guard_intact(buf, sz));
     free(buf);
 
+    /* A process bound across TWO packages. The old shape rendered the sites
+     * only, into the caller's single <package> element, and reported one
+     * package number - so each package overwrote the previous one from the
+     * top of the buffer and the result named the last package and dropped
+     * every earlier one's cores. That is not incomplete output, it is wrong
+     * output, and it disagreed with what _cset2str() reports for the same
+     * binding. A rankfile slot list of "P0:0;P1:0" produces exactly this. */
+    hwloc_bitmap_zero(cpuset);
+    hwloc_bitmap_set(cpuset, 0);   /* package 0, core 0 */
+    hwloc_bitmap_set(cpuset, 32);  /* package 1, core 32 */
+    sz = 8192;
+    buf = malloc(sz + GUARD_LEN);
+    memset(buf + sz, GUARD_BYTE, GUARD_LEN);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
+    CHECK("cross-package binding names package 0", NULL != strstr(buf, "<package id=\"0\">"));
+    CHECK("cross-package binding names package 1", NULL != strstr(buf, "<package id=\"1\">"));
+    CHECK("cross-package binding keeps package 0's core", NULL != strstr(buf, "<core>0</core>"));
+    CHECK("cross-package binding keeps package 1's core", NULL != strstr(buf, "<core>32</core>"));
+    CHECK("cross-package binding closes both packages",
+          2 == count_substr(buf, "</package>"));
+    CHECK("cross-package binding stays in bounds", guard_intact(buf, sz));
+    free(buf);
+
     /* a truly tiny buffer must still be safe */
     sz = 4;
     buf = malloc(sz + GUARD_LEN);
     memset(buf + sz, GUARD_BYTE, GUARD_LEN);
-    pkgnum = 12345;
-    prte_hwloc_get_binding_info(cpuset, false, topo, &pkgnum, buf, sz);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
     CHECK("tiny buffer stays in bounds", guard_intact(buf, sz));
+    CHECK("tiny buffer is NUL terminated", sz > (int) strlen(buf));
     free(buf);
 
     hwloc_bitmap_free(cpuset);
@@ -628,48 +733,230 @@ static int test_cset2str(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* build_map (core vs hwthread coresets)                              */
+/* cpuset2ranges (the one place bits become cpu numbers)              */
 /* ------------------------------------------------------------------ */
 
-static int test_build_map(void)
+static int test_cpuset2ranges(void)
 {
     int failures = 0;
     hwloc_topology_t topo;
-    hwloc_cpuset_t avail, coreset;
+    hwloc_cpuset_t avail;
+    char *str;
 
     topo = make_topo("package:1 core:4 pu:2");
     if (NULL == topo) {
-        fprintf(stdout, "  SKIP build-map (no synthetic topology support)\n");
+        fprintf(stdout, "  SKIP cpuset2ranges (no synthetic topology support)\n");
         return 0;
     }
     avail = hwloc_bitmap_alloc();
-    coreset = hwloc_bitmap_alloc();
 
     /* both hwthreads of cores 0 and 1 */
     hwloc_bitmap_set_range(avail, 0, 3);
-    prte_hwloc_build_map(topo, avail, false, coreset);
-    CHECK("two cores map to two core bits", 2 == hwloc_bitmap_weight(coreset));
-    CHECK("core 0 is marked", hwloc_bitmap_isset(coreset, 0));
-    CHECK("core 1 is marked", hwloc_bitmap_isset(coreset, 1));
+    str = prte_hwloc_base_cpuset2ranges(topo, avail, false, false);
+    CHECK("two whole cores collapse into a range", NULL != str && 0 == strcmp(str, "0-1"));
+    free(str);
 
-    /* the same cpuset in hwthread terms keeps all four bits */
-    prte_hwloc_build_map(topo, avail, true, coreset);
-    CHECK("hwthread terms keep every bit", 4 == hwloc_bitmap_weight(coreset));
+    /* the same cpuset in hwthread terms names all four hwthreads */
+    str = prte_hwloc_base_cpuset2ranges(topo, avail, true, false);
+    CHECK("hwthread terms keep every bit", NULL != str && 0 == strcmp(str, "0-3"));
+    free(str);
 
-    /* one hwthread of one core still marks that core */
+    /* one hwthread of one core still names that core, exactly once */
     hwloc_bitmap_zero(avail);
     hwloc_bitmap_set(avail, 5);
-    prte_hwloc_build_map(topo, avail, false, coreset);
-    CHECK("a single hwthread marks its core", 1 == hwloc_bitmap_weight(coreset));
-    CHECK("that core is core 2", hwloc_bitmap_isset(coreset, 2));
+    str = prte_hwloc_base_cpuset2ranges(topo, avail, false, false);
+    CHECK("a single hwthread names its core", NULL != str && 0 == strcmp(str, "2"));
+    free(str);
 
-    /* an empty input yields an empty coreset, not the previous contents */
+    /* a scattered set lists individually and collapses what it can */
     hwloc_bitmap_zero(avail);
-    prte_hwloc_build_map(topo, avail, false, coreset);
-    CHECK("an empty cpuset yields an empty coreset", hwloc_bitmap_iszero(coreset));
+    hwloc_bitmap_set(avail, 0); /* core 0 */
+    hwloc_bitmap_set(avail, 4); /* core 2 */
+    hwloc_bitmap_set(avail, 6); /* core 3 */
+    str = prte_hwloc_base_cpuset2ranges(topo, avail, false, false);
+    CHECK("a scattered set lists and collapses", NULL != str && 0 == strcmp(str, "0,2-3"));
+    free(str);
+
+    /* an empty input has no sites at all */
+    hwloc_bitmap_zero(avail);
+    str = prte_hwloc_base_cpuset2ranges(topo, avail, false, false);
+    CHECK("an empty cpuset has no ranges", NULL == str);
+    free(str);
 
     hwloc_bitmap_free(avail);
-    hwloc_bitmap_free(coreset);
+    free_topo(topo);
+
+    /* hwloc does not find cores on every platform - PPC64 on old Linux
+     * kernels reported only NUMA nodes and PUs. A core-based rendering
+     * resolves nothing there, so every binding came back NULL and every
+     * caller printed "UNBOUND". Fall back to hwthreads, and say so. */
+    topo = make_topo("package:1 pu:4");
+    if (NULL != topo) {
+        CHECK("a core-less topology really has no cores",
+              0 == prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_CORE));
+        avail = hwloc_bitmap_alloc();
+        hwloc_bitmap_set_range(avail, 1, 2);
+        str = prte_hwloc_base_cpuset2ranges(topo, avail, false, false);
+        CHECK("a core-less topology still renders", NULL != str && 0 == strcmp(str, "1-2"));
+        free(str);
+        str = prte_hwloc_base_cset2str(avail, false, false, topo);
+        CHECK("a core-less topology says it is reporting hwthreads",
+              NULL != str && NULL != strstr(str, "hwt:L"));
+        free(str);
+        hwloc_bitmap_free(avail);
+        free_topo(topo);
+    }
+
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
+/* logical vs physical index basis                                    */
+/* ------------------------------------------------------------------ */
+
+/* A topology whose PU OS indices are interleaved across its two packages -
+ * the ordinary shape of a machine whose firmware round-robins cpu numbers,
+ * and of any SMT machine viewed in hwthreads. hwloc's synthetic generator
+ * always makes os_index and logical_index agree, so the divergence that
+ * matters here can only be built from XML.
+ *
+ * Package 0 owns PUs 0,2,4,6 (logical 0-3); package 1 owns PUs 1,3,5,7
+ * (logical 4-7). One PU per core, so npus == ncores: this is exactly the
+ * "the bits already are cores" shape that the renderers used to short-cut
+ * by printing the raw bit numbers.
+ */
+static const char *interleaved_xml =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE topology SYSTEM \"hwloc2.dtd\">\n"
+    "<topology version=\"2.0\">\n"
+    "  <object type=\"Machine\" os_index=\"0\" cpuset=\"0x000000ff\" complete_cpuset=\"0x000000ff\" allowed_cpuset=\"0x000000ff\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" allowed_nodeset=\"0x00000001\" gp_index=\"1\">\n"
+    "    <object type=\"NUMANode\" os_index=\"0\" cpuset=\"0x000000ff\" complete_cpuset=\"0x000000ff\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"2\" local_memory=\"1073741824\"/>\n"
+    "    <object type=\"Package\" os_index=\"0\" cpuset=\"0x00000055\" complete_cpuset=\"0x00000055\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"3\">\n"
+    "      <object type=\"Core\" os_index=\"0\" cpuset=\"0x00000001\" complete_cpuset=\"0x00000001\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"10\">\n"
+    "        <object type=\"PU\" os_index=\"0\" cpuset=\"0x00000001\" complete_cpuset=\"0x00000001\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"11\"/>\n"
+    "      </object>\n"
+    "      <object type=\"Core\" os_index=\"2\" cpuset=\"0x00000004\" complete_cpuset=\"0x00000004\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"12\">\n"
+    "        <object type=\"PU\" os_index=\"2\" cpuset=\"0x00000004\" complete_cpuset=\"0x00000004\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"13\"/>\n"
+    "      </object>\n"
+    "      <object type=\"Core\" os_index=\"4\" cpuset=\"0x00000010\" complete_cpuset=\"0x00000010\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"14\">\n"
+    "        <object type=\"PU\" os_index=\"4\" cpuset=\"0x00000010\" complete_cpuset=\"0x00000010\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"15\"/>\n"
+    "      </object>\n"
+    "      <object type=\"Core\" os_index=\"6\" cpuset=\"0x00000040\" complete_cpuset=\"0x00000040\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"16\">\n"
+    "        <object type=\"PU\" os_index=\"6\" cpuset=\"0x00000040\" complete_cpuset=\"0x00000040\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"17\"/>\n"
+    "      </object>\n"
+    "    </object>\n"
+    "    <object type=\"Package\" os_index=\"1\" cpuset=\"0x000000aa\" complete_cpuset=\"0x000000aa\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"4\">\n"
+    "      <object type=\"Core\" os_index=\"1\" cpuset=\"0x00000002\" complete_cpuset=\"0x00000002\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"18\">\n"
+    "        <object type=\"PU\" os_index=\"1\" cpuset=\"0x00000002\" complete_cpuset=\"0x00000002\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"19\"/>\n"
+    "      </object>\n"
+    "      <object type=\"Core\" os_index=\"3\" cpuset=\"0x00000008\" complete_cpuset=\"0x00000008\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"20\">\n"
+    "        <object type=\"PU\" os_index=\"3\" cpuset=\"0x00000008\" complete_cpuset=\"0x00000008\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"21\"/>\n"
+    "      </object>\n"
+    "      <object type=\"Core\" os_index=\"5\" cpuset=\"0x00000020\" complete_cpuset=\"0x00000020\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"22\">\n"
+    "        <object type=\"PU\" os_index=\"5\" cpuset=\"0x00000020\" complete_cpuset=\"0x00000020\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"23\"/>\n"
+    "      </object>\n"
+    "      <object type=\"Core\" os_index=\"7\" cpuset=\"0x00000080\" complete_cpuset=\"0x00000080\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"24\">\n"
+    "        <object type=\"PU\" os_index=\"7\" cpuset=\"0x00000080\" complete_cpuset=\"0x00000080\" nodeset=\"0x00000001\" complete_nodeset=\"0x00000001\" gp_index=\"25\"/>\n"
+    "      </object>\n"
+    "    </object>\n"
+    "  </object>\n"
+    "</topology>\n";
+
+static int test_index_basis(void)
+{
+    int failures = 0;
+    hwloc_topology_t topo;
+    hwloc_cpuset_t cpuset;
+    hwloc_obj_t pkg;
+    char *str, *buf;
+    int sz;
+
+    if (0 != hwloc_topology_init(&topo)) {
+        fprintf(stdout, "  SKIP index-basis (topology_init failed)\n");
+        return 0;
+    }
+    if (0 != hwloc_topology_set_xmlbuffer(topo, interleaved_xml, (int) strlen(interleaved_xml) + 1)
+        || 0 != hwloc_topology_load(topo)) {
+        fprintf(stdout, "  SKIP index-basis (no XML topology support)\n");
+        hwloc_topology_destroy(topo);
+        return 0;
+    }
+
+    /* sanity: this is the topology the rest of the test assumes */
+    CHECK("interleaved topology has 8 PUs",
+          8 == prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PU));
+    CHECK("interleaved topology has 8 cores",
+          8 == prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_CORE));
+    CHECK("interleaved topology has 2 packages",
+          2 == prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PACKAGE));
+
+    pkg = prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_PACKAGE, 0);
+    CHECK("package 0 resolves", NULL != pkg);
+    if (NULL == pkg) {
+        hwloc_topology_destroy(topo);
+        return failures;
+    }
+
+    cpuset = hwloc_bitmap_dup(pkg->cpuset);
+
+    /* THE bug. Package 0's cpus are OS indices 0,2,4,6 and logical cores
+     * 0-3. Because npus == ncores, every renderer here used to take the
+     * "the bits already are cores" short cut and print the raw bit numbers
+     * while labelling them logical - so --display cpus reported "0,2,4,6"
+     * for a package whose logical cores are 0-3, and a user who fed those
+     * numbers back to --cpu-set (which resolves logically) selected cpus
+     * spread across both packages. */
+    str = prte_hwloc_base_cpuset2ranges(topo, cpuset, false, false);
+    CHECK("logical cores are logical", NULL != str && 0 == strcmp(str, "0-3"));
+    free(str);
+
+    str = prte_hwloc_base_cpuset2ranges(topo, cpuset, false, true);
+    CHECK("physical cores are the OS indices", NULL != str && 0 == strcmp(str, "0,2,4,6"));
+    free(str);
+
+    /* the same divergence in hwthread terms */
+    str = prte_hwloc_base_cpuset2ranges(topo, cpuset, true, false);
+    CHECK("logical hwthreads are logical", NULL != str && 0 == strcmp(str, "0-3"));
+    free(str);
+
+    str = prte_hwloc_base_cpuset2ranges(topo, cpuset, true, true);
+    CHECK("physical hwthreads are the OS indices", NULL != str && 0 == strcmp(str, "0,2,4,6"));
+    free(str);
+
+    /* package 1's logical cores continue where package 0's left off */
+    pkg = prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_PACKAGE, 1);
+    if (NULL != pkg) {
+        str = prte_hwloc_base_cpuset2ranges(topo, pkg->cpuset, false, false);
+        CHECK("package 1's logical cores are 4-7", NULL != str && 0 == strcmp(str, "4-7"));
+        free(str);
+    }
+
+    /* cset2str carries the same basis, and says which one it used */
+    str = prte_hwloc_base_cset2str(cpuset, false, false, topo);
+    CHECK("cset2str renders logical cores",
+          NULL != str && 0 == strcmp(str, "package[0][core:L0-3]"));
+    free(str);
+
+    str = prte_hwloc_base_cset2str(cpuset, false, true, topo);
+    CHECK("cset2str renders physical cores",
+          NULL != str && 0 == strcmp(str, "package[0][core:P0,2,4,6]"));
+    free(str);
+
+    /* and so does the parseable XML rendering, which used to ignore
+     * "physical" outright */
+    sz = 4096;
+    buf = malloc(sz);
+    prte_hwloc_get_binding_info(cpuset, false, false, topo, buf, sz);
+    CHECK("binding info reports package 0", NULL != strstr(buf, "<package id=\"0\">"));
+    CHECK("binding info renders logical core 3", NULL != strstr(buf, "<core>3</core>"));
+    CHECK("binding info does not leak an OS index",
+          NULL == strstr(buf, "<core>6</core>"));
+
+    prte_hwloc_get_binding_info(cpuset, false, true, topo, buf, sz);
+    CHECK("binding info honors physical", NULL != strstr(buf, "<core>6</core>"));
+    free(buf);
+
+    hwloc_bitmap_free(cpuset);
     free_topo(topo);
     return failures;
 }
@@ -735,6 +1022,151 @@ static int test_print_binding(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* loading the local topology from a file                             */
+/* ------------------------------------------------------------------ */
+
+/* "hwloc_use_topo_file" means "this XML describes the machine I am running
+ * on". hwloc cannot know that, so it zeroes every support bit of an imported
+ * topology - and prte_rmaps_base_check_support() refuses any explicitly
+ * requested binding when those bits are clear, so the option was usable only
+ * with "--bind-to none". PRRTE asserts the bits itself; this pins that it
+ * happens, and that it happens *after* hwloc_topology_load(), which is the
+ * only place it sticks (hwloc's header: the support structure "only contains
+ * valid information after" the load). */
+static int test_topo_file(void)
+{
+    int failures = 0;
+    const struct hwloc_topology_support *support;
+    char path[] = "/tmp/prte_test_topoXXXXXX";
+    char *saved_file;
+    hwloc_topology_t saved_topo;
+    int fd, rc;
+    size_t len;
+    ssize_t wrote;
+
+    fd = mkstemp(path);
+    if (0 > fd) {
+        fprintf(stderr, "SKIP test_topo_file: could not create a temp file\n");
+        return 0;
+    }
+    len = strlen(interleaved_xml);
+    wrote = write(fd, interleaved_xml, len);
+    close(fd);
+    if ((ssize_t) len != wrote) {
+        fprintf(stderr, "SKIP test_topo_file: short write\n");
+        unlink(path);
+        return 0;
+    }
+
+    /* get_topology() reads these two globals and returns early if the
+     * topology is already set, so stand them up and put them back */
+    saved_file = prte_hwloc_base_topo_file;
+    saved_topo = prte_hwloc_topology;
+    prte_hwloc_base_topo_file = path;
+    prte_hwloc_topology = NULL;
+
+    rc = prte_hwloc_base_get_topology();
+    CHECK("a topology file loads", PRTE_SUCCESS == rc);
+    if (PRTE_SUCCESS == rc && NULL != prte_hwloc_topology) {
+        CHECK("the loaded topology has the file's packages",
+              2 == prte_hwloc_base_get_nbobjs_by_type(prte_hwloc_topology,
+                                                      HWLOC_OBJ_PACKAGE));
+        support = hwloc_topology_get_support(prte_hwloc_topology);
+        CHECK("the loaded topology reports support", NULL != support);
+        if (NULL != support) {
+            CHECK("cpubind is asserted for an imported topology",
+                  support->cpubind->set_thisproc_cpubind &&
+                  support->cpubind->set_thisthread_cpubind);
+            CHECK("membind is asserted for an imported topology",
+                  support->membind->set_thisproc_membind &&
+                  support->membind->set_thisthread_membind);
+        }
+        prte_hwloc_base_release_userdata(prte_hwloc_topology);
+        hwloc_topology_destroy(prte_hwloc_topology);
+    }
+
+    /* a file that is not a topology is refused, and leaves no handle behind
+     * for a later reader to mistake for a live one */
+    prte_hwloc_topology = NULL;
+    fd = open(path, O_WRONLY | O_TRUNC);
+    if (0 <= fd) {
+        wrote = write(fd, "not a topology\n", 15);
+        (void) wrote;
+        close(fd);
+        rc = prte_hwloc_base_get_topology();
+        CHECK("a malformed topology file is refused", PRTE_SUCCESS != rc);
+        CHECK("a refused topology file leaves no handle", NULL == prte_hwloc_topology);
+    }
+
+    prte_hwloc_base_topo_file = saved_file;
+    prte_hwloc_topology = saved_topo;
+    unlink(path);
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
+/* the default-binding chooser                                        */
+/* ------------------------------------------------------------------ */
+
+/* prte_hwloc_base_set_default_binding() derives a binding from the mapping
+ * when the user gave none. Every arm of it has to reach a policy: leaving
+ * jdata->map->binding at zero is not "bind to nothing", it is a value that
+ * is not in the policy space at all - PRTE_GET_BINDING_POLICY() yields 0,
+ * which is neither NONE nor any object - and the caller then feeds it to the
+ * bind-upwards check and to a switch that has no case for it. The PPR arm is
+ * the one with an object-by-object chain and hence the one that could
+ * acquire a hole; ppr_object() in rmaps_base_map_job.c produces exactly the
+ * eight types below, so those eight are what this arm has to cover. */
+static int test_default_binding(void)
+{
+    int failures = 0;
+    prte_job_t *jdata;
+    prte_rmaps_options_t options;
+    hwloc_obj_type_t ppr_types[] = {HWLOC_OBJ_MACHINE, HWLOC_OBJ_PACKAGE,
+                                    HWLOC_OBJ_NUMANODE, HWLOC_OBJ_L1CACHE,
+                                    HWLOC_OBJ_L2CACHE, HWLOC_OBJ_L3CACHE,
+                                    HWLOC_OBJ_CORE, HWLOC_OBJ_PU};
+    size_t t;
+    int rc;
+
+    for (t = 0; t < sizeof(ppr_types) / sizeof(ppr_types[0]); t++) {
+        jdata = PMIX_NEW(prte_job_t);
+        jdata->map = PMIX_NEW(prte_job_map_t);
+        PRTE_SET_MAPPING_POLICY(jdata->map->mapping, PRTE_MAPPING_PPR);
+
+        memset(&options, 0, sizeof(options));
+        /* a verbosity above the stream's threshold keeps the chooser quiet */
+        options.verbosity = 1000;
+        options.stream = 0;
+        options.maptype = ppr_types[t];
+        options.nprocs = 4;
+
+        rc = prte_hwloc_base_set_default_binding(jdata, &options);
+        CHECK("ppr default binding succeeds", PRTE_SUCCESS == rc);
+        CHECK("ppr default binding lands on a real policy",
+              0 != PRTE_GET_BINDING_POLICY(jdata->map->binding) &&
+              PRTE_BIND_TO_HWTHREAD >= PRTE_GET_BINDING_POLICY(jdata->map->binding));
+        PMIX_RELEASE(jdata);
+    }
+
+    /* a tool is never bound, and that answer is marked as given so nothing
+     * downstream re-derives one for it */
+    jdata = PMIX_NEW(prte_job_t);
+    jdata->map = PMIX_NEW(prte_job_map_t);
+    PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
+    memset(&options, 0, sizeof(options));
+    options.verbosity = 1000;
+    options.stream = 0;
+    rc = prte_hwloc_base_set_default_binding(jdata, &options);
+    CHECK("a tool's default binding succeeds", PRTE_SUCCESS == rc);
+    CHECK("a tool is not bound",
+          PRTE_BIND_TO_NONE == PRTE_GET_BINDING_POLICY(jdata->map->binding));
+    PMIX_RELEASE(jdata);
+
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
 /* --bind-to parsing                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -753,6 +1185,19 @@ static int test_binding_policy(void)
 
     CHECK("a NULL spec is not an error",
           PRTE_SUCCESS == prte_hwloc_base_set_binding_policy(jdata, NULL));
+
+    /* A job with no map cannot hold the answer, so it is refused before any
+     * qualifier gets the chance to record itself on it. That check used to
+     * run last, so "--bind-to core:report" against a mapless job left
+     * REPORT_BINDINGS on the job and then failed. */
+    {
+        prte_job_t *nomap = PMIX_NEW(prte_job_t);
+        CHECK("a mapless job is refused",
+              PRTE_SUCCESS != prte_hwloc_base_set_binding_policy(nomap, "core:report"));
+        CHECK("a refused mapless job records nothing",
+              !prte_get_attribute(&nomap->attributes, PRTE_JOB_REPORT_BINDINGS, NULL, PMIX_BOOL));
+        PMIX_RELEASE(nomap);
+    }
 
     CHECK("none parses", PRTE_SUCCESS == prte_hwloc_base_set_binding_policy(jdata, "none"));
     CHECK("none is recorded", PRTE_BIND_TO_NONE == PRTE_GET_BINDING_POLICY(jdata->map->binding));
@@ -819,11 +1264,50 @@ static int test_binding_policy(void)
     CHECK("a zero limit is refused",
           PRTE_SUCCESS != prte_hwloc_base_set_binding_policy(jdata, "core:limit=0"));
 
+    /* A qualifier with NO policy means "whatever binding would otherwise
+     * apply, plus this qualifier" - the same thing "--map-by :OVERSUBSCRIBE"
+     * has always meant. pmix_check_cli_option() compares only
+     * min(strlen(a),strlen(b)) characters, so an empty policy word matched
+     * the first option tested against it, which is "none": "--bind-to
+     * :overload-allowed" silently disabled binding altogether. The policy
+     * bits must stay unset so the default chooser can still fill them in,
+     * and the qualifier must survive into the word. */
+    jdata->map->binding = 0;
+    CHECK("a qualifier-only spec parses",
+          PRTE_SUCCESS == prte_hwloc_base_set_binding_policy(jdata, ":overload-allowed"));
+    CHECK("a qualifier-only spec does not choose a policy",
+          !PRTE_BINDING_POLICY_IS_SET(jdata->map->binding));
+    CHECK("a qualifier-only spec did not silently select none",
+          PRTE_BIND_TO_NONE != PRTE_GET_BINDING_POLICY(jdata->map->binding));
+    CHECK("a qualifier-only spec keeps its qualifier",
+          PRTE_BIND_OVERLOAD_ALLOWED(jdata->map->binding));
+    /* ...and the default chooser then fills the policy in around it */
+    PRTE_SET_DEFAULT_BINDING_POLICY(jdata->map->binding, PRTE_BIND_TO_CORE);
+    CHECK("the default policy lands on top of the qualifier",
+          PRTE_BIND_TO_CORE == PRTE_GET_BINDING_POLICY(jdata->map->binding));
+    CHECK("the qualifier survived the default policy",
+          PRTE_BIND_OVERLOAD_ALLOWED(jdata->map->binding));
+
+    /* the same form is legal as a DVM default */
+    CHECK("a qualifier-only default parses",
+          PRTE_SUCCESS == prte_hwloc_base_set_binding_policy(NULL, ":if-supported"));
+    CHECK("a qualifier-only default does not choose a policy",
+          !PRTE_BINDING_POLICY_IS_SET(prte_hwloc_default_binding_policy));
+
     /* bad input */
     CHECK("an unknown policy is refused",
           PRTE_SUCCESS != prte_hwloc_base_set_binding_policy(jdata, "sockets"));
     CHECK("an unknown qualifier is refused",
           PRTE_SUCCESS != prte_hwloc_base_set_binding_policy(jdata, "core:frobnicate"));
+
+    /* A spec that does not parse must leave the job exactly as it was. The
+     * qualifiers used to be applied first, so "sockets:report" recorded
+     * report-bindings on the job and then rejected the request. */
+    prte_remove_attribute(&jdata->attributes, PRTE_JOB_REPORT_BINDINGS);
+    CHECK("a bad policy carrying a good qualifier is refused",
+          PRTE_SUCCESS != prte_hwloc_base_set_binding_policy(jdata, "sockets:report"));
+    CHECK("a refused spec records nothing on the job",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_BINDINGS, NULL, PMIX_BOOL));
 
     /* the job-only qualifiers are refused on the DVM default, where there is
      * no job to record them against */
@@ -931,8 +1415,8 @@ static int test_userdata(void)
     depth = hwloc_get_type_depth(topo, HWLOC_OBJ_CORE);
     CHECK("core counters are released", 0 == count_userdata(topo, depth));
 
-    /* releasing twice is safe - prte_hwloc_base_close() and the topology
-     * destructor both reach for it */
+    /* releasing twice is safe - the topology destructor and the XML-loading
+     * path both reach for it */
     prte_hwloc_base_release_userdata(topo);
     prte_hwloc_base_release_userdata(NULL);
 
@@ -1000,6 +1484,17 @@ static int test_reset_counters(void)
         CHECK("core counter is reset",
               0 == ((prte_hwloc_obj_data_t *) core->userdata)->nprocs);
     }
+    /* The NUMA counter is the one that used to survive. hwloc 2.x keeps NUMA
+     * nodes out of the depth hierarchy, so a walk over 0..get_depth() never
+     * visits one - and "--bind-to numa:limit=N" attaches its per-object
+     * counter there. Missing the reset left those counters accumulating for
+     * the life of the DVM, so the second such job found every domain already
+     * at its limit and could not be bound at all. */
+    CHECK("a numa node resolves", NULL != numa);
+    if (NULL != numa && NULL != numa->userdata) {
+        CHECK("numa counter is reset",
+              0 == ((prte_hwloc_obj_data_t *) numa->userdata)->nprocs);
+    }
     /* The root's summary is NOT an obj_data_t. reset_counters must not walk
      * depth 0, or it would reinterpret the summary as a counter and scribble
      * on numa_cutoff. */
@@ -1014,6 +1509,133 @@ static int test_reset_counters(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the topology renderer behind --display topo                        */
+/* ------------------------------------------------------------------ */
+
+static int test_hwloc_print(void)
+{
+    int failures = 0;
+    hwloc_topology_t topo;
+    char *output = NULL;
+    int rc;
+
+    /* two packages, each with its own NUMA domain */
+    topo = make_topo("pack:2 numa:1 core:2 pu:2");
+    if (NULL == topo) {
+        fprintf(stderr, "SKIP test_hwloc_print: no synthetic topology support\n");
+        return 0;
+    }
+
+    /* a NULL topology is answered, not dereferenced: every caller hands us
+     * one out of prte_node_topologies and prints the result unconditionally */
+    output = (char *) 0x1;
+    rc = prte_hwloc_print(&output, NULL, NULL);
+    CHECK("print of a NULL topology reports not-found", PRTE_ERR_NOT_FOUND == rc);
+    CHECK("print of a NULL topology clears the output", NULL == output);
+
+    output = NULL;
+    rc = prte_hwloc_print(&output, NULL, topo);
+    CHECK("print succeeds", PRTE_SUCCESS == rc && NULL != output);
+    if (NULL != output) {
+        /* The levels a user expects to see. NUMANode is the one that was
+         * missing: hwloc 2.x hangs NUMA nodes off memory_first_child, not
+         * off the children[] array the renderer walked, so --display topo
+         * showed a topology with no NUMA domains in it at all - on a runtime
+         * whose "--map-by numa" is usually why the user asked. */
+        CHECK("print includes the machine", NULL != strstr(output, "Type: Machine"));
+        CHECK("print includes packages", NULL != strstr(output, "Type: Package"));
+        CHECK("print includes cores", NULL != strstr(output, "Type: Core"));
+        CHECK("print includes PUs", NULL != strstr(output, "Type: PU"));
+        CHECK("print includes NUMA nodes", NULL != strstr(output, "Type: NUMANode"));
+        /* the child count has to cover every child list, or the object it
+         * names reads as childless right where a memory child hangs */
+        CHECK("machine reports both packages",
+              NULL != strstr(output, "Type: Machine Number of child objects: 2"));
+        CHECK("a package reports its core children and its NUMA child",
+              NULL != strstr(output, "Type: Package Number of child objects: 3"));
+        free(output);
+    }
+
+    /* a prefix is applied to every line of the dump */
+    output = NULL;
+    rc = prte_hwloc_print(&output, "XX", topo);
+    CHECK("prefixed print succeeds", PRTE_SUCCESS == rc && NULL != output);
+    if (NULL != output) {
+        CHECK("the prefix reaches the root", NULL != strstr(output, "XXType: Machine"));
+        free(output);
+    }
+
+    free_topo(topo);
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
+
+
+/*
+ * prte_hwloc_base_close() releases the hwloc base's OWN state and nothing
+ * else.  In particular it must not destroy prte_hwloc_topology: the only two
+ * producers of that global immediately hand it to a prte_topology_t placed in
+ * prte_node_topologies, and that object's destructor is what frees it.  The
+ * function used to destroy it as well, which is a double free on whichever
+ * side of the array release it runs -- and is why it ended up with no callers
+ * at all while still being documented as live teardown.
+ *
+ * The property that makes it safe now is that clearing the alias is correct
+ * in EITHER order, so this drives both: close-then-release, and
+ * release-then-close.  Under a debug PMIx (which this suite builds against)
+ * a double free here is an abort, so surviving the sequence is the assertion.
+ */
+static int test_base_close(void)
+{
+    int failures = 0;
+    hwloc_topology_t topo;
+    prte_topology_t *t;
+
+    /* close-then-release: the base drops its alias first, and the array
+     * still owns a perfectly good topology to destroy afterwards */
+    if (0 != hwloc_topology_init(&topo) || 0 != hwloc_topology_load(topo)) {
+        fprintf(stderr, "FAIL [base_close]: could not build a topology\n");
+        return 1;
+    }
+    prte_hwloc_topology = topo;
+    prte_hwloc_base_inited = true;
+    prte_hwloc_default_cpu_list = strdup("0-1");
+
+    prte_hwloc_base_close();
+    CHECK("close drops its alias of the local topology", NULL == prte_hwloc_topology);
+    CHECK("close frees the DVM cpu-set", NULL == prte_hwloc_default_cpu_list);
+    CHECK("close marks the base uninitialized", !prte_hwloc_base_inited);
+
+    /* the topology it did NOT destroy is still ours to hand to the owner */
+    t = PMIX_NEW(prte_topology_t);
+    t->topo = topo;
+    PMIX_RELEASE(t);
+
+    /* a second close with nothing left to do must be a no-op, not a repeat */
+    prte_hwloc_base_close();
+    CHECK("closing twice is harmless", NULL == prte_hwloc_topology);
+
+    /* release-then-close: the array destroys the topology, leaving the global
+     * aliasing freed memory, and close must not touch it */
+    if (0 != hwloc_topology_init(&topo) || 0 != hwloc_topology_load(topo)) {
+        fprintf(stderr, "FAIL [base_close]: could not build a second topology\n");
+        return failures + 1;
+    }
+    prte_hwloc_topology = topo;
+    prte_hwloc_base_inited = true;
+    t = PMIX_NEW(prte_topology_t);
+    t->topo = topo;
+    PMIX_RELEASE(t);            /* destroys the topology */
+    prte_hwloc_base_close();    /* must only clear the now-stale alias */
+    CHECK("close after the owner released it clears the stale alias",
+          NULL == prte_hwloc_topology);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_base_close\n");
+    }
+    return failures;
+}
 
 int main(void)
 {
@@ -1031,11 +1653,16 @@ int main(void)
     failures += test_cpu_list_parse();
     failures += test_binding_info();
     failures += test_cset2str();
-    failures += test_build_map();
+    failures += test_cpuset2ranges();
+    failures += test_index_basis();
     failures += test_print_binding();
+    failures += test_topo_file();
+    failures += test_default_binding();
     failures += test_binding_policy();
     failures += test_userdata();
     failures += test_reset_counters();
+    failures += test_hwloc_print();
+    failures += test_base_close();
 
     prte_finalize();
 

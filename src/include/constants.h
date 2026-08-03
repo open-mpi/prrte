@@ -160,10 +160,15 @@ enum {
     PRTE_PMIX_LAUNCHER_READY = (PRTE_ERR_BASE - 71),
     PRTE_OPERATION_SUCCEEDED = (PRTE_ERR_BASE - 72),
 
-    /* error codes specific to PRTE - don't forget to update
-        src/util/error_strings.c when adding new error codes!!
-        Otherwise, the error reporting system will potentially crash,
-        or at the least not be able to report the new error correctly.
+    /* Error codes specific to PRRTE.
+     *
+     * Whichever group you append to, give the new code a string in
+     * prte_strerror(), which lives in src/util/error.c -- NOT in
+     * src/util/error_strings.c, which this comment used to name.  That file
+     * holds the *state* strings (prte_job_state_to_str() and friends), so
+     * following the old instruction put the string somewhere prte_strerror()
+     * never looks and left the user reading "Unknown error" -- precisely the
+     * failure the instruction exists to prevent.  test/unit/util catches it.
      */
 
     PRTE_ERR_RECV_LESS_THAN_POSTED = (PRTE_ERR_BASE - 101),
@@ -220,7 +225,30 @@ enum {
     PRTE_ERR_SLURM_BAD_JOB_STATUS = (PRTE_ERR_BASE - 152),
     PRTE_ERR_SLURM_SUBMIT_FAILURE = (PRTE_ERR_BASE - 153),
     PRTE_ERR_SLURM_CANCEL_FAILURE = (PRTE_ERR_BASE - 154),
-    PRTE_ERR_SLURM_SHRINK_FAILURE = (PRTE_ERR_BASE - 155)
+    PRTE_ERR_SLURM_SHRINK_FAILURE = (PRTE_ERR_BASE - 155),
+    PRTE_ERR_PRELOAD_CONFLICT = (PRTE_ERR_BASE - 156),
+
+    /* Not an error code.  Nothing returns it, nothing tests for it, and
+     * prte_strerror() deliberately has no case for it: it is one past the
+     * last assigned offset, and it exists so that the code that sweeps this
+     * list has a bound it does not have to guess.
+     *
+     * Bump it in the same edit that appends a code above.  It sits here,
+     * adjacent to where you are appending, for exactly that reason -- the
+     * two copies of this bound that used to live in test/unit/include and
+     * test/unit/util both went stale on the first code added after they
+     * were written, which silently stopped the string sweep one code short
+     * of the end.  Forgetting is now a test failure rather than a quiet
+     * loss of coverage: test/unit/util checks that PRTE_ERR_MAX itself has
+     * no string and that the code just above it does, so a bound that is
+     * either too low or too high is caught.
+     *
+     * There was an earlier PRTE_ERR_MAX, removed because nothing consumed
+     * it -- and because, computed from a base whose sign had been dropped,
+     * it evaluated to PRTE_SUCCESS.  This one has consumers, and a test
+     * that notices when it lies.
+     */
+    PRTE_ERR_MAX = (PRTE_ERR_BASE - 157)
 };
 
 END_C_DECLS

@@ -1074,6 +1074,180 @@ static int test_envar_order_mpmd(int *nskipped)
     return failures;
 }
 
+/*
+ * Where a placement directive lands: on the job, or on the app that carried
+ * it.
+ *
+ * The first app segment is where a command line speaks for the job, so a
+ * directive written there and nowhere else is the job's, however many apps
+ * follow.  Written on any later app it is that app's alone, and its silent
+ * siblings fall back to the defaults - they said nothing, which is not the
+ * same as agreeing.  Reading a lone directive on a later app as the job's
+ * meant asking for one app to be placed differently placed them all that
+ * way, with no way to say what was plainly meant.
+ */
+static bool app_has_key(prte_pmix_app_t *app, const char *key)
+{
+    pmix_data_array_t darray;
+    pmix_info_t *infos;
+    bool found = false;
+    size_t n;
+    int rc;
+
+    PMIX_DATA_ARRAY_CONSTRUCT(&darray, 0, PMIX_INFO);
+    rc = PMIx_Info_list_convert(app->info, &darray);
+    if (PMIX_SUCCESS != rc) {
+        /* PMIX_ERR_EMPTY: the app carried no directives at all */
+        return false;
+    }
+    infos = (pmix_info_t *) darray.array;
+    for (n = 0; n < darray.size; n++) {
+        if (PMIx_Check_key(infos[n].key, key)) {
+            found = true;
+            break;
+        }
+    }
+    PMIX_DATA_ARRAY_DESTRUCT(&darray);
+    return found;
+}
+
+static bool list_has_key(pmix_list_t *list, const char *key)
+{
+    prte_info_item_t *item;
+
+    PMIX_LIST_FOREACH(item, list, prte_info_item_t) {
+        if (PMIx_Check_key(item->info.key, key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The spelling here is "--mapby", the canonical one the option tables
+ * carry: a real command line reaches create_app() only after
+ * prte_schizo_base_normalize_argv() has rewritten the deprecated hyphenated
+ * "--map-by" into it. */
+typedef struct {
+    const char *desc;
+    const char *argv[20];
+    bool on_job;        /* the directive belongs to the whole job */
+    bool on_app0;       /* app 0 carries one of its own */
+    bool on_app1;       /* app 1 carries one of its own */
+} distrib_case_t;
+
+static distrib_case_t distrib_cases[] = {
+    {"first app only -> the job",
+     {"prterun", "--mapby", "core", "-n", "2", "app1", ":", "-n", "2", "app2", NULL},
+     true, false, false},
+    {"second app only -> that app alone",
+     {"prterun", "-n", "2", "app1", ":", "--mapby", "core", "-n", "2", "app2", NULL},
+     false, false, true},
+    {"both apps -> each its own",
+     {"prterun", "--mapby", "slot", "-n", "2", "app1", ":",
+      "--mapby", "core", "-n", "2", "app2", NULL},
+     false, true, true},
+    {"no directive at all",
+     {"prterun", "-n", "2", "app1", ":", "-n", "2", "app2", NULL},
+     false, false, false},
+    {NULL, {NULL}, false, false, false},
+};
+
+static int test_directive_distribution(void)
+{
+    prte_schizo_base_module_t *schizo;
+    distrib_case_t *c;
+    pmix_list_t apps, jobdata;
+    prte_pmix_app_t *app0, *app1;
+    int failures = 0, rc;
+
+    schizo = envar_test_schizo();
+    if (NULL == schizo) {
+        return 1;
+    }
+
+    for (c = distrib_cases; NULL != c->desc; c++) {
+        PMIX_CONSTRUCT(&apps, pmix_list_t);
+        PMIX_CONSTRUCT(&jobdata, pmix_list_t);
+        rc = prte_parse_locals(schizo, &apps, (char **) c->argv, NULL, NULL,
+                               &jobdata, NULL);
+        if (PRTE_SUCCESS != rc) {
+            fprintf(stderr, "FAIL [%s]: parse failed: %s\n", c->desc, prte_strerror(rc));
+            ++failures;
+            goto next;
+        }
+        if (2 != pmix_list_get_size(&apps)) {
+            fprintf(stderr, "FAIL [%s]: %d apps, wanted 2\n", c->desc,
+                    (int) pmix_list_get_size(&apps));
+            ++failures;
+            goto next;
+        }
+        app0 = (prte_pmix_app_t *) pmix_list_get_first(&apps);
+        app1 = (prte_pmix_app_t *) pmix_list_get_next(&app0->super);
+        CHECK(c->desc, c->on_job == list_has_key(&jobdata, PMIX_MAPBY));
+        CHECK(c->desc, c->on_app0 == app_has_key(app0, PMIX_MAPBY));
+        CHECK(c->desc, c->on_app1 == app_has_key(app1, PMIX_MAPBY));
+
+    next:
+        PMIX_LIST_DESTRUCT(&apps);
+        PMIX_LIST_DESTRUCT(&jobdata);
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "  PASS directive distribution\n");
+    }
+    return failures;
+}
+
+
+/*
+ * A scheduler's session time limit (PMIX_ALLOC_TIME) is the one directive
+ * whose whole meaning is a string parse, and getting it wrong terminates a
+ * user's session early or never. The format is scanned from the RIGHT, so a
+ * bare "2" is two seconds - not two months.
+ */
+static const struct {
+    const char *spec;
+    long expected;      /* -1 == must be rejected */
+} session_time_cases[] = {
+    /* right-to-left: seconds, minutes, hours, days, months */
+    {"0",                       0},
+    {"2",                       2},
+    {"90",                     90},
+    {"1:30",                   90},
+    {"0:01",                    1},
+    {"2:00:00",              7200},
+    {"1:00:00:00",          86400},
+    {"1:00:00:00:00",     2592000},
+    {"1:2:3:4:5",         2592000 + 2*86400 + 3*3600 + 4*60 + 5},
+    /* malformed */
+    {NULL,                     -1},
+    {"",                       -1},
+    {"abc",                    -1},
+    {"1:",                     -1},
+    {":1",                     -1},
+    {"1::2",                   -1},
+    {"-5",                     -1},
+    {"5s",                     -1},
+    {"1:2:3:4:5:6",            -1},   /* one field too many */
+};
+
+static int test_session_time(void)
+{
+    size_t n;
+    long got;
+    int failures = 0;
+    char desc[128];
+
+    for (n = 0; n < sizeof(session_time_cases) / sizeof(session_time_cases[0]); n++) {
+        got = prte_pmix_server_parse_session_time(session_time_cases[n].spec);
+        snprintf(desc, sizeof(desc), "sessiontime/%s",
+                 (NULL == session_time_cases[n].spec) ? "NULL"
+                                                      : session_time_cases[n].spec);
+        CHECK(desc, got == session_time_cases[n].expected);
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0, skipped = 0;
@@ -1139,6 +1313,8 @@ int main(void)
     failures += test_xfer_job_info();
     failures += test_xfer_app();
     failures += test_job_info_cache();
+    failures += test_session_time();
+    failures += test_directive_distribution();
     failures += test_envar_order(&skipped);
     failures += test_envar_order_permutations(&skipped);
     failures += test_envar_order_mpmd(&skipped);

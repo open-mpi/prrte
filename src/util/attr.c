@@ -322,6 +322,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "PRTE_APP_RESOLVED_RANKBY";
         case PRTE_APP_RESOLVED_BINDTO:
             return "PRTE_APP_RESOLVED_BINDTO";
+        case PRTE_APP_LAST_MAPPER:
+            return "PRTE_APP_LAST_MAPPER";
 
         case PRTE_NODE_USERNAME:
             return "NODE-USERNAME";
@@ -1186,6 +1188,18 @@ char* prte_print_session_flags(struct prte_session_t *ptr)
         PMIx_Argv_append_nosize(&tmp, "DYNAMIC");
     } else {
         PMIx_Argv_append_nosize(&tmp, "STATIC");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_RESERVED)) {
+        PMIx_Argv_append_nosize(&tmp, "RESERVED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_DETACHED)) {
+        PMIx_Argv_append_nosize(&tmp, "DETACHED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_PAUSED)) {
+        PMIx_Argv_append_nosize(&tmp, "PAUSED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_SCHEDULER)) {
+        PMIx_Argv_append_nosize(&tmp, "SCHEDULER");
     }
     ans = PMIx_Argv_join(tmp, '|');
     PMIx_Argv_free(tmp);

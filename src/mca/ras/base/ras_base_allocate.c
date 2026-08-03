@@ -188,32 +188,30 @@ static void display_cpus(prte_topology_t *t,
                          prte_job_t *jdata,
                          char *node)
 {
-    char tmp[2048];
+    char *tmp;
     unsigned pkg, npkgs;
-    bool bits_as_cores = false, use_hwthread_cpus = prte_hwloc_default_use_hwthread_cpus;
-    unsigned npus, ncores;
+    bool use_hwthread_cpus, physical;
     hwloc_obj_t obj;
     hwloc_cpuset_t avail = NULL;
     hwloc_cpuset_t allowed;
-    hwloc_cpuset_t coreset = NULL;
     bool parsable;
 
     parsable = prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT, NULL, PMIX_BOOL);
 
-    npus = prte_hwloc_base_get_nbobjs_by_type(t->topo, HWLOC_OBJ_PU);
-    ncores = prte_hwloc_base_get_nbobjs_by_type(t->topo, HWLOC_OBJ_CORE);
-    if (npus == ncores && !use_hwthread_cpus) {
-        /* the bits in this bitmap represent cores */
-        bits_as_cores = true;
-    }
     use_hwthread_cpus = prte_get_attribute(&jdata->attributes, PRTE_JOB_HWT_CPUS, NULL, PMIX_BOOL);
-    if (!use_hwthread_cpus && !bits_as_cores) {
-        coreset = hwloc_bitmap_alloc();
-    }
+    physical = prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_PHYSICAL_CPUS, NULL,
+                                  PMIX_BOOL);
     avail = hwloc_bitmap_alloc();
 
     if (parsable) {
-        pmix_output(prte_clean_output, "<processors node=%s>", node);
+        /* "parseable" has to actually parse. This element carried an
+         * unquoted attribute value and wrapped a "<pkg=0 cpus=0-7>" that is
+         * not an element at all, while the very same information inside
+         * "--display map:parseable" is written as
+         * <package id="0" cpus="0-7"/> - the two spellings of one fact, one
+         * of them unusable by any XML reader. Follow the map document's
+         * shape; see prte_node_print() in runtime/data_type_support. */
+        pmix_output(prte_clean_output, "<processors node=\"%s\">", node);
     } else {
         pmix_output(prte_clean_output,
                     "\n======================   AVAILABLE PROCESSORS [node: %s]   ======================\n\n", node);
@@ -225,43 +223,25 @@ static void display_cpus(prte_topology_t *t,
         hwloc_bitmap_and(avail, obj->cpuset, allowed);
         if (hwloc_bitmap_iszero(avail)) {
             if (parsable) {
-                pmix_output(prte_clean_output, "    <pkg=%d cpus=%s>", pkg, "NONE");
+                pmix_output(prte_clean_output, "    <package id=\"%d\" cpus=\"%s\"/>", pkg, "NONE");
             } else {
                 pmix_output(prte_clean_output, "PKG[%d]: NONE", pkg);
             }
             continue;
         }
-        if (bits_as_cores) {
-            /* can just use the hwloc fn directly */
-            hwloc_bitmap_list_snprintf(tmp, 2048, avail);
-             if (parsable) {
-                pmix_output(prte_clean_output, "    <pkg=%d cpus=%s>", pkg, tmp);
-            } else {
-                pmix_output(prte_clean_output, "PKG[%d]: %s", pkg, tmp);
-            }
-        } else if (use_hwthread_cpus) {
-            /* can just use the hwloc fn directly */
-            hwloc_bitmap_list_snprintf(tmp, 2048, avail);
-             if (parsable) {
-                pmix_output(prte_clean_output, "    <pkg=%d cpus=%s>", pkg, tmp);
-            } else {
-                pmix_output(prte_clean_output, "PKG[%d]: %s", pkg, tmp);
-            }
+        /* the bits are PU OS indices; what the user needs to read back out
+         * (and hand to --cpu-set) is the list of cores, or of hwthreads if
+         * that is what this job is using as cpus */
+        tmp = prte_hwloc_base_cpuset2ranges(t->topo, avail, use_hwthread_cpus, physical);
+        if (parsable) {
+            pmix_output(prte_clean_output, "    <package id=\"%d\" cpus=\"%s\"/>", pkg,
+                        (NULL == tmp) ? "NONE" : tmp);
         } else {
-            prte_hwloc_build_map(t->topo, avail, use_hwthread_cpus | bits_as_cores, coreset);
-            /* now print out the string */
-            hwloc_bitmap_list_snprintf(tmp, 2048, coreset);
-             if (parsable) {
-                pmix_output(prte_clean_output, "    <pkg=%d cpus=%s>", pkg, tmp);
-            } else {
-                pmix_output(prte_clean_output, "PKG[%d]: %s", pkg, tmp);
-            }
+            pmix_output(prte_clean_output, "PKG[%d]: %s", pkg, (NULL == tmp) ? "NONE" : tmp);
         }
+        free(tmp);
     }
     hwloc_bitmap_free(avail);
-    if (NULL != coreset) {
-        hwloc_bitmap_free(coreset);
-    }
     if (parsable) {
         pmix_output(prte_clean_output, "</processors>\n");
     } else {
@@ -520,9 +500,12 @@ DISPLAY:
                 pmix_output(prte_clean_output,
                             "=================================================================\n");
                 pmix_output(prte_clean_output, "TOPOLOGY FOR NODE %s", node->name);
-                prte_hwloc_print(&ptr, NULL, node->topology->topo);
-                pmix_output(prte_clean_output, "%s", ptr);
-                free(ptr);
+                if (PRTE_SUCCESS == prte_hwloc_print(&ptr, NULL, node->topology->topo)) {
+                    pmix_output(prte_clean_output, "%s", ptr);
+                    free(ptr);
+                } else {
+                    pmix_output(prte_clean_output, "TOPOLOGY NOT AVAILABLE");
+                }
                 pmix_output(prte_clean_output,
                             "=================================================================\n");
             }
@@ -536,9 +519,12 @@ DISPLAY:
                 pmix_output(prte_clean_output,
                             "=================================================================\n");
                 pmix_output(prte_clean_output, "TOPOLOGY FOR NODE %s", node->name);
-                prte_hwloc_print(&ptr, NULL, node->topology->topo);
-                pmix_output(prte_clean_output, "%s", ptr);
-                free(ptr);
+                if (PRTE_SUCCESS == prte_hwloc_print(&ptr, NULL, node->topology->topo)) {
+                    pmix_output(prte_clean_output, "%s", ptr);
+                    free(ptr);
+                } else {
+                    pmix_output(prte_clean_output, "TOPOLOGY NOT AVAILABLE");
+                }
                 pmix_output(prte_clean_output,
                             "=================================================================\n");
             }
@@ -896,6 +882,15 @@ void prte_ras_base_teardown_reservation(prte_session_t *session,
                 if (NULL == nd || NULL == nd->daemon) {
                     continue;
                 }
+                /* Never shrink ourselves out of our own DVM. A reservation may
+                 * legitimately include the head node - a single-node DVM whose
+                 * whole allocation is carved into one session is the extreme
+                 * case - and ordering the master's own daemon to depart takes
+                 * the DVM down with it, losing every other job still running
+                 * on it. The head node simply reverts to the general pool. */
+                if (nd->daemon->name.rank == PRTE_PROC_MY_NAME->rank) {
+                    continue;
+                }
                 ranks[m++] = nd->daemon->name.rank;
             }
         }
@@ -1062,6 +1057,13 @@ void prte_ras_base_check_reservations_on_term(prte_job_t *jdata)
         if (!(s->flags & PRTE_SESSION_FLAG_RESERVED)) {
             continue;
         }
+        /* a session separated from its parent (PMIX_SESSION_SEP) terminates
+         * independently of the namespace that owns it, so no namespace
+         * termination fires its inheritance disposition. It is released only
+         * by an explicit PMIX_SESSION_TERMINATE or at DVM teardown. */
+        if (s->flags & PRTE_SESSION_FLAG_DETACHED) {
+            continue;
+        }
 
         switch (s->inheritance) {
 #if defined(PMIX_ALLOC_INHERIT_NONE)
@@ -1101,7 +1103,7 @@ void prte_ras_base_check_reservations_on_term(prte_job_t *jdata)
     }
 }
 
-static pmix_status_t ras_base_parse_node_list(pmix_info_t *info, char **ndstring)
+pmix_status_t prte_ras_base_parse_node_list(pmix_info_t *info, char **ndstring)
 {
     pmix_status_t rc;
     char **nodes = NULL;
@@ -1242,7 +1244,7 @@ static pmix_status_t ras_base_prepare_grow(prte_pmix_server_req_t *req,
     return PMIX_SUCCESS;
 }
 
-static int ras_base_insert_node_string(char *ndstring, prte_session_t *dest)
+int prte_ras_base_insert_node_string(char *ndstring, prte_session_t *dest)
 {
     pmix_list_t ndlist;
     prte_node_t *snap;
@@ -1374,13 +1376,13 @@ static void ras_base_complete_grow_request(prte_pmix_server_req_t *req)
             continue;
         }
 
-        rc = ras_base_parse_node_list(&req->info[n], &ndstring);
+        rc = prte_ras_base_parse_node_list(&req->info[n], &ndstring);
         if (PMIX_SUCCESS != rc) {
             req->pstatus = rc;
             return;
         }
 
-        ret = ras_base_insert_node_string(ndstring, dest);
+        ret = prte_ras_base_insert_node_string(ndstring, dest);
         free(ndstring);
         if (PRTE_SUCCESS != ret) {
             req->pstatus = prte_pmix_convert_rc(ret);
@@ -1661,7 +1663,7 @@ static void ras_base_complete_release_request(prte_pmix_server_req_t *req)
             continue;
         }
 
-        rc = ras_base_parse_node_list(&req->info[n], &ndstring);
+        rc = prte_ras_base_parse_node_list(&req->info[n], &ndstring);
         if (PMIX_SUCCESS != rc) {
             req->pstatus = rc;
             return;

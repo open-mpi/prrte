@@ -92,3 +92,32 @@ void prte_errmgr_base_log(int error_code, char *filename, int line)
     pmix_output(0, "%s PRTE_ERROR_LOG: %s in file %s at line %d",
                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), errstring, filename, line);
 }
+
+bool prte_errmgr_base_any_live_children(const char *job)
+{
+    int i;
+    prte_proc_t *child;
+
+    if (NULL == prte_local_children) {
+        return false;
+    }
+
+    for (i = 0; i < prte_local_children->size; i++) {
+        child = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+        if (NULL == child) {
+            continue;
+        }
+        /* is this child part of the specified job? */
+        if ((PMIX_NSPACE_INVALID(job) || PMIX_CHECK_NSPACE(job, child->name.nspace))
+            && PRTE_FLAG_TEST(child, PRTE_PROC_FLAG_ALIVE)) {
+            PMIX_OUTPUT_VERBOSE((5, prte_errmgr_base_framework.framework_output,
+                                 "%s errmgr: proc %s is still alive",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_NAME_PRINT(&child->name)));
+            return true;
+        }
+    }
+
+    /* if we get here, then nobody is left alive from that job */
+    return false;
+}

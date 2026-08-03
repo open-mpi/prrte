@@ -341,8 +341,23 @@ docker cp prte-node1:/tmp/vg-hnp.txt .
 A daemon can be traced the same way by pointing `prte_launch_agent` at a
 wrapper script that execs `valgrind prted`. Note this is deliberately **not**
 part of `run-tests.sh`: a valgrind run is many times slower than the suite it
-would be embedded in. Compare totals before and after a change rather than
-chasing an absolute number — PMIx and hwloc contribute their own.
+would be embedded in.
+
+**For `definitely lost` the number to expect is zero**, and that command above
+is the one to check it with. Read `still reachable` differently — PMIx, hwloc
+and libevent all keep live state at exit, so compare totals before and after
+rather than chasing an absolute there.
+
+Two things this found that are easy to reintroduce:
+
+- A record with **direct bytes but zero indirect bytes** means a container was
+  dropped after its payload was moved out — someone unloaded a
+  `pmix_data_buffer_t` and never released the shell. That was every
+  inter-daemon reliable message (`prte_relm_start_msg`).
+- The leak you are looking for may only be on an **error** path, so run a
+  command line that *fails*, not just one that works. `prterun -n 1 --display
+  map --display cpus hostname` is refused for the repeated option, and that
+  return leaked the parser's argv until it was fixed.
 
 ## 6. What "success" looks like
 
@@ -1118,7 +1133,7 @@ The probe is `groupcon`, compiled by `build.sh` the same way as
 `elastic`/`dataserver`/`proctable`:
 
 ```sh
-groupcon <groupID> [secs]
+groupcon [--ft] [--delay <s>] <groupID> [secs]
 ```
 
 Every rank contributes `PMIX_GROUP_LOCAL_CID` = 1234 + rank as
@@ -1143,6 +1158,66 @@ single-host test wearing a hat), and three back-to-back constructs
 followed by a plain job must all succeed — a caddy leak or a tracker that
 is never deleted shows up as drift across runs rather than as one bad
 one.
+
+### Losing a daemon mid-construct (`test_grpcomm_ft`)
+
+The second half of the phase kills a real `prted` while a construct is in
+flight. It is gated on `pmix_cap PMIX_CAP_GROUP_FT` and skips without it,
+since the whole feature compiles out.
+
+**`--delay <s>` is what makes these cases real.** Without a stagger the
+construct is over microseconds after `prun` starts and the kill lands on
+a DVM with nothing in flight — every assertion still passes, and nothing
+has been tested. The ranks sleep before calling construct; the kill goes
+in during that window. If you change the timing, check the capture file
+still shows `DELAYING` lines before the daemon dies.
+
+**`--rtos recoverable` is not optional, and this is the thing that will
+waste your afternoon.** Killing the daemon that hosts a rank does not
+merely remove a group member — by default the errmgr treats the loss of
+any proc as fatal to its whole job and terminates the survivors too, so
+they never reach the construct at all. The capture then contains nothing
+but `DELAYING` lines and *"We cannot recover from this failure, and
+therefore will terminate the job"*, and every assertion fails with an
+empty string, which reads like the feature is broken when it is the test
+that is. The survivors have to be told to survive: `recoverable` (or
+`continuous`) is what flips `errmgr/dvm` from abort-the-job to
+notify-and-continue. That is also the honest usage — an application
+asking for a fault-tolerant group collective is by definition one that
+expects to outlive a lost member.
+
+Note the *"will terminate the job"* text is emitted unconditionally by
+the daemon-loss path, so it still appears in a recoverable run that goes
+on to complete perfectly. Do not read it as a failure, and do not assert
+on its absence.
+
+Four cases:
+
+1. **With `--ft`, the construct completes on the survivors.** Three
+   survivors must each report `CONSTRUCT PMIX_SUCCESS`, agree on
+   `MEMBERS 3`, and receive a `MEMBER-FAILED` event naming the process
+   that went away. The event is the part worth having: the construct
+   returning success only says the group formed, not that the membership
+   is smaller than what was asked for.
+2. **Without `--ft`, the same loss aborts** with
+   `PMIX_GROUP_CONSTRUCT_ABORT`, and the DVM survives. This is the
+   regression guard on the pre-existing behavior, and it is the case that
+   fails if the flag stops being plumbed. Note `groupcon` jumps to its
+   exit on a failed construct, so there is **no** `DESTRUCT` line here —
+   assert on the construct status.
+3. **Losing a relay-only daemon does not stall the construct.** Run at
+   `--prtemca rml_base_radix 2` so the tree is deep enough to have an
+   interior daemon at all; at the default radix every daemon is a child of
+   the controller and the case cannot exist. Membership must be
+   **unchanged** — nothing was lost, only a message path.
+4. **Further constructs still work afterwards**, which is where a leaked
+   tracker, memo entry or caddy shows up.
+
+A note if you extend this. Do not assert on the *absence* of a failure
+marker — a run whose job never started has no marker either. Every case
+here counts positive evidence (`CONSTRUCT`, `MEMBERS`, `MEMBER-FAILED`
+lines) and guards the setup separately by checking the target daemon is
+actually up before killing it.
 
 ## 16. The event base and the constants (`test_event`, `test_include`)
 
@@ -1205,3 +1280,39 @@ own: every message between daemons runs its header epoch through them, so
 every other phase in this suite exercises them already. What no container
 swarm can cover is the case they exist for — a **heterogeneous** DVM, where
 the two ends disagree about endianness.
+
+## 17. Daemon bring-up (`test_ess`)
+
+[`src/mca/ess`](../../src/mca/ess/AGENTS.md) *is* the bring-up, so nearly
+all of it needs a live DVM by construction, and the two pieces that are
+pure parsing are covered without one by `test/unit/ess`. Three things are
+left for a swarm:
+
+- **Every daemon derives a distinct identity.** A daemon's rank is
+  `ess_base_vpid` plus a per-node index, summed in
+  `prte_ess_base_set_identity()`. Getting that sum wrong makes two
+  daemons claim the same rank, and the failure is silent — the DVM simply
+  loses a node with no error anywhere. So the case asserts a job mapped
+  one-per-node reaches as many **distinct** hosts as there are nodes.
+- **A daemon that cannot establish an identity fails cleanly.** A vpid
+  that is not a number used to be read as 0 by `strtoul`, and 0 is the
+  controller's rank, so the daemon would adopt the HNP's identity. The
+  case starts a `prted` by hand with a bad vpid on node2 and requires
+  both the diagnostic and that no daemon is left running.
+- **A bad `--forward-signals` request is refused**, by number as well as
+  by name — those are separate parse branches in
+  `prte_ess_base_setup_signals()`, and a check added to one is easy to
+  leave off the other. This one is single-node by nature; it is here as
+  the end-to-end proof that the refusal reaches the user through a real
+  tool invocation.
+
+**What is deliberately not here: forwarded signals reaching a process.**
+That path is tool-side — `prte`/`prun` catch the signal and relay
+`PRTE_DAEMON_SIGNAL_LOCAL_PROCS` over the RML — and it is already covered
+twice: `test_event` asserts the cross-node relay (launcher on node1,
+process on node4) and `test_prted` asserts its job scoping. A daemon
+installs no handlers of its own for those signals; the block in
+`prte_ess_base_prted_setup()` that appeared to do so read a list that is
+always empty in a `prted`, and has been removed. Do not write a case that
+signals a `prted` directly and expects delivery — it will simply kill the
+daemon.

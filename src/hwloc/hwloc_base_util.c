@@ -74,6 +74,12 @@ bool prte_hwloc_base_core_cpus(hwloc_topology_t topo)
     }
     /* see if the cpuset of a core match that of a PU */
     pu = hwloc_get_obj_by_type(topo, HWLOC_OBJ_PU, 0);
+    if (NULL == pu) {
+        /* a topology with cores but no PUs answers no question we can
+         * usefully ask here, and dereferencing the missing PU took the
+         * caller down */
+        return false;
+    }
     /* if the two are equal, then we really don't have
      * cores in this topology */
     if (hwloc_bitmap_isequal(obj->cpuset, pu->cpuset)) {
@@ -155,7 +161,7 @@ hwloc_cpuset_t prte_hwloc_base_generate_cpuset(hwloc_topology_t topo,
 {
     hwloc_cpuset_t avail = NULL, pucpus, res;
     char **ranges = NULL, **range = NULL;
-    int idx, cpu, start, end;
+    int idx, cpu, start, end, nranges;
     hwloc_obj_t pu;
     char **cache = NULL;
     char tmp[256];
@@ -163,11 +169,12 @@ hwloc_cpuset_t prte_hwloc_base_generate_cpuset(hwloc_topology_t topo,
 
     /* find the specified logical cpus */
     ranges = PMIx_Argv_split(*cpulist, ',');
+    nranges = PMIx_Argv_count(ranges);
     avail = hwloc_bitmap_alloc();
     hwloc_bitmap_zero(avail);
     res = hwloc_bitmap_alloc();
     pucpus = hwloc_bitmap_alloc();
-    for (idx = 0; idx < PMIx_Argv_count(ranges); idx++) {
+    for (idx = 0; idx < nranges; idx++) {
         range = PMIx_Argv_split(ranges[idx], '-');
         bad = false;
         switch (PMIx_Argv_count(range)) {
@@ -278,6 +285,14 @@ void prte_hwloc_base_setup_summary(hwloc_topology_t topo)
         root->userdata = (void *) PMIX_NEW(prte_hwloc_topo_data_t);
     }
     sum = (prte_hwloc_topo_data_t *) root->userdata;
+    if (NULL == sum) {
+        /* the summary could not be allocated. Both callers re-read the
+         * root's userdata afterwards and cope with it still being NULL, so
+         * say nothing more than we can - dereferencing it here would turn
+         * an allocation failure into a segfault */
+        PMIX_ERROR_LOG(PMIX_ERR_OUT_OF_RESOURCE);
+        return;
+    }
 
     /* only need to do this once */
     if (sum->computed) {
@@ -477,12 +492,11 @@ int prte_hwloc_base_get_topology(void)
     * that aren't really of interest
     */
     obj = hwloc_get_root_obj(prte_hwloc_topology);
-    for (i = 0; i < obj->infos_count; i++) {
-        if (NULL == obj->infos[i].name || NULL == obj->infos[i].value) {
-            continue;
-        }
-        if (0 == strncmp(obj->infos[i].name, "HostName", strlen("HostName")) ||
-            0 == strncmp(obj->infos[i].name, "ProcessName", strlen("ProcessName"))) {
+    i = 0;
+    while (i < obj->infos_count) {
+        if (NULL != obj->infos[i].name && NULL != obj->infos[i].value &&
+            (0 == strcmp(obj->infos[i].name, "HostName") ||
+             0 == strcmp(obj->infos[i].name, "ProcessName"))) {
             free(obj->infos[i].name);
             free(obj->infos[i].value);
             /* left justify the array */
@@ -492,7 +506,12 @@ int prte_hwloc_base_get_topology(void)
             obj->infos[obj->infos_count - 1].name = NULL;
             obj->infos[obj->infos_count - 1].value = NULL;
             obj->infos_count--;
+            /* the entry that just shifted into slot i has not been examined
+             * yet, so do not advance - two removable entries side by side
+             * used to leave the second one behind */
+            continue;
         }
+        i++;
     }
 
     /* fill prte_cache_line_size global with the smallest L2 cache
@@ -515,6 +534,7 @@ int prte_hwloc_base_get_topology(void)
 static int set_topology(char *topofile)
 {
     int rc;
+    struct hwloc_topology_support *support;
 
     PMIX_OUTPUT_VERBOSE((5, prte_hwloc_base_output,
                         "hwloc:base:set_topology %s", topofile));
@@ -536,9 +556,8 @@ static int set_topology(char *topofile)
         return PRTE_ERR_NOT_SUPPORTED;
     }
 
-    /* since we are loading this from an external source, we have to
-     * explicitly set a flag so hwloc sets things up correctly
-     */
+    /* no extra topology flags for an imported description - the support
+     * bits it needs are asserted by hand below, after the load */
     rc = topology_set_flags(prte_hwloc_topology, 0, true);
     if (0 != rc) {
         hwloc_topology_destroy(prte_hwloc_topology);
@@ -551,6 +570,35 @@ static int set_topology(char *topofile)
         prte_hwloc_topology = NULL;
         PMIX_OUTPUT_VERBOSE((5, prte_hwloc_base_output, "hwloc:base:set_topology failed to load"));
         return PRTE_ERR_NOT_SUPPORTED;
+    }
+
+    /* hwloc zeroes every support bit of an imported topology - it has no way
+     * to know what the machine the XML describes can do, and says so:
+     * "binding is disabled by default ... also marked by putting zeroes in
+     * the corresponding supported feature bits". But this option means "this
+     * file describes the machine I am running on", and
+     * prte_rmaps_base_check_support() refuses any *explicitly requested*
+     * binding when those bits are clear - so "--prtemca hwloc_use_topo_file
+     * X --bind-to core" was answered with "at least one node does NOT support
+     * binding processes to cpus" on a machine that supports it perfectly,
+     * which leaves the option usable only with --bind-to none.
+     *
+     * So assert them, as this code has always meant to. Note the "always
+     * meant to": the assertion used to sit *before* hwloc_topology_load(),
+     * and hwloc's own header says the support structure "only contains valid
+     * information after" the load - the load filled the struct in and wiped
+     * it. It has to be here, after.
+     *
+     * HWLOC_TOPOLOGY_FLAG_IMPORT_SUPPORT is not the answer: it reports what
+     * the *exporting* machine could do, which is a different question and,
+     * per the commit that took it back out, not a reliable one. */
+    support = (struct hwloc_topology_support *)
+              hwloc_topology_get_support(prte_hwloc_topology);
+    if (NULL != support) {
+        support->cpubind->set_thisproc_cpubind = true;
+        support->cpubind->set_thisthread_cpubind = true;
+        support->membind->set_thisproc_membind = true;
+        support->membind->set_thisthread_membind = true;
     }
 
     /* all done */
@@ -760,8 +808,6 @@ static int package_core_to_cpu_set(char *package_core_list, hwloc_topology_t top
     int package_id, core_id;
     hwloc_obj_t package, core;
     hwloc_obj_type_t obj_type = HWLOC_OBJ_CORE;
-    unsigned int npus;
-    bool hwthreadcpus = false;
 
     package_core = PMIx_Argv_split(package_core_list, ':');
     if (NULL == package_core || !parse_cpu_id(package_core[0], &package_id)) {
@@ -782,12 +828,16 @@ static int package_core_to_cpu_set(char *package_core_list, hwloc_topology_t top
      */
     if (NULL == prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_CORE, 0)) {
         obj_type = HWLOC_OBJ_PU;
-        hwthreadcpus = true;
     }
-    npus = prte_hwloc_base_get_npus(topo, hwthreadcpus, NULL, package);
-    npus = npus * package_id;
 
-    for (i = 1; NULL != package_core[i]; i++) {
+    /* Every element below is user input, and the loop stops at the first one
+     * that does not resolve. It used to record the failure in "rc" and carry
+     * on, which had two consequences: bits from later elements went on
+     * accumulating into a mask the caller was going to discard, and a later
+     * "*" element assigned rc = PRTE_SUCCESS - so "--cpu-set P0:99:*" was
+     * accepted as "every cpu on package 0" with the nonexistent core 99
+     * silently forgiven. */
+    for (i = 1; PRTE_SUCCESS == rc && NULL != package_core[i]; i++) {
         if ('C' == package_core[i][0] || 'c' == package_core[i][0]) {
             corestr = &package_core[i][1];
         } else {
@@ -812,9 +862,14 @@ static int package_core_to_cpu_set(char *package_core_list, hwloc_topology_t top
                         rc = PRTE_ERR_BAD_PARAM;
                         break;
                     }
-                    core_id += npus;
-                    /* get that object */
-                    core = prte_hwloc_base_get_obj_by_type(topo, obj_type, core_id);
+                    /* The id is relative to this package. Ask hwloc for the
+                     * nth object *inside* the package's cpuset rather than
+                     * offsetting into the global index by "cores per package
+                     * times package id" - that arithmetic silently names an
+                     * object in the wrong package the moment two packages
+                     * do not hold the same number of them. */
+                    core = hwloc_get_obj_inside_cpuset_by_type(topo, package->cpuset,
+                                                               obj_type, core_id);
                     if (NULL == core) {
                         rc = PRTE_ERR_NOT_FOUND;
                         break;
@@ -835,10 +890,10 @@ static int package_core_to_cpu_set(char *package_core_list, hwloc_topology_t top
                     return PRTE_ERR_BAD_PARAM;
                 }
                 for (j = lower_range; j <= upper_range; j++) {
-                    /* get the indexed core from this package */
-                    core_id = j + npus;
-                    /* get that object */
-                    core = prte_hwloc_base_get_obj_by_type(topo, obj_type, core_id);
+                    /* the indexed object within this package - see the note
+                     * on the single-id case above */
+                    core = hwloc_get_obj_inside_cpuset_by_type(topo, package->cpuset,
+                                                               obj_type, j);
                     if (NULL == core) {
                         rc = PRTE_ERR_NOT_FOUND;
                         break;
@@ -1050,173 +1105,6 @@ char *prte_hwloc_base_print_binding(prte_binding_policy_t binding)
     return ret;
 }
 
-void prte_hwloc_build_map(hwloc_topology_t topo,
-                          hwloc_cpuset_t avail,
-                          bool use_hwthread_cpus,
-                          hwloc_bitmap_t coreset)
-{
-    unsigned k, obj_index, core_index;
-    hwloc_obj_t pu, core;
-
-    /* the bits in the cpuset _always_ represent hwthreads, so
-     * we have to manually determine which core each bit is under
-     * so we can report the cpus in terms of "cores" */
-    /* start with the first set bit */
-    hwloc_bitmap_zero(coreset);
-    k = hwloc_bitmap_first(avail);
-    obj_index = 0;
-    while (k != (unsigned) -1) {
-        if (use_hwthread_cpus) {
-            /* mark this thread as occupied */
-            hwloc_bitmap_set(coreset, k);
-        } else {
-            /* Go upward and find the core this PU belongs to */
-            pu = hwloc_get_obj_inside_cpuset_by_type(topo, avail, HWLOC_OBJ_PU, obj_index);
-            core = pu;
-            while (NULL != core && core->type != HWLOC_OBJ_CORE) {
-                core = core->parent;
-            }
-            core_index = 0;
-            if (NULL != core) {
-                core_index = core->logical_index;
-            }
-            /* mark everything since the last place as
-             * being empty */
-            hwloc_bitmap_set(coreset, core_index);
-        }
-        /* move to the next set bit */
-        k = hwloc_bitmap_next(avail, k);
-        ++obj_index;
-    }
-}
-
-/* Render the set bits of a bitmap as one XML element per bit.
- *
- * Returns the number of bytes that *would* have been written (snprintf
- * semantics), so a return >= buflen means the output was truncated. The
- * previous version advanced the write pointer inside a range without also
- * charging the bytes against the remaining budget, so a bitmap holding a
- * run of bits walked straight off the end of the caller's buffer.
- */
-static int bitmap_list_snprintf_exp(char *__hwloc_restrict buf, size_t buflen,
-                                    const struct hwloc_bitmap_s *__hwloc_restrict set,
-                                    char *type)
-{
-    size_t total = 0;
-    int prev = -1;
-    int begin, end, i, res;
-
-    /* mark the end in case we do nothing later */
-    if (0 < buflen) {
-        buf[0] = '\0';
-    }
-
-    while (1) {
-        begin = hwloc_bitmap_next(set, prev);
-        if (-1 == begin) {
-            break;
-        }
-        end = hwloc_bitmap_next_unset(set, begin);
-        /* an infinite run has no next unset bit - emit the one bit we know
-         * about rather than looping forever */
-        if (-1 == end) {
-            end = begin + 1;
-        }
-
-        for (i = begin; i < end; i++) {
-            /* Always hand snprintf the *remaining* room. total can exceed
-             * buflen once we truncate, so clamp rather than subtract. */
-            char *at = (total < buflen) ? buf + total : NULL;
-            size_t room = (total < buflen) ? buflen - total : 0;
-
-            res = snprintf(at, room, "%*c<%s>%d</%s>\n", 20, ' ', type, i, type);
-            if (0 > res) {
-                return -1;
-            }
-            total += (size_t) res;
-        }
-
-        prev = end - 1;
-    }
-    return (int) total;
-}
-
-/*
- * Render a process' binding as XML elements, and report the package it
- * lies in. Output is undefined if a rank is bound to more than 1 package.
- *
- * "cores" always comes back NUL-terminated and "*pkgnum" always comes back
- * set: the caller wraps both in one <package> element, and every caller
- * leaves pkgnum uninitialized on the way in.
- */
-void prte_hwloc_get_binding_info(hwloc_const_cpuset_t cpuset,
-                               bool use_hwthread_cpus, hwloc_topology_t topo,
-                               int *pkgnum, char *cores, int sz)
-{
-    int n, npkgs, npus, ncores;
-    hwloc_cpuset_t avail, coreset = NULL;
-    hwloc_obj_t pkg;
-    bool bits_as_cores = false;
-
-    *pkgnum = -1;
-    if (0 < sz) {
-        cores[0] = '\0';
-    }
-
-    /* if the cpuset is all zero, then something is wrong. Say so and stop -
-     * the scan below would otherwise find nothing and leave the message in
-     * place only by accident */
-    if (hwloc_bitmap_iszero(cpuset)) {
-        snprintf(cores, sz, "\n%*c<EMPTY CPUSET/>\n", 20, ' ');
-        return;
-    }
-
-    /* get the number of packages in the topology */
-    npkgs = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PACKAGE);
-    avail = hwloc_bitmap_alloc();
-    npus = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PU);
-    ncores = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_CORE);
-
-    if (npus == ncores && !use_hwthread_cpus) {
-        /* the bits in this bitmap represent cores */
-        bits_as_cores = true;
-    }
-    if (!use_hwthread_cpus && !bits_as_cores) {
-        coreset = hwloc_bitmap_alloc();
-    }
-
-    /* binding happens within a package and not across packages */
-    for (n = 0; n < npkgs; n++) {
-        pkg = prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_PACKAGE, n);
-        if (NULL == pkg || NULL == pkg->cpuset) {
-            continue;
-        }
-        /* see if we have any here */
-        hwloc_bitmap_and(avail, cpuset, pkg->cpuset);
-
-        if (hwloc_bitmap_iszero(avail)) {
-            continue;
-        }
-
-        if (bits_as_cores) {
-            /* can just use the hwloc fn directly */
-            bitmap_list_snprintf_exp(cores, sz, avail, "core");
-        } else if (use_hwthread_cpus) {
-            /* can just use the hwloc fn directly */
-            bitmap_list_snprintf_exp(cores, sz, avail, "hwt");
-        } else {
-            prte_hwloc_build_map(topo, avail, use_hwthread_cpus | bits_as_cores, coreset);
-            /* now print out the string */
-            bitmap_list_snprintf_exp(cores, sz, coreset, "core");
-        }
-        *pkgnum = n;
-    }
-    hwloc_bitmap_free(avail);
-    if (NULL != coreset) {
-        hwloc_bitmap_free(coreset);
-    }
-}
-
 static int compare_unsigned(const void *a, const void *b)
 {
     unsigned x = *(const unsigned *) a;
@@ -1233,128 +1121,269 @@ static int compare_unsigned(const void *a, const void *b)
     return 0;
 }
 
-#define PRTE_HWLOC_MAX_SITES 2048
-
-/* Append to a bounded buffer, tracking the offset. Returns false once the
- * buffer is full so the caller can stop instead of writing past the end -
- * the original open-coded memcpy() chain here charged nothing against the
- * caller's size and would run off a 2048-byte buffer given a scattered
- * binding wide enough to need more. */
-static bool append_str(char *buf, size_t size, size_t *pos, const char *str)
+/* Resolve the set bits of a cpuset to the objects that own them.
+ *
+ * The bits of an hwloc cpuset are always PU *OS* indices. What PRRTE reports
+ * to a user is a list of cores - or of hwthreads, when the job is treating
+ * hwthreads as cpus - and every PRRTE grammar that accepts such a list
+ * (--cpu-set, the rankfile slot lists) is expressed in hwloc *logical*
+ * indices. So a rendering has to walk each bit up to the object it is being
+ * reported in terms of and take that object's index, logical unless the
+ * caller asked for physical.
+ *
+ * Printing the raw bit numbers instead is right only by coincidence - when
+ * a PU's logical and OS indices happen to agree - and it is wrong on
+ * precisely the machines where the answer matters: any SMT node rendered in
+ * hwthreads (PU 1 of core 0 is OS index 24 on a 24-core part), and any node
+ * whose firmware interleaves cpu numbers across packages. Reporting a core
+ * that way is worse than cosmetic: the user reads the number back out and
+ * hands it to --cpu-set, which resolves it logically.
+ *
+ * On success writes a malloc'd, sorted, duplicate-free array of indices to
+ * *sites and returns how many there are. Returns -1 if a bit could not be
+ * resolved (already reported through show_help) or on allocation failure.
+ */
+static int collect_sites(hwloc_topology_t topo, hwloc_const_cpuset_t bitmap,
+                         bool as_hwthreads, bool physical,
+                         unsigned **sites)
 {
-    size_t len = strlen(str);
+    hwloc_obj_type_t leaf = as_hwthreads ? HWLOC_OBJ_PU : HWLOC_OBJ_CORE;
+    unsigned *indices, val;
+    int nsites = 0, n, weight, id;
+    hwloc_obj_t obj;
+    bool unique;
 
-    if (*pos + len + 1 > size) {
-        return false;
+    *sites = NULL;
+    weight = hwloc_bitmap_weight(bitmap);
+    if (0 >= weight) {
+        /* weight() is -1 for an infinitely-set bitmap, which no topology
+         * produces, and 0 for an empty one - neither has any sites */
+        return 0;
     }
-    memcpy(&buf[*pos], str, len);
-    *pos += len;
-    buf[*pos] = '\0';
-    return true;
-}
-
-/* generate a logical string output of a hwloc_cpuset_t */
-static int build_map(char *answer, size_t size,
-                     hwloc_const_cpuset_t bitmap,
-                     bool physical, char *prefix,
-                     hwloc_topology_t topo)
-{
-    unsigned indices[PRTE_HWLOC_MAX_SITES], id;
-    int nsites = 0, n, start, end;
-    size_t pos;
-    hwloc_obj_t pu;
-    char tmp[128];
-    bool first, unique;
-    unsigned val;
-
-    if (0 == size) {
-        return PRTE_ERR_BAD_PARAM;
+    /* each set bit contributes at most one site, so this is an exact bound */
+    indices = (unsigned *) malloc(weight * sizeof(unsigned));
+    if (NULL == indices) {
+        return -1;
     }
-    answer[0] = '\0';
 
-    for (id = hwloc_bitmap_first(bitmap);
-         id != (unsigned)-1;
-         id = hwloc_bitmap_next(bitmap, id)) {
-        // the id's are for threads, but we want cores
-        pu = hwloc_get_pu_obj_by_os_index(topo, id);
-
-        // go upward to find the core that contains this pu
-        while (NULL != pu && pu->type != HWLOC_OBJ_CORE) {
-            pu = pu->parent;
+    for (id = hwloc_bitmap_first(bitmap); -1 != id; id = hwloc_bitmap_next(bitmap, id)) {
+        obj = hwloc_get_pu_obj_by_os_index(topo, (unsigned) id);
+        /* a PU is its own leaf; a core is the first CORE ancestor */
+        while (NULL != obj && leaf != obj->type) {
+            obj = obj->parent;
         }
-        if (NULL == pu) {
-            pmix_show_help("help-prte-hwloc-base.txt", "pu-not-found", true, id);
-            return PRTE_ERR_SILENT;
+        if (NULL == obj) {
+            pmix_show_help("help-prte-hwloc-base.txt", "pu-not-found", true, (unsigned) id);
+            free(indices);
+            return -1;
         }
-        if (physical) {
-            // record the physical site
-            val = pu->os_index;
-        } else {
-            // record the logical site
-            val = pu->logical_index;
+        val = physical ? obj->os_index : obj->logical_index;
+        if (HWLOC_UNKNOWN_INDEX == val) {
+            /* XML written by hand, or by an hwloc old enough not to record
+             * OS indices, carries no physical index. The logical one always
+             * exists, so report that rather than (unsigned)-1. */
+            val = obj->logical_index;
         }
-        // add it uniquely to the array of indices - it could be a duplicate
+        /* several PUs can sit under one core, so the same site comes up
+         * once per hwthread */
         unique = true;
-        for (n=0; n < nsites; n++) {
+        for (n = 0; n < nsites; n++) {
             if (indices[n] == val) {
                 unique = false;
                 break;
             }
         }
         if (unique) {
-            if (PRTE_HWLOC_MAX_SITES == nsites) {
-                pmix_show_help("help-prte-hwloc-base.txt", "too-many-sites", true);
-                return PRTE_ERR_SILENT;
-            }
             indices[nsites] = val;
             ++nsites;
         }
     }
 
-    /* this should never happen as it would mean that the bitmap was
-     * empty, which is something we checked before calling this function */
-    if (0 == nsites) {
-        return PRTE_ERR_NOT_FOUND;
-    }
-
-    // sort them
     qsort(indices, nsites, sizeof(unsigned), compare_unsigned);
+    *sites = indices;
+    return nsites;
+}
 
-    pos = 0;
-    if (!append_str(answer, size, &pos, prefix)) {
-        return PRTE_ERR_SILENT;
+/* Are we reporting this topology in hwthreads? Either because the job asked
+ * for it, or because the topology has no cores to report - hwloc does not
+ * find cores on every platform (PPC64 on old Linux kernels reports only NUMA
+ * nodes and PUs), and on such a machine a core-based rendering resolves
+ * nothing and every binding comes out "UNBOUND". */
+static bool report_as_hwthreads(hwloc_topology_t topo, bool use_hwthread_cpus)
+{
+    return (use_hwthread_cpus || !prte_hwloc_base_has_cores(topo));
+}
+
+char *prte_hwloc_base_cpuset2ranges(hwloc_topology_t topo,
+                                    hwloc_const_cpuset_t bitmap,
+                                    bool use_hwthread_cpus,
+                                    bool physical)
+{
+    unsigned *sites = NULL, start, end;
+    int nsites, n;
+    char **output = NULL, *result;
+    char tmp[64];
+
+    nsites = collect_sites(topo, bitmap, report_as_hwthreads(topo, use_hwthread_cpus),
+                           physical, &sites);
+    if (0 >= nsites) {
+        free(sites);
+        return NULL;
     }
 
     /* Walk the sorted indices, collapsing consecutive runs into "lo-hi".
-     * [start,end] is the run we are currently accumulating; it is emitted
-     * as soon as the next index does not extend it, and once more at the
-     * end for the run left dangling. */
-    start = indices[0];
-    end = indices[0];
-    first = true;
+     * [start,end] is the run currently being accumulated; it is emitted as
+     * soon as the next index does not extend it, and once more at the end
+     * for the run left dangling. */
+    start = sites[0];
+    end = sites[0];
     for (n = 1; n <= nsites; n++) {
-        if (n < nsites && indices[n] == (unsigned)(end + 1)) {
-            end = indices[n];
+        if (n < nsites && sites[n] == end + 1) {
+            end = sites[n];
             continue;
         }
         if (start == end) {
-            snprintf(tmp, sizeof(tmp), "%s%u", first ? "" : ",", start);
+            snprintf(tmp, sizeof(tmp), "%u", start);
         } else {
-            snprintf(tmp, sizeof(tmp), "%s%u-%u", first ? "" : ",", start, end);
+            snprintf(tmp, sizeof(tmp), "%u-%u", start, end);
         }
-        if (!append_str(answer, size, &pos, tmp)) {
-            /* the caller renders this into a fixed-size element, so a
-             * truncated site list is worse than none */
-            pmix_show_help("help-prte-hwloc-base.txt", "too-many-sites", true);
-            return PRTE_ERR_SILENT;
-        }
-        first = false;
+        PMIx_Argv_append_nosize(&output, tmp);
         if (n < nsites) {
-            start = indices[n];
-            end = indices[n];
+            start = sites[n];
+            end = sites[n];
         }
     }
-    return PRTE_SUCCESS;
+    free(sites);
+
+    result = PMIx_Argv_join(output, ',');
+    PMIx_Argv_free(output);
+    return result;
+}
+
+/* Append one formatted item to a bounded buffer, snprintf-style.
+ *
+ * "total" is how many bytes the output would need so far, which can exceed
+ * "buflen" once we have truncated - so the room handed to vsnprintf is
+ * clamped rather than subtracted. Returns what this item would have needed;
+ * the caller adds it to its running total. An earlier version advanced the
+ * write pointer through a run of set bits without also charging the bytes
+ * against the remaining budget, so a process bound to more than a few cores
+ * walked straight off the end of the caller's buffer - in the HNP, which
+ * holds every node's topology, so the corruption surfaced somewhere else
+ * entirely.
+ */
+static int bounded_append(char *buf, size_t buflen, size_t total,
+                          const char *fmt, ...)
+    __prte_attribute_format__(__printf__, 4, 5);
+
+static int bounded_append(char *buf, size_t buflen, size_t total,
+                          const char *fmt, ...)
+{
+    char *at = (total < buflen) ? buf + total : NULL;
+    size_t room = (total < buflen) ? buflen - total : 0;
+    va_list ap;
+    int res;
+
+    va_start(ap, fmt);
+    res = vsnprintf(at, room, fmt, ap);
+    va_end(ap);
+    return res;
+}
+
+/*
+ * Render a process' binding as XML: one <package> element per package the
+ * process has cpus in, each holding one <core>/<hwt> element per site.
+ *
+ * "cores" always comes back NUL-terminated, and the caller emits it verbatim
+ * inside its <binding> element.
+ *
+ * This used to render only the *sites*, into the caller's single <package>
+ * element, and report the package number through an out parameter - which
+ * made the output of a process bound across more than one package not merely
+ * incomplete but wrong: each package overwrote the previous one from the top
+ * of the buffer, so the rendering named the last package and dropped every
+ * earlier one's cores. The short form of the same binding
+ * (prte_hwloc_base_cset2str, "--display map") has always reported every
+ * package, so the two renderings of one binding disagreed - and the one that
+ * was wrong is the machine-readable one. It is reachable: PRRTE's own
+ * cross-package diagnostic points users at the rankfile mapper, and a
+ * rankfile slot list of "P0:0;P1:0" produces exactly this.
+ */
+void prte_hwloc_get_binding_info(hwloc_const_cpuset_t cpuset,
+                                 bool use_hwthread_cpus, bool physical,
+                                 hwloc_topology_t topo,
+                                 char *cores, int sz)
+{
+    int n, npkgs, nsites, i, res;
+    size_t total = 0, buflen;
+    hwloc_cpuset_t avail;
+    hwloc_obj_t pkg;
+    unsigned *sites = NULL;
+    bool as_hwt;
+    const char *type;
+
+    if (NULL == cores || 0 >= sz) {
+        return;
+    }
+    buflen = (size_t) sz;
+    cores[0] = '\0';
+
+    /* If the cpuset is all zero, then something is wrong. Say so and stop -
+     * the scan below would otherwise find nothing and leave the message in
+     * place only by accident. The element name carries no space: this goes
+     * into the document "--display map:parseable" produces, and an element
+     * whose name contains a space does not parse. */
+    if (hwloc_bitmap_iszero(cpuset)) {
+        snprintf(cores, buflen, "%*c<empty_cpuset/>\n", 16, ' ');
+        return;
+    }
+
+    /* get the number of packages in the topology */
+    npkgs = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PACKAGE);
+    avail = hwloc_bitmap_alloc();
+    as_hwt = report_as_hwthreads(topo, use_hwthread_cpus);
+    type = as_hwt ? "hwt" : "core";
+
+    for (n = 0; n < npkgs; n++) {
+        pkg = prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_PACKAGE, n);
+        if (NULL == pkg || NULL == pkg->cpuset) {
+            continue;
+        }
+        /* see if we have any here */
+        hwloc_bitmap_and(avail, cpuset, pkg->cpuset);
+        if (hwloc_bitmap_iszero(avail)) {
+            continue;
+        }
+        nsites = collect_sites(topo, avail, as_hwt, physical, &sites);
+        if (0 >= nsites) {
+            free(sites);
+            sites = NULL;
+            continue;
+        }
+        res = bounded_append(cores, buflen, total, "%*c<package id=\"%d\">\n",
+                             16, ' ', n);
+        if (0 > res) {
+            free(sites);
+            break;
+        }
+        total += (size_t) res;
+        for (i = 0; i < nsites; i++) {
+            res = bounded_append(cores, buflen, total, "%*c<%s>%u</%s>\n",
+                                 20, ' ', type, sites[i], type);
+            if (0 > res) {
+                break;
+            }
+            total += (size_t) res;
+        }
+        free(sites);
+        sites = NULL;
+        res = bounded_append(cores, buflen, total, "%*c</package>\n", 16, ' ');
+        if (0 > res) {
+            break;
+        }
+        total += (size_t) res;
+    }
+    hwloc_bitmap_free(avail);
 }
 
 /*
@@ -1365,14 +1394,11 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
                                bool physical,
                                hwloc_topology_t topo)
 {
-    int n, npkgs, npus, ncores;
-    char tmp[2048], ans[4096];
-    hwloc_cpuset_t avail, coreset = NULL;
-    char **output = NULL, *result;
+    int n, npkgs;
+    hwloc_cpuset_t avail;
+    char **output = NULL, *result, *ranges, *ans;
     hwloc_obj_t pkg;
-    bool bits_as_cores = false;
-    int complete;
-    char *prefix;
+    const char *prefix;
 
     /* if the cpuset is all zero, then something is wrong */
     if (hwloc_bitmap_iszero(cpuset)) {
@@ -1388,36 +1414,17 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
      * proc carries no cpuset at all - so the test is gone rather than
      * repaired, which would have changed --display bind output. */
 
+    if (report_as_hwthreads(topo, use_hwthread_cpus)) {
+        prefix = physical ? "hwt:P" : "hwt:L";
+    } else {
+        prefix = physical ? "core:P" : "core:L";
+    }
+
     /* get the number of packages in the topology */
     npkgs = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PACKAGE);
     avail = hwloc_bitmap_alloc();
 
-    npus = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_PU);
-    ncores = prte_hwloc_base_get_nbobjs_by_type(topo, HWLOC_OBJ_CORE);
-    if (npus == ncores && !use_hwthread_cpus) {
-        /* the bits in this bitmap represent cores */
-        bits_as_cores = true;
-    }
-    if (!use_hwthread_cpus && !bits_as_cores) {
-        coreset = hwloc_bitmap_alloc();
-    }
-    if (bits_as_cores || !use_hwthread_cpus) {
-        if (physical) {
-            prefix = "core:P";
-        } else {
-            prefix = "core:L";
-        }
-    } else {
-        if (physical) {
-            prefix = "hwt:P";
-        } else {
-            prefix = "hwt:L";
-        }
-    }
-
     for (n = 0; n < npkgs; n++) {
-        memset(tmp, 0, sizeof(tmp));
-        memset(ans, 0, sizeof(ans));
         pkg = prte_hwloc_base_get_obj_by_type(topo, HWLOC_OBJ_PACKAGE, n);
         if (NULL == pkg || NULL == pkg->cpuset) {
             continue;
@@ -1427,30 +1434,16 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
         if (hwloc_bitmap_iszero(avail)) {
             continue;
         }
-        if (bits_as_cores) {
-            /* can just use the hwloc fn directly */
-            hwloc_bitmap_list_snprintf(tmp, sizeof(tmp), avail);
-            snprintf(ans, sizeof(ans), "package[%d][%s%s]", n, prefix, tmp);
-        } else if (use_hwthread_cpus) {
-            /* can just use the hwloc fn directly */
-            hwloc_bitmap_list_snprintf(tmp, sizeof(tmp), avail);
-            snprintf(ans, sizeof(ans), "package[%d][%s%s]", n, prefix, tmp);
-        } else {
-            // build the map for this cpuset
-            complete = build_map(tmp, sizeof(tmp), avail,
-                                 physical, prefix, topo);
-            if (PRTE_SUCCESS == complete) {
-                snprintf(ans, sizeof(ans), "package[%d][%s]", n, tmp);
-            } else {
-                PMIx_Argv_free(output);
-                hwloc_bitmap_free(avail);
-                if (NULL != coreset) {
-                    hwloc_bitmap_free(coreset);
-                }
-                return NULL;
-            }
+        ranges = prte_hwloc_base_cpuset2ranges(topo, avail, use_hwthread_cpus, physical);
+        if (NULL == ranges) {
+            PMIx_Argv_free(output);
+            hwloc_bitmap_free(avail);
+            return NULL;
         }
+        pmix_asprintf(&ans, "package[%d][%s%s]", n, prefix, ranges);
+        free(ranges);
         PMIx_Argv_append_nosize(&output, ans);
+        free(ans);
     }
 
     if (NULL != output) {
@@ -1460,9 +1453,6 @@ char *prte_hwloc_base_cset2str(hwloc_const_cpuset_t cpuset,
         result = NULL;
     }
     hwloc_bitmap_free(avail);
-    if (NULL != coreset) {
-        hwloc_bitmap_free(coreset);
-    }
     return result;
 }
 
@@ -1492,14 +1482,20 @@ static void print_hwloc_obj(char **output, char *prefix, hwloc_topology_t topo, 
 {
     hwloc_obj_t obj2;
     char string[PRTE_HWLOC_MAX_STRING], *tmp, *tmp2, *pfx;
-    unsigned i;
+    unsigned nchildren;
     struct hwloc_topology_support *support;
+
+    /* Count every child, not just the normal ones. In hwloc 2.x an object's
+     * children are split across four lists, and "arity" covers only the
+     * first of them - so reporting it alone understates the object for
+     * exactly the levels a user is most likely to be looking for. */
+    nchildren = obj->arity + obj->memory_arity + obj->io_arity + obj->misc_arity;
 
     /* print the object type */
     hwloc_obj_type_snprintf(string, sizeof(string), obj, 1);
     pmix_asprintf(&pfx, "\n%s\t", (NULL == prefix) ? "" : prefix);
     pmix_asprintf(&tmp, "%sType: %s Number of child objects: %u%sName=%s",
-                  (NULL == prefix) ? "" : prefix, string, obj->arity, pfx,
+                  (NULL == prefix) ? "" : prefix, string, nchildren, pfx,
                   (NULL == obj->name) ? "NULL" : obj->name);
     if (0 < hwloc_obj_attr_snprintf(string, sizeof(string), obj, pfx, 1)) {
         /* print the attributes */
@@ -1534,10 +1530,20 @@ static void print_hwloc_obj(char **output, char *prefix, hwloc_topology_t topo, 
     free(tmp);
     free(pfx);
     pmix_asprintf(&pfx, "%s\t", (NULL == prefix) ? "" : prefix);
-    for (i = 0; i < obj->arity; i++) {
-        obj2 = obj->children[i];
+    /* Walk *all* the children. "obj->children" is the normal-children array
+     * only: in hwloc 2.x NUMA nodes hang off memory_first_child, and the
+     * I/O objects this directory deliberately asks hwloc to keep
+     * (HWLOC_TYPE_FILTER_KEEP_IMPORTANT, see topology_set_flags) hang off
+     * io_first_child. Recursing through the array therefore printed a
+     * topology with no NUMA domains in it at all - on a runtime whose
+     * "--map-by numa" is the thing a user is most often trying to
+     * understand when they ask for the topology. hwloc_get_next_child()
+     * walks normal, then memory, then I/O, then Misc. */
+    obj2 = hwloc_get_next_child(topo, obj, NULL);
+    while (NULL != obj2) {
         /* print the object */
         print_hwloc_obj(&tmp2, pfx, topo, obj2);
+        obj2 = hwloc_get_next_child(topo, obj, obj2);
     }
     free(pfx);
     if (NULL != *output) {
@@ -1551,12 +1557,42 @@ int prte_hwloc_print(char **output, char *prefix, hwloc_topology_t src)
     hwloc_obj_t obj;
     char *tmp = NULL;
 
+    /* every caller hands us a topology out of prte_node_topologies and
+     * prints the result unconditionally, so answer rather than crash if the
+     * node's topology has not arrived */
+    *output = NULL;
+    if (NULL == src) {
+        return PRTE_ERR_NOT_FOUND;
+    }
     /* get root object */
     obj = hwloc_get_root_obj(src);
+    if (NULL == obj) {
+        return PRTE_ERR_NOT_FOUND;
+    }
     /* print it */
     print_hwloc_obj(&tmp, prefix, src, obj);
     *output = tmp;
     return PRTE_SUCCESS;
+}
+
+/* zero the placement counters hanging off every object at one level of a
+ * topology. Only ever called for a level below the root: depth 0 carries a
+ * prte_hwloc_topo_data_t, and reinterpreting that as a counter would
+ * scribble on numa_cutoff. */
+static void reset_level_counters(hwloc_topology_t topo, int depth)
+{
+    hwloc_obj_t obj;
+    prte_hwloc_obj_data_t *objcnt;
+    unsigned width, w;
+
+    width = hwloc_get_nbobjs_by_depth(topo, depth);
+    for (w = 0; w < width; w++) {
+        obj = hwloc_get_obj_by_depth(topo, depth, w);
+        if (NULL != obj && NULL != obj->userdata) {
+            objcnt = (prte_hwloc_obj_data_t *) obj->userdata;
+            objcnt->nprocs = 0;
+        }
+    }
 }
 
 void prte_hwloc_base_reset_counters(void)
@@ -1564,9 +1600,6 @@ void prte_hwloc_base_reset_counters(void)
     prte_topology_t *ptopo;
     hwloc_topology_t topo;
     hwloc_obj_type_t type;
-    hwloc_obj_t obj;
-    prte_hwloc_obj_data_t *objcnt;
-    unsigned width, w;
     unsigned depth, d;
     int n;
 
@@ -1597,31 +1630,23 @@ void prte_hwloc_base_reset_counters(void)
         for (d = 1; d < depth; d++) {
             /* get the object type at this depth */
             type = hwloc_get_depth_type(topo, d);
-            /* if it isn't one of interest, then ignore it */
-            if (HWLOC_OBJ_NUMANODE != type && HWLOC_OBJ_PACKAGE != type &&
+            /* if it isn't one of interest, then ignore it. NUMA nodes are
+             * deliberately absent from this list - they cannot appear at a
+             * normal depth in hwloc 2.x, and are swept separately below. */
+            if (HWLOC_OBJ_PACKAGE != type &&
                 HWLOC_OBJ_L1CACHE != type && HWLOC_OBJ_L2CACHE != type && HWLOC_OBJ_L3CACHE != type &&
                 HWLOC_OBJ_CORE != type && HWLOC_OBJ_PU != type) {
                 continue;
             }
-
-            /* get the width of the topology at this depth */
-            width = hwloc_get_nbobjs_by_depth(topo, d);
-            if (0 == width) {
-                continue;
-            }
-
-            /* scan all objects at this depth to see if
-             * the location overlaps with them
-             */
-            for (w = 0; w < width; w++) {
-                /* get the object at this depth/index */
-                obj = hwloc_get_obj_by_depth(topo, d, w);
-                if (NULL != obj->userdata) {
-                    objcnt = (prte_hwloc_obj_data_t*)obj->userdata;
-                    objcnt->nprocs = 0;
-                }
-            }
+            reset_level_counters(topo, d);
         }
+        /* NUMA nodes live at a special depth of their own, so a walk over
+         * 0..get_depth() never visits one. Binding attaches a counter to a
+         * NUMA node exactly as it does to a package (--bind-to numa), and
+         * missing them here left those counters accumulating across every
+         * job in the life of a DVM: the second "--bind-to numa:limit=N" job
+         * found every domain already at its limit and could not be bound. */
+        reset_level_counters(topo, HWLOC_TYPE_DEPTH_NUMANODE);
     }
 }
 

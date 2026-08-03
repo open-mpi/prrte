@@ -117,6 +117,12 @@ prted_count() { local c=0 n; for n in "$@"; do ON "$n" 'pgrep -x prted' >/dev/nu
 # one) -- two daemons on a single machine is what a duplicated node-pool
 # entry produces
 prted_procs() { docker exec "$NODE$1" sh -c 'pgrep -x prted 2>/dev/null | wc -l' | tr -d ' \r'; }
+# wait up to N seconds for every listed node to have no prted, then echo the
+# count that remains.  A tool that exits on a FAILED launch does not wait for
+# the daemons to finish dying, so a count taken the instant it returns can
+# still see one -- that is teardown in flight, not a stray.
+prted_settle() { local secs=$1 c; shift; for _ in $(seq "$secs"); do
+                     c=$(prted_count "$@"); [ "$c" = 0 ] && break; sleep 1; done; echo "$c"; }
 
 # Run something on the head node detached, capturing its output to a file --
 # for a tool that has to stay alive while the case pokes at the DVM around it.
@@ -886,6 +892,111 @@ test_rmaps() {
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     else
         bad "could not start a DVM for the per-app mapping test"
+    fi
+    cleanup_swarm
+
+    banner "rmaps: a directive on a later app describes that app alone"
+    # The first app segment is where the command line speaks for the job, so
+    # a lone directive written there applies to every app.  Written on a
+    # LATER app it is that app's alone, and the apps that gave none take the
+    # defaults -- an app that says nothing is not agreeing with one that did.
+    # This used to place every app the way the one directive said, whichever
+    # app carried it, with no way to say what was plainly meant.  Only
+    # visible across nodes: by-node deals one rank per node, the default
+    # by-slot fills a node first.
+    RUN 'nohup prte --daemonize --host node1:4,node2:4,node3:4 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        # directive on the second app only: app0 (ranks 0-1) takes the
+        # default and lands together, app1 (ranks 2-3) is spread by node
+        out=$(RUN "timeout 60 prun -n 2 $RANKHOST : --map-by node -n 2 $RANKHOST" 2>&1)
+        rc=$?
+        if [ "$rc" = 0 ]; then
+            [ "$(rh_host "$out" 0)" = "$(rh_host "$out" 1)" ] \
+                && ok "the app that gave no directive followed the default rules" \
+                || bad "app0 was placed by app1's directive: $(echo "$out" | grep '^RH' | tr '\n' ' ')"
+            [ "$(rh_host "$out" 2)" != "$(rh_host "$out" 3)" ] \
+                && ok "the app that gave one followed its own" \
+                || bad "app1's --map-by node was not applied: $(echo "$out" | grep '^RH' | tr '\n' ' ')"
+        else
+            bad "later-app directive job failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        fi
+        sleep 2
+        # the same directive on the FIRST app and nowhere else describes the
+        # job, so both apps are spread by node
+        out=$(RUN "timeout 60 prun --map-by node -n 2 $RANKHOST : -n 2 $RANKHOST" 2>&1)
+        rc=$?
+        if [ "$rc" = 0 ]; then
+            [ "$(rh_host "$out" 0)" != "$(rh_host "$out" 1)" ] \
+                && [ "$(rh_host "$out" 2)" != "$(rh_host "$out" 3)" ] \
+                && ok "a directive on the first app applied to both apps" \
+                || bad "the first app's directive did not reach the job: $(echo "$out" | grep '^RH' | tr '\n' ' ')"
+        else
+            bad "first-app directive job failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the directive-distribution test"
+    fi
+    cleanup_swarm
+
+    banner "rmaps: two apps of one job can be placed by two mapping components"
+    # Every mapper's gate used to ask the JOB which policy it had, and the
+    # job's policy is whatever default was resolved for the apps that gave no
+    # directive -- so seq, rankfile and ppr all deferred and a per-app
+    # request for them was quietly placed by round_robin instead.  The gates
+    # now read each app's own resolved policy.  A rankfile names hosts, so
+    # this needs more than one host to mean anything; and the ranks it names
+    # are that app's, offset into the job's numbering by what came before.
+    RUN 'nohup prte --daemonize --host node1:2,node2:2,node3:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        RUN 'printf "rank 0=node3 slot=0\nrank 1=node2 slot=0\n" > /tmp/rmaps_pa_rf.txt'
+        out=$(RUN "timeout 60 prun -n 2 $RANKHOST : --map-by rankfile:FILE=/tmp/rmaps_pa_rf.txt -n 2 $RANKHOST" 2>&1)
+        rc=$?
+        if [ "$rc" = 0 ]; then
+            n=$(echo "$out" | grep '^RH ' | awk '{print $2}' | sort -u | wc -l | tr -d ' ')
+            [ "$n" = 4 ] \
+                && ok "4 procs across the two apps got 4 distinct ranks" \
+                || bad "the rankfile app renumbered from 0 (distinct=$n): $(echo "$out" | grep '^RH' | tr '\n' ' ')"
+            # the rankfile's own rank 0 is the job's rank 2, on node3
+            [ "$(rh_host "$out" 2)" = "node3" ] && [ "$(rh_host "$out" 3)" = "node2" ] \
+                && ok "the per-app rankfile placed its ranks on the hosts it named" \
+                || bad "per-app rankfile placement was ignored: $(echo "$out" | grep '^RH' | tr '\n' ' ')"
+        else
+            bad "per-app rankfile job failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        fi
+        sleep 2
+        # a per-app seq file, same story. Both files name node2/node3 and
+        # leave node1 to the app that gave no directive: node1 is where the
+        # default placement puts it, and these nodes have only two slots
+        # apiece, so a sequence entry naming node1 would be asking for a
+        # slot the first app has already taken.
+        RUN 'printf "node3\nnode2\n" > /tmp/rmaps_pa_seq.txt'
+        out=$(RUN "timeout 60 prun -n 2 $RANKHOST : --map-by seq:FILE=/tmp/rmaps_pa_seq.txt -n 2 $RANKHOST" 2>&1)
+        rc=$?
+        if [ "$rc" = 0 ]; then
+            [ "$(rh_host "$out" 2)" = "node3" ] && [ "$(rh_host "$out" 3)" = "node2" ] \
+                && ok "the per-app seq file placed its ranks in file order" \
+                || bad "per-app seq placement was ignored: $(echo "$out" | grep '^RH' | tr '\n' ' ')"
+        else
+            bad "per-app seq job failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        fi
+        sleep 2
+        # a per-app ppr pattern names both a count and an object; only the
+        # count used to be kept, so the app was placed N per whatever object
+        # the job had resolved
+        out=$(RUN "timeout 60 prun -n 1 $RANKHOST : --map-by ppr:2:node -n 4 $RANKHOST" 2>&1)
+        rc=$?
+        if [ "$rc" = 0 ]; then
+            n=$(echo "$out" | grep '^RH ' | awk '$1=="RH" && $2>=1 {print $3}' | sort -u | wc -l | tr -d ' ')
+            [ "$n" = 2 ] \
+                && ok "ppr:2:node put the app's 4 procs two to a node" \
+                || bad "per-app ppr pattern was not honored (nodes=$n): $(echo "$out" | grep '^RH' | tr '\n' ' ')"
+        else
+            bad "per-app ppr job failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        fi
+        RUN 'rm -f /tmp/rmaps_pa_rf.txt /tmp/rmaps_pa_seq.txt; timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the per-app mapper-selection test"
     fi
     cleanup_swarm
 }
@@ -2130,40 +2241,55 @@ test_prted() {
         # from the master.  node1 is the HNP (its own children take the
         # read-handler path) and node2 is an ordinary daemon (the forwarded
         # path); both relay points are covered by requiring both names.
-        out=$(ONT 3 'timeout -k 5 45 prun --host node1:1,node2:1 -n 2 --map-by node hostname 2>&1')
-        if echo "$out" | grep -qE '^node1$' && echo "$out" | grep -qE '^node2$'; then
-            ok "a tool on a non-master daemon saw output from ranks on both other nodes"
+        #
+        # The relay is compiled out without PMIX_CAP_IOF_DELIVER_LOCAL
+        # (PRTE_PMIX_IOF_DELIVER_LOCAL): the delivery has no way to say "give
+        # this to the tool but do not emit it here", so the HNP does not relay
+        # at all.  These cases can therefore only ever fail against a PMIx
+        # that predates the flag, and the baked PMIx goes stale as a matter of
+        # course (see AGENTS.md) -- red for that reads as "your tree is
+        # broken" when it is not.  The file-emission cases below are skipped
+        # with them: with no relay happening, "no files appeared here" is true
+        # for the wrong reason.
+        if ! pmix_cap PMIX_CAP_IOF_DELIVER_LOCAL; then
+            skp "output relayed back to a tool (PMIx predates PMIX_CAP_IOF_DELIVER_LOCAL)"
         else
-            bad "output never reached the tool on node3: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            out=$(ONT 3 'timeout -k 5 45 prun --host node1:1,node2:1 -n 2 --map-by node hostname 2>&1')
+            if echo "$out" | grep -qE '^node1$' && echo "$out" | grep -qE '^node2$'; then
+                ok "a tool on a non-master daemon saw output from ranks on both other nodes"
+            else
+                bad "output never reached the tool on node3: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            fi
+
+            # Every line exactly once.  The relay skips the daemon that
+            # already delivered a chunk to its own PMIx server, and if that
+            # dedup were dropped a tool would see its own node's ranks twice.
+            out=$(ONT 2 'timeout -k 5 60 prun --host node1:2,node2:2,node3:2 -n 6 --map-by node sh -c "for i in \$(seq 1 50); do echo RELAYLINE-\$i; done" 2>&1')
+            n=$(echo "$out" | grep -c '^RELAYLINE-')
+            u=$(echo "$out" | grep '^RELAYLINE-' | sort | uniq -c | awk '{print $1}' | sort -u | tr '\n' ' ')
+            [ "$n" = 300 ] && [ "$u" = "6 " ] \
+                && ok "300 lines from 6 ranks reached the tool, each exactly once" \
+                || bad "relayed output was lost or duplicated (got $n lines, per-line counts '$u'; expected 300 and '6 ')"
+
+            # The relayed copy must not be EMITTED where it lands.  Every
+            # daemon registers the job's namespace with the same output
+            # directives, so a daemon handed another node's output writes its
+            # own copy of that rank's file unless the delivery says not to --
+            # and node3 hosts none of these ranks, so any file appearing there
+            # is a duplicate of one node1 or node2 already wrote.  Measured,
+            # not assumed: flipping the PMIX_IOF_LOCAL_OUTPUT directive to
+            # true puts a full set here.
+            for i in 1 2 3; do ON $i 'rm -rf /tmp/relayout; mkdir -p /tmp/relayout' >/dev/null 2>&1; done
+            ONT 3 'timeout -k 5 45 prun --output file=/tmp/relayout/out --host node1:1,node2:1 -n 2 --map-by node hostname' >/dev/null 2>&1
+            n=$(ON 3 'find /tmp/relayout -type f 2>/dev/null | wc -l' | tr -d ' \r')
+            m=$(ON 2 'find /tmp/relayout -type f 2>/dev/null | wc -l' | tr -d ' \r')
+            [ "$n" = 0 ] \
+                && ok "the tool's daemon wrote no output files for ranks it does not host" \
+                || bad "relayed output was emitted on the tool's node too ($n files); two daemons are writing one --output file"
+            [ "$m" = 1 ] \
+                && ok "...and the daemon that does host a rank still wrote its file" \
+                || bad "output-to-file broke on the hosting daemon ($m files, expected 1)"
         fi
-
-        # Every line exactly once.  The relay skips the daemon that already
-        # delivered a chunk to its own PMIx server, and if that dedup were
-        # dropped a tool would see its own node's ranks twice.
-        out=$(ONT 2 'timeout -k 5 60 prun --host node1:2,node2:2,node3:2 -n 6 --map-by node sh -c "for i in \$(seq 1 50); do echo RELAYLINE-\$i; done" 2>&1')
-        n=$(echo "$out" | grep -c '^RELAYLINE-')
-        u=$(echo "$out" | grep '^RELAYLINE-' | sort | uniq -c | awk '{print $1}' | sort -u | tr '\n' ' ')
-        [ "$n" = 300 ] && [ "$u" = "6 " ] \
-            && ok "300 lines from 6 ranks reached the tool, each exactly once" \
-            || bad "relayed output was lost or duplicated (got $n lines, per-line counts '$u'; expected 300 and '6 ')"
-
-        # The relayed copy must not be EMITTED where it lands.  Every daemon
-        # registers the job's namespace with the same output directives, so a
-        # daemon handed another node's output writes its own copy of that
-        # rank's file unless the delivery says not to -- and node3 hosts none
-        # of these ranks, so any file appearing there is a duplicate of one
-        # node1 or node2 already wrote.  Measured, not assumed: flipping the
-        # PMIX_IOF_LOCAL_OUTPUT directive to true puts a full set here.
-        for i in 1 2 3; do ON $i 'rm -rf /tmp/relayout; mkdir -p /tmp/relayout' >/dev/null 2>&1; done
-        ONT 3 'timeout -k 5 45 prun --output file=/tmp/relayout/out --host node1:1,node2:1 -n 2 --map-by node hostname' >/dev/null 2>&1
-        n=$(ON 3 'find /tmp/relayout -type f 2>/dev/null | wc -l' | tr -d ' \r')
-        m=$(ON 2 'find /tmp/relayout -type f 2>/dev/null | wc -l' | tr -d ' \r')
-        [ "$n" = 0 ] \
-            && ok "the tool's daemon wrote no output files for ranks it does not host" \
-            || bad "relayed output was emitted on the tool's node too ($n files); two daemons are writing one --output file"
-        [ "$m" = 1 ] \
-            && ok "...and the daemon that does host a rank still wrote its file" \
-            || bad "output-to-file broke on the hosting daemon ($m files, expected 1)"
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
     cleanup_swarm
@@ -2207,6 +2333,158 @@ test_prted() {
 # behavior that only shows up when there is more than one node or more than
 # one DVM to be wrong about:
 #
+########################################################################
+# src/prted/pmix/pmix_server_session.c -- PMIx_Session_control.
+#
+# A session is a set of NODES, so nothing interesting about it exists on one
+# host.  What only appears here:
+#
+#   * a reservation actually withholding its nodes -- a job that names no
+#     session must land somewhere else, which needs more nodes than one
+#   * a request arriving at a NON-MASTER daemon and being relayed to the DVM
+#     master, which is the only way the PRTE_PMIX_SESSION_CTRL relay runs at all
+#   * a signal reaching the jobs of a session on every node they occupy
+#   * a session terminate killing its jobs across nodes and giving the nodes
+#     back to the general pool
+########################################################################
+# sessionctrl is installed by build.sh; use the absolute path for the same
+# reason DS and SC do (an app inherits the daemon PATH, not the install bin).
+SESSCTL=/opt/prte/prte/bin/sessionctrl
+
+test_session() {
+    local out rc n ns
+
+    banner "session: instantiate reserves its nodes out of the general pool"
+    # The DVM spans node1-node4.  Instantiate a session holding node3+node4
+    # and put a long-lived job in it.  A SECOND job, naming no session, must
+    # then be unable to reach node3/node4 at all -- that is what "reserved"
+    # means, and with a single node there is nothing to observe.
+    cleanup_swarm
+    # the session jobs below are bare "sleep" processes, and this phase counts
+    # them to decide whether a signal landed -- so make sure none is left over
+    # from anything else (cleanup_swarm only reaps PRRTE tools and daemons)
+    for n in $(seq 1 10); do docker exec "$NODE$n" sh -c 'pkill -9 -x sleep 2>/dev/null; true'; done
+    if ! RUN "test -x $SESSCTL"; then
+        skp "sessionctrl not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the session-control tests"
+    else
+        # name the slot counts explicitly: a node list is parsed by the
+        # dash-host rules, so a bare name means ONE slot -- and it overwrites
+        # the count the pool already had for that node.
+        out=$(RUN "timeout 60 $SESSCTL instantiate 4242 --hosts node3:2,node4:2 \
+                       --np 2 --mapby node -- /bin/sleep 240" 2>&1)
+        ns=$(echo "$out" | grep -m1 'pmix.nspace' | awk -F'= ' '{print $2}' | tr -d '\r')
+        if echo "$out" | grep -q PMIX_SUCCESS && [ -n "$ns" ]; then
+            ok "session 4242 instantiated on node3,node4 running $ns"
+        else
+            bad "instantiate failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+
+        # a general job may now only use node1/node2
+        sleep 3
+        out=$(PRUN '-n 4 --map-by node hostname' 2>&1)
+        n=$(echo "$out" | grep -cE '^node(3|4)$')
+        [ "$n" = 0 ] \
+            && ok "a general job was kept off the reserved nodes" \
+            || bad "a general job landed on reserved nodes: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+        banner "session: a request relayed from a non-master daemon is served"
+        # node3 is not the DVM master, so this goes out on PRTE_RML_TAG_SCHED
+        # and comes back on ..._SCHED_RESP.  With one daemon that relay never
+        # runs.  Run the tool THROUGH node3 by executing it there: it attaches
+        # to its local daemon, which is not the master.
+        out=$(ONT 3 "timeout 60 $SESSCTL pause 4242" 2>&1)
+        echo "$out" | grep -q PMIX_SUCCESS \
+            && ok "pause relayed through node3 was served by the master" \
+            || bad "relayed pause failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        # the procs of the session are stopped -- on BOTH nodes
+        sleep 2
+        n=0
+        for h in 3 4; do
+            ON $h 'ps -o stat= -C sleep 2>/dev/null | grep -q T' && n=$((n+1))
+        done
+        [ "$n" = 2 ] \
+            && ok "both nodes of the session have stopped procs" \
+            || skp "could not confirm stopped procs on both nodes (saw $n); ps may not report state here"
+
+        out=$(ONT 3 "timeout 60 $SESSCTL resume 4242" 2>&1)
+        echo "$out" | grep -q PMIX_SUCCESS \
+            && ok "resume relayed through node3 was served" \
+            || bad "relayed resume failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        banner "session: signal reaches the session jobs on every node"
+        # SIGTERM through the session, not through prun.  This is the path
+        # that packed the target namespace: it used to pack the ADDRESS OF THE
+        # POINTER rather than the name, so every daemon matched no job and the
+        # signal was silently dropped -- invisible on one node too, but this
+        # is where it is checked.
+        out=$(RUN "timeout 60 $SESSCTL signal 4242 15" 2>&1)
+        echo "$out" | grep -q PMIX_SUCCESS \
+            && ok "session signal accepted" \
+            || bad "session signal failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 5
+        n=0
+        for h in 1 2 3 4; do
+            ON $h 'pgrep -x sleep >/dev/null' && n=$((n+1))
+        done
+        [ "$n" = 0 ] \
+            && ok "the signal reached the session procs on every node" \
+            || bad "session procs survived the signal on $n node(s)"
+
+        banner "session: a session created to run apps is reclaimed when they end"
+        # 4242 was instantiated WITH apps, so it exists in order to run them
+        # and is finished when the last of them retires -- which the signal
+        # above just caused.  It must be gone, and its nodes must be back in
+        # the general pool without anyone having asked.
+        sleep 4
+        out=$(RUN "timeout 60 $SESSCTL pause 4242" 2>&1)
+        echo "$out" | grep -q PMIX_ERR_NOT_FOUND \
+            && ok "the session retired with its jobs" \
+            || bad "session 4242 outlived its only job: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(PRUN '-n 8 --map-by node hostname' 2>&1)
+        n=$(echo "$out" | grep -E '^node[0-9]+$' | sort -u | wc -l | tr -d ' ')
+        [ "$n" = 4 ] \
+            && ok "all four nodes are back in the general pool" \
+            || bad "expected 4 usable nodes after the session ended, saw $n: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+        banner "session: a standing reservation persists until it is terminated"
+        # Instantiated with NO apps, so nothing retires and nothing reclaims
+        # it.  It holds node4 until an explicit terminate says otherwise.
+        out=$(RUN "timeout 60 $SESSCTL instantiate 4243 --hosts node4:2" 2>&1)
+        echo "$out" | grep -q PMIX_SUCCESS \
+            && ok "standing reservation 4243 instantiated" \
+            || bad "instantiate failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 2
+        out=$(PRUN '-n 6 --map-by node hostname' 2>&1)
+        n=$(echo "$out" | grep -cE '^node4$')
+        [ "$n" = 0 ] \
+            && ok "the standing reservation is withholding its node" \
+            || bad "a general job used the reserved node: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        out=$(RUN "timeout 60 $SESSCTL terminate 4243" 2>&1)
+        echo "$out" | grep -q PMIX_SUCCESS \
+            && ok "session 4243 terminated on request" \
+            || bad "terminate failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 4
+        out=$(PRUN '-n 8 --map-by node hostname' 2>&1)
+        n=$(echo "$out" | grep -E '^node[0-9]+$' | sort -u | wc -l | tr -d ' ')
+        [ "$n" = 4 ] \
+            && ok "the terminated reservation gave its node back" \
+            || bad "expected 4 usable nodes after terminate, saw $n: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+        banner "session: an unknown session and a conflicting request are refused"
+        out=$(RUN "timeout 60 $SESSCTL pause 9999" 2>&1)
+        echo "$out" | grep -q PMIX_ERR_NOT_FOUND \
+            && ok "an unknown session id is refused with NOT_FOUND" \
+            || bad "unknown session was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    for n in $(seq 1 10); do docker exec "$NODE$n" sh -c 'pkill -9 -x sleep 2>/dev/null; true'; done
+    cleanup_swarm
+}
+
 #   * prte-info describing the build that is actually installed on each node
 #     -- a swarm running a stale install on some nodes is otherwise a launch
 #     failure with no obvious cause
@@ -2514,7 +2792,7 @@ test_util() {
 }
 
 test_hwloc() {
-    local out rc n c bad_cores
+    local out rc n c bad_cores cpus back
 
     # src/hwloc is a library of pure functions over a topology, so nearly all
     # of it is pinned down by test/unit/hwloc against synthetic topologies.
@@ -2717,6 +2995,230 @@ test_hwloc() {
     echo "$out" | grep -q 'Cpuset:  0x' \
         && ok "object cpusets were rendered" \
         || bad "no cpuset was rendered in the topology dump"
+    # The dump has to contain the levels PRRTE maps and binds to. NUMA is the
+    # one that was missing: hwloc 2.x hangs NUMA nodes off memory_first_child,
+    # not off the children[] array the renderer walked, so a user who ran
+    # "--display topo" to work out what "--map-by numa" would do got a
+    # topology with no NUMA domains in it at all. hwloc always synthesizes at
+    # least one NUMA node covering the machine, so this holds even here where
+    # sysfs reports none.
+    for lvl in Package Core PU NUMANode; do
+        echo "$out" | grep -q "Type: $lvl" \
+            && ok "--display topo shows $lvl objects" \
+            || bad "--display topo omitted every $lvl object"
+    done
+    cleanup_swarm
+
+    banner "hwloc: the DVM-wide bindto parameter means what it says"
+    # "bindto" is the DVM-wide default binding policy, and it documents eight
+    # values. Five of them were unusable.
+    #
+    # 1. A value the parser refuses was diagnosed and then IGNORED:
+    #    prte_init() discarded prte_hwloc_base_open()'s return, so the DVM
+    #    came up with the default binding after telling the user their request
+    #    was not recognized. The command-line spelling of the same typo
+    #    ("--bind-to bogus") has always been fatal.
+    # 2. A value COARSER THAN A CORE was refused outright. Deriving the
+    #    default mapping reads jdata->map->binding, but the MCA default was
+    #    not copied onto the job until after the mapping had been settled -
+    #    so the job mapped BYCORE and the bind-upwards check then rejected
+    #    binding to a package. "--bind-to package" on the command line
+    #    mapped BYPACKAGE and worked.
+    cleanup_swarm
+    out=$(RUN 'timeout 60 prterun --prtemca bindto bogus --host node2:2 -n 1 hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && ok "an unrecognized DVM-wide bindto is fatal (rc=$rc)" \
+                   || bad "bindto=bogus was diagnosed and then ignored"
+    echo "$out" | grep -q 'not recognized' \
+        && ok "the refusal named the unrecognized policy" \
+        || bad "no diagnostic for the unrecognized bindto: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # a job-only qualifier at DVM scope is the same class of mistake
+    out=$(RUN 'timeout 60 prterun --prtemca bindto core:report --host node2:2 -n 1 hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && ok "a job-only bindto qualifier is fatal at DVM scope (rc=$rc)" \
+                   || bad "bindto=core:report was diagnosed and then ignored"
+    # every documented value that this node actually provides must map AND bind
+    for lvl in hwthread core package numa; do
+        out=$(RUN "timeout 60 prterun --prtemca bindto $lvl --host node2:4 -n 2 --display map hostname" 2>&1)
+        rc=$?
+        echo "$out" | grep -q 'lies above the mapping' \
+            && bad "bindto=$lvl was refused by the bind-upwards check" \
+            || ok "bindto=$lvl was not refused as binding above the map"
+        [ "$rc" = 0 ] && ok "bindto=$lvl ran the job" \
+                      || bad "bindto=$lvl failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        n=$(echo "$out" | grep -c 'Bound: ')
+        [ "$n" = 2 ] && ok "bindto=$lvl bound both ranks" \
+                     || bad "bindto=$lvl bound $n/2 ranks: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    done
+    cleanup_swarm
+
+    banner "hwloc: per-object binding limits do not carry over between jobs"
+    # prte_hwloc_base_reset_counters() clears the per-object "how many procs
+    # did I already place here" counters between jobs. It walked only the
+    # normal depth hierarchy, and hwloc 2.x keeps NUMA nodes OUT of that
+    # hierarchy - so a counter attached to a NUMA node by "--bind-to
+    # numa:limit=N" was never cleared. It survived for the life of the DVM,
+    # and the SECOND such job found every domain already at its limit and
+    # could not be bound at all.
+    #
+    # A persistent DVM is the only place this shows: prterun starts a fresh
+    # HNP each time and takes the stale counters down with it. One proc per
+    # job against limit=1, so a leaked counter is immediately fatal to the
+    # next job. These containers report a single NUMA node covering the
+    # machine, which is all this needs.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prte --daemonize --host node2:8 && sleep 2 &&
+               for i in 1 2 3; do
+                   echo "RUN$i";
+                   timeout 60 prun -n 1 --bind-to numa:limit=1 --display map hostname;
+               done; pterm' 2>&1)
+    n=$(echo "$out" | grep -c 'Process rank: 0 Bound: package')
+    [ "$n" = 3 ] && ok "all 3 numa:limit jobs bound in one DVM" \
+                 || bad "$n/3 numa:limit jobs bound - a per-NUMA counter leaked between jobs: $(echo "$out" | tr '\n' ' ' | tail -c 400)"
+    cleanup_swarm
+
+    banner "hwloc: the cpu numbers PRRTE prints are the ones it accepts"
+    # Every renderer here used to short-cut whenever the bits "already were"
+    # cores (npus == ncores, which is exactly these containers) and print the
+    # raw cpuset bits - PU OS indices - under a "core:L" label. --cpu-set
+    # resolves its input LOGICALLY, so on any node whose OS and logical
+    # numbering differ, the numbers PRRTE printed were not numbers PRRTE
+    # would accept back. This asserts the round trip: whatever --display cpus
+    # reports for a node has to be selectable, and selecting it has to yield
+    # the same set.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:8 -n 1 --display cpus hostname' 2>&1)
+    cpus=$(echo "$out" | sed -n 's/^PKG\[0\]: \(.*\)$/\1/p' | head -1)
+    [ -n "$cpus" ] && ok "--display cpus reported package 0 as '$cpus'" \
+                   || bad "--display cpus reported nothing: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    if [ -n "$cpus" ]; then
+        out=$(RUN "timeout 90 prterun --prtemca hwloc_default_cpu_list '$cpus' \
+                       --host node2:8 -n 1 --display cpus hostname" 2>&1)
+        rc=$?
+        [ "$rc" = 0 ] && ok "the reported cpu list is accepted by --cpu-set (rc=0)" \
+                      || bad "--cpu-set rejected the list --display cpus just printed ('$cpus', rc=$rc)"
+        back=$(echo "$out" | sed -n 's/^PKG\[0\]: \(.*\)$/\1/p' | head -1)
+        [ "$back" = "$cpus" ] && ok "selecting those cpus reports the same set back ('$back')" \
+                              || bad "round trip changed the set: printed '$cpus', got back '$back'"
+    fi
+    cleanup_swarm
+
+    banner "hwloc: the parseable renderings actually parse"
+    # PRRTE writes the same fact two ways. "--display map:parseable" runs
+    # prte_hwloc_get_binding_info() and emits <package id="0"><core>N</core>
+    # ...</package>; "--display cpus:parseable" runs the ras/base copy and
+    # used to emit "<processors node=x>" wrapping "<pkg=0 cpus=0-7>" - an
+    # unquoted attribute value around something that is not an element at
+    # all. Neither could be read by an XML parser, which is the one thing
+    # the mode is named for. Both are checked here against a real parser
+    # rather than a grep, because a grep is exactly what let this stand.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:4 -n 2 --map-by core --bind-to core \
+                   --display map:parseable hostname' 2>&1)
+    echo "$out" | sed -n '/<map>/,/<\/map>/p' > /tmp/prte-map-parseable.$$
+    python3 -c "import sys,xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
+        /tmp/prte-map-parseable.$$ 2>/dev/null \
+        && ok "--display map:parseable produces a well-formed document" \
+        || bad "--display map:parseable does not parse: $(head -c 300 /tmp/prte-map-parseable.$$ | tr '\n' ' ')"
+    grep -q '<package id=' /tmp/prte-map-parseable.$$ \
+        && ok "the map document names each package as an element attribute" \
+        || bad "no <package id=...> element in the map document"
+    rm -f /tmp/prte-map-parseable.$$
+
+    out=$(RUN 'timeout 90 prterun --host node2:4 -n 1 --display cpus:parseable hostname' 2>&1)
+    echo "$out" | sed -n '/<processors/,/<\/processors>/p' > /tmp/prte-cpus-parseable.$$
+    python3 -c "import sys,xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
+        /tmp/prte-cpus-parseable.$$ 2>/dev/null \
+        && ok "--display cpus:parseable produces a well-formed document" \
+        || bad "--display cpus:parseable does not parse: $(head -c 300 /tmp/prte-cpus-parseable.$$ | tr '\n' ' ')"
+    grep -q '<package id=' /tmp/prte-cpus-parseable.$$ \
+        && ok "both parseable renderings spell a package the same way" \
+        || bad "--display cpus:parseable does not use the <package id=...> shape"
+    rm -f /tmp/prte-cpus-parseable.$$
+    cleanup_swarm
+
+    banner "hwloc: a qualifier with no policy keeps the default binding"
+    # "--bind-to :overload-allowed" means "the binding I would have got,
+    # but allow overload" - the same thing "--map-by :OVERSUBSCRIBE" has
+    # always meant. pmix_check_cli_option() compares only
+    # min(strlen(a),strlen(b)) characters, so the empty policy word matched
+    # the first option tested against it, which is "none": binding was
+    # silently disabled, and the default MAPPING policy fell from BYCORE to
+    # BYSLOT along with it. Nothing was printed to say so.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:4 -n 2 --bind-to :overload-allowed \
+                   --display map hostname' 2>&1)
+    echo "$out" | grep -q 'Binding policy: CORE' \
+        && ok "a qualifier-only --bind-to keeps the default CORE policy" \
+        || bad "qualifier-only --bind-to changed the policy: $(echo "$out" | grep -i 'policy' | tr '\n' ' ')"
+    echo "$out" | grep -q 'OVERLOAD-ALLOWED' \
+        && ok "the qualifier itself survived" \
+        || bad "the qualifier was lost: $(echo "$out" | grep -i 'policy' | tr '\n' ' ')"
+    n=$(echo "$out" | grep -c 'Bound: package')
+    [ "$n" = 2 ] && ok "both ranks were still bound" \
+                 || bad "$n/2 ranks bound under a qualifier-only --bind-to"
+    # and the mapping policy has to be untouched too - it is chosen from the
+    # binding, so "none" dragged it down with it
+    echo "$out" | grep -q 'Mapping policy: BYCORE' \
+        && ok "the mapping policy is unchanged" \
+        || bad "the mapping policy moved: $(echo "$out" | grep -i 'Mapping policy' | tr '\n' ' ')"
+    cleanup_swarm
+
+    banner "hwloc: the REPORT binding qualifier is reachable"
+    # Three lists decide what a --bind-to qualifier is: the schizo whitelist
+    # (bndquals[]), the job-level parser in src/hwloc, and the per-app parser
+    # in rmaps/base. REPORT was implemented only in the job-level parser and
+    # was missing from the whitelist, so no command line could reach it -
+    # including the diagnostic that same arm emits when it is given as a
+    # DVM-wide default, which tells the user to give it per job instead.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:4 -n 2 --bind-to core:report hostname' 2>&1)
+    rc=$?
+    [ "$rc" = 0 ] && ok "--bind-to core:report is accepted for a job (rc=0)" \
+                  || bad "--bind-to core:report was refused (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    echo "$out" | grep -qi 'unrecognized qualifier' \
+        && bad "--bind-to core:report is still refused as an unrecognized qualifier" \
+        || ok "the qualifier was not reported as unrecognized"
+    # ...and it describes the whole job, so a later MPMD segment has nowhere
+    # to record it. That has to be said by name - the same spelling is legal
+    # one segment earlier, so the generic "unrecognized qualifier" would be
+    # baffling.
+    out=$(RUN 'timeout 90 prterun --host node2:4 -n 1 hostname : -n 1 --bind-to core:report hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && ok "a per-app REPORT is refused (rc=$rc)" \
+                   || bad "a per-app REPORT was accepted, but there is nowhere to record it"
+    echo "$out" | grep -q 'describes the whole job' \
+        && ok "the per-app refusal explains itself" \
+        || bad "the per-app refusal was generic: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    cleanup_swarm
+
+    banner "hwloc: logical and physical binding reports agree on this node"
+    # --report-bindings renders through the same path with "physical" either
+    # set or not, and it used to be ignored outright whenever the short cut
+    # above fired - both spellings produced the OS indices. These containers
+    # number their cpus 0-7 either way, so this cannot catch a wrong BASIS;
+    # what it does catch is the label going missing or the two spellings
+    # rendering through different code again.
+    cleanup_swarm
+    out=$(RUN 'timeout 90 prterun --host node2:2 -n 2 --bind-to core \
+                   --display map hostname' 2>&1)
+    echo "$out" | grep -q 'core:L' \
+        && ok "a logical binding is labelled core:L" \
+        || bad "no core:L label in the default binding report: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    out=$(RUN 'timeout 90 prterun --host node2:2 -n 2 --bind-to core \
+                   --display map:physical hostname' 2>&1)
+    echo "$out" | grep -q 'core:P' \
+        && ok "a physical binding is labelled core:P" \
+        || bad "--display map:physical did not reach the renderer: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # --display cpus goes through its own renderer, which ignored the
+    # qualifier entirely until both were routed through cpuset2ranges()
+    out=$(RUN 'timeout 90 prterun --host node2:8 -n 1 --display cpus:physical hostname' 2>&1)
+    rc=$?
+    [ "$rc" = 0 ] && ok "--display cpus:physical completed (rc=0)" \
+                  || bad "--display cpus:physical failed (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    echo "$out" | grep -qE '^PKG\[0\]: [0-9]' \
+        && ok "--display cpus:physical reported a package" \
+        || bad "--display cpus:physical reported nothing: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
     cleanup_swarm
 }
 
@@ -2829,6 +3331,582 @@ test_grpcomm() {
         || bad "the DVM did not run a plain job after the group tests ($n of 3)"
 
     RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
+
+    test_grpcomm_ft
+}
+
+# Losing a whole daemon mid-construct.  This is the daemon-death analog of the
+# client-death handling the PMIx server library already does, and it is the
+# reason grpcomm carries a recovery epoch at all: the rollup's expected counts
+# come from the routing tree, so a failure invalidates every one of them and
+# the collective has to be restarted rather than merely waited on.
+#
+# Every case here kills a real daemon under a live construct, so they need the
+# stagger that --delay gives: without it the construct is long over before the
+# kill lands and the case passes without testing anything.
+test_grpcomm_ft() {
+    local out n g
+
+    if ! pmix_cap PMIX_CAP_GROUP_FT; then
+        skp "grpcomm FT: the installed PMIx has no PMIX_CAP_GROUP_FT"
+        return
+    fi
+
+    banner "grpcomm: an FT construct survives losing a participating daemon"
+    # With PMIX_GROUP_FT_COLLECTIVE the construct must complete on the
+    # survivors with a reduced membership, and each survivor must be told
+    # which processes went away.  Ranks are one per node so killing node4
+    # removes exactly one member.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        PRUN_BG /tmp/grp-ft.out "--rtos recoverable,notifyerrors --host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $GC --ft --delay 12 ftgrp"
+        sleep 4
+        if ! ON 4 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node4 has no daemon to kill -- the job did not land where expected"
+        else
+            ON 4 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 60 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            out=$(RUN 'tr -d "\\000" < /tmp/grp-ft.out' 2>&1)
+            # three survivors, each of which must have completed the construct
+            n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+            [ "$n" = 3 ] \
+                && ok "all 3 surviving ranks completed the construct" \
+                || bad "$n of 3 survivors completed the construct: $(echo "$out" | grep CONSTRUCT | tr '\n' ' ' | tail -c 300)"
+            # the membership must have shrunk to the survivors
+            n=$(echo "$out" | grep -c 'MEMBERS 3')
+            [ "$n" = 3 ] \
+                && ok "...on the reduced membership of 3" \
+                || bad "survivors did not agree on a membership of 3: $(echo "$out" | grep MEMBERS | tr '\n' ' ' | tail -c 200)"
+            # and they must have been told who was lost
+            n=$(echo "$out" | grep -c 'MEMBER-FAILED')
+            [ "$n" -ge 3 ] \
+                && ok "...and every survivor was told which member failed" \
+                || bad "only $n MEMBER-FAILED events reached the survivors (want >= 3)"
+            # the reduced group must still be usable: each survivor reads back
+            # every remaining member's contribution and reports no failures
+            n=$(echo "$out" | grep -c 'DONE 0')
+            [ "$n" = 3 ] \
+                && ok "...and the reduced group was intact and usable" \
+                || bad "$n of 3 survivors finished cleanly: $(echo "$out" | grep -E 'CID-FAIL|DONE' | tr '\n' ' ' | tail -c 250)"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "the HNP survived the loss" \
+                || bad "the HNP died along with the lost daemon"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the FT group test"
+    fi
+    cleanup_swarm
+
+    banner "grpcomm: without FT_COLLECTIVE the same loss aborts the construct"
+    # The regression guard on the pre-existing behavior.  Note groupcon jumps
+    # straight to its exit on a failed construct, so there is no DESTRUCT line
+    # on this path -- assert on the CONSTRUCT status and on the DVM surviving.
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        PRUN_BG /tmp/grp-noft.out "--rtos recoverable,notifyerrors --host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $GC --delay 12 noftgrp"
+        sleep 4
+        if ! ON 4 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node4 has no daemon to kill -- the job did not land where expected"
+        else
+            ON 4 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 60 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            out=$(RUN 'tr -d "\\000" < /tmp/grp-noft.out' 2>&1)
+            n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_GROUP_CONSTRUCT_ABORT')
+            [ "$n" = 3 ] \
+                && ok "all 3 survivors were told the construct aborted" \
+                || bad "$n of 3 survivors reported an abort: $(echo "$out" | grep CONSTRUCT | tr '\n' ' ' | tail -c 300)"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "...and the DVM survived the abort" \
+                || bad "the HNP died rather than aborting the construct"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the non-FT group test"
+    fi
+    cleanup_swarm
+
+    banner "grpcomm: losing a relay-only daemon does not stall a construct"
+    # A daemon that hosts no member but sits between the controller and one
+    # that does.  Nothing about the membership changes, so the construct must
+    # simply complete -- with or without --ft.  Before the rollup learned to
+    # recompute what it expects, this was the silent case: the operation was
+    # not "affected", so it was never aborted either, and it hung on a count
+    # that could never be reached.
+    #
+    # radix 2 is what makes the tree deep enough to have an interior node at
+    # all; at the default radix every daemon is a child of the controller.
+    if prted_dvm_start_mca 'node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1' \
+                           '--prtemca rml_base_radix 2'; then
+        # members on node1 and node7 only; node3 relays for node7's side of
+        # the radix-2 tree and hosts nobody
+        PRUN_BG /tmp/grp-relay.out "--host node1:1,node7:1 -n 2 --map-by node $GC --ft --delay 12 relaygrp"
+        sleep 4
+        if ! ON 3 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node3 has no daemon to kill"
+        else
+            ON 3 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 60 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            out=$(RUN 'tr -d "\\000" < /tmp/grp-relay.out' 2>&1)
+            n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+            [ "$n" = 2 ] \
+                && ok "both members completed the construct despite the lost relay" \
+                || bad "$n of 2 members completed: $(echo "$out" | grep -E 'CONSTRUCT|DELAYING' | tr '\n' ' ' | tail -c 300)"
+            n=$(echo "$out" | grep -c 'MEMBERS 2')
+            [ "$n" = 2 ] \
+                && ok "...with the membership intact -- no member was lost" \
+                || bad "the membership changed when only a relay died: $(echo "$out" | grep MEMBERS | tr '\n' ' ' | tail -c 200)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a radix-2 DVM for the relay-loss test"
+    fi
+    cleanup_swarm
+
+    banner "grpcomm: a daemon loss elsewhere does not disturb a live fence"
+    # The bystander case, and the reason the fence handler was changed. It
+    # used to kill the job whenever ANY daemon failed while ANY fence was in
+    # flight, without asking whether the two were related - and fences run
+    # constantly, so an unrelated failure anywhere was fatal. Here the fence
+    # spans node1 and node2 only, and the daemon that dies hosts none of it.
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        PRUN_BG /tmp/grp-fence1.out "--host node1:1,node2:1 -n 2 --map-by node $GC --fence --delay 12 fen1"
+        sleep 4
+        if ! ON 4 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node4 has no daemon to kill"
+        else
+            ON 4 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 60 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            out=$(RUN 'tr -d "\000" < /tmp/grp-fence1.out' 2>&1)
+            n=$(echo "$out" | grep -c 'FENCE PMIX_SUCCESS')
+            [ "$n" = 2 ] \
+                && ok "both ranks completed the fence despite an unrelated daemon dying" \
+                || bad "$n of 2 ranks completed the fence: $(echo "$out" | grep -E 'FENCE|FENCING' | tr '\n' ' ' | tail -c 250)"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "...and the HNP survived" \
+                || bad "the HNP died over a fence it had no part in"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the fence bystander test"
+    fi
+    cleanup_swarm
+
+    banner "grpcomm: a fence that loses a participant fails, and only it"
+    # An allgather has no opt-in to running degraded - its answer is every
+    # participant's contribution - so a fence that really lost one cannot
+    # complete. It must say so to its own participants rather than activating
+    # a DVM-wide comm failure, which is what it used to do.
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        PRUN_BG /tmp/grp-fence2.out "--rtos recoverable,notifyerrors --host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $GC --fence --delay 12 fen2"
+        sleep 4
+        if ! ON 4 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node4 has no daemon to kill"
+        else
+            ON 4 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 60 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            out=$(RUN 'tr -d "\000" < /tmp/grp-fence2.out' 2>&1)
+            # the three survivors must each be told the fence failed, rather
+            # than being left blocked in it
+            n=$(echo "$out" | grep -c '^GRP [0-2] FENCE ')
+            [ "$n" = 3 ] \
+                && ok "all 3 survivors were released from the fence" \
+                || bad "$n of 3 survivors got a fence result: $(echo "$out" | grep -E 'FENCE' | tr '\n' ' ' | tail -c 250)"
+            n=$(echo "$out" | grep -c 'FENCE PMIX_SUCCESS')
+            [ "$n" = 0 ] \
+                && ok "...and none of them was told the allgather succeeded" \
+                || bad "$n survivors were told a fence missing a participant had succeeded"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "...and the DVM survived" \
+                || bad "the HNP died rather than failing the fence"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the fence participant-loss test"
+    fi
+    cleanup_swarm
+
+    banner "grpcomm: the DVM still runs group constructs after a loss"
+    # A recovery that leaves a tracker, a memo entry or a caddy behind shows
+    # up as drift on the next operation rather than as a bad run of its own.
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        PRUN_BG /tmp/grp-after.out "--rtos recoverable,notifyerrors --host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $GC --ft --delay 12 killgrp"
+        sleep 4
+        ON 4 'pkill -9 -x prted' >/dev/null 2>&1
+        n=0
+        while [ "$n" -lt 60 ]; do
+            RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+            sleep 1; n=$((n+1))
+        done
+        n=0
+        for g in a1 a2; do
+            out=$(PRUN "--host node1:1,node2:1,node3:1 -n 3 --map-by node $GC --ft $g" 2>&1)
+            [ "$(echo "$out" | grep -c 'CID-OK 3')" = 3 ] && n=$((n+1))
+        done
+        [ "$n" = 2 ] \
+            && ok "two further group constructs completed on the reduced DVM" \
+            || bad "only $n of 2 group constructs completed after the loss"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the post-loss group test"
+    fi
+    cleanup_swarm
+}
+
+########################################################################
+# src/mca/errmgr -- what happens when a process or a daemon fails.
+#
+# The framework has two components with deliberately opposite policies, and
+# BOTH are involved in every failure: the prted that owns the failing proc
+# classifies it, kills what it must, and reports upward; the HNP decides
+# whether the job dies, whether the DVM dies with it, and whether the
+# survivors are told.  On a single host one process plays both roles and no
+# report ever crosses a wire, so none of that is reachable without a swarm.
+# test/unit/errmgr covers the parts that are: the module contract, the
+# live-children scan, and the wire format of the report itself.
+########################################################################
+# Absolute path, as for the other helpers: an app launched into the DVM
+# inherits the daemon PATH, which does not contain the install bindir.
+FLT=/opt/prte/prte/bin/faulty
+
+########################################################################
+# src/mca/ess -- daemon/HNP bring-up.  ess IS the bring-up, so nearly all
+# of it needs a live DVM by construction and the two pure parsers are
+# covered without one by test/unit/ess.  What lands here is what only a
+# real multi-node DVM can show.
+#
+# NOTE what is deliberately NOT here: forwarded signals.  That path is
+# tool-side -- prte/prun catch the signal and relay
+# PRTE_DAEMON_SIGNAL_LOCAL_PROCS over the RML -- and test_event already
+# covers the cross-node relay, with test_prted covering its job scoping.
+# A daemon installs no handlers of its own for those signals, so there is
+# nothing ess-specific left to assert here.
+########################################################################
+
+test_ess() {
+    local out rc n
+
+    banner "ess: every daemon derives a distinct identity"
+    # Each daemon's rank is ess_base_vpid plus a per-node index, summed in
+    # prte_ess_base_set_identity.  Get that sum wrong and two daemons claim
+    # the same rank, which is a silent failure: the DVM simply loses a node,
+    # with no error anywhere.  So the observable is that a job mapped
+    # one-per-node lands on as many DISTINCT hosts as there are nodes.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        out=$(PRUN '--host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node hostname' 2>&1)
+        n=$(echo "$out" | grep -cE '^node[0-9]+$')
+        [ "$n" = 4 ] && ok "all four daemons accepted work" \
+                     || bad "expected 4 procs, got $n: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        n=$(echo "$out" | grep -E '^node[0-9]+$' | sort -u | wc -l | tr -d ' ')
+        [ "$n" = 4 ] && ok "...on four distinct nodes, so no two daemons share a rank" \
+                     || bad "only $n distinct nodes -- daemon ranks collided"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the daemon-identity test"
+    fi
+    cleanup_swarm
+
+    banner "ess: a bad forward-signals request is refused, not ignored"
+    # prte_ess_base_setup_signals parses the list on the TOOL.  A signal
+    # number this platform cannot deliver used to be accepted silently: the
+    # handler install then failed with nothing said, so the user got no
+    # forwarding and no diagnostic.  It must be refused up front, and by
+    # NUMBER as well as by name -- those are separate parse branches and a
+    # check added to one is easy to leave off the other.
+    #
+    # This runs on one node by nature; it is here rather than only in the
+    # unit test because it is the end-to-end proof that the refusal actually
+    # reaches the user through a real tool invocation.
+    cleanup_swarm
+    out=$(RUN 'timeout -k 5 30 prterun --prtemca ess_base_forward_signals 999 --host node1:1 -n 1 hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && ok "an out-of-range signal number was refused (rc=$rc)" \
+                   || bad "signal number 999 was accepted"
+    echo "$out" | grep -q 'not a recognized signal' \
+        && ok "...with a diagnostic naming it" \
+        || bad "no diagnostic for the bad signal number: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    out=$(RUN 'timeout -k 5 30 prterun --prtemca ess_base_forward_signals SIGKILL --host node1:1 -n 1 hostname' 2>&1)
+    echo "$out" | grep -q 'does not support trapping' \
+        && ok "...and a non-forwardable signal is refused by name" \
+        || bad "SIGKILL was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    out=$(RUN 'timeout -k 5 30 prterun --prtemca ess_base_forward_signals 9 --host node1:1 -n 1 hostname' 2>&1)
+    echo "$out" | grep -q 'does not support trapping' \
+        && ok "...and by number, through the other parse branch" \
+        || bad "signal 9 was not refused the way SIGKILL is: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    cleanup_swarm
+
+    banner "ess: a daemon that cannot establish an identity fails cleanly"
+    # prte_ess_base_set_identity refuses a vpid that is not a plain number
+    # rather than letting strtoul read it as 0 -- which is the DVM
+    # controller's rank, so the daemon would adopt the HNP identity and the
+    # DVM would come apart later, nowhere near the cause.  A daemon started
+    # by hand with a bad vpid must die saying so, and must not join.
+    cleanup_swarm
+    out=$(ONT 2 'timeout -k 5 20 prted --prtemca ess_base_nspace bogus-dvm \
+                     --prtemca ess_base_vpid not-a-number \
+                     --prtemca prte_hnp_uri "bogus-dvm.0;tcp://127.0.0.1:1" 2>&1' 2>&1)
+    echo "$out" | grep -qi 'not a valid non-negative number' \
+        && ok "a non-numeric daemon vpid is refused with a diagnostic" \
+        || bad "no bad-identity diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    ON 2 'pgrep -x prted' >/dev/null 2>&1 \
+        && bad "the daemon stayed up despite having no valid identity" \
+        || ok "...and the daemon did not come up"
+    cleanup_swarm
+}
+
+test_errmgr() {
+    local out rc n c
+
+    banner "errmgr: an aborting rank kills its job and leaves the DVM standing"
+    # PMIx_Abort on the last rank (node4, not the head node) arrives at its
+    # own daemon as CALLED_ABORT.  errmgr/prted reports it to the HNP, and
+    # errmgr/dvm - because the job is NOT recoverable - flags the job aborted,
+    # terminates the rest of it, and must keep the DVM itself alive.  That
+    # split is the whole point of having two components.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        out=$(PRUN "--host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $FLT abort 25" 2>&1)
+        rc=$?
+        [ "$rc" != 0 ] && ok "the aborting rank failed the job (rc=$rc)" \
+                       || bad "a PMIx_Abort was reported as success"
+        echo "$out" | grep -q 'FLT 3 ABORTING' \
+            && ok "...and it was rank 3 on the far node that aborted" \
+            || bad "rank 3 never reached its abort: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        # the survivors must have been killed rather than left to run out
+        # their sleep - an abort takes the whole job with it
+        n=$(echo "$out" | grep -c 'SURVIVED')
+        [ "$n" = 0 ] && ok "...and no rank outlived the abort" \
+                     || bad "$n rank(s) survived a non-recoverable abort"
+        RUN 'pgrep -x prte' >/dev/null 2>&1 \
+            && ok "...and the DVM survived the job it killed" \
+            || bad "the DVM died along with the aborted job"
+        # the surest proof the DVM is still usable: run another job in it
+        out=$(PRUN '--host node2:1,node3:1 -n 2 --map-by node hostname' 2>&1); rc=$?
+        [ "$rc" = 0 ] && ok "...and still runs a job afterwards" \
+                      || bad "the DVM could not run a job after the abort: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the abort test"
+    fi
+    cleanup_swarm
+
+    banner "errmgr: a non-zero exit is reported with its status"
+    # TERM_NON_ZERO in errmgr/prted, which reports the proc to the HNP once
+    # per job (the PRTE_JOB_FAIL_NOTIFIED dedup), and errmgr/dvm, which adopts
+    # the proc exit code as the job exit code and records the proc in
+    # PRTE_JOB_ABORTED_PROC so the eventual report can name it.  That report
+    # is the assertion here: the rank and the code in it are the daemon's
+    # classification arriving intact at the HNP.
+    #
+    # The tool's exit status is the rank's own.  It did not use to be: the DVM
+    # put the application exit code into PMIX_JOB_TERM_STATUS, a field typed
+    # as a pmix_status_t, and prun ran it back through the status converter -
+    # which recognized nothing and answered PRTE_ERROR, so every failed job
+    # came back as 71.  The exit code now travels as PMIX_EXIT_CODE and prun
+    # reports it, the way prterun always has.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        out=$(PRUN "--host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $FLT exit 25" 2>&1)
+        rc=$?
+        [ "$rc" = 7 ] && ok "the tool exits with the rank's own status (7)" \
+                      || bad "expected exit status 7 from the failing rank, got $rc"
+        echo "$out" | grep -qi 'non-zero status' \
+            && ok "...and the HNP reported it as a non-zero termination" \
+            || bad "no non-zero-exit diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -qE 'Exit code:[[:space:]]*7\b' \
+            && ok "...naming the rank's own exit code (7)" \
+            || bad "the report does not carry exit code 7: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN 'pgrep -x prte' >/dev/null 2>&1 \
+            && ok "...and the DVM survived it" \
+            || bad "the DVM died over a non-zero exit"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the non-zero exit test"
+    fi
+    cleanup_swarm
+
+    banner "errmgr: a rank killed by a signal is named as such"
+    # ABORTED_BY_SIG: the odls waitpid on node4 sees the signal, errmgr/prted
+    # reports it, errmgr/dvm renders it.  The message naming the signal is
+    # produced on the HNP from the state the daemon sent, so a wrong or lost
+    # state shows up here as a missing or generic diagnostic.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        out=$(PRUN "--host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $FLT signal 25" 2>&1)
+        rc=$?
+        [ "$rc" != 0 ] && ok "a signalled rank fails the job (rc=$rc)" \
+                       || bad "a SIGSEGV was reported as success"
+        echo "$out" | grep -qiE 'signal|segmentation' \
+            && ok "...and the report names the signal" \
+            || bad "no diagnostic naming the signal: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'node4' \
+            && ok "...and the node it died on" \
+            || bad "the diagnostic does not name node4: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN 'pgrep -x prte' >/dev/null 2>&1 \
+            && ok "...and the DVM survived it" \
+            || bad "the DVM died over a signalled rank"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the signal test"
+    fi
+    cleanup_swarm
+
+    banner "errmgr: a recoverable job is notified instead of being killed"
+    # The other half of errmgr/dvm's per-state table.  With
+    # --rtos recoverable,notifyerrors the same failure must NOT terminate the
+    # job: check_send_notification xcasts a PMIx event naming the dead peer
+    # to every survivor, and prte_state_base_recover_resources gives its slot
+    # back.  An FLT ... EVENT line is a survivor that actually received it,
+    # which can only happen through a daemon that is not the HNP.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        out=$(PRUN "--rtos recoverable,notifyerrors --host node1:1,node2:1,node3:1,node4:1 \
+                        -n 4 --map-by node $FLT exit 20" 2>&1)
+        n=$(echo "$out" | grep -c 'SURVIVED')
+        [ "$n" = 3 ] && ok "all 3 survivors outlived the failed rank" \
+                     || bad "$n of 3 ranks survived a recoverable failure: $(echo "$out" | grep -cE 'FLT' ) FLT lines"
+        n=$(echo "$out" | grep -c 'FLT .* EVENT ')
+        [ "$n" -ge 3 ] \
+            && ok "...and every survivor was notified of the loss ($n events)" \
+            || bad "only $n survivors were notified of the failure (want >= 3)"
+        RUN 'pgrep -x prte' >/dev/null 2>&1 \
+            && ok "...and the DVM survived" \
+            || bad "the DVM died over a recoverable failure"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the recoverable test"
+    fi
+    cleanup_swarm
+
+    banner "errmgr: losing a daemon is reported and does not take the DVM down"
+    # errmgr/dvm's daemon branch: the HNP marks the daemon gone, shows
+    # help-errmgr-base.txt:node-died, and walks every job marking the procs
+    # that lived on that node TERM_WO_SYNC.  The DVM has to stay up on the
+    # remaining nodes - killing a compute daemon is not a reason to lose the
+    # whole machine.
+    cleanup_swarm
+    if prted_dvm_start 'node1:1,node2:1,node3:1,node4:1'; then
+        PRUN_BG /tmp/errmgr-nodedie.out "--host node2:1,node3:1,node4:1 -n 3 --map-by node $FLT clean 60"
+        sleep 6
+        if ! ON 4 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node4 has no daemon to kill -- the job did not land where expected"
+        else
+            ON 4 'pkill -9 -x prted' >/dev/null 2>&1
+            n=0
+            while [ "$n" -lt 90 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            [ "$n" -lt 90 ] && ok "the job ended when its daemon was killed" \
+                            || bad "prun never returned after the daemon was killed"
+            out=$(RUN 'tr -d "\\000" < /tmp/errmgr-nodedie.out' 2>&1)
+            echo "$out" | grep -qi 'lost communication' \
+                && ok "...and the HNP reported the lost daemon" \
+                || bad "no node-died diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "...and the DVM survived losing a compute daemon" \
+                || bad "the HNP died when a compute daemon was killed"
+            out=$(PRUN '--host node2:1,node3:1 -n 2 --map-by node hostname' 2>&1); rc=$?
+            [ "$rc" = 0 ] && ok "...and still runs a job on the survivors" \
+                          || bad "the reduced DVM could not run a job: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the daemon-loss test"
+    fi
+    cleanup_swarm
+
+    banner "errmgr: losing a leaf daemon does not take down its parent"
+    # With the default radix a 7-node DVM is flat: every daemon is a child of
+    # the HNP, so the only process that ever notices another daemon's death
+    # is the HNP, and errmgr/prted's daemon-loss handling is never exercised.
+    # radix 2 puts interior daemons in between (0 -> {1,2}, 1 -> {3,5},
+    # 2 -> {4,6}), so killing rank 6 (node7) is noticed first by rank 2
+    # (node3), a prted.  Its job is to route around the loss.  It must not
+    # decide that this is its own lifeline going away, kill its local
+    # processes and exit - which is what treating any unreachable peer as a
+    # lifeline loss does, and it costs the whole subtree, not just the leaf.
+    cleanup_swarm
+    if prted_dvm_start_mca 'node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1' \
+                           '--prtemca rml_base_radix 2'; then
+        # the job deliberately does NOT run on the node being killed
+        PRUN_BG /tmp/errmgr-leaf.out "--host node2:1,node3:1,node4:1 -n 3 --map-by node $FLT clean 30"
+        sleep 6
+        if ! ON 7 'pgrep -x prted' >/dev/null 2>&1; then
+            bad "node7 has no daemon to kill -- the DVM did not span 7 nodes"
+        else
+            ON 7 'pkill -9 -x prted' >/dev/null 2>&1
+            sleep 8
+            ON 3 'pgrep -x prted' >/dev/null 2>&1 \
+                && ok "the parent daemon survived losing its child" \
+                || bad "node3 died along with the leaf below it"
+            c=$(prted_count 2 3 4 5 6)
+            [ "$c" = 5 ] && ok "...and so did every other daemon" \
+                         || bad "only $c of 5 remaining daemons survived one leaf death"
+            RUN 'pgrep -x prte' >/dev/null 2>&1 \
+                && ok "...and the HNP" \
+                || bad "the HNP died over a leaf daemon"
+            # the running job never touched node7, so it must finish normally
+            n=0
+            while [ "$n" -lt 60 ]; do
+                RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+                sleep 1; n=$((n+1))
+            done
+            out=$(RUN 'tr -d "\\000" < /tmp/errmgr-leaf.out' 2>&1)
+            [ "$(echo "$out" | grep -c 'SURVIVED')" = 3 ] \
+                && ok "...and the job on the other nodes ran to completion" \
+                || bad "the job did not complete after the leaf died: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a radix-2 DVM for the leaf-loss test"
+    fi
+    cleanup_swarm
+
+    banner "errmgr: procs that never start are reported once, together"
+    # FAILED_TO_START.  errmgr/prted deliberately does NOT report each proc
+    # as it fails: it counts them and only activates the job state once every
+    # local proc has attempted to start, so the HNP gets ONE consolidated
+    # report per daemon.  With several procs per node a per-proc report would
+    # show up as a storm of duplicate diagnostics.
+    cleanup_swarm
+    out=$(RUN 'timeout -k 5 90 prterun --host node2:2,node3:2 -np 4 --map-by node \
+                  /no/such/executable' 2>&1); rc=$?
+    [ "$rc" != 0 ] && ok "a job that cannot start fails (rc=$rc)" \
+                   || bad "a missing executable was reported as success"
+    echo "$out" | grep -qi 'while attempting to start process' \
+        && ok "...with a diagnostic naming the failure" \
+        || bad "no start-failure diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    # ...once.  The consolidation is the point: each daemon waits for all of
+    # its local procs to have attempted a start before it activates the job
+    # state, so two failing procs per node must not produce two reports.
+    n=$(echo "$out" | grep -ci 'while attempting to start process')
+    [ "$n" = 1 ] && ok "...exactly once, not once per failed proc" \
+                 || bad "the start failure was reported $n times (want 1)"
+    c=$(prted_count 1 2 3 4 5 6 7 8 9 10)
+    [ "$c" = 0 ] && ok "...and no daemon is left behind" \
+                 || bad "$c stray prted after a failed start"
     cleanup_swarm
 }
 
@@ -3324,6 +4402,64 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         bad "could not compile the marker binary on node1 (need gcc in the image)"
     fi
     docker exec "${NODE}1" sh -c 'rm -f /root/staged_marker /root/staged_marker.c' 2>/dev/null
+
+    banner "filem: --preload-files cross-node staging (data file only on node1)"
+    # The data-file half of the same path. The file exists on node1 only, and
+    # the ranks run on node2/node3 with their ordinary working directory --
+    # so reading it back by the bare relative name proves both that the bytes
+    # crossed and that they were placed where the procs actually run, which is
+    # the whole of issue #2525. Single-host runs cannot show either: the
+    # source file is already sitting in the launch directory.
+    docker exec "${NODE}1" sh -c 'echo PRELOADED-DATA-OK > /root/pf.dat' >/dev/null 2>&1
+    for n in 2 3; do docker exec "$NODE$n" sh -c 'rm -f /root/pf.dat' >/dev/null 2>&1; done
+    leaked=0
+    for n in 2 3; do ON "$n" 'test -e /root/pf.dat' && leaked=1; done
+    if [ "$leaked" != 0 ]; then
+        bad "pf.dat is present on a target node -- staging test would be meaningless"
+    else
+        out=$(RUN 'cd /root && prterun --host node2:1,node3:1 -np 2 --map-by node \
+                     --preload-files /root/pf.dat -- sh -c "cat pf.dat"' 2>&1); rc=$?
+        hits=$(echo "$out" | grep -c 'PRELOADED-DATA-OK')
+        [ "$rc" = 0 ] && [ "$hits" = 2 ] \
+            && ok "preload-files staged from node1 and read by both remote ranks" \
+            || bad "preload-files cross-node failed (rc=$rc, hits=$hits): $(echo "$out" | tr '\n' ' ')"
+        # and it is a real file in the working directory, not a link into a
+        # session dir that will be gone with the DVM
+        placed=0
+        for n in 2 3; do
+            ON "$n" 'test -f /root/pf.dat && ! test -L /root/pf.dat' && placed=$((placed+1))
+        done
+        [ "$placed" = 2 ] && ok "the staged file is a real file in each node's working directory" \
+                          || bad "expected pf.dat placed as a regular file on node2+node3, got $placed"
+    fi
+
+    banner "filem: --preload-files refuses to overwrite a different file"
+    # The safety rule: a file of that name that is NOT what was to be staged
+    # belongs to the user, so the launch is refused rather than clobbering it.
+    # node3 keeps the identical copy from the case above, which must stay
+    # quiet -- only node2's differing file may fail the job.
+    docker exec "${NODE}2" sh -c 'echo NODE2-PRECIOUS > /root/pf.dat' >/dev/null 2>&1
+    out=$(RUN 'cd /root && prterun --host node2:1,node3:1 -np 2 --map-by node \
+                 --preload-files /root/pf.dat -- sh -c "cat pf.dat"' 2>&1); rc=$?
+    kept=$(ON 2 'cat /root/pf.dat' | tr -d '\r')
+    [ "$rc" != 0 ] && [ "$kept" = "NODE2-PRECIOUS" ] \
+        && ok "collision refused the launch and left the user's file alone" \
+        || bad "collision not refused (rc=$rc, node2 file now '$kept')"
+    echo "$out" | grep -q 'already' \
+        && ok "collision reported to the user" \
+        || bad "collision produced no diagnostic: $(echo "$out" | tr '\n' ' ')"
+    # PRTE_ERR_PRELOAD_CONFLICT is the last code in constants.h, and this is
+    # the only place in the suite that provokes it. That matters beyond
+    # filem: the string sweep in test/unit/util ran to a bound written out by
+    # hand, and when this code was appended the bound was not moved, so the
+    # newest code was precisely the one nothing checked. Assert here that it
+    # still reaches the user as a sentence rather than as "Unknown error".
+    echo "$out" | grep -qi 'unknown error' \
+        && bad "the collision came back as \"Unknown error\": $(echo "$out" | tr '\n' ' ' | tail -c 250)" \
+        || ok "the collision was named, not reported as \"Unknown error\""
+    c=$(prted_settle 10 1 2 3 4 5 6 7 8 9 10)
+    [ "$c" = 0 ] && ok "no daemons linger after the refused preload" || bad "$c stray prted after refused preload"
+    for n in 1 2 3; do docker exec "$NODE$n" sh -c 'rm -f /root/pf.dat' >/dev/null 2>&1; done
 
     banner "iof: stdin forwarded to a REMOTE proc (HNP -> prted -> proc)"
     # Rank 0 is mapped onto node2, not the head node, so every stdin byte must
@@ -4008,6 +5144,8 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
 
     test_prted
 
+    test_session
+
     test_tools
 
     test_util
@@ -4021,6 +5159,10 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     test_runtime
 
     test_rml
+
+    test_ess
+
+    test_errmgr
 
     test_grpcomm
 

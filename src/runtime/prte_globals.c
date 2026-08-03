@@ -954,8 +954,6 @@ PMIX_CLASS_INSTANCE(prte_proc_t, pmix_list_item_t,
 
 static void prte_job_map_construct(prte_job_map_t *map)
 {
-    map->req_mapper = NULL;
-    map->last_mapper = NULL;
     map->mapping = 0;
     map->ranking = 0;
     map->binding = 0;
@@ -973,12 +971,6 @@ static void prte_job_map_destruct(prte_job_map_t *map)
     int32_t i;
     prte_node_t *node;
 
-    if (NULL != map->req_mapper) {
-        free(map->req_mapper);
-    }
-    if (NULL != map->last_mapper) {
-        free(map->last_mapper);
-    }
     for (i = 0; i < map->nodes->size; i++) {
         if (NULL != (node = (prte_node_t *) pmix_pointer_array_get_item(map->nodes, i))) {
             PMIX_RELEASE(node);
@@ -1030,6 +1022,9 @@ static void session_con(prte_session_t *s)
     s->alloc_refid = NULL;
     s->alloc_module = NULL;
     memset(&s->timeout, 0, sizeof(struct timeval));
+    s->timer = NULL;
+    s->results = NULL;
+    s->nresults = 0;
     s->nodes = PMIX_NEW(pmix_pointer_array_t);
     pmix_pointer_array_init(s->nodes, PRTE_GLOBAL_ARRAY_BLOCK_SIZE,
                             PRTE_GLOBAL_ARRAY_MAX_SIZE,
@@ -1053,6 +1048,19 @@ static void session_des(prte_session_t *s)
 
     /* notify the RAS so it can release the underlying allocation */
     prte_ras_base_release_allocation(s);
+
+    /* disarm the session time limit, if one was in force - the event holds a
+     * bare pointer to us and would fire on freed memory */
+    if (NULL != s->timer) {
+        prte_event_evtimer_del(s->timer->ev);
+        PMIX_RELEASE(s->timer);
+        s->timer = NULL;
+    }
+    if (NULL != s->results) {
+        PMIX_INFO_FREE(s->results, s->nresults);
+        s->results = NULL;
+        s->nresults = 0;
+    }
 
     if (NULL != s->user_refid) {
         free(s->user_refid);

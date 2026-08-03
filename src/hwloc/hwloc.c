@@ -213,9 +213,16 @@ int prte_hwloc_base_register(void)
 
 
     if (NULL != default_cpu_list) {
-        if (NULL != (ptr = strrchr(default_cpu_list, ':'))) {
+        /* The MCA layer owns this string and reports the parameter's value
+         * through it, so parse a copy: splitting the modifier off in place
+         * makes prte_info and every later reader see a truncated value the
+         * user never set. */
+        prte_hwloc_default_cpu_list = strdup(default_cpu_list);
+        if (NULL == prte_hwloc_default_cpu_list) {
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+        if (NULL != (ptr = strrchr(prte_hwloc_default_cpu_list, ':'))) {
             *ptr = '\0';
-            prte_hwloc_default_cpu_list = strdup(default_cpu_list);
             ++ptr;
             if (0 == strcasecmp(ptr, "HWTCPUS")) {
                 prte_hwloc_default_use_hwthread_cpus = true;
@@ -224,10 +231,10 @@ int prte_hwloc_base_register(void)
             } else {
                 pmix_show_help("help-prte-hwloc-base.txt", "bad-processor-type", true,
                                default_cpu_list, ptr);
+                free(prte_hwloc_default_cpu_list);
+                prte_hwloc_default_cpu_list = NULL;
                 return PRTE_ERR_BAD_PARAM;
             }
-        } else {
-            prte_hwloc_default_cpu_list = strdup(default_cpu_list);
         }
     }
 
@@ -254,11 +261,23 @@ int prte_hwloc_base_open(void)
     }
     prte_hwloc_base_inited = true;
 
-    /* check the provided default binding policy for correctness - specifically want to ensure
-     * there are no disallowed qualifiers and setup the global param */
-    if (PRTE_SUCCESS
-        != (rc = prte_hwloc_base_set_binding_policy(NULL, prte_hwloc_base_binding_policy))) {
-        return rc;
+    /* Check the provided default binding policy for correctness - specifically want to ensure
+     * there are no disallowed qualifiers and setup the global param.
+     *
+     * A bad value here is fatal, exactly as a bad "mem_alloc_policy" or
+     * "mem_bind_failure_action" is in prte_hwloc_base_register() above. It
+     * did not used to be: prte_init() discarded this function's return, so
+     * "--prtemca bindto bogus" printed "the specified binding policy is not
+     * recognized" and then launched the job anyway with the default binding
+     * - having told the user their request was refused. The command-line
+     * spelling of the same mistake ("--bind-to bogus") has always been
+     * fatal, so the two were answering differently for one typo. */
+    rc = prte_hwloc_base_set_binding_policy(NULL, prte_hwloc_base_binding_policy);
+    if (PRTE_SUCCESS != rc) {
+        /* the parser has already said precisely what is wrong with the
+         * value, so keep prte_init() from wrapping that in a generic
+         * "internal failure" report on top of it */
+        return PRTE_ERR_SILENT;
     }
 
     return PRTE_SUCCESS;
@@ -278,12 +297,23 @@ void prte_hwloc_base_close(void)
         prte_hwloc_default_cpu_list = NULL;
     }
 
-    /* destroy the topology */
-    if (NULL != prte_hwloc_topology) {
-        prte_hwloc_base_release_userdata(prte_hwloc_topology);
-        hwloc_topology_destroy(prte_hwloc_topology);
-        prte_hwloc_topology = NULL;
-    }
+    /* Drop our reference to the local topology WITHOUT destroying it.
+     *
+     * prte_hwloc_topology is not ours to free by the time we get here. The
+     * only two callers of prte_hwloc_base_get_topology() - ess/hnp and the
+     * shared daemon bring-up - each immediately wrap it in a prte_topology_t
+     * and add that to prte_node_topologies, and THAT object's destructor
+     * releases the userdata and destroys the topology. So the array owns
+     * every topology it holds, the local one included, and this global is a
+     * borrowed alias of one of its entries.
+     *
+     * Destroying it here as well is a double free, which is exactly why this
+     * function ended up with no callers at all: it could not be called
+     * either before the array release (the array would then destroy freed
+     * memory) or after it (we would). Clearing the alias instead is correct
+     * in both orders, so the ordering stops being a trap.
+     */
+    prte_hwloc_topology = NULL;
 
     /* All done */
     prte_hwloc_base_inited = false;
@@ -511,6 +541,16 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
         return PRTE_SUCCESS;
     }
 
+    /* A job we cannot record the answer on has to be refused before we parse
+     * anything, not after: the "report" and "limit=N" qualifiers write to
+     * jdata->attributes as they are read, so failing this check at the end
+     * left them on a job whose binding was never set - the same ordering
+     * mistake the policy word above used to make. */
+    if (NULL != jdata && NULL == jdata->map) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
     myspec = strdup(spec); // protect the input
 
     /* check for qualifiers */
@@ -518,6 +558,64 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
     if (NULL != ptr) {
         *ptr = '\0';
         ++ptr;
+    }
+
+    /* Resolve the policy word FIRST, before any qualifier can record itself
+     * on the job: a spec whose policy does not parse must leave the job
+     * exactly as it found it.
+     *
+     * An empty policy word - the ":qualifier" form, with no policy at all -
+     * means "keep whatever binding policy would otherwise apply, but with
+     * these qualifiers". That is what "--map-by :OVERSUBSCRIBE" has always
+     * meant on the mapping side, and it has to mean the same here. It did
+     * not: pmix_check_cli_option() compares only min(strlen(a), strlen(b))
+     * characters, so an empty string matches the first option it is tested
+     * against - which is "none". "--bind-to :overload-allowed" therefore
+     * disabled binding outright, silently, and took the default mapping
+     * policy down with it. Leaving the policy bits at zero here means
+     * PRTE_BINDING_POLICY_IS_SET() still answers "no" and
+     * PRTE_SET_DEFAULT_BINDING_POLICY() later fills the policy in while
+     * preserving the qualifier half of the word. */
+    if ('\0' != myspec[0]) {
+        if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NONE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NONE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_HWT)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_CORE)) {
+            /* honor the user's "core" unless the topology has no cores at all;
+             * a core that holds a single hwthread is still a core to bind to */
+            if (!prte_rmaps_base.have_cores) {
+                PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
+            } else {
+                PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_CORE);
+            }
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L1CACHE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L1CACHE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L2CACHE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L2CACHE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L3CACHE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L3CACHE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NUMA)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NUMA);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_PACKAGE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_PACKAGE);
+
+        } else {
+            pmix_show_help("help-prte-hwloc-base.txt", "invalid binding_policy", true, "binding",
+                           spec);
+            free(myspec);
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+
+    if (NULL != ptr) {
         quals = PMIx_Argv_split(ptr, ':');
         for (i = 0; NULL != quals[i]; i++) {
             if (PMIX_CHECK_CLI_OPTION(quals[i], PRTE_CLI_IF_SUPP)) {
@@ -590,52 +688,12 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
         }
         PMIx_Argv_free(quals);
     }
-
-    if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NONE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NONE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_HWT)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_CORE)) {
-        /* honor the user's "core" unless the topology has no cores at all;
-         * a core that holds a single hwthread is still a core to bind to */
-        if (!prte_rmaps_base.have_cores) {
-            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
-        } else {
-            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_CORE);
-        }
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L1CACHE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L1CACHE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L2CACHE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L2CACHE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L3CACHE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L3CACHE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NUMA)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NUMA);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_PACKAGE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_PACKAGE);
-
-    } else {
-        pmix_show_help("help-prte-hwloc-base.txt", "invalid binding_policy", true, "binding",
-                       spec);
-        free(myspec);
-        return PRTE_ERR_BAD_PARAM;
-    }
     free(myspec);
 
     if (NULL == jdata) {
         prte_hwloc_default_binding_policy = tmp;
     } else {
-        if (NULL == jdata->map) {
-            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-            return PRTE_ERR_BAD_PARAM;
-        }
+        /* jdata->map was checked on the way in */
         jdata->map->binding = tmp;
     }
     return PRTE_SUCCESS;

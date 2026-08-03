@@ -56,5 +56,19 @@ PRTE_EXPORT extern prte_errmgr_base_module_t prte_errmgr_default_fns;
  */
 PRTE_EXPORT void prte_errmgr_base_log(int error_code, char *filename, int line);
 
+/* Is any local child still alive?
+ *
+ * Every errmgr handler that has to decide "is this node empty yet" asks this
+ * question, and each one used to spell out its own scan of
+ * prte_local_children.  They must not: the loop variable of such a scan sits
+ * in the same scope as the proc whose error is being handled, and clobbering
+ * the latter makes the handler report the wrong proc (that bug was live in
+ * errmgr/prted).  Ask here instead.
+ *
+ * Pass an invalid nspace to ask about any job, or a job's nspace to restrict
+ * the question to that job's children.
+ */
+PRTE_EXPORT bool prte_errmgr_base_any_live_children(const char *job);
+
 END_C_DECLS
 #endif

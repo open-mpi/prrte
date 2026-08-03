@@ -22,12 +22,18 @@ Files:
 | `ess_lsf_component.c` | Registration; `prte_mca_ess_lsf_component_query` (priority 40 under LSF). |
 | `ess_lsf_module.c` | `rte_init` / `rte_finalize` + `lsf_set_name()`. |
 | `ess_lsf.h` | Component struct + open/close/query prototypes. |
-| `configure.m4` | Gates the build on `PRTE_CHECK_LSF` — only built where the LSF libraries are present. |
+| `configure.m4` | Gates the build on `PRTE_CHECK_LSF`, **or** on `--enable-testbuild-launchers`. |
 
-Because `configure.m4` gates on `PRTE_CHECK_LSF` (and sets
-`ess_lsf_CPPFLAGS`/`LDFLAGS`/`LIBS`), this component is **only compiled
-where LSF is available**. On a platform without LSF it will not appear in
-the framework's `static-components.h`.
+Because `configure.m4` gates on `PRTE_CHECK_LSF`, this component is
+normally **only compiled where LSF is available** — on a platform without
+it, it does not appear in the framework's `static-components.h` at all.
+
+Configure with **`--enable-testbuild-launchers`** to build it anyway. It
+needs no stub headers and links nothing: as the `Makefile.am` says, the
+plugin calls no LSF library function, so its whole LSF dependency is two
+`getenv` calls. That is precisely why it is worth building — a component
+nothing compiles is a component that quietly stops compiling, which is
+what had happened.
 
 ---
 
@@ -61,15 +67,25 @@ The standard three-step daemon shape:
 
 ## `lsf_set_name` — identity with a 1-based LSF task offset
 
-1. Require `prte_ess_base_nspace`; load into `PRTE_PROC_MY_NAME->nspace`.
-2. Require `prte_ess_base_vpid`; `strtoul` it to a base `vpid`.
-3. **`PRTE_PROC_MY_NAME->rank = vpid + atoi(getenv("LSF_PM_TASKID")) - 1`**
-   — note the **`- 1`**: `LSF_PM_TASKID` is **1-based** (LSF's process
-   manager numbers tasks from 1), so it is decremented to a 0-based
-   offset before being added to the base vpid. This is the single most
-   important detail in the file; the other RM modules
-   (`slurm`/`pals`) use 0-based node ids and do not subtract.
-4. Set `prte_process_info.num_daemons = prte_ess_base_num_procs`.
+The whole function is one call into the base:
+
+```c
+return prte_ess_base_set_identity("LSF_PM_TASKID", -1);
+```
+
+— note the **`-1`**: `LSF_PM_TASKID` is **1-based** (LSF's process
+manager numbers tasks from 1), so it is decremented to a 0-based offset
+before being added to the base vpid. This is the single most important
+detail in the file; the other RM modules (`slurm`/`pals`) use 0-based
+node ids and pass `0`.
+
+`prte_ess_base_set_identity()` does the rest — nspace, the base-vpid
+parse, the range check, and `num_daemons`; see the [framework
+guide](../AGENTS.md#daemon-identity-is-established-in-one-place). It
+computes the sum as a **signed** value precisely because of this
+component: a `LSF_PM_TASKID` of 0 with the `-1` adjustment would
+otherwise wrap around to a rank up near `UINT32_MAX` instead of being
+refused.
 
 Like `pals` (and unlike `slurm`), `lsf` does **not** rewrite
 `prte_process_info.nodename`.
@@ -81,15 +97,21 @@ Like `pals` (and unlike `slurm`), `lsf` does **not** rewrite
 - **The `- 1` is not a typo.** `LSF_PM_TASKID` counts from 1; dropping
   the decrement shifts every daemon's rank by one and collides ranks.
   This is the classic bug to avoid here.
-- **`LSF_PM_TASKID` is `NULL`-guarded before `atoi`.** `lsf_set_name`
-  checks `getenv("LSF_PM_TASKID")` for `NULL` and returns
-  `PRTE_ERR_NOT_FOUND` if it is missing, rather than calling
-  `atoi(NULL)` (undefined behavior). The LSF process manager sets the
-  variable when it launches the daemon, so this only fires in a
-  misconfigured launch — keeping it a clean error instead of a crash.
-- **Build gating.** Any new LSF symbol must be covered by
-  `PRTE_CHECK_LSF` in `configure.m4`, or the build breaks on non-LSF
-  systems. The wrapper flags (`ess_lsf_CPPFLAGS`/`LDFLAGS`/`LIBS`) are
-  substituted from there.
+- **`LSF_PM_TASKID` is validated, not just `NULL`-guarded.** A missing
+  variable is `PRTE_ERR_NOT_FOUND`; a non-numeric one is refused with a
+  diagnostic rather than read as 0 by `atoi`. The LSF process manager
+  sets it when it launches the daemon, so this only fires in a
+  misconfigured launch — the point is that such a launch fails loudly.
+- **Build it before you claim it compiles.** This component is not built
+  on a developer machine, and it had drifted into not compiling at all
+  under the project's `-Wall -Wextra -Werror`: `rte_init` was missing its
+  `PRTE_HIDE_UNUSED_PARAMS(argc, argv)` and a `my_node_rank` static sat
+  unused. Configure a tree with `--enable-testbuild-launchers` and build
+  it; an ordinary build will not tell you.
+- **Keep it library-free.** The moment this component references a real
+  LSF symbol, it stops being safe to build with
+  `--enable-testbuild-launchers` (no stub header covers it) and stops
+  being safe to link into `libprrte`. If you genuinely need one, it has to
+  move to the stub-plus-DSO treatment the `plm`/`ras` LSF components get.
 - Daemon-only. LSF allocation/launch integration lives in the `ras`/`plm`
   frameworks; this component is only the daemon's own RTE bring-up.

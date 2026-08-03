@@ -392,6 +392,19 @@ build_linux() {
                 /prrte-src/contrib/dockerswarm/groupcon.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
+            # faulty: a PMIx client that fails on purpose, once per way the
+            # errmgr has a policy branch for (abort, non-zero exit, signal,
+            # exit without finalize).  Both errmgr components are involved in
+            # every one of those -- the prted that owns the proc classifies
+            # and reports it, the HNP decides the fate of the job and whether
+            # the survivors are notified -- and on one host there is only one
+            # process playing both roles, so the report never crosses a wire.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> faulty (deliberate process failures) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/faulty \
+                /prrte-src/contrib/dockerswarm/faulty.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
             # slowcat: a deliberately slow stdin reader (no PMIx at all).  The
             # stdin bugs in iof live in the back-pressure path, and a normal
             # "cat" drains its pipe as fast as the daemon fills it, so the
@@ -413,6 +426,19 @@ build_linux() {
             echo ">>>> dynamic (PMIx_Spawn) test client"
             gcc -O0 -g -o /opt/prte/prte/bin/dynamic \
                 /prrte-src/examples/dynamic.c -I/prrte-src/examples \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
+            # sessionctrl: the PMIx_Session_control example shipped in this
+            # tree.  Session control is a DVM-master operation whose whole
+            # point is a set of nodes, so the parts that matter -- carving a
+            # reservation out of the pool, a request relayed from a NON-master
+            # daemon, a signal reaching the jobs on every node of the session
+            # -- do not exist on one host.
+            # NOTE: this whole block is inside bash -c ..., so an apostrophe
+            # anywhere in it (even in a comment) ends the script.
+            echo ">>>> sessionctrl (PMIx_Session_control) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/sessionctrl \
+                /prrte-src/examples/sessionctrl.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
             # The fake SLURM control plane, installed under its own prefix --

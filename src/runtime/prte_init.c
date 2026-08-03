@@ -314,7 +314,7 @@ int prte_init_minimum(void)
     if (prte_bootstrap_setup) {
         if (PRTE_SUCCESS != (ret = prte_ess_base_bootstrap_params())) {
             if (PRTE_ERR_SILENT != ret) {
-                pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
+                pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                                "prte bootstrap params", PRTE_ERROR_NAME(ret), ret);
             }
             return 1;
@@ -324,7 +324,7 @@ int prte_init_minimum(void)
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (ret = prte_register_params())) {
         if (PRTE_ERR_SILENT != ret) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
+            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte register params",
                            PRTE_ERROR_NAME(ret), ret);
         }
@@ -339,7 +339,7 @@ int prte_init_minimum(void)
     ret = prte_preload_default_mca_params();
     if (PRTE_SUCCESS != ret) {
         if (PRTE_ERR_SILENT != ret) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
+            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte preload mca params", PRTE_ERROR_NAME(ret), ret);
         }
         return ret;
@@ -398,7 +398,7 @@ int prte_init_util(prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true, error,
+        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 
@@ -450,8 +450,12 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
     /* let the pmix server register params */
     pmix_server_register_params();
 
-    /* open hwloc */
-    prte_hwloc_base_open();
+    /* open hwloc - this is where the DVM-wide "bindto" value is validated,
+     * so a bad one has to stop us here rather than be diagnosed and ignored */
+    if (PRTE_SUCCESS != (ret = prte_hwloc_base_open())) {
+        error = "prte_hwloc_base_open";
+        goto error;
+    }
 
     /* setup the global job and node arrays */
     prte_job_data = PMIX_NEW(pmix_pointer_array_t);
@@ -559,7 +563,7 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true, error,
+        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 

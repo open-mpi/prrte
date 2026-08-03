@@ -349,6 +349,24 @@ python3 src/util/prte-convert-help.py --root . --check-only \
     --cppflags="$(pkg-config --cflags-only-I pmix)"
 ```
 
+### Mixed-version DVMs are strictly forbidden
+
+Every process in a DVM comes from the same build. There is no version
+negotiation, no compatibility window, and no supported way to mix a `prte`
+of one version with a `prted` or `prun` of another.
+
+That is a rule for users (see
+[`docs/versions.rst`](docs/versions.rst)), and for you it is a *licence*:
+the messages daemons exchange carry no format version and no
+self-description, so you may add, remove or retype a packed field **provided
+you change the packer and the unpacker together, in the same commit**. You do
+not have to keep an old field for compatibility, and you must not invent a
+version byte to avoid changing both sides. See
+[`src/runtime/data_type_support/AGENTS.md`](src/runtime/data_type_support/AGENTS.md).
+
+Nothing catches a half-done change: a type of the same width silently yields
+wrong values, and a different width desynchronizes the rest of the buffer.
+
 ### Unique numeric values for status and state codes
 
 Error constants, job states, and process states are hand-assigned
@@ -439,7 +457,7 @@ Common configure options:
 | `--with-flux=<dir>` | Enable Flux support |
 | `--enable-debug` | Build with debug symbols and extra assertions |
 | `--enable-devel-check` | Enable strict compiler warnings (treat warnings as errors); on by default when `--enable-debug` is used in a git repo build |
-| `--enable-testbuild-launchers` | **Compile-only.** Build the `plm`/`ras` components that need third-party headers (LSF, Flux, jansson) against declaration-only stubs, so they are syntax-checked on a machine that lacks those libraries. Those components must be run-time loadable plugins (the default `--enable-mca-dso` list) — a stub's unresolved symbols only fail to `dlopen`, whereas in `libprrte` they break the link of every tool. Such a tree builds and runs, but the stubbed components can do no actual work; don't install one over a good installation. See [`src/mca/ras/AGENTS.md`](src/mca/ras/AGENTS.md). |
+| `--enable-testbuild-launchers` | **Compile-only.** Build the `plm`/`ras`/`ess` components that an ordinary developer machine cannot, so they are compiled somewhere. Two shapes: the `plm`/`ras` launchers that need third-party headers (LSF, Flux, jansson) are built against declaration-only stubs, and must be run-time loadable plugins (the default `--enable-mca-dso` list) because a stub's unresolved symbols only fail to `dlopen`, whereas in `libprrte` they break the link of every tool. `ess/lsf` and `ess/pals` need no stubs and link nothing — their entire dependency on that RM is a `getenv` — so they build straight into `libprrte`; the gate is all that was keeping them from being compiled, which is exactly why they had drifted into not compiling at all. Such a tree builds and runs, but the stubbed components can do no actual work; don't install one over a good installation. See [`src/mca/ras/AGENTS.md`](src/mca/ras/AGENTS.md). |
 
 Version requirements: PMIx ≥ 6.1.0, hwloc ≥ 2.1.0, libevent ≥ 2.0.21.
 

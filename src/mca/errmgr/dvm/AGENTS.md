@@ -53,15 +53,30 @@ Fires when a job is activated into an error state. Flow:
 1. `PMIX_ACQUIRE_OBJECT(caddy)`; bail immediately if `prte_finalizing`.
 2. If `caddy->jdata == NULL`, this refers to the **daemon job** — back-fill
    it from `prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace)` and
-   `PMIX_RETAIN` it.
+   `PMIX_RETAIN` it. If that lookup comes back `NULL` the handler gives up
+   rather than retaining and dereferencing it: a crash inside the handler
+   whose job is to report crashes is the worst possible outcome here.
 3. Copy `caddy->job_state` into `jdata->state`.
 4. **Two policies, chosen by whose job it is:**
 
    **The daemon job itself** (`nspace == PRTE_PROC_MY_NAME->nspace`) —
    the DVM is in trouble:
    - `FAILED_TO_START` / `NEVER_LAUNCHED` / `FAILED_TO_LAUNCH` /
-     `CANNOT_LAUNCH`: disable routing (`prte_routing_is_enabled = false`)
-     and activate `PRTE_JOB_STATE_DAEMONS_TERMINATED` to exit.
+     `CANNOT_LAUNCH`: the DVM could not be formed — disable routing
+     (`prte_routing_is_enabled = false`) and activate
+     `PRTE_JOB_STATE_DAEMONS_TERMINATED` to exit. For the two states that
+     mean *we tried and they did not come up* — `FAILED_TO_START` and
+     `FAILED_TO_LAUNCH` — also show
+     `help-errmgr-base.txt: failed-daemon-launch`. That is the only place
+     the message is emitted; it used to be attempted from `proc_errors`'
+     *application*-proc switch, behind a test asking whether the proc was
+     a daemon — which it never is there, because the daemon branch above
+     that switch always exits first. So a user whose DVM failed to form
+     got a non-zero exit and silence.
+     `NEVER_LAUNCHED`/`CANNOT_LAUNCH` are deliberately excluded: they mean
+     we never got as far as launching, and whoever decided that has
+     already said why (plm/ssh's `agent-not-found`, for one), so a generic
+     checklist of reasons daemons fail would only bury the real message.
    - `ABORTED` while `num_procs != num_reported`: a daemon likely died
      without finding its way back — show `help-errmgr-base.txt:
      failed-daemon` and disable routing.
@@ -122,10 +137,18 @@ For the communication-loss family — `COMM_FAILED`, `HEARTBEAT_FAILED`,
    activate `DAEMONS_TERMINATED` to exit; else just note the remaining
    routes. `goto cleanup`.
 6. **Unexpected daemon loss** (the real fault path): show
-   `node-died` (unless `FAILED_TO_START`), call `prte_rml_route_lost`.
+   `node-died` (unless `FAILED_TO_START`; and a daemon that was recorded
+   but never placed has no `node`, so the message names it "unknown"
+   rather than dereferencing NULL), call `prte_rml_route_lost`.
    On success **the HNP walks every job** and marks each proc that lived
-   on the lost daemon's node `PRTE_PROC_STATE_TERM_WO_SYNC` (only rank 0
-   / the HNP does this sweep), then `goto cleanup`. Otherwise mark the
+   on the lost daemon's node `PRTE_PROC_STATE_TERM_WO_SYNC`, then
+   `goto cleanup`. (That sweep used to be gated on `PRTE_PROC_MY_NAME->rank
+   == 0` as a stand-in for "am I the HNP". This component only ever runs
+   on the HNP, so the test bought nothing — and it is not a reliable
+   spelling of the question either: `prte_plm_base_set_hnp_name()` takes
+   the HNP's rank from `PMIX_SERVER_RANK` when PRRTE comes up under an
+   existing PMIx server, and any non-zero value there skipped the sweep,
+   leaving the job waiting on processes whose node was already gone.) Otherwise mark the
    daemon job `PRTE_JOB_STATE_COMM_FAILED`, stash the offending proc in
    `PRTE_JOB_ABORTED_PROC`, set `PRTE_JOB_FLAG_ABORTED`, and set
    `exit_code` (defaulting to `PRTE_ERR_COMM_FAILURE`).
@@ -139,8 +162,12 @@ ERROR STATE …")` branch — a real one indicates a bug upstream.
 
 First, idempotency: `pptr->state = state` only if
 `pptr->state < PRTE_PROC_STATE_TERMINATED` (a proc can be reported more
-than once). If `prte_prteds_term_ordered`, check whether any local child
-is still alive and, if not and no routed children remain, exit.
+than once). If `prte_prteds_term_ordered`, ask
+`prte_errmgr_base_any_live_children(NULL)` whether any local child is
+still alive and, if not and no routed children remain, exit. Ask the
+base; do not write the scan out here — the obvious loop variable in this
+scope is `pptr`, the proc whose error is being handled, and clobbering it
+corrupts every branch below.
 
 Then it always marks the waitpid fired
 (`PRTE_ACTIVATE_PROC_STATE(WAITPID_FIRED)`) and, for a **remote** proc,
@@ -152,11 +179,11 @@ between "notify and keep going" and "abort the job":
 |------------|-------------------------------------|--------------|
 | `KILLED_BY_CMD` | notify `PMIX_ERR_PROC_KILLED_BY_CMD` + recover resources | if all procs terminated → `TERMINATED` |
 | `ABORTED_BY_SIG` | notify `PMIX_ERR_PROC_ABORTED_BY_SIG` + recover | set `JOB_STATE_ABORTED_BY_SIG`, record aborted proc, `_terminate_job` |
-| `TERM_WO_SYNC` | notify `PMIX_ERR_PROC_TERM_WO_SYNC` + recover | set `ABORTED_WO_SYNC`; if `exit_code == 0` force `PRTE_ERROR_DEFAULT_EXIT_CODE` so the user sees an error; `_terminate_job` |
-| `FAILED_TO_START` / `FAILED_TO_LAUNCH` | *(unconditional)* set `FAILED_TO_START`/`_LAUNCH`, `_terminate_job`, activate `FAILED_TO_START`; if it was a daemon, show `failed-daemon-launch` | same |
+| `TERM_WO_SYNC` | notify `PMIX_ERR_PROC_TERM_WO_SYNC` + recover | set `ABORTED_WO_SYNC`; if `exit_code == 0` force `PRTE_ERROR_DEFAULT_EXIT_CODE` so the user sees an error; `_terminate_job`. (No notification: this arm has just flagged the job ABORTED, and `check_send_notification` declines to speak about a proc in an aborting job, so the call that used to sit here could never send.) |
+| `FAILED_TO_START` / `FAILED_TO_LAUNCH` | *(unconditional)* set `FAILED_TO_START`/`_LAUNCH`, `_terminate_job`, activate `FAILED_TO_START` | same |
 | `CALLED_ABORT` | notify `PMIX_ERR_PROC_REQUESTED_ABORT` + recover | set `CALLED_ABORT`, `_terminate_job` |
 | `TERM_NON_ZERO` | if `PRTE_JOB_ERROR_NONZERO_EXIT` also set: notify `PMIX_ERR_EXIT_NONZERO_TERM` + recover | set `NON_ZERO_TERM`, `_terminate_job`; always bump `PRTE_JOB_NUM_NONZERO_EXIT` |
-| default | if `num_terminated == num_procs` → `TERMINATED` |
+| default | if `num_terminated >= num_procs` → `TERMINATED` (`>=`, not `==`: this is an unrecognized state's last chance to end a job whose procs are all gone, and an exact test the count has stepped past never fires again) |
 
 The abort branches all guard on `!PRTE_JOB_FLAG_ABORTED` so only the
 **first** offending proc drives the abort, `PMIX_RETAIN` the recorded
@@ -225,6 +252,13 @@ application uses to learn a peer died without the whole job being killed.
   (`proct`) — an earlier version tested the *failed daemon* `pptr`,
   whose `ALIVE` flag had just been cleared a few lines above, so the
   guard was always false and the DVM could declare itself done while a
-  local child was still alive. The two sibling loops (the application
-  arm here, and the daemon `proc_errors` loop in the `prted` component)
-  both correctly test the iterated child; keep all three consistent.
+  local child was still alive. This is the one such scan still written
+  inline, because it adds a `state < PRTE_PROC_STATE_UNTERMINATED` test
+  the shared helper does not make; every other one in the framework now
+  calls `prte_errmgr_base_any_live_children()` instead, after the same
+  mistake in `errmgr/prted` caused it to report the *wrong proc* to the
+  HNP. If you touch this loop, consider whether the extra state test is
+  still earning its keep, and if not, use the helper.
+- **Nothing may be read out of the caddy before `PMIX_ACQUIRE_OBJECT`,**
+  including in a variable initializer — see the threading section of the
+  [framework guide](../AGENTS.md).
