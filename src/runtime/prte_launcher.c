@@ -104,9 +104,17 @@
 #include "src/runtime/runtime.h"
 
 #include "include/prte.h"
+/* NOTE: src/prted/prted.h MUST be included before the pmix_server
+ * headers below. Those headers transitively pull in the daemon-only
+ * prted.h (src/tools/prted/prted.h), which shares the same
+ * "PRTED_H" include guard as this one. If the daemon header is seen
+ * first, it defines PRTED_H and this header's body - including the
+ * prte_parse_locals, prun_common, and prte_prun_parse_common_cli
+ * prototypes we rely on - would be skipped entirely, producing
+ * implicit-declaration errors. */
+#include "src/prted/prted.h"
 #include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
-#include "src/prted/prted.h"
 
 typedef struct {
     prte_pmix_lock_t lock;
@@ -639,7 +647,7 @@ int prte_launch(int argc, char *argv[])
     if (!pmix_cmd_line_is_taken(&results, PRTE_CLI_DAEMONIZE)) {
         /* see if they want to run an application - let's parse
          * the cmd line to get it */
-        rc = prte_parse_locals(schizo, &apps, pargv, &hostfiles, &hosts, &jobdata);
+        rc = prte_parse_locals(schizo, &apps, pargv, &hostfiles, &hosts, &jobdata, &results);
         // not-found => no app given
         if (PRTE_SUCCESS != rc && PRTE_ERR_NOT_FOUND != rc) {
             PRTE_UPDATE_EXIT_STATUS(rc);
@@ -1458,8 +1466,13 @@ static int prep_singleton(const char *name)
     node->num_procs = 1;
     node->slots_inuse = 1;
 
-    // register the info with our PMIx server
-    rc = prte_pmix_server_register_nspace(jdata);
+    // register the info with our PMIx server. Registration now
+    // completes asynchronously: a PRTE_SUCCESS return means the
+    // provided callback will fire once registration is done, while
+    // an error return means it never will. We have nothing to do on
+    // completion here, so pass a NULL callback - register_nspace
+    // guards against a NULL cbfunc.
+    rc = prte_pmix_server_register_nspace(jdata, NULL, NULL);
 
     return rc;
 }
