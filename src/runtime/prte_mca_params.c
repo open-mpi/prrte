@@ -80,8 +80,10 @@ int prte_register_params(void)
     pmix_output_stream_t lds;
     char *string = NULL;
     char *fstype = NULL;
-    char *home;
     char cwd[MAXPATHLEN];
+#if PRTE_WANT_HOME_CONFIG_FILES
+    char *home;
+#endif
 
     /* only go thru this once - mpirun calls it twice, which causes
      * any error messages to show up twice
@@ -534,26 +536,33 @@ int prte_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_homo_nodes);
 
-    home = (char *) pmix_home_directory(geteuid());
     if (NULL == getcwd(cwd, MAXPATHLEN)) {
         return PRTE_ERROR;
     }
 
 #if PRTE_WANT_HOME_CONFIG_FILES
+    home = (char *) pmix_home_directory(geteuid());
     pmix_asprintf(&prte_param_files,
                    "%s" PMIX_PATH_SEP ".prte" PMIX_PATH_SEP "mca-params.conf%c%s" PMIX_PATH_SEP
                    "prte-mca-params.conf",
                    home, ',', prte_install_dirs.sysconfdir);
 #else
-    pmix_sprintf(&prte_param_files, "%s" PMIX_PATH_SEP "prte-mca-params.conf",
+    /* --disable-per-user-config-files: only the system file is consulted */
+    pmix_asprintf(&prte_param_files, "%s" PMIX_PATH_SEP "prte-mca-params.conf",
                   prte_install_dirs.sysconfdir);
 #endif
+    /* the var system takes the current value as the default and then hands
+     * back a string of its own, so keep a handle on ours to release - the
+     * same pattern used for every other computed string param here */
+    string = prte_param_files;
 
    (void) pmix_mca_base_var_register("prte", "prte", NULL, "param_files",
                                       "Path for MCA configuration files containing "
                                       "variable values",
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
                                       &prte_param_files);
+    free(string);
+    string = NULL;
 
     (void) pmix_mca_base_var_register("prte", "prte", NULL, "override_param_file",
                                       "Variables set in this file will override any value "
@@ -571,6 +580,11 @@ int prte_register_params(void)
                                       "Self-construct the DVM based on a configuration file (default: false)",
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_bootstrap_setup);
+
+    (void) pmix_mca_base_var_register("prte", "prte", "elastic", "mode",
+                                      "Allow DVM to expand and contract as directed (default: false)",
+                                      PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                      &prte_elastic_mode);
 
     /* pickup the RML params */
     prte_rml_register();

@@ -64,9 +64,6 @@ option to the help request as "--help <option>".
 | "--no-aggregate-help" | Do not aggregate help output from multiple   |
 |                      | processes.                                    |
 +----------------------+-----------------------------------------------+
-| "--test-suicide      | Suicide instead of clean abort after          |
-| <arg0>"              | specified delay                               |
-+----------------------+-----------------------------------------------+
 
 +----------------------+-----------------------------------------------+
 |                      | DVM Options                                   |
@@ -89,17 +86,11 @@ option to the help request as "--help <option>".
 | "--machinefile       | Provide a hostfile (synonym for "--hostfile") |
 | <filename>"          |                                               |
 +----------------------+-----------------------------------------------+
-| "--bootstrap"        | Self-construct the DVM based on a             |
-|                      | configuration file                            |
-+----------------------+-----------------------------------------------+
 | "--pmixmca <key>     | Pass PMIx MCA parameters                      |
 | <value>"             |                                               |
 +----------------------+-----------------------------------------------+
 | "--prtemca <key>     | Pass PRTE MCA parameters to the DVM           |
 | <value>"             |                                               |
-+----------------------+-----------------------------------------------+
-| "--show-progress"    | Output a brief periodic report on DVM startup |
-|                      | progress                                      |
 +----------------------+-----------------------------------------------+
 | "-x                  | Export an environment variable, optionally    |
 | <var_name>[=value]"  | specifying a value                            |
@@ -109,8 +100,9 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 | "--daemonize"        | Daemonize the DVM daemons into the background |
 +----------------------+-----------------------------------------------+
-| "--forward-signals   | Comma-delimited list of additional signals    |
-| <signals>"           | (names or integers) to forward                |
+| "--forward-signals   | Comma-delimited list of the signals (names or |
+| <signals>"           | integers) to be forwarded, replacing the      |
+|                      | default set                                   |
 +----------------------+-----------------------------------------------+
 | "--keepalive <arg0>" | Pipe to monitor - DVM will terminate upon     |
 |                      | closure                                       |
@@ -150,9 +142,6 @@ option to the help request as "--help <option>".
 +----------------------+-----------------------------------------------+
 | "--system-server"    | Start the DVM as the system server            |
 +----------------------+-----------------------------------------------+
-| "--tmpdir <dir>"     | Set the filesystem root for the session       |
-|                      | directory tree                                |
-+----------------------+-----------------------------------------------+
 | "--tune <arg0>"      | File(s) containing MCA params for tuning DVM  |
 |                      | operations                                    |
 +----------------------+-----------------------------------------------+
@@ -167,7 +156,7 @@ option to the help request as "--help <option>".
 |                      | and topological layers, etc.                  |
 +----------------------+-----------------------------------------------+
 
-Report bugs to %s
+%s
 #
 [prtemca]
 
@@ -234,11 +223,6 @@ Printout DVM controller's PID on stdout [-], stderr [+], or a file
 Printout DVM controller's URI on stdout [-], stderr [+], or a file
 (passed as anything else)
 #
-[test-suicide]
-
-Test DVM cleanup upon daemon failure by having one daemon suicide
-after delay
-#
 [default-hostfile]
 
 Specify a default hostfile.
@@ -292,13 +276,6 @@ stdout and stderr) remain open after launch, thus allowing the user to
 see any daemon-generated error messages. Otherwise, the daemon will
 "daemonize" itself upon launch, thereby closing its output streams.
 #
-[tmpdir]
-
-Define the root location for the PRRTE session directory tree
-
-See the "Session directory" HTML documentation for additional details
-about the PRRTE session directory.
-#
 [prefix]
 
 Prefix to be used to look for PRRTE executables. PRRTE automatically
@@ -330,10 +307,10 @@ of the PMIx installation used to build PRRTE.
 #
 [forward-signals]
 
-Comma-delimited list of additional signals (names or integers) to
-forward to application processes ("none" = forward nothing). Signals
-provided by default include SIGTSTP, SIGUSR1, SIGUSR2, SIGABRT,
-SIGALRM, and SIGCONT.
+Comma-delimited list of the signals (names or integers) to be forwarded
+to application processes ("none" = forward nothing). The list replaces
+the default set, which is SIGTSTP, SIGUSR1, SIGUSR2, SIGABRT, SIGALRM,
+and SIGCONT.
 #
 [allow-run-as-root]
 
@@ -389,10 +366,6 @@ example:
 * "-x foo*" exports all current environmental variables starting with
   "foo".
 #
-[show-progress]
-
-Output a brief periodic report on DVM startup progress
-#
 [hostfile]
 
 #include#help-hostfile.txt#hostfile
@@ -408,11 +381,6 @@ Output a brief periodic report on DVM startup progress
 #include#help-hostfile.txt#host
 
 #
-[bootstrap]
-
-Self-construct the DVM based on a configuration file
-
-#
 [display]
 
 #include#help-schizo-display.txt#display
@@ -426,3 +394,15 @@ Self-construct the DVM based on a configuration file
 [rtos]
 
 #include#help-schizo-rtos.txt#rtos
+
+#
+[bad-singleton]
+%s was given a malformed singleton identifier:
+
+  Identifier: %s
+
+The value of the "--singleton" option must have the form
+
+  <namespace>.<rank>
+
+for example, "myapp.0". Please correct the identifier and try again.

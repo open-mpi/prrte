@@ -55,3 +55,28 @@ colon (``:``) and any combination of one or more of the following
 
 Provided qualifiers will apply to *all* of the display directives unless
 noted.
+
+Every directive and qualifier above that asks a yes-or-no question
+|mdash| everything except ``TOPO`` and ``CPUS``, which name a list of
+nodes |mdash| may also be given an explicit truth value:
+
+.. code::
+
+   --display map        the directive is requested
+   --display map=1      the same, said explicitly
+   --display map=0      the directive is NOT requested
+
+True may also be written ``T``, ``Y``, ``TRUE``, ``YES`` or ``ENABLE``,
+and false ``F``, ``N``, ``FALSE``, ``NO`` or ``DISABLE`` |mdash|
+case-insensitively, and as whole words (``TR`` is not an abbreviation of
+``TRUE``).
+
+A value that is neither true nor false is refused rather than guessed at:
+the truth test underneath reads anything it does not recognize as
+``false``, so ``map=maybe`` would otherwise quietly turn the display off.
+
+``--display`` describes the job as a whole: there is no such thing as one
+app context of an MPMD command line being displayed. It may therefore be
+written in *any* app context and applies to all of them. Two app contexts
+that ask for opposite things are refused, since there is no way to honor
+both.

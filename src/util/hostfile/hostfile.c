@@ -113,9 +113,7 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
     char *node_name = NULL;
     char *username = NULL;
     int cnt;
-    int number_of_slots = 0;
     char buff[64];
-    char *alias = NULL;
 
     if (PRTE_HOSTFILE_STRING == token || PRTE_HOSTFILE_HOSTNAME == token ||
         PRTE_HOSTFILE_INT == token || PRTE_HOSTFILE_IPV4 == token ||
@@ -141,17 +139,6 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             return PRTE_ERROR;
         }
         PMIx_Argv_free(argv);
-
-        if (!prte_keep_fqdn_hostnames) {
-            // Strip off the FQDN if present, ignore IP addresses
-            if (!pmix_net_isaddr(node_name)) {
-                char *ptr;
-                alias = strdup(node_name);
-                if (NULL != (ptr = strchr(node_name, '.'))) {
-                    *ptr = '\0';
-                }
-            }
-        }
 
         /* if the first letter of the name is '^', then this is a node
          * to be excluded. Remove the ^ character so the nodename is
@@ -181,19 +168,10 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             node = prte_node_match(exclude, node_name);
             if (NULL == node) {
                 node = PMIX_NEW(prte_node_t);
-                if (prte_keep_fqdn_hostnames || NULL == alias) {
-                    node->name = strdup(node_name);
-                } else {
-                    node->name = strdup(alias);
-                    node->rawname = strdup(node_name);
-                }
+                node->name = strdup(node_name);
                 if (NULL != username) {
                     prte_set_attribute(&node->attributes, PRTE_NODE_USERNAME, PRTE_ATTR_LOCAL,
                                        username, PMIX_STRING);
-                }
-                if (NULL != alias && 0 != strcmp(alias, node->name)) {
-                    // new node object, so alias must be unique
-                    PMIx_Argv_append_nosize(&node->aliases, alias);
                 }
                 pmix_list_append(exclude, &node->super);
             } else {
@@ -203,13 +181,6 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
                     PMIx_Argv_append_unique_nosize(&node->aliases, node_name);
                 }
                 free(node_name);
-                if (NULL != alias && 0 != strcmp(alias, node->name)) {
-                    PMIx_Argv_append_unique_nosize(&node->aliases, alias);
-                }
-            }
-            if (NULL != alias) {
-                free(alias);
-                alias = NULL;
             }
             if (NULL != username) {
                 free(username);
@@ -222,10 +193,9 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
          */
 
         PMIX_OUTPUT_VERBOSE((3, prte_ras_base_framework.framework_output,
-                             "%s hostfile: node %s is being included - keep all is %s alias %s",
+                             "%s hostfile: node %s is being included - keep all is %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node_name,
-                             keep_all ? "TRUE" : "FALSE",
-                             (NULL == alias) ? "NULL" : alias));
+                             keep_all ? "TRUE" : "FALSE"));
 
         /* see if this is another name for us */
         if (prte_check_host_is_local(node_name)) {
@@ -237,21 +207,12 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
         /* Do we need to make a new node object? */
         if (keep_all || NULL == (node = prte_node_match(updates, node_name))) {
             node = PMIX_NEW(prte_node_t);
-            if (prte_keep_fqdn_hostnames || NULL == alias) {
-                node->name = strdup(node_name);
-            } else {
-                node->name = strdup(node_name);
-                node->rawname = strdup(alias);
-            }
+            node->name = strdup(node_name);
             free(node_name);
             node->slots = 1;
             if (NULL != username) {
                 prte_set_attribute(&node->attributes, PRTE_NODE_USERNAME, PRTE_ATTR_LOCAL, username,
                                    PMIX_STRING);
-            }
-            if (NULL != alias && 0 != strcmp(alias, node->name)) {
-                // new node object, so alias must be unique
-                PMIx_Argv_append_nosize(&node->aliases, alias);
             }
             pmix_list_append(updates, &node->super);
         } else {
@@ -264,44 +225,13 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
                 PMIx_Argv_append_unique_nosize(&node->aliases, node_name);
             }
             free(node_name);
-            if (NULL != alias && 0 != strcmp(alias, node->name)) {
-                PMIx_Argv_append_unique_nosize(&node->aliases, alias);
-            }
-        }
-        if (NULL != alias) {
-            free(alias);
-            alias = NULL;
         }
 
     } else if (PRTE_HOSTFILE_RELATIVE == token) {
         /* store this for later processing */
         node = PMIX_NEW(prte_node_t);
-        // Strip off the FQDN if present, ignore IP addresses
-        if (!pmix_net_isaddr(prte_util_hostfile_value.sval)) {
-            char *ptr;
-            alias = strdup(prte_util_hostfile_value.sval);
-            if (NULL != (ptr = strchr(alias, '.'))) {
-                *ptr = '\0';
-            } else {
-                free(alias);
-                alias = NULL;
-            }
-        }
-        if (prte_keep_fqdn_hostnames || NULL == alias) {
-            node->name = strdup(prte_util_hostfile_value.sval);
-        } else {
-            node->name = strdup(alias);
-            node->rawname = strdup(prte_util_hostfile_value.sval);
-        }
-        if (NULL != alias && 0 != strcmp(alias, node->name)) {
-            // new node object, so alias must be unique
-            PMIx_Argv_append_nosize(&node->aliases, alias);
-        }
+        node->name = strdup(prte_util_hostfile_value.sval);
         pmix_list_append(updates, &node->super);
-        if (NULL != alias) {
-            free(alias);
-            alias = NULL;
-        }
 
     } else if (PRTE_HOSTFILE_RANK == token) {
         /* we can ignore the rank, but we need to extract the node name. we
@@ -339,15 +269,6 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
         }
         PMIx_Argv_free(argv);
 
-        // Strip off the FQDN if present, ignore IP addresses
-        if (!prte_keep_fqdn_hostnames && !pmix_net_isaddr(node_name)) {
-            char *ptr;
-            alias = strdup(node_name);
-            if (NULL != (ptr = strchr(alias, '.'))) {
-                *ptr = '\0';
-            }
-        }
-
         /* Do we need to make a new node object? */
         if (NULL == (node = prte_node_match(updates, node_name))) {
             node = PMIX_NEW(prte_node_t);
@@ -367,12 +288,6 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
                 PMIx_Argv_append_unique_nosize(&node->aliases, node_name);
             }
         }
-        if (NULL != alias) {
-            PMIx_Argv_append_unique_nosize(&node->aliases, alias);
-            free(alias);
-            node->rawname = strdup(node_name);
-            alias = NULL;
-        }
         PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
                              "%s hostfile: node %s slots %d nodes-given %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name, node->slots,
@@ -386,6 +301,9 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             token = prte_util_hostfile_lex();
         }
         free(node_name);
+        /* prte_set_attribute() copied it, and the already-known-node branch
+         * above never touched it at all */
+        free(username);
         return PRTE_SUCCESS;
 
     } else {
@@ -487,12 +405,6 @@ static int hostfile_parse_line(int token, pmix_list_t *updates,
             PMIX_RELEASE(node);
             return PRTE_ERROR;
         }
-        if (number_of_slots > node->slots) {
-            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-            pmix_list_remove_item(updates, &node->super);
-            PMIX_RELEASE(node);
-            return PRTE_ERROR;
-        }
     }
 
 done:
@@ -517,6 +429,10 @@ static int hostfile_parse(const char *hostfile, pmix_list_t *updates, pmix_list_
     cur_hostfile_name = hostfile;
 
     prte_util_hostfile_done = false;
+    /* the lexer's line counter is a global that it only ever increments, so
+     * every hostfile after the first reported its parse errors at a line
+     * number carried over from the ones before it */
+    prte_util_hostfile_line = 1;
     prte_util_hostfile_in = fopen(hostfile, "r");
     if (NULL == prte_util_hostfile_in) {
         if (NULL == prte_default_hostfile || 0 != strcmp(prte_default_hostfile, hostfile)) {
@@ -572,14 +488,21 @@ static int hostfile_parse(const char *hostfile, pmix_list_t *updates, pmix_list_
 
         default:
             hostfile_parse_error(token);
+            rc = PRTE_ERROR;
             goto unlock;
         }
     }
-    fclose(prte_util_hostfile_in);
-    prte_util_hostfile_in = NULL;
-    prte_util_hostfile_lex_destroy();
 
 unlock:
+    /* close and reset the lexer on *every* exit, not just the clean one. A
+     * parse error used to jump straight past this, leaking the descriptor
+     * and leaving the flex buffer live - so the next hostfile parsed in the
+     * same process resumed in the middle of the failed one. */
+    if (NULL != prte_util_hostfile_in) {
+        fclose(prte_util_hostfile_in);
+        prte_util_hostfile_in = NULL;
+        prte_util_hostfile_lex_destroy();
+    }
     cur_hostfile_name = NULL;
 
     return rc;
@@ -794,6 +717,17 @@ int prte_util_filter_hostfile_nodes(pmix_list_t *nodes, char *hostfile, bool rem
                  * look it up on global pool
                  */
                 nodeidx = strtol(&node_from_file->name[2], NULL, 10);
+                /* "+n#" indexes the ALLOCATION from zero. The head node
+                 * always occupies pool slot 0, so when it is not part of
+                 * the allocation the pool is offset by one and the index
+                 * has to be adjusted - otherwise "+n0" in a hostfile names
+                 * a node the job was never given, and every index is one
+                 * node adrift of the same index given to --host.
+                 * prte_util_get_ordered_host_list() and dash-host's
+                 * parse_dash_host() both make this adjustment. */
+                if (!prte_hnp_is_allocated) {
+                    nodeidx++;
+                }
                 node_from_pool = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, nodeidx);
                 if (NULL == node_from_pool) {
                     /* this is an error */
@@ -881,17 +815,14 @@ int prte_util_filter_hostfile_nodes(pmix_list_t *nodes, char *hostfile, bool rem
      */
     if (0 != pmix_list_get_size(&newnodes)) {
         pmix_show_help("help-hostfile.txt", "not-all-mapped-alloc", true, hostfile);
-        while (NULL != (item1 = pmix_list_remove_first(&newnodes))) {
-            PMIX_RELEASE(item1);
-        }
-        PMIX_DESTRUCT(&newnodes);
-        return PRTE_ERR_SILENT;
+        rc = PRTE_ERR_SILENT;
+        goto cleanup;
     }
 
     if (!remove) {
         /* all done */
-        PMIX_DESTRUCT(&newnodes);
-        return PRTE_SUCCESS;
+        rc = PRTE_SUCCESS;
+        goto cleanup;
     }
 
     /* clear the rest of the nodes list */
@@ -905,7 +836,13 @@ int prte_util_filter_hostfile_nodes(pmix_list_t *nodes, char *hostfile, bool rem
     }
 
 cleanup:
-    PMIX_DESTRUCT(&newnodes);
+    /* "keep" holds nodes this routine took *off* the caller's list, so on
+     * any path that does not put them back they are the caller's nodes being
+     * dropped on the floor - every error return used to leak them, along
+     * with the two lists themselves */
+    PMIX_LIST_DESTRUCT(&keep);
+    PMIX_LIST_DESTRUCT(&newnodes);
+    PMIX_LIST_DESTRUCT(&exclude);
 
     return rc;
 }
@@ -975,13 +912,20 @@ int prte_util_get_ordered_host_list(pmix_list_t *nodes, char *hostfile)
                     /* if the slot count here is less than the
                      * total slots avail on this node, set it
                      * to the specified count - this allows people
-                     * to subdivide an allocation
+                     * to subdivide an allocation.
+                     *
+                     * Only if the hostfile actually gave a count, though: a
+                     * bare "+e" is a placeholder node whose slots are still
+                     * the constructor's zero, and taking that as "subdivide
+                     * to zero slots" handed back nodes with no slots at all.
                      */
-                    if (node->slots < node_from_pool->slots) {
+                    if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN)
+                        && node->slots < node_from_pool->slots) {
                         newnode->slots = node->slots;
                     } else {
                         newnode->slots = node_from_pool->slots;
                     }
+                    PRTE_FLAG_SET(newnode, PRTE_NODE_FLAG_SLOTS_GIVEN);
                     pmix_list_insert_pos(nodes, item1, &newnode->super);
                     /* track number added */
                     --num_empty;
@@ -1027,13 +971,17 @@ int prte_util_get_ordered_host_list(pmix_list_t *nodes, char *hostfile)
             /* if the slot count here is less than the
              * total slots avail on this node, set it
              * to the specified count - this allows people
-             * to subdivide an allocation
+             * to subdivide an allocation. As with "+e" above, a bare
+             * "+n<K>" carries no count of its own, so only honor one that
+             * the hostfile actually gave.
              */
-            if (node->slots < node_from_pool->slots) {
+            if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN)
+                && node->slots < node_from_pool->slots) {
                 newnode->slots = node->slots;
             } else {
                 newnode->slots = node_from_pool->slots;
             }
+            PRTE_FLAG_SET(newnode, PRTE_NODE_FLAG_SLOTS_GIVEN);
             /* insert it before item1 */
             pmix_list_insert_pos(nodes, item1, &newnode->super);
             /* since we have expanded the provided node, remove
@@ -1053,21 +1001,23 @@ int prte_util_get_ordered_host_list(pmix_list_t *nodes, char *hostfile)
         item2 = item1;
     }
 
-    /* remove from the list of nodes those that are in the exclude list */
+    /* remove from the list of nodes those that are in the exclude list.
+     * This list keeps duplicates, so every match has to be removed - which
+     * means the successor has to be saved before the item is released, not
+     * read out of it afterwards. */
     while (NULL != (item = pmix_list_remove_first(&exclude))) {
         prte_node_t *exnode = (prte_node_t *) item;
         /* check for matches on nodes */
-        for (itm = pmix_list_get_first(nodes); itm != pmix_list_get_end(nodes);
-             itm = pmix_list_get_next(itm)) {
+        itm = pmix_list_get_first(nodes);
+        while (itm != pmix_list_get_end(nodes)) {
             prte_node_t *node = (prte_node_t *) itm;
+            pmix_list_item_t *nxt = pmix_list_get_next(itm);
             if (prte_nptr_match(exnode, node)) {
                 /* match - remove it */
                 pmix_list_remove_item(nodes, itm);
                 PMIX_RELEASE(itm);
-                /* have to cycle through the entire list as we could
-                 * have duplicates
-                 */
             }
+            itm = nxt;
         }
         PMIX_RELEASE(item);
     }

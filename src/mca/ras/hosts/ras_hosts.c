@@ -16,7 +16,11 @@
 #include "constants.h"
 #include "types.h"
 
+#include <ctype.h>
+
 #include "src/class/pmix_list.h"
+#include "src/util/pmix_show_help.h"
+#include "src/util/pmix_string_copy.h"
 
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/mca/state/state.h"
@@ -67,19 +71,9 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
         free(hosts);
     }
 
-    /* if something was found in the rankfile, we add those resources to
-     * our global pool, use that as our global
-     * pool - set it and we are done
+    /* if something was found in the rankfile, then we are done
      */
     if (!pmix_list_is_empty(nodes)) {
-        /* store the results in the global resource pool - this removes the
-         * list items
-         */
-        rc = prte_ras_base_node_insert(nodes, jdata);
-        if (PRTE_SUCCESS != rc) {
-            PRTE_ERROR_LOG(rc);
-            return rc;
-        }
         /* Record that the rankfile mapping policy has been selected */
         if (NULL == jdata->map) {
             jdata->map = PMIX_NEW(prte_job_map_t);
@@ -107,7 +101,7 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
             PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
                                  "%s ras:base:allocate adding dash_hosts",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            rc = prte_util_add_dash_host_nodes(nodes, hosts, true);
+            rc = prte_util_add_dash_host_nodes(nodes, hosts);
             if (PRTE_SUCCESS != rc) {
                 free(hosts);
                 return rc;
@@ -116,18 +110,9 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
         }
     }
 
-    /* if something was found in the dash-host(s), we use that as our global
-     * pool - set it and we are done
-     */
+    /* if something was found in the dash-host(s), then we are done */
     if (!pmix_list_is_empty(nodes)) {
-        /* store the results in the global resource pool - this removes the
-         * list items
-         */
-        if (PRTE_SUCCESS != (rc = prte_ras_base_node_insert(nodes, jdata))) {
-            PRTE_ERROR_LOG(rc);
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
-        }
-        return rc;
+        return PRTE_SUCCESS;
     }
 
     /* Our next option is to look for a hostfile and assign our global
@@ -171,18 +156,10 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
         }
     }
 
-    /* if something was found in the hosthosts(s), we use that as our global
-     * pool - set it and we are done
+    /* if something was found in the hosthosts(s), then we are done
      */
     if (!pmix_list_is_empty(nodes)) {
-        /* store the results in the global resource pool - this removes the
-         * list items
-         */
-        if (PRTE_SUCCESS != (rc = prte_ras_base_node_insert(nodes, jdata))) {
-            PRTE_ERROR_LOG(rc);
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
-        }
-        return rc;
+        return PRTE_SUCCESS;
     }
 
     /* if nothing was found so far, then look for a default hostfile */
@@ -198,18 +175,9 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
         }
     }
 
-    /* if something was found in the default hostfile, we use that as our global
-     * pool - set it and we are done
-     */
+    /* if something was found in the default hostfile, then we are done */
     if (!pmix_list_is_empty(nodes)) {
-        /* store the results in the global resource pool - this removes the
-         * list items
-         */
-        if (PRTE_SUCCESS != (rc = prte_ras_base_node_insert(nodes, jdata))) {
-            PRTE_ERROR_LOG(rc);
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED);
-        }
-        return rc;
+        return PRTE_SUCCESS;
     }
 
     PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
@@ -227,8 +195,285 @@ static int finalize(void)
     return PRTE_SUCCESS;
 }
 
+/* Apply a "slots=+N" / "slots=-N" adjustment to a node that is already in the
+ * global pool.
+ *
+ * Two things the open-coded version got wrong. It clamped at zero but not at
+ * slots_max, so an adjustment could push a node above the ceiling the
+ * allocation gave it - unlike every other slot adjustment in the framework
+ * (prte_ras_base_node_insert clamps both ends for PRTE_NODE_ADD_SLOTS). And it
+ * never told prte_ras_base.total_slots_alloc, which is what a managed
+ * allocation reports to applications as PMIX_UNIV_SIZE / PMIX_MAX_PROCS, so
+ * the DVM's idea of its own size drifted from the pool it was describing. */
+static void adjust_slots(prte_node_t *nptr, int slots)
+{
+    int before = nptr->slots;
+
+    nptr->slots += slots;
+    if (0 > nptr->slots) {
+        nptr->slots = 0;
+    } else if (0 < nptr->slots_max && nptr->slots > nptr->slots_max) {
+        nptr->slots = nptr->slots_max;
+    }
+    prte_ras_base.total_slots_alloc += (nptr->slots - before);
+}
+
+static pmix_status_t process_hostfile(char *hostfile, pmix_list_t *nodes)
+{
+    FILE *fp;
+    char *line, *cptr, *ptr, *nm;
+    bool addslots, found;
+    int slots, m, n;
+    prte_node_t *nptr, *node;
+
+    /* We don't use the hostfile parsing code in src/util because it
+     * uses flex and that has problems handling the range of allowed
+     * syntax here */
+    fp = fopen(hostfile, "r");
+    if (NULL == fp) {
+        pmix_show_help("help-ras-base.txt", "ras-base:addhost-not-found", true, hostfile);
+        return PMIX_ERR_SILENT;
+    }
+
+    while (NULL != (line = pmix_getline(fp))) {
+        // ignore comments and blank lines
+        if (0 == strlen(line)) {
+            free(line);
+            continue;
+        }
+        // remove leading whitespace. NOTE: isspace() takes an int whose
+        // value must be representable as unsigned char (or EOF); passing a
+        // plain char is undefined for any byte with the high bit set, so
+        // every ctype call here casts.
+        cptr = line;
+        while (isspace((unsigned char) *cptr)) {
+            ++cptr;
+        }
+        if ('#' == *cptr) {
+            free(line);
+            continue;
+        }
+        addslots = false;
+        // because there can be arbitrary whitespace around keywords,
+        // we manually parse the line to get the directives
+        ptr = cptr;
+        while ('\0' != *ptr && !isspace((unsigned char) *ptr)) {
+            ++ptr;
+        }
+        if ('\0' == *ptr) {
+            // end of the line - just the node name was given
+            slots = -1;
+            goto process;
+        }
+        *ptr = '\0'; // terminate the name
+        // find the '=' sign
+        ++ptr;
+        while ('\0' != *ptr && '=' != *ptr) {
+            ++ptr;
+        }
+        if ('\0' == *ptr) {
+            // didn't specify slots - use the default value
+            slots = -1;
+            goto process;
+        }
+        // find the value
+        ++ptr;
+        while ('\0' != *ptr && isspace((unsigned char) *ptr)) {
+            ++ptr;
+        }
+        if ('\0' == *ptr) {
+            // bad syntax
+            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+            fclose(fp);
+            free(line);
+            return PMIX_ERR_SILENT;
+        }
+        // if it is a '+' or '-', then we are adjusting
+        // the #slots
+        if ('+' == *ptr || '-' == *ptr) {
+            addslots = true;
+        }
+        slots = strtol(ptr, NULL, 10);
+
+process:
+        // see if we have this node
+        found = false;
+        // does the name refer to me?
+        if (prte_check_host_is_local(cptr)) {
+            nm = prte_process_info.nodename;
+        } else {
+            nm = cptr;
+        }
+
+        for (n = 0; !found && n < prte_node_pool->size; n++) {
+            nptr = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, n);
+            if (NULL == nptr) {
+                continue;
+            }
+            if (0 == strcmp(nm, nptr->name)) {
+                // we have the node
+                if (addslots) {
+                    adjust_slots(nptr, slots);
+                }
+                found = true;
+                break;
+            } else if (NULL != nptr->aliases) {
+                /* no choice but an exhaustive search - fortunately, these lists are short! */
+                for (m = 0; NULL != nptr->aliases[m]; m++) {
+                    /* match on nm, not cptr: if the name given refers to this
+                     * host it was resolved to our canonical nodename above, and
+                     * that is the spelling the pool's aliases carry */
+                    if (0 == strcmp(nm, nptr->aliases[m])) {
+                        if (addslots) {
+                            adjust_slots(nptr, slots);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!found) {
+            // this is a new node - add it
+            node = PMIX_NEW(prte_node_t);
+            node->name = strdup(cptr);
+            node->state = PRTE_NODE_STATE_ADDED;
+            if (0 <= slots) {
+                /* they gave us the number of slots, so set it - including an
+                 * explicit "slots=0", which means this node contributes none
+                 * and must NOT be silently re-sized from its core count.
+                 * Only the -1 marker (no slots clause at all) leaves the
+                 * count to be computed when the daemon reports its topology. */
+                node->slots = slots;
+                PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
+            } else if (0 > slots && -1 != slots) {
+                // cannot have a new node with negative slots - the -1
+                // is a marker for a node without slots being specified
+                pmix_show_help("help-ras-base.txt", "negative-slots", true,
+                               hostfile, cptr);
+                PMIX_RELEASE(node);
+                free(line);
+                fclose(fp);
+                return PMIX_ERR_BAD_PARAM;
+            }
+            pmix_list_append(nodes, &node->super);
+        }
+        free(line);
+    }
+    fclose(fp);
+    return PMIX_SUCCESS;
+}
+
 static pmix_status_t modify(prte_pmix_server_req_t *req)
 {
-    req->status = PMIX_ERR_NOT_SUPPORTED;
+    int rc;
+    pmix_list_t nodes;
+    size_t n, k;
+    char **hostfiles;
+    bool handled = false;
+
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+
+    // look for applicable directives
+    for (n=0; n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_ADD_HOSTFILE)) {
+            /* the value has to be a string we can split - a request that
+             * arrived over the wire may carry anything */
+            if (PMIX_STRING != req->info[n].value.type ||
+                NULL == req->info[n].value.data.string) {
+                PMIX_LIST_DESTRUCT(&nodes);
+                req->pstatus = PMIX_ERR_BAD_PARAM;
+                return req->pstatus;
+            }
+            // comma-delimited list of hostfiles to add or delete
+            hostfiles = PMIx_Argv_split(req->info[n].value.data.string, ',');
+            if (NULL == hostfiles) {
+                continue;
+            }
+            for (k=0; NULL != hostfiles[k]; k++) {
+                rc = process_hostfile(hostfiles[k], &nodes);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_LIST_DESTRUCT(&nodes);
+                    PMIx_Argv_free(hostfiles);
+                    req->pstatus = rc;
+                    return rc;
+                }
+            }
+            PMIx_Argv_free(hostfiles);
+            handled = true;
+        }
+        if (PMIx_Check_key(req->info[n].key, PMIX_ADD_HOST)) {
+            pmix_list_t dhnodes;
+            prte_node_t *nd;
+
+            if (PMIX_STRING != req->info[n].value.type ||
+                NULL == req->info[n].value.data.string) {
+                PMIX_LIST_DESTRUCT(&nodes);
+                req->pstatus = PMIX_ERR_BAD_PARAM;
+                return req->pstatus;
+            }
+            // comma-delimited list of hosts to add or delete
+            PMIX_CONSTRUCT(&dhnodes, pmix_list_t);
+            rc = prte_util_add_dash_host_nodes(&dhnodes, req->info[n].value.data.string);
+            if (PRTE_SUCCESS != rc) {
+                PRTE_ERROR_LOG(rc);
+                PMIX_LIST_DESTRUCT(&dhnodes);
+                PMIX_LIST_DESTRUCT(&nodes);
+                req->pstatus = prte_pmix_convert_rc(rc);
+                return req->pstatus;
+            }
+            /* mark these as newly added so the DVM extension will
+             * include them despite any static -host filter given
+             * when the DVM was started - the hostfile parser above
+             * already does this for its new nodes */
+            while (NULL != (nd = (prte_node_t *) pmix_list_remove_first(&dhnodes))) {
+                nd->state = PRTE_NODE_STATE_ADDED;
+                pmix_list_append(&nodes, &nd->super);
+            }
+            PMIX_DESTRUCT(&dhnodes);
+            handled = true;
+        }
+    }
+
+    if (0 < pmix_list_get_size(&nodes)) {
+        /* mark that an updated nidmap must be communicated to existing daemons */
+        prte_nidmap_communicated = false;
+        rc = prte_ras_base_node_insert(&nodes, req->jdata);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            /* node_insert drains what it consumed; destruct so whatever it
+             * did not reach is not leaked along with the list itself */
+            PMIX_LIST_DESTRUCT(&nodes);
+            req->pstatus = prte_pmix_convert_rc(rc);
+            return req->pstatus;
+        }
+    }
+    PMIX_LIST_DESTRUCT(&nodes);
+
+    /* When no external scheduler is present, this component is the DVM's local
+     * resource authority for elastic operations.  Claim the size-change
+     * directives so the base prte_ras_base_complete_request() logic runs with
+     * the ORIGINAL request info intact:
+     *   - PMIX_ALLOC_NEW / PMIX_ALLOC_EXTEND carrying PMIX_ALLOC_NODE_LIST add
+     *     the named nodes and extend the DVM;
+     *   - PMIX_ALLOC_RELEASE removes the named nodes (PMIX_ALLOC_NODE_LIST) or
+     *     tears down a whole reservation (PMIX_ALLOC_ID).
+     * Keeping the original request info intact preserves the node list and the
+     * allocation ids, so a release can target a specific reservation. */
+    switch (req->allocdir) {
+    case PMIX_ALLOC_NEW:
+    case PMIX_ALLOC_EXTEND:
+    case PMIX_ALLOC_RELEASE:
+        handled = true;
+        break;
+    default:
+        break;
+    }
+
+    /* If we satisfied something, let the base layer finish it; otherwise defer
+     * to the next module (this component is the lowest-priority RAS). */
+    if (handled) {
+        return PMIX_OPERATION_SUCCEEDED;
+    }
     return PMIX_ERR_TAKE_NEXT_OPTION;
 }

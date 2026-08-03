@@ -80,11 +80,8 @@ static bool signals_set = false;
 static prte_event_t term_handler;
 static prte_event_t int_handler;
 static prte_event_t epipe_handler;
-static char *log_path = NULL;
 static void shutdown_signal(int fd, short flags, void *arg);
 static void epipe_signal_callback(int fd, short flags, void *arg);
-static void signal_forward_callback(int fd, short event, void *arg);
-static prte_event_t *forward_signals_events = NULL;
 
 static void setup_sighandler(int signal, prte_event_t *ev, prte_event_cbfunc_t cbfunc)
 {
@@ -99,12 +96,11 @@ int prte_ess_base_prted_setup(void)
     char log_file[PRTE_PATH_MAX];
     char *error = NULL;
     char *tmp = NULL;
+    char *log_path = NULL;
     prte_job_t *jdata = NULL;
     prte_proc_t *proc;
     prte_app_context_t *app = NULL;
     prte_topology_t *t = NULL;
-    prte_ess_base_signal_t *sig = NULL;
-    int idx;
 
     plm_in_use = false;
 
@@ -112,24 +108,18 @@ int prte_ess_base_prted_setup(void)
     setup_sighandler(SIGPIPE, &epipe_handler, epipe_signal_callback);
     /* Set signal handlers to catch kill signals so we can properly clean up
      * after ourselves.
+     *
+     * NOTE: a daemon installs no handlers for the signals on
+     * prte_ess_base_signals, and must not - that list is empty here.  Signal
+     * forwarding is a TOOL-side feature: prte/prterun and prun each build the
+     * list from their own --forward-signals option, catch the signal
+     * themselves, and relay it to us as a PRTE_DAEMON_SIGNAL_LOCAL_PROCS
+     * command over the RML (see prted_comm.c), which is what reaches the
+     * application processes.  Nothing populates the list in a prted, so
+     * handlers installed from it here would never exist.
      */
     setup_sighandler(SIGTERM, &term_handler, shutdown_signal);
     setup_sighandler(SIGINT, &int_handler, shutdown_signal);
-    /** setup callbacks for signals we should forward */
-    if (0 < (idx = pmix_list_get_size(&prte_ess_base_signals))) {
-        forward_signals_events = (prte_event_t *) malloc(sizeof(prte_event_t) * idx);
-        if (NULL == forward_signals_events) {
-            ret = PRTE_ERR_OUT_OF_RESOURCE;
-            error = "unable to malloc";
-            goto error;
-        }
-        idx = 0;
-        PMIX_LIST_FOREACH(sig, &prte_ess_base_signals, prte_ess_base_signal_t)
-        {
-            setup_sighandler(sig->signal, forward_signals_events + idx, signal_forward_callback);
-            ++idx;
-        }
-    }
     signals_set = true;
 
     /* get the local topology */
@@ -188,7 +178,12 @@ int prte_ess_base_prted_setup(void)
     /* create and store the job data object */
     jdata = PMIX_NEW(prte_job_t);
     PMIX_LOAD_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace);
-    prte_set_job_data_object(jdata);
+    ret = prte_set_job_data_object(jdata);
+    if (PRTE_SUCCESS != ret) {
+        PRTE_ERROR_LOG(ret);
+        error = "prte_set_job_data_object";
+        goto error;
+    }
     /* set the schizo personality to "prte" by default */
     jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy("prte");
     if (NULL == jdata->schizo) {
@@ -340,20 +335,17 @@ int prte_ess_base_prted_setup(void)
         error = "prte_odls_base_select";
         goto error;
     }
-    if (PRTE_SUCCESS
-        != (ret = pmix_mca_base_framework_open(&prte_rmaps_base_framework,
-                                               PMIX_MCA_BASE_OPEN_DEFAULT))) {
-        PRTE_ERROR_LOG(ret);
-        error = "prte_rmaps_base_open";
-        goto error;
-    }
-    if (PRTE_SUCCESS != (ret = prte_rmaps_base_select())) {
-        PRTE_ERROR_LOG(ret);
-        error = "prte_rmaps_base_select";
-        goto error;
-    }
+    /* NOTE: a daemon does NOT open the rmaps framework. Mapping is the
+     * HNP's job - the mapper is driven by the DVM state machine, which a
+     * daemon does not run, and the launch path deliberately does not even
+     * forward the rmaps MCA params out to us. The parsers and printers a
+     * daemon does use (translating a local client's map-by/rank-by spawn
+     * directives in pmix_server_dyn) live in the base and are compiled
+     * into libprrte, so they need no open framework behind them. Neither
+     * is ras opened here: only the HNP allocates.
+     */
 
-    /* if a topology file was given, then the rmaps framework open
+    /* if a topology file was given, then the framework opens above
      * will have reset our topology. Ensure we always get the right
      * one by setting our node topology afterwards
      */
@@ -422,8 +414,14 @@ int prte_ess_base_prted_setup(void)
     return PRTE_SUCCESS;
 
 error:
-    pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
-                   error, PRTE_ERROR_NAME(ret), ret);
+    /* Several steps above deliberately set PRTE_ERR_SILENT precisely because
+     * they have already shown their own, more specific diagnostic - honor
+     * that here rather than following it with this generic one, the same way
+     * every ess module's error path does. */
+    if (PRTE_ERR_SILENT != ret && !prte_report_silent_errors) {
+        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                       error, PRTE_ERROR_NAME(ret), ret);
+    }
     if (NULL != jdata) {
         PMIX_RELEASE(jdata);
     }
@@ -432,25 +430,16 @@ error:
 
 int prte_ess_base_prted_finalize(void)
 {
-    prte_ess_base_signal_t *sig;
-    unsigned int i;
-
     if (signals_set) {
         prte_event_del(&epipe_handler);
         prte_event_del(&term_handler);
         prte_event_del(&int_handler);
-        /** Remove the USR signal handlers */
-        i = 0;
-        PMIX_LIST_FOREACH(sig, &prte_ess_base_signals, prte_ess_base_signal_t)
-        {
-            prte_event_signal_del(forward_signals_events + i);
-            ++i;
-        }
-        free(forward_signals_events);
-        forward_signals_events = NULL;
         signals_set = false;
     }
 
+    /* first stage shutdown of the errmgr: deregister the handler but keep the
+     * required facilities until the rml and oob are offline - the framework
+     * itself is closed further down */
     if (NULL != prte_errmgr.finalize) {
         prte_errmgr.finalize();
     }
@@ -459,8 +448,6 @@ int prte_ess_base_prted_finalize(void)
     (void) pmix_mca_base_framework_close(&prte_filem_base_framework);
     (void) pmix_mca_base_framework_close(&prte_grpcomm_base_framework);
     (void) pmix_mca_base_framework_close(&prte_iof_base_framework);
-    /* first stage shutdown of the errmgr, deregister the handler but keep
-     * the required facilities until the rml and oob are offline */
     (void) pmix_mca_base_framework_close(&prte_plm_base_framework);
     /* make sure our local procs are dead */
     prte_odls.kill_local_procs(NULL);
@@ -495,52 +482,4 @@ static void epipe_signal_callback(int fd, short flags, void *arg)
     PRTE_HIDE_UNUSED_PARAMS(fd, flags, arg);
     /* for now, we just ignore them */
     return;
-}
-
-/* Pass user signals to the local application processes */
-static void signal_forward_callback(int fd, short event, void *arg)
-{
-    prte_event_t *signal = (prte_event_t *) arg;
-    int32_t signum, rc;
-    pmix_data_buffer_t *cmd;
-    prte_daemon_cmd_flag_t command = PRTE_DAEMON_SIGNAL_LOCAL_PROCS;
-    PRTE_HIDE_UNUSED_PARAMS(fd, event);
-
-    signum = PRTE_EVENT_SIGNAL(signal);
-    if (!prte_execute_quiet) {
-        fprintf(stderr, "PRTE: Forwarding signal %d to job\n", signum);
-    }
-
-    PMIX_DATA_BUFFER_CREATE(cmd);
-
-    /* pack the command */
-    rc = PMIx_Data_pack(PRTE_PROC_MY_NAME, cmd, &command, 1, PRTE_DAEMON_CMD);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        PMIX_DATA_BUFFER_RELEASE(cmd);
-        return;
-    }
-
-    /* pack the jobid */
-    rc = PMIx_Data_pack(PRTE_PROC_MY_NAME, cmd, &PRTE_JOBID_WILDCARD, 1, PMIX_PROC_NSPACE);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        PMIX_DATA_BUFFER_RELEASE(cmd);
-        return;
-    }
-
-    /* pack the signal */
-    rc = PMIx_Data_pack(PRTE_PROC_MY_NAME, cmd, &PRTE_JOBID_WILDCARD, 1, PMIX_INT32);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        PMIX_DATA_BUFFER_RELEASE(cmd);
-        return;
-    }
-
-    /* send it to ourselves */
-    PRTE_RML_SEND(rc, PRTE_PROC_MY_NAME->rank, cmd, PRTE_RML_TAG_DAEMON);
-    if (PRTE_SUCCESS != rc) {
-        PRTE_ERROR_LOG(rc);
-        PMIX_DATA_BUFFER_RELEASE(cmd);
-    }
 }

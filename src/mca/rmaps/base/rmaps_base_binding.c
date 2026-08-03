@@ -52,6 +52,45 @@
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/rmaps/base/rmaps_private.h"
 
+/* Record the cpuset a proc bound to "obj" is to get: every cpu of the
+ * object, less any cpu this job is not permitted to use.
+ *
+ * Binding to an object means binding to the whole object - but "the whole
+ * object" has to be read within the cpu-set the user restricted the job to.
+ * This used to hand back obj->cpuset raw, so a DVM cpu-set was honored by
+ * --bind-to core (where the object is inside the set anyway) and silently
+ * ignored by --bind-to package or numa: the rank came back owning every core
+ * of the object. The documented intent is the opposite - see the cpu_list
+ * comment in src/hwloc/hwloc.c.
+ *
+ * The constraint is taken from node->jobcache, the node's availability as
+ * this job first found it, because that is where a DVM-wide cpu-set has
+ * already been applied and - unlike node->available - it does not shrink as
+ * procs are placed. Every proc bound to the same object therefore gets the
+ * same answer. A per-job --cpu-set does not narrow node->available at all,
+ * so it is applied separately from options->job_cpuset.
+ *
+ * With no cpu-set in force the intersection is a no-op: jobcache is then the
+ * node's entire allowed set.
+ */
+static void set_proc_cpuset(prte_proc_t *proc, prte_node_t *node,
+                            hwloc_obj_t obj, prte_rmaps_options_t *options)
+{
+    hwloc_bitmap_and(prte_rmaps_base.baseset, obj->cpuset, node->jobcache);
+    if (NULL != options->cpuset) {
+        hwloc_bitmap_and(prte_rmaps_base.baseset, prte_rmaps_base.baseset,
+                         options->job_cpuset);
+    }
+    if (hwloc_bitmap_iszero(prte_rmaps_base.baseset)) {
+        /* Should be unreachable - this object was chosen precisely because it
+         * had free cpus in this intersection. Bind to the object rather than
+         * to nothing: the paths that do not run through get_target_nodes
+         * (colocation) never populate jobcache. */
+        hwloc_bitmap_copy(prte_rmaps_base.baseset, obj->cpuset);
+    }
+    hwloc_bitmap_list_asprintf(&proc->cpuset, prte_rmaps_base.baseset);
+}
+
 static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
                         prte_node_t *node, hwloc_obj_t obj,
                         prte_rmaps_options_t *options)
@@ -113,7 +152,12 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
         hwloc_bitmap_and(prte_rmaps_base.available, node->available, tmpcpus);
         hwloc_bitmap_and(prte_rmaps_base.available, prte_rmaps_base.available, prte_rmaps_base.baseset);
 
-        if (options->use_hwthreads) {
+        if (options->use_hwthreads || HWLOC_OBJ_PU == options->hwb) {
+            /* count available hwthreads when treating them as cpus, or when
+             * the binding target itself is a hwthread - a single PU is finer
+             * than a core, so counting whole cores "inside" it would yield
+             * zero on an SMT topology and wrongly reject every PU
+             */
             ncpus = hwloc_bitmap_weight(prte_rmaps_base.available);
         } else {
             /* if we are treating cores as cpus, then we really
@@ -136,6 +180,49 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
         }
     }
     if (NULL == trg_obj) {
+        /* None of the candidate objects has a free CPU. If overload binding
+         * is permitted, this is not an error: the node is oversubscribed -
+         * typically because another still-running job (e.g., the parent of a
+         * PMIx_Spawn) already consumed the CPUs - and the caller has
+         * explicitly accepted binding more procs to a CPU than there are
+         * CPUs. Pick a target object by round-robin (the one carrying the
+         * fewest procs from this pass) and bind to it anyway. We deliberately
+         * do not consume node->available here: those CPUs remain accounted to
+         * whatever job holds them, so a later job that does not allow overload
+         * still sees the node as full and is not bound on top of them. */
+        if (options->overload) {
+            unsigned least = 0;
+            for (n = 0; n < nobjs; n++) {
+                tmp_obj = prte_hwloc_base_get_obj_by_type(node->topology->topo,
+                                                          options->hwb, n);
+                if (NULL == tmp_obj) {
+                    continue;
+                }
+                if (NULL == tmp_obj->userdata) {
+                    objcnt = PMIX_NEW(prte_hwloc_obj_data_t);
+                    tmp_obj->userdata = (void *) objcnt;
+                } else {
+                    objcnt = (prte_hwloc_obj_data_t *) tmp_obj->userdata;
+                }
+                if (NULL == trg_obj || objcnt->nprocs < least) {
+                    least = objcnt->nprocs;
+                    trg_obj = tmp_obj;
+                }
+            }
+            if (NULL == trg_obj) {
+                PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                return PRTE_ERR_SILENT;
+            }
+            objcnt = (prte_hwloc_obj_data_t *) trg_obj->userdata;
+            objcnt->nprocs++;
+            set_proc_cpuset(proc, node, trg_obj, options);
+            pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
+                                "%s BOUND PROC %s[%s] TO %s (overloaded)",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                PRTE_NAME_PRINT(&proc->name), node->name,
+                                (NULL == proc->cpuset) ? "NULL" : proc->cpuset);
+            return PRTE_SUCCESS;
+        }
         /* there aren't any appropriate targets under this object */
         if (PRTE_BINDING_REQUIRED(jdata->map->binding)) {
             pmix_show_help("help-prte-rmaps-base.txt", "rmaps:no-available-cpus", true, node->name);
@@ -145,11 +232,10 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
         }
     }
 
-    tgtcpus = trg_obj->cpuset;
-    if (NULL == tgtcpus) {
+    if (NULL == trg_obj->cpuset) {
         return PRTE_ERROR;
     }
-    hwloc_bitmap_list_asprintf(&proc->cpuset, tgtcpus); // bind to the entire target object
+    set_proc_cpuset(proc, node, trg_obj, options);
     if (4 < pmix_output_get_verbosity(prte_rmaps_base_framework.framework_output)) {
         char *tmp1;
         bool physical;
@@ -177,6 +263,17 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
     tmp_obj = hwloc_get_obj_inside_cpuset_by_type(node->topology->topo,
                                                   prte_rmaps_base.available,
                                                   type, 0);
+    if (NULL == tmp_obj && HWLOC_OBJ_CORE == type) {
+        /* the binding target is finer than a core (e.g. --bind-to hwthread
+         * while treating cores as cpus): the consumed core is not *inside*
+         * the target's cpuset, it *covers* it. Consume the containing core so
+         * the whole core is accounted for - one process per core. */
+        tmp_obj = hwloc_get_obj_covering_cpuset(node->topology->topo,
+                                                prte_rmaps_base.available);
+        while (NULL != tmp_obj && HWLOC_OBJ_CORE != tmp_obj->type) {
+            tmp_obj = tmp_obj->parent;
+        }
+    }
     if (NULL == tmp_obj) {
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
         if (PRTE_BINDING_REQUIRED(jdata->map->binding)) {
@@ -304,8 +401,7 @@ static int bind_multiple(prte_job_t *jdata, prte_proc_t *proc,
     hwloc_obj_type_t type;
     hwloc_cpuset_t result, tgtcpus;
     hwloc_obj_t target, tmp_obj, pkg;
-    uint16_t n;
-    unsigned npkgs, ncpus;
+    unsigned n, npkgs, ncpus;
     bool moveon = false;
     PRTE_HIDE_UNUSED_PARAMS(jdata);
 
@@ -314,6 +410,11 @@ static int bind_multiple(prte_job_t *jdata, prte_proc_t *proc,
                         PRTE_NAME_PRINT(&proc->name),
                         options->cpus_per_rank);
 
+    /* the caller's per-node scratch cpuset is what we carve the envelope
+     * out of - bind_generic makes the same check */
+    if (NULL == options->target) {
+        return PRTE_ERROR;
+    }
     /* initialize */
     result = hwloc_bitmap_alloc();
     hwloc_bitmap_zero(result);

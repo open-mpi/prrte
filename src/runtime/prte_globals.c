@@ -54,6 +54,7 @@
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 
+#include "src/mca/ras/base/base.h"
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/runtime.h"
 #include "src/runtime/runtime_internals.h"
@@ -73,12 +74,59 @@ char *prte_tool_basename = NULL;
 char *prte_tool_actual = NULL;
 bool prte_dvm_ready = false;
 pmix_pointer_array_t *prte_cache = NULL;
+
+int prte_dvm_launch_fence = 0;
+pmix_pointer_array_t *prte_held_jobs = NULL;
+pmix_pointer_array_t *prte_prelaunch_held_jobs = NULL;
+pmix_list_t prte_shrink_campaigns;
+pmix_list_t prte_grow_campaigns;
+
+static void campaign_construct(prte_shrink_campaign_t *p)
+{
+    /* zero the pointer/count fields: PMIX_NEW does not zero the object, and the
+     * creators set alloc_id/req_id only when the corresponding key is present,
+     * so without this the destructor would free() uninitialized garbage. */
+    p->targets = NULL;
+    p->ntargets = 0;
+    p->pending = 0;
+    PMIX_PROC_LOAD(&p->requester, NULL, PMIX_RANK_INVALID);
+    p->alloc_id = NULL;
+    p->req_id = NULL;
+    p->have_requester = false;
+}
+static void campaign_destruct(prte_shrink_campaign_t *p)
+{
+    free(p->targets);
+    free(p->alloc_id);
+    free(p->req_id);
+}
+PMIX_CLASS_INSTANCE(prte_shrink_campaign_t, pmix_list_item_t,
+                    campaign_construct, campaign_destruct);
+
+static void grow_campaign_construct(prte_grow_campaign_t *p)
+{
+    p->targets = NULL;
+    p->ntargets = 0;
+    PMIX_PROC_LOAD(&p->requester, NULL, PMIX_RANK_INVALID);
+    p->alloc_id = NULL;
+    p->req_id = NULL;
+    p->have_requester = false;
+}
+static void grow_campaign_destruct(prte_grow_campaign_t *p)
+{
+    free(p->targets);
+    free(p->alloc_id);
+    free(p->req_id);
+}
+PMIX_CLASS_INSTANCE(prte_grow_campaign_t, pmix_list_item_t,
+                    grow_campaign_construct, grow_campaign_destruct);
 bool prte_persistent = true;
 bool prte_allow_run_as_root = false;
 bool prte_fwd_environment = false;
 bool prte_show_launch_progress = false;
 bool prte_bootstrap_setup = false;
 bool prte_xml_output = false;
+bool prte_elastic_mode = false;
 
 /* PRTE OOB port flags */
 bool prte_static_ports = false;
@@ -100,7 +148,6 @@ char **prte_launch_environ = NULL;
 
 bool prte_hnp_is_allocated = false;
 bool prte_allocation_required = false;
-bool prte_managed_allocation = false;
 char *prte_set_slots = NULL;
 bool prte_set_slots_override = false;
 bool prte_nidmap_communicated = false;
@@ -117,6 +164,7 @@ bool prte_routing_is_enabled = true;
 bool prte_dvm_abort_ordered = false;
 bool prte_prteds_term_ordered = false;
 bool prte_allowed_exit_without_sync = false;
+bool prte_dvm_leaving = false;
 
 int prte_timeout_usec_per_proc = -1;
 float prte_max_timeout = -1.0;
@@ -298,7 +346,7 @@ prte_session_t *prte_get_session_object_from_id(const char *id)
             continue;
         }
         if (NULL == session->alloc_refid) {
-	     continue;
+            continue;
         }
         if (0 == strcasecmp(session->alloc_refid, id)) {
             return session;
@@ -323,6 +371,9 @@ prte_session_t *prte_get_session_object_from_refid(const char *refid)
     for (i = 0; i < prte_sessions->size; i++) {
         session = (prte_session_t *) pmix_pointer_array_get_item(prte_sessions, i);
         if (NULL == session) {
+            continue;
+        }
+        if (NULL == session->user_refid) {
             continue;
         }
         if (0 == strcasecmp(session->user_refid, refid)) {
@@ -365,25 +416,6 @@ int prte_set_session_object(prte_session_t *session)
         pmix_pointer_array_set_item(prte_sessions, save, session);
     }
     return PRTE_SUCCESS;
-}
-
-bool prte_sessions_related(prte_session_t *session1, prte_session_t *session2){
-    int n;
-    prte_session_t *session_ptr;
-
-    if(session1->session_id == session2->session_id){
-        return true;
-    }
-
-    for (n = 0; n < session1->children->size; n++){
-        session_ptr = (prte_session_t *) pmix_pointer_array_get_item(session1->children, n);
-        if (NULL != session_ptr) {
-            if (session_ptr->session_id == session2->session_id) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 prte_proc_t *prte_get_proc_object(const pmix_proc_t *proc)
@@ -445,11 +477,41 @@ prte_node_rank_t prte_get_proc_node_rank(const pmix_proc_t *proc)
     return proct->node_rank;
 }
 
+/* does this node answer to either the name as given or the name it was
+ * resolved to?  Kept in one place so the list walk and the pool walk below
+ * cannot drift apart. */
+static bool node_answers_to(prte_node_t *nptr, const char *name, const char *nm)
+{
+    int m;
+
+    if (NULL == nptr->name) {
+        return false;
+    }
+    if (0 == strcmp(nptr->name, nm)) {
+        return true;
+    }
+    if (NULL == nptr->aliases) {
+        return false;
+    }
+    /* no choice but an exhaustive search - fortunately, these lists are short! */
+    for (m = 0; NULL != nptr->aliases[m]; m++) {
+        if (0 == strcmp(name, nptr->aliases[m])) {
+            /* this is the node! */
+            return true;
+        }
+    }
+    return false;
+}
+
 prte_node_t* prte_node_match(pmix_list_t *nodes, const char *name)
 {
-    int m, n;
+    int n;
     prte_node_t *nptr;
     char *nm;
+
+    if (NULL == name) {
+        return NULL;
+    }
 
     /* does the name refer to me? */
     if (prte_check_host_is_local(name)) {
@@ -460,40 +522,25 @@ prte_node_t* prte_node_match(pmix_list_t *nodes, const char *name)
 
     if (NULL != nodes) {
         PMIX_LIST_FOREACH(nptr, nodes, prte_node_t) {
-            if (0 == strcmp(nptr->name, nm)) {
+            if (node_answers_to(nptr, name, nm)) {
                 return nptr;
-            }
-            if (NULL == nptr->aliases) {
-                continue;
-            }
-            /* no choice but an exhaustive search - fortunately, these lists are short! */
-            for (m = 0; NULL != nptr->aliases[m]; m++) {
-                if (0 == strcmp(name, nptr->aliases[m])) {
-                    /* this is the node! */
-                    return nptr;
-                }
             }
         }
-    } else {
-        /* check the node pool */
-        for (n=0; n < prte_node_pool->size; n++) {
-            nptr = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, n);
-            if (NULL == nptr) {
-                continue;
-            }
-            if (0 == strcmp(nptr->name, nm)) {
-                return nptr;
-            }
-            if (NULL == nptr->aliases) {
-                continue;
-            }
-            /* no choice but an exhaustive search - fortunately, these lists are short! */
-            for (m = 0; NULL != nptr->aliases[m]; m++) {
-                if (0 == strcmp(name, nptr->aliases[m])) {
-                    /* this is the node! */
-                    return nptr;
-                }
-            }
+        return NULL;
+    }
+
+    /* check the node pool - which may not exist yet if we are being
+     * called before prte_init laid out the global arrays */
+    if (NULL == prte_node_pool) {
+        return NULL;
+    }
+    for (n=0; n < prte_node_pool->size; n++) {
+        nptr = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, n);
+        if (NULL == nptr) {
+            continue;
+        }
+        if (node_answers_to(nptr, name, nm)) {
+            return nptr;
         }
     }
 
@@ -653,6 +700,10 @@ static void prte_job_construct(prte_job_t *job)
     PMIX_DATA_BUFFER_CONSTRUCT(&job->launch_msg);
     PMIX_CONSTRUCT(&job->children, pmix_list_t);
     PMIX_LOAD_NSPACE(job->launcher, NULL);
+    job->uid = PRTE_INVALID_UID;
+    job->gid = PRTE_INVALID_GID;
+    job->target_sessions = NULL;
+    job->num_target_sessions = 0;
     job->ntraces = 0;
     job->traces = NULL;
     PMIX_CONSTRUCT(&job->cli, pmix_cli_result_t);
@@ -747,6 +798,12 @@ static void prte_job_destruct(prte_job_t *job)
     if (NULL != job->traces) {
         PMIx_Argv_free(job->traces);
     }
+    /* target_sessions holds borrowed session pointers - free only the array */
+    if (NULL != job->target_sessions) {
+        free(job->target_sessions);
+        job->target_sessions = NULL;
+    }
+    job->num_target_sessions = 0;
     PMIX_DESTRUCT(&job->cli);
 }
 
@@ -781,6 +838,7 @@ static void prte_node_construct(prte_node_t *node)
 
     node->flags = 0;
     PMIX_CONSTRUCT(&node->attributes, pmix_list_t);
+    node->session = NULL;
 }
 
 static void prte_node_destruct(prte_node_t *node)
@@ -814,12 +872,24 @@ static void prte_node_destruct(prte_node_t *node)
     for (i = 0; i < node->procs->size; i++) {
         if (NULL != (proc = (prte_proc_t *) pmix_pointer_array_get_item(node->procs, i))) {
             pmix_pointer_array_set_item(node->procs, i, NULL);
+            /* the proc borrows its backpointer to us, so clear it before we
+             * go away - a proc can outlive its node (its job holds a
+             * reference too) */
+            if (proc->node == node) {
+                proc->node = NULL;
+            }
             PMIX_RELEASE(proc);
         }
     }
     PMIX_RELEASE(node->procs);
 
-    /* do NOT destroy the topology */
+    /* release our reference to the topology - the topology object itself
+     * lives until the last node pointing at it (and the entry in
+     * prte_node_topologies) has been released */
+    if (NULL != node->topology) {
+        PMIX_RELEASE(node->topology);
+        node->topology = NULL;
+    }
 
     // release any diffs
     if (NULL != node->topodiff) {
@@ -828,6 +898,9 @@ static void prte_node_destruct(prte_node_t *node)
 
     /* release the attributes */
     PMIX_LIST_DESTRUCT(&node->attributes);
+
+    /* the session backpointer is borrowed, not retained - just clear it */
+    node->session = NULL;
 }
 
 PMIX_CLASS_INSTANCE(prte_node_t, pmix_list_item_t,
@@ -856,10 +929,14 @@ static void prte_proc_construct(prte_proc_t *proc)
 
 static void prte_proc_destruct(prte_proc_t *proc)
 {
-    if (NULL != proc->node) {
-        PMIX_RELEASE(proc->node);
-        proc->node = NULL;
-    }
+    /* proc->node is a BORROWED backpointer - the node is owned by
+     * prte_node_pool (and by any job map that retained it), and it is
+     * cleared by prte_node_destruct on the procs it knows about. Retaining
+     * it here would form a reference cycle with node->daemon /
+     * node->procs, which both hold real references: neither object could
+     * then ever reach a zero count, so neither destructor would run and
+     * every node and proc would leak. */
+    proc->node = NULL;
     if (NULL != proc->cpuset) {
         free(proc->cpuset);
         proc->cpuset = NULL;
@@ -877,8 +954,6 @@ PMIX_CLASS_INSTANCE(prte_proc_t, pmix_list_item_t,
 
 static void prte_job_map_construct(prte_job_map_t *map)
 {
-    map->req_mapper = NULL;
-    map->last_mapper = NULL;
     map->mapping = 0;
     map->ranking = 0;
     map->binding = 0;
@@ -896,12 +971,6 @@ static void prte_job_map_destruct(prte_job_map_t *map)
     int32_t i;
     prte_node_t *node;
 
-    if (NULL != map->req_mapper) {
-        free(map->req_mapper);
-    }
-    if (NULL != map->last_mapper) {
-        free(map->last_mapper);
-    }
     for (i = 0; i < map->nodes->size; i++) {
         if (NULL != (node = (prte_node_t *) pmix_pointer_array_get_item(map->nodes, i))) {
             PMIX_RELEASE(node);
@@ -933,13 +1002,11 @@ static void tcon(prte_topology_t *t)
 }
 static void tdes(prte_topology_t *t)
 {
-    hwloc_obj_t root;
-
     if (NULL != t->topo) {
-        root = hwloc_get_root_obj(t->topo);
-        if (NULL != root->userdata) {
-            PMIX_RELEASE(root->userdata);
-        }
+        /* the root carries a topology summary, but placement also attaches
+         * a counter object to every object it considers - all of them have
+         * to go back before hwloc frees the objects holding them */
+        prte_hwloc_base_release_userdata(t->topo);
         hwloc_topology_destroy(t->topo);
     }
 }
@@ -948,11 +1015,16 @@ PMIX_CLASS_INSTANCE(prte_topology_t, pmix_object_t,
 
 static void session_con(prte_session_t *s)
 {
+    s->flags = 0;
     s->index = -1;
     s->session_id = UINT32_MAX;
     s->user_refid = NULL;
     s->alloc_refid = NULL;
+    s->alloc_module = NULL;
     memset(&s->timeout, 0, sizeof(struct timeval));
+    s->timer = NULL;
+    s->results = NULL;
+    s->nresults = 0;
     s->nodes = PMIX_NEW(pmix_pointer_array_t);
     pmix_pointer_array_init(s->nodes, PRTE_GLOBAL_ARRAY_BLOCK_SIZE,
                             PRTE_GLOBAL_ARRAY_MAX_SIZE,
@@ -961,17 +1033,34 @@ static void session_con(prte_session_t *s)
     pmix_pointer_array_init(s->jobs, PRTE_GLOBAL_ARRAY_BLOCK_SIZE,
                             PRTE_GLOBAL_ARRAY_MAX_SIZE,
                             PRTE_GLOBAL_ARRAY_BLOCK_SIZE);
-    s->children = PMIX_NEW(pmix_pointer_array_t);
-    pmix_pointer_array_init(s->children, PRTE_GLOBAL_ARRAY_BLOCK_SIZE,
-                            PRTE_GLOBAL_ARRAY_MAX_SIZE,
-                            PRTE_GLOBAL_ARRAY_BLOCK_SIZE);
+    s->owners = NULL;
+    PMIX_LOAD_NSPACE(s->owner, NULL);
+    s->owner_job = NULL;
+    PMIX_LOAD_PROCID(&s->requestor, NULL, PMIX_RANK_INVALID);
+    s->owner_uid = PRTE_INVALID_UID;
+    s->inheritance = PRTE_INHERIT_DEFAULT_VALUE;
 }
 static void session_des(prte_session_t *s)
 {
     int n;
     prte_node_t *nd;
     prte_job_t *job;
-    prte_session_t *session;
+
+    /* notify the RAS so it can release the underlying allocation */
+    prte_ras_base_release_allocation(s);
+
+    /* disarm the session time limit, if one was in force - the event holds a
+     * bare pointer to us and would fire on freed memory */
+    if (NULL != s->timer) {
+        prte_event_evtimer_del(s->timer->ev);
+        PMIX_RELEASE(s->timer);
+        s->timer = NULL;
+    }
+    if (NULL != s->results) {
+        PMIX_INFO_FREE(s->results, s->nresults);
+        s->results = NULL;
+        s->nresults = 0;
+    }
 
     if (NULL != s->user_refid) {
         free(s->user_refid);
@@ -979,41 +1068,141 @@ static void session_des(prte_session_t *s)
     if (NULL != s->alloc_refid) {
         free(s->alloc_refid);
     }
+    if (NULL != s->alloc_module) {
+        free(s->alloc_module);
+    }
 
     for (n=0; n < s->nodes->size; n++) {
         nd = (prte_node_t*)pmix_pointer_array_get_item(s->nodes, n);
         if (NULL != nd) {
-            PMIX_RELEASE(nd);
+            /* The node's session backpointer is borrowed, so it does not keep
+             * us alive - which means a node that survives this release (the
+             * global pool holds its own reference) would be left pointing at
+             * freed memory. Clear it while the node is still here. Must come
+             * BEFORE the release, which may be the node's last. */
+            if (nd->session == s) {
+                nd->session = NULL;
+            }
             pmix_pointer_array_set_item(s->nodes, n, NULL);
+            PMIX_RELEASE(nd);
         }
     }
     PMIX_RELEASE(s->nodes);
 
+    /* Unlike the node array, s->jobs holds BORROWED references: a job is
+     * added to it without a retain and removed from it without a release
+     * when the job terminates. A job's lifetime is governed by the global
+     * job pool, not by the session it ran in, so releasing here would drop
+     * a reference this session never took. */
     for (n=0; n < s->jobs->size; n++) {
         job = (prte_job_t*)pmix_pointer_array_get_item(s->jobs, n);
         if (NULL != job) {
-            PMIX_RELEASE(job);
             pmix_pointer_array_set_item(s->jobs, n, NULL);
         }
     }
     PMIX_RELEASE(s->jobs);
 
-    for (n=0; n < s->children->size; n++) {
-        session = (prte_session_t*)pmix_pointer_array_get_item(s->children, n);
-        if (NULL != session) {
-            PMIX_RELEASE(session);
-            pmix_pointer_array_set_item(s->children, n, NULL);
-        }
+    if (NULL != s->owners) {
+        PMIx_Argv_free(s->owners);
+        s->owners = NULL;
     }
-    PMIX_RELEASE(s->children);
+    /* balance the PMIX_RETAIN taken in create_reservation */
+    if (NULL != s->owner_job) {
+        PMIX_RELEASE(s->owner_job);
+        s->owner_job = NULL;
+    }
     // remove this from the global array
     if (0 <= s->index) {
         pmix_pointer_array_set_item(prte_sessions, s->index, NULL);
     }
 }
+/* The parent class here has to be pmix_object_t, because that is what
+ * prte_session_t actually embeds. Declaring pmix_list_item_t made the class
+ * system run pmix_list_item_t's constructor and destructor over a struct
+ * that has no room for one: next/prev and the debug bookkeeping land on top
+ * of the session's own leading fields. The constructor damage is masked
+ * because session_con runs afterwards and rewrites those fields, but the
+ * destructor is not - pmix_list_item_destruct asserts that the item is not
+ * still linked into a list, and reads that "refcount" out of the middle of
+ * the session's own data. Releasing any session under a debug PMIx
+ * therefore aborted the process; it went unnoticed only because the one
+ * session that always exists, prte_default_session, is never released.
+ * A session lives in prte_sessions (a pointer array) and is never placed on
+ * a pmix_list_t, so it needs nothing pmix_list_item_t provides. */
 PMIX_CLASS_INSTANCE(prte_session_t,
-                    pmix_list_item_t,
+                    pmix_object_t,
                     session_con, session_des);
+
+bool prte_session_is_owned_by(prte_session_t *session,
+                              const pmix_nspace_t nspace)
+{
+    prte_job_t *jdata;
+    int n;
+
+    /* the default session is usable by everyone */
+    if (NULL == session || session == prte_default_session) {
+        return true;
+    }
+    /* The scheduler is an implicit owner of every session - but only if
+     * there IS one. PMIX_CHECK_NSPACE answers "true" when either side is an
+     * empty nspace (that is its wildcard rule), and scheduler.nspace is
+     * empty until a scheduler connects. Testing it unguarded therefore
+     * declared every namespace to be the scheduler on every DVM running
+     * without one, which is the common case - and that turned the whole
+     * reservation ownership check into an unconditional "yes". */
+    if (!PMIX_NSPACE_INVALID(prte_pmix_server_globals.scheduler.nspace) &&
+        PMIX_CHECK_NSPACE(prte_pmix_server_globals.scheduler.nspace, nspace)) {
+        return true;
+    }
+    if (NULL != session->owners) {
+        for (n = 0; NULL != session->owners[n]; n++) {
+            if (PMIX_CHECK_NSPACE(session->owners[n], nspace)) {
+                return true;
+            }
+        }
+    }
+
+    /* The namespace test above is what keeps other JOBS in this DVM out of
+     * somebody else's allocation, and it is the whole answer for them. It is
+     * not the whole answer for a TOOL: a tool namespace is minted per
+     * invocation, so the reservation a user's first command created could
+     * never be named by their second one - and once that first command
+     * exited, its namespace was gone and the allocation was unreachable by
+     * anybody at all. The user is the other half of the identity here, so a
+     * tool presenting the uid the reservation was granted to may act on it:
+     * spawn into it, extend it, release it. An application job never reaches
+     * this - it is not a tool, and its namespace is its identity. */
+    if (PRTE_INVALID_UID == session->owner_uid) {
+        return false;
+    }
+    jdata = prte_get_job_data_object(nspace);
+    if (NULL == jdata ||
+        !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL) ||
+        PRTE_INVALID_UID == jdata->uid) {
+        return false;
+    }
+    return (jdata->uid == session->owner_uid);
+}
+
+void prte_session_add_owner(prte_session_t *session,
+                            const pmix_nspace_t nspace)
+{
+    int n;
+
+    /* the default session is owned by everyone - nothing to record */
+    if (NULL == session || session == prte_default_session) {
+        return;
+    }
+    if (NULL != session->owners) {
+        for (n = 0; NULL != session->owners[n]; n++) {
+            if (PMIX_CHECK_NSPACE(session->owners[n], nspace)) {
+                /* already present */
+                return;
+            }
+        }
+    }
+    PMIx_Argv_append_nosize(&session->owners, nspace);
+}
 
 #if PRTE_PICKY_COMPILERS
 void prte_hide_unused_params(int x, ...)

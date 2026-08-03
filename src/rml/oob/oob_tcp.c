@@ -76,8 +76,6 @@
 
 prte_oob_base_t prte_oob_base = {
     .output = -1,
-    .addr_count = 0,
-    .num_links = 0,
     .max_retries = 0,
     .max_uri_length = -1,
     .events = PMIX_LIST_STATIC_INIT,
@@ -113,9 +111,6 @@ prte_oob_base_t prte_oob_base = {
     .max_recon_attempts = 0
 };
 
-static void split_and_resolve(char **orig_str, char *name,
-                              char ***interfaces);
-
 int prte_oob_open(void)
 {
     pmix_pif_t *copied_interface, *selected_interface;
@@ -137,7 +132,6 @@ int prte_oob_open(void)
         prte_oob_base.listen_thread_tv.tv_sec = 3600;
         prte_oob_base.listen_thread_tv.tv_usec = 0;
     }
-    prte_oob_base.addr_count = 0;
     prte_oob_base.ipv4conns = NULL;
     prte_oob_base.ipv4ports = NULL;
     prte_oob_base.ipv6conns = NULL;
@@ -153,12 +147,12 @@ int prte_oob_open(void)
      * subnet+mask
      */
     if (NULL != prte_if_include) {
-        split_and_resolve(&prte_if_include,
-                          "include", &interfaces);
+        prte_oob_split_and_resolve(&prte_if_include,
+                                   "include", &interfaces);
         including = true;
     } else if (NULL != prte_if_exclude) {
-        split_and_resolve(&prte_if_exclude,
-                          "exclude", &interfaces);
+        prte_oob_split_and_resolve(&prte_if_exclude,
+                                   "exclude", &interfaces);
     }
 
     /* if we are the master, then check the interfaces for loopbacks
@@ -269,6 +263,7 @@ int prte_oob_open(void)
         }
         copied_interface = PMIX_NEW(pmix_pif_t);
         if (NULL == copied_interface) {
+            PMIx_Argv_free(interfaces);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
         pmix_string_copy(copied_interface->if_name, selected_interface->if_name, PMIX_IF_NAMESIZE);
@@ -301,11 +296,17 @@ int prte_oob_open(void)
         && 0 == PMIx_Argv_count(prte_oob_base.ipv6conns)
 #endif
     ) {
+        /* say so: this is reachable straight from user input (an if_include or
+         * if_exclude that leaves nothing), and the caller can only turn the
+         * bare error code into an abort */
+        pmix_show_help("help-oob-tcp.txt", "no-interfaces", true,
+                       prte_process_info.nodename);
         return PRTE_ERR_NOT_AVAILABLE;
     }
 
     // start the listeners
     if (PRTE_SUCCESS != (rc = prte_oob_tcp_start_listening())) {
+        pmix_show_help("help-oob-tcp.txt", "no-listeners", true);
         PRTE_ERROR_LOG(rc);
     }
     return rc;
@@ -330,6 +331,29 @@ void prte_oob_close(void)
 
     PMIX_LIST_DESTRUCT(&prte_oob_base.local_ifs);
     PMIX_LIST_DESTRUCT(&prte_oob_base.peers);
+    /* the listener objects and the parsed port ranges are ours too - this tree
+     * is kept valgrind-clean, so tear down everything prte_oob_open and
+     * prte_oob_register built */
+    PMIX_LIST_DESTRUCT(&prte_oob_base.listeners);
+
+    if (NULL != prte_oob_base.tcp_static_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp_static_ports);
+        prte_oob_base.tcp_static_ports = NULL;
+    }
+    if (NULL != prte_oob_base.tcp_dyn_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp_dyn_ports);
+        prte_oob_base.tcp_dyn_ports = NULL;
+    }
+#if PRTE_ENABLE_IPV6
+    if (NULL != prte_oob_base.tcp6_static_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp6_static_ports);
+        prte_oob_base.tcp6_static_ports = NULL;
+    }
+    if (NULL != prte_oob_base.tcp6_dyn_ports) {
+        PMIx_Argv_free(prte_oob_base.tcp6_dyn_ports);
+        prte_oob_base.tcp6_dyn_ports = NULL;
+    }
+#endif
 
     if (NULL != prte_oob_base.ipv4conns) {
         PMIx_Argv_free(prte_oob_base.ipv4conns);
@@ -544,11 +568,24 @@ int prte_oob_register(void)
                                         "Max number of times to attempt connection before giving up (-1 -> never give up)",
                                         PMIX_MCA_BASE_VAR_TYPE_INT,
                                         &prte_oob_base.max_recon_attempts);
+
+    prte_oob_base.retry_max_delay = 0;
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "retry_max_delay",
+                                        "Maximum delay (in sec) between connection retries. When larger than retry_delay, the delay backs off exponentially up to this cap; 0 keeps the delay fixed at retry_delay",
+                                        PMIX_MCA_BASE_VAR_TYPE_INT,
+                                        &prte_oob_base.retry_max_delay);
+
+    prte_oob_base.connect_max_time = 0;
+    (void) pmix_mca_base_var_register("prte", "prte", NULL, "connect_max_time",
+                                        "Maximum time (in sec) to keep retrying a connection to a non-lifeline peer before giving up so the routing tree can heal to an ancestor; 0 means retry forever",
+                                        PMIX_MCA_BASE_VAR_TYPE_INT,
+                                        &prte_oob_base.connect_max_time);
+
     prte_oob_base.max_msg_size = 100;
     (void) pmix_mca_base_var_register("prte", "prte", NULL, "max_msg_size",
                                         "Max size of an OOB message in Megabytes(default = 100)",
                                         PMIX_MCA_BASE_VAR_TYPE_INT,
-                                        &prte_oob_base.max_recon_attempts);
+                                        &prte_oob_base.max_msg_size);
 
     return PRTE_SUCCESS;
 }
@@ -605,52 +642,6 @@ void prte_oob_accept_connection(const int accepted_fd, const struct sockaddr *ad
      *  process ident message to complete this connection
      */
     PRTE_ACTIVATE_TCP_ACCEPT_STATE(accepted_fd, addr, recv_handler);
-}
-
-/* API functions */
-void prte_oob_ping(const pmix_proc_t *proc)
-{
-    prte_oob_tcp_peer_t *peer;
-
-    pmix_output_verbose(2, prte_oob_base.output,
-                        "%s:[%s:%d] processing ping to peer %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                        __FILE__, __LINE__, PRTE_NAME_PRINT(proc));
-
-    /* do we know this peer? */
-    if (NULL == (peer = prte_oob_tcp_peer_lookup(proc))) {
-        /* push this back to the component so it can try
-         * another module within this transport. If no
-         * module can be found, the component can push back
-         * to the framework so another component can try
-         */
-        pmix_output_verbose(2, prte_oob_base.output,
-                            "%s:[%s:%d] hop %s unknown", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                            __FILE__, __LINE__, PRTE_NAME_PRINT(proc));
-        PRTE_ACTIVATE_TCP_MSG_ERROR(NULL, NULL, proc, prte_mca_oob_tcp_component_hop_unknown);
-        return;
-    }
-
-    /* if we are already connected, there is nothing to do */
-    if (MCA_OOB_TCP_CONNECTED == peer->state) {
-        pmix_output_verbose(2, prte_oob_base.output,
-                            "%s:[%s:%d] already connected to peer %s",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), __FILE__, __LINE__,
-                            PRTE_NAME_PRINT(proc));
-        return;
-    }
-
-    /* if we are already connecting, there is nothing to do */
-    if (MCA_OOB_TCP_CONNECTING == peer->state || MCA_OOB_TCP_CONNECT_ACK == peer->state) {
-        pmix_output_verbose(2, prte_oob_base.output,
-                            "%s:[%s:%d] already connecting to peer %s",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), __FILE__, __LINE__,
-                            PRTE_NAME_PRINT(proc));
-        return;
-    }
-
-    /* attempt the connection */
-    peer->state = MCA_OOB_TCP_CONNECTING;
-    PRTE_ACTIVATE_TCP_CONN_STATE(peer, prte_oob_tcp_peer_try_connect);
 }
 
 /*
@@ -721,8 +712,8 @@ cleanup:
  * (a.b.c.d/e), resolve them to an interface name (Currently only
  * supporting IPv4).  If unresolvable, warn and remove.
  */
-static void split_and_resolve(char **orig_str, char *name,
-                              char ***interfaces)
+void prte_oob_split_and_resolve(char **orig_str, char *name,
+                                char ***interfaces)
 {
     pmix_pif_t *selected_interface;
     int i, n, ret, match_count;
@@ -737,6 +728,15 @@ static void split_and_resolve(char **orig_str, char *name,
         return;
     }
 
+    /* If there is no list to collect into, then there is nothing to
+     * resolve against and nothing for the caller to consult afterwards -
+     * just discard the specification */
+    if (NULL == interfaces) {
+        free(*orig_str);
+        *orig_str = NULL;
+        return;
+    }
+
     argv = PMIx_Argv_split(*orig_str, ',');
     if (NULL == argv) {
         return;
@@ -745,9 +745,9 @@ static void split_and_resolve(char **orig_str, char *name,
         if (isalpha(argv[i][0])) {
             /* This is an interface name. If not already in the interfaces array, add it */
             found = false;
-            if (NULL != interfaces) {
-                for (n = 0; NULL != interfaces[n]; n++) {
-                    if (0 == strcmp(argv[i], *interfaces[n])) {
+            if (NULL != *interfaces) {
+                for (n = 0; NULL != (*interfaces)[n]; n++) {
+                    if (0 == strcmp(argv[i], (*interfaces)[n])) {
                         found = true;
                         break;
                     }
@@ -771,7 +771,6 @@ static void split_and_resolve(char **orig_str, char *name,
             pmix_show_help("help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename,
                            tmp, "Invalid specification (missing \"/\")");
-            free(argv[i]);
             free(tmp);
             continue;
         }
@@ -782,7 +781,6 @@ static void split_and_resolve(char **orig_str, char *name,
         ((struct sockaddr*) &argv_inaddr)->sa_family = AF_INET;
         ret = inet_pton(AF_INET, argv[i],
                         &((struct sockaddr_in*) &argv_inaddr)->sin_addr);
-        free(argv[i]);
 
         if (1 != ret) {
             pmix_show_help("help-oob-tcp.txt", "invalid if_inexclude",
@@ -798,14 +796,21 @@ static void split_and_resolve(char **orig_str, char *name,
                             pmix_net_get_hostname((struct sockaddr*) &argv_inaddr),
                             argv_prefix);
 
-        /* Go through all interfaces and see if we can find a match */
+        /* Go through all interfaces and see if we can find a match.
+         *
+         * Compare against each entry's own address, not the one
+         * pmix_ifkindextoaddr() returns for its kernel index: an interface
+         * carrying both an IPv4 and an IPv6 address appears in the list
+         * once per address, and both entries share a kernel index, so that
+         * lookup answers with whichever entry the kernel reported first.
+         * On Linux that is routinely the IPv6 one (loopback always), and
+         * an IPv4 subnet then fails to match the very interface it names.
+         */
         match_count = 0;
         PMIX_LIST_FOREACH(selected_interface, &pmix_if_list, pmix_pif_t) {
-            ret = pmix_ifkindextoaddr(selected_interface->if_kernel_index,
-                                     (struct sockaddr*) &if_inaddr,
-                                     sizeof(if_inaddr));
-            if (PMIX_SUCCESS == ret &&
-                pmix_net_samenetwork((struct sockaddr_storage*) &argv_inaddr,
+            memcpy(&if_inaddr, &selected_interface->if_addr,
+                   MIN(sizeof(if_inaddr), sizeof(selected_interface->if_addr)));
+            if (pmix_net_samenetwork((struct sockaddr_storage*) &argv_inaddr,
                                      (struct sockaddr_storage*) &if_inaddr,
                                      argv_prefix)) {
                 /* We found a match. If it's not already in the interfaces array,
@@ -813,9 +818,9 @@ static void split_and_resolve(char **orig_str, char *name,
                 match_count = match_count + 1;
                 pmix_ifkindextoname(selected_interface->if_kernel_index, if_name, sizeof(if_name));
                 found = false;
-                if (NULL != interfaces) {
-                    for (n = 0; NULL != interfaces[n]; n++) {
-                        if (0 == strcmp(if_name, *interfaces[n])) {
+                if (NULL != *interfaces) {
+                    for (n = 0; NULL != (*interfaces)[n]; n++) {
+                        if (0 == strcmp(if_name, (*interfaces)[n])) {
                             found = true;
                             break;
                         }
@@ -844,13 +849,9 @@ static void split_and_resolve(char **orig_str, char *name,
     }
 
     // cleanup and construct output string
-    free(argv);
+    PMIx_Argv_free(argv);
     free(*orig_str);
-    if (NULL != interfaces) {
-        *orig_str = PMIx_Argv_join(*interfaces, ',');
-    } else {
-        *orig_str = NULL;
-    }
+    *orig_str = PMIx_Argv_join(*interfaces, ',');
     return;
 }
 

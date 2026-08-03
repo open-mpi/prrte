@@ -49,12 +49,6 @@ typedef struct {
 
     bool engine_constructed;
     pmix_thread_t engine;
-#if PRTE_HAVE_LIBEV
-    ev_async async;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    pmix_list_t list;
-#endif
 } prte_progress_tracker_t;
 
 static void tracker_constructor(prte_progress_tracker_t *p)
@@ -64,10 +58,6 @@ static void tracker_constructor(prte_progress_tracker_t *p)
     p->ev_base = NULL;
     p->ev_active = false;
     p->engine_constructed = false;
-#if PRTE_HAVE_LIBEV
-    pthread_mutex_init(&p->mutex, NULL);
-    PMIX_CONSTRUCT(&p->list, pmix_list_t);
-#endif
 }
 
 static void tracker_destructor(prte_progress_tracker_t *p)
@@ -83,121 +73,10 @@ static void tracker_destructor(prte_progress_tracker_t *p)
     if (p->engine_constructed) {
         PMIX_DESTRUCT(&p->engine);
     }
-#if PRTE_HAVE_LIBEV
-    pthread_mutex_destroy(&p->mutex);
-    PMIX_LIST_DESTRUCT(&p->list);
-#endif
 }
 
 static PMIX_CLASS_INSTANCE(prte_progress_tracker_t, pmix_list_item_t, tracker_constructor,
                            tracker_destructor);
-
-#if PRTE_HAVE_LIBEV
-
-typedef enum { PRTE_EVENT_ACTIVE, PRTE_EVENT_ADD, PRTE_EVENT_DEL } prte_event_type_t;
-
-typedef struct {
-    pmix_list_item_t super;
-    struct event *ev;
-    struct timeval *tv;
-    int res;
-    short ncalls;
-    prte_event_type_t type;
-} prte_event_caddy_t;
-
-static PMIX_CLASS_INSTANCE(prte_event_caddy_t, pmix_list_item_t, NULL, NULL);
-
-static prte_progress_tracker_t *prte_progress_tracker_get_by_base(struct event_base *);
-
-static void prte_libev_ev_async_cb(EV_P_ ev_async *w, int revents)
-{
-    prte_progress_tracker_t *trk = prte_progress_tracker_get_by_base((struct event_base *) EV_A);
-    assert(NULL != trk);
-    pthread_mutex_lock(&trk->mutex);
-    prte_event_caddy_t *cd, *next;
-    PMIX_LIST_FOREACH_SAFE(cd, next, &trk->list, prte_event_caddy_t)
-    {
-        switch (cd->type) {
-        case PRTE_EVENT_ADD:
-            (void) event_add(cd->ev, cd->tv);
-            break;
-        case PRTE_EVENT_DEL:
-            (void) event_del(cd->ev);
-            break;
-        case PRTE_EVENT_ACTIVE:
-            (void) event_active(cd->ev, cd->res, cd->ncalls);
-            break;
-        }
-        pmix_list_remove_item(&trk->list, &cd->super);
-        PMIX_RELEASE(cd);
-    }
-    pthread_mutex_unlock(&trk->mutex);
-}
-
-int prte_event_add(struct event *ev, struct timeval *tv)
-{
-    int res;
-    prte_progress_tracker_t *trk = prte_progress_tracker_get_by_base(ev->ev_base);
-    if ((NULL != trk) && !pthread_equal(pthread_self(), trk->engine.t_handle)) {
-        prte_event_caddy_t *cd = PMIX_NEW(prte_event_caddy_t);
-        cd->type = PRTE_EVENT_ADD;
-        cd->ev = ev;
-        cd->tv = tv;
-        pthread_mutex_lock(&trk->mutex);
-        pmix_list_append(&trk->list, &cd->super);
-        ev_async_send((struct ev_loop *) trk->ev_base, &trk->async);
-        pthread_mutex_unlock(&trk->mutex);
-        res = PRTE_SUCCESS;
-    } else {
-        res = event_add(ev, tv);
-    }
-    return res;
-}
-
-int prte_event_del(struct event *ev)
-{
-    int res;
-    prte_progress_tracker_t *trk = prte_progress_tracker_get_by_base(ev->ev_base);
-    if ((NULL != trk) && !pthread_equal(pthread_self(), trk->engine.t_handle)) {
-        prte_event_caddy_t *cd = PMIX_NEW(prte_event_caddy_t);
-        cd->type = PRTE_EVENT_DEL;
-        cd->ev = ev;
-        pthread_mutex_lock(&trk->mutex);
-        pmix_list_append(&trk->list, &cd->super);
-        ev_async_send((struct ev_loop *) trk->ev_base, &trk->async);
-        pthread_mutex_unlock(&trk->mutex);
-        res = PRTE_SUCCESS;
-    } else {
-        res = event_del(ev);
-    }
-    return res;
-}
-
-void prte_event_active(struct event *ev, int res, short ncalls)
-{
-    prte_progress_tracker_t *trk = prte_progress_tracker_get_by_base(ev->ev_base);
-    if ((NULL != trk) && !pthread_equal(pthread_self(), trk->engine.t_handle)) {
-        prte_event_caddy_t *cd = PMIX_NEW(prte_event_caddy_t);
-        cd->type = PRTE_EVENT_ACTIVE;
-        cd->ev = ev;
-        cd->res = res;
-        cd->ncalls = ncalls;
-        pthread_mutex_lock(&trk->mutex);
-        pmix_list_append(&trk->list, &cd->super);
-        ev_async_send((struct ev_loop *) trk->ev_base, &trk->async);
-        pthread_mutex_unlock(&trk->mutex);
-    } else {
-        event_active(ev, res, ncalls);
-    }
-}
-
-void prte_event_base_loopexit(prte_event_base_t *ev_base)
-{
-    prte_progress_tracker_t *trk = prte_progress_tracker_get_by_base(ev_base);
-    assert(NULL != trk);
-    ev_async_send((struct ev_loop *) trk->ev_base, &trk->async);
-}
-#endif
 
 static bool inited = false;
 static pmix_list_t tracking;
@@ -243,12 +122,72 @@ static void stop_progress_engine(prte_progress_tracker_t *trk)
     pmix_thread_join(&trk->engine, NULL);
 }
 
+/* Expand a comma-delimited list of cpu ranges - "0", "0,3", "2-5,8" - into
+ * cpus[], returning how many ids were stored or PRTE_ERR_BAD_PARAM if the
+ * specification does not parse. Always compiled, and reachable from the unit
+ * test, even though its one caller sits behind HAVE_PTHREAD_SETAFFINITY_NP:
+ * the parsing is where the bugs were, and leaving it inside the ifdef meant
+ * nothing could check it on a platform without pthread_setaffinity_np. */
+int prte_progress_thread_parse_cpus(const char *spec, int *cpus, int max)
+{
+    char **ranges, *dash, *end_ptr;
+    int n, k, ncpus = 0;
+    unsigned long start, end;
+
+    if (NULL == spec || NULL == cpus || 0 >= max) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    ranges = PMIx_Argv_split(spec, ',');
+    if (NULL == ranges) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+    for (n = 0; NULL != ranges[n]; n++) {
+        // look for '-'. Note that strtoul always hands back a non-NULL end
+        // pointer - it points at the first character it did not consume - so
+        // the range test has to look at what that character IS. Testing the
+        // pointer itself let a bare "3" fall into the range branch, where the
+        // "skip the dash" step walked off the end of the string.
+        start = strtoul(ranges[n], &dash, 10);
+        if (dash == ranges[n]) {
+            /* no digits at all */
+            PMIx_Argv_free(ranges);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        if ('-' != *dash) {
+            if ('\0' != *dash) {
+                PMIx_Argv_free(ranges);
+                return PRTE_ERR_BAD_PARAM;
+            }
+            end = start;
+        } else {
+            ++dash;  // skip over the '-'
+            end = strtoul(dash, &end_ptr, 10);
+            if (end_ptr == dash || '\0' != *end_ptr || end < start) {
+                PMIx_Argv_free(ranges);
+                return PRTE_ERR_BAD_PARAM;
+            }
+        }
+        // the range is inclusive of its upper bound: "0-3" names four cpus,
+        // not three
+        for (k = (int) start; k <= (int) end; k++) {
+            if (ncpus >= max) {
+                PMIx_Argv_free(ranges);
+                return PRTE_ERR_BAD_PARAM;
+            }
+            cpus[ncpus++] = k;
+        }
+    }
+    PMIx_Argv_free(ranges);
+    return ncpus;
+}
+
 static int start_progress_engine(prte_progress_tracker_t *trk)
 {
 #ifdef HAVE_PTHREAD_SETAFFINITY_NP
     cpu_set_t cpuset;
-    char **ranges, *dash;
-    int k, n, start, end;
+    int cpus[PRTE_MAX_PROGRESS_THREAD_CPUS];
+    int ncpus, n;
 #endif
 
     assert(!trk->ev_active);
@@ -261,25 +200,24 @@ static int start_progress_engine(prte_progress_tracker_t *trk)
     int rc = pmix_thread_start(&trk->engine);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
+        /* no thread was created, so there is nothing to bind and nothing
+         * for a later stop_progress_engine to join */
+        trk->ev_active = false;
+        return rc;
     }
 
 #ifdef HAVE_PTHREAD_SETAFFINITY_NP
     if (NULL != prte_progress_thread_cpus) {
+        ncpus = prte_progress_thread_parse_cpus(prte_progress_thread_cpus, cpus,
+                                                PRTE_MAX_PROGRESS_THREAD_CPUS);
+        if (0 > ncpus) {
+            pmix_output(0, "Could not parse prte_progress_thread_cpus \"%s\"",
+                        prte_progress_thread_cpus);
+            return prte_bind_progress_thread_reqd ? PRTE_ERR_BAD_PARAM : PRTE_SUCCESS;
+        }
         CPU_ZERO(&cpuset);
-        // comma-delimited list of cpu ranges
-        ranges = PMIx_Argv_split(prte_progress_thread_cpus, ',');
-        for (n=0; NULL != ranges[n]; n++) {
-            // look for '-'
-            start = strtoul(ranges[n], &dash, 10);
-            if (NULL == dash) {
-                CPU_SET(start, &cpuset);
-            } else {
-                ++dash;  // skip over the '-'
-                end = strtoul(dash, NULL, 10);
-                for (k=start; k < end; k++) {
-                    CPU_SET(k, &cpuset);
-                }
-            }
+        for (n = 0; n < ncpus; n++) {
+            CPU_SET(cpus[n], &cpuset);
         }
         rc = pthread_setaffinity_np(trk->engine.t_handle, sizeof(cpu_set_t), &cpuset);
         if (0 != rc && prte_bind_progress_thread_reqd) {
@@ -343,11 +281,6 @@ prte_event_base_t *prte_progress_thread_init(const char *name)
     prte_event_set(trk->ev_base, &trk->block, -1, PRTE_EV_PERSIST, dummy_timeout_cb, trk);
     prte_event_add(&trk->block, &long_timeout);
 
-#if PRTE_HAVE_LIBEV
-    ev_async_init(&trk->async, prte_libev_ev_async_cb);
-    ev_async_start((struct ev_loop *) trk->ev_base, &trk->async);
-#endif
-
     /* construct the thread object */
     PMIX_CONSTRUCT(&trk->engine, pmix_thread_t);
     trk->engine_constructed = true;
@@ -404,38 +337,33 @@ int prte_progress_thread_pause(const char *name)
         return PRTE_ERR_NOT_FOUND;
     }
 
-    /* find the specified engine */
-    PMIX_LIST_FOREACH(trk, &tracking, prte_progress_tracker_t)
-    {
-        if (NULL == name || 0 == strcmp(name, trk->name)) {
+    /* a NULL name means "pause them all", and finding none is not an error */
+    if (NULL == name) {
+        PMIX_LIST_FOREACH(trk, &tracking, prte_progress_tracker_t)
+        {
             if (trk->ev_active) {
                 stop_progress_engine(trk);
             }
-            if (NULL != name) {
-                break;
+        }
+        return PRTE_SUCCESS;
+    }
+
+    /* find the specified engine */
+    PMIX_LIST_FOREACH(trk, &tracking, prte_progress_tracker_t)
+    {
+        if (0 == strcmp(name, trk->name)) {
+            if (trk->ev_active) {
+                stop_progress_engine(trk);
             }
+            return PRTE_SUCCESS;
         }
     }
 
-    return PRTE_SUCCESS;
+    /* the header promises PRTE_ERR_NOT_FOUND for a name we do not have, and
+     * its siblings resume/finalize deliver that - pause used to fall off the
+     * end and report success for a thread that does not exist */
+    return PRTE_ERR_NOT_FOUND;
 }
-
-#if PRTE_HAVE_LIBEV
-static prte_progress_tracker_t *prte_progress_tracker_get_by_base(prte_event_base_t *base)
-{
-    prte_progress_tracker_t *trk;
-
-    if (inited) {
-        PMIX_LIST_FOREACH(trk, &tracking, prte_progress_tracker_t)
-        {
-            if (trk->ev_base == base) {
-                return trk;
-            }
-        }
-    }
-    return NULL;
-}
-#endif
 
 int prte_progress_thread_resume(const char *name)
 {

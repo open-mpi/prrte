@@ -47,7 +47,10 @@
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/rmaps/base/rmaps_private.h"
 
-#define PRTE_RMAPS_PRINT_MAX_SIZE 50
+/* long enough for the longest policy word plus every qualifier that can
+ * accompany it - "BYHWTHREAD:NO_USE_LOCAL:NOOVERSUBSCRIBE:SPAN:ORDERED"
+ * is 52 characters and used to come back truncated */
+#define PRTE_RMAPS_PRINT_MAX_SIZE 80
 #define PRTE_RMAPS_PRINT_NUM_BUFS 16
 
 static bool fns_init = false;
@@ -68,6 +71,7 @@ static void buffer_cleanup(void *value)
         for (i = 0; i < PRTE_RMAPS_PRINT_NUM_BUFS; i++) {
             free(ptr->buffers[i]);
         }
+        free(ptr);
     }
 }
 

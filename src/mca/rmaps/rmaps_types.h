@@ -13,7 +13,7 @@
  * Copyright (c) 2012-2015 Los Alamos National Security, LLC. All rights
  *                         reserved.
  * Copyright (c) 2014-2020 Intel, Inc.  All rights reserved.
- * Copyright (c) 2021-2025 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -49,11 +49,16 @@ typedef uint16_t prte_ranking_policy_t;
  * Structure that represents the mapping of a job to an
  * allocated set of resources.
  */
+/* Note there is no "which mapper" field here, and deliberately so: the
+ * mapping policy IS the choice of mapper. Every component claims the
+ * policies it implements and defers on the rest, so "use this mapper"
+ * says nothing the policy has not already said - and when the two
+ * disagreed there was no answer that could be right. The record of which
+ * component placed a given app is kept where it is actually useful, on
+ * the app (PRTE_APP_LAST_MAPPER), and never leaves this daemon. */
 struct prte_job_map_t {
     pmix_object_t super;
     /* user-specified mapping params */
-    char *req_mapper;  /* requested mapper */
-    char *last_mapper; /* last mapper used */
     prte_mapping_policy_t mapping;
     prte_ranking_policy_t ranking;
     prte_binding_policy_t binding;
@@ -91,6 +96,10 @@ typedef struct {
 
     /* mapping values */
     prte_mapping_policy_t map;
+    /* true when "map" is the policy the user asked for rather than one the
+     * base derived - the mappers that only claim a job nobody described
+     * (lsf) have to tell the two apart */
+    bool mapgiven;
     bool mapspan;
     bool ordered;
     prte_binding_policy_t mapdepth;
@@ -109,6 +118,11 @@ typedef struct {
 
     /* binding values */
     prte_binding_policy_t bind;
+    /* the full binding policy word of an app that gave its own --bind-to,
+     * directives and all; zero when the app gave none and the job's stand.
+     * Only the map display reads it - "bind" carries the bare policy the
+     * mappers use */
+    prte_binding_policy_t appbind;
     bool dobind;
     hwloc_obj_type_t hwb;
     uint16_t limit;
@@ -117,6 +131,20 @@ typedef struct {
     hwloc_cpuset_t target;
     hwloc_obj_t obj;
 
+    /* When >= 0, map only the app context at this index in jdata->apps.
+     * When < 0 (default -1), map all app contexts as today. */
+    int app_idx;
+    /* The first global rank this dispatch may assign - zero for a whole-job
+     * dispatch, and in per-app dispatch the base's running cursor, i.e. the
+     * first rank no earlier app has taken. Only the mappers that number
+     * their own procs (rank_file, seq, lsf) read it; every other mapper
+     * leaves ranking to prte_rmaps_base_compute_vpids(), which threads the
+     * same cursor. A user-ranked mapper that started from zero for every app
+     * gave two apps the same ranks, and the second app's procs then replaced
+     * the first's in jdata->procs. */
+    uint32_t start_vpid;
+    char *dist_device;  /* device name for dist mapping, from PRTE_APP_DIST_DEVICE */
+
 } prte_rmaps_options_t;
 
 
@@ -124,7 +152,11 @@ typedef struct {
  **
  * Macro for use in components that are of type rmaps
  */
-#define PRTE_RMAPS_BASE_VERSION_4_0_0 PRTE_MCA_BASE_VERSION_3_0_0("rmaps", 4, 0, 0)
+#define PRTE_RMAPS_BASE_VERSION_5_0_0 PRTE_MCA_BASE_VERSION_3_0_0("rmaps", 5, 0, 0)
+/* deprecated alias — out-of-tree components get a version mismatch rather than
+ * a silent ABI violation */
+#undef  PRTE_RMAPS_BASE_VERSION_4_0_0
+#define PRTE_RMAPS_BASE_VERSION_4_0_0 PRTE_RMAPS_BASE_VERSION_5_0_0
 
 /* define map-related directives */
 #define PRTE_MAPPING_NO_USE_LOCAL     0x0100

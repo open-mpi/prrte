@@ -16,7 +16,7 @@ jobs:
     - name: Install dependencies
       run: brew install libevent hwloc autoconf automake libtool
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -38,7 +38,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false
@@ -78,6 +78,12 @@ jobs:
             LDFLAGS=$libevent_ldflags
         make -j
         make install
+    - name: Run unit tests
+      run: |
+        if test "${{ matrix.path }}" = vpath; then
+            cd build
+        fi
+        make check
     - name: Build examples
       run: |
         pushd examples
@@ -102,7 +108,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends software-properties-common libhwloc-dev libevent-dev
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -116,7 +122,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false
@@ -142,6 +148,12 @@ jobs:
             --enable-testbuild-launchers
         make -j
         make install
+    - name: Run unit tests
+      run: |
+        if test "${{ matrix.path }}" = vpath; then
+            cd build
+        fi
+        make check
     - name: Build examples
       run: |
         pushd examples
@@ -164,7 +176,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends software-properties-common libhwloc-dev libevent-dev clang
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -178,7 +190,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false
@@ -195,6 +207,8 @@ jobs:
             --enable-testbuild-launchers
         make -j
         make install
+    - name: Run unit tests
+      run: make check
     - name: Build examples
       run: |
         pushd examples
@@ -217,7 +231,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends software-properties-common libhwloc-dev libevent-dev python3 python3-pip
     - name: Git clone OpenPMIx
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             repository: openpmix/openpmix
@@ -231,7 +245,7 @@ jobs:
         make -j
         make install
     - name: Git clone PRRTE
-      uses: actions/checkout@v3
+      uses: actions/checkout@v6
       with:
             submodules: recursive
             clean: false

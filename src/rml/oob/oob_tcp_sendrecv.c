@@ -254,6 +254,7 @@ void prte_oob_tcp_send_handler(int sd, short flags, void *cbdata)
                                         (int) ntohl(msg->hdr.nbytes), peer->sd);
                     msg->msg->status = PRTE_SUCCESS;
                     PRTE_RML_SEND_COMPLETE(msg->msg);
+                    msg->msg = NULL; // completion released it
                     PMIX_RELEASE(msg);
                     peer->send_msg = NULL;
                 }
@@ -499,6 +500,29 @@ void prte_oob_tcp_recv_handler(int sd, short flags, void *cbdata)
                     PRTE_NAME_PRINT(&peer->recv_msg->hdr.origin), (int) peer->recv_msg->hdr.nbytes,
                     PRTE_NAME_PRINT(&peer->recv_msg->hdr.dst), peer->recv_msg->hdr.tag);
 
+                /* Incarnation guard (bootstrap only): a departed daemon can
+                 * reboot into the same rank and return with a strictly-greater
+                 * boot epoch. Drop traffic stamped with a stale (older) epoch
+                 * for a daemon rank so the old incarnation's late messages are
+                 * not confused with the new one. Only daemon-namespace traffic
+                 * is checked -- tool namespaces reuse rank numbers. The full
+                 * message has already been read off the socket, so dropping
+                 * here leaves the byte stream correctly framed. */
+                if (prte_bootstrap_setup &&
+                    PMIX_CHECK_NSPACE(peer->recv_msg->hdr.origin.nspace,
+                                      PRTE_PROC_MY_NAME->nspace) &&
+                    !prte_rml_epoch_ok(peer->recv_msg->hdr.origin.rank,
+                                       peer->recv_msg->hdr.epoch)) {
+                    pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
+                                        "%s DROPPING STALE-INCARNATION MSG FROM %s epoch %lu",
+                                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                        PRTE_NAME_PRINT(&peer->recv_msg->hdr.origin),
+                                        (unsigned long) peer->recv_msg->hdr.epoch);
+                    PMIX_RELEASE(peer->recv_msg);
+                    peer->recv_msg = NULL;
+                    return;
+                }
+
                 /* am I the intended recipient (header was already converted back to host order)? */
                 if (PMIX_CHECK_PROCID(&peer->recv_msg->hdr.dst, PRTE_PROC_MY_NAME)) {
                     /* yes - post it to the RML for delivery */
@@ -510,18 +534,25 @@ void prte_oob_tcp_recv_handler(int sd, short flags, void *cbdata)
                     PRTE_RML_POST_MESSAGE(&peer->recv_msg->hdr.origin, peer->recv_msg->hdr.tag,
                                           peer->recv_msg->hdr.seq_num, peer->recv_msg->data,
                                           peer->recv_msg->hdr.nbytes);
+                    /* PMIx_Data_load took ownership of the payload */
+                    peer->recv_msg->data = NULL;
                     PMIX_RELEASE(peer->recv_msg);
                 } else {
-                    /* promote this to the OOB as some other transport might
-                     * be the next best hop */
+                    /* not for us - we are an intermediate hop. Re-enter the
+                     * OOB send path, which will route the message on toward
+                     * its final destination via the next hop in the tree.
+                     */
                     pmix_output_verbose(OOB_TCP_DEBUG_CONNECT,
                                         prte_oob_base.output,
-                                        "%s TCP PROMOTING ROUTED MESSAGE FOR %s TO OOB",
+                                        "%s TCP RELAYING ROUTED MESSAGE FOR %s",
                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                         PRTE_NAME_PRINT(&peer->recv_msg->hdr.dst));
                     snd = PMIX_NEW(prte_rml_send_t);
                     snd->dst = peer->recv_msg->hdr.dst;
                     PMIX_XFER_PROCID(&snd->origin, &peer->recv_msg->hdr.origin);
+                    /* preserve the origin's epoch across the relay (the
+                     * constructor defaulted it to our own epoch) */
+                    snd->epoch = peer->recv_msg->hdr.epoch;
                     snd->tag = peer->recv_msg->hdr.tag;
                     bo.bytes = peer->recv_msg->data;
                     bo.size = peer->recv_msg->hdr.nbytes;
@@ -570,14 +601,17 @@ static void snd_cons(prte_oob_tcp_send_t *ptr)
     ptr->sdptr = NULL;
     ptr->sdbytes = 0;
 }
-/* we don't destruct any RML msg that is
- * attached to our send as the RML owns
- * that memory. However, if we relay a
- * msg, the data in the relay belongs to
- * us and must be free'd
+/* an OOB send owns the RML message attached to it until that message is
+ * completed - completion clears the pointer, so anything still attached
+ * here (a send abandoned when its peer was torn down) is ours to release.
+ * If we relay a msg, the data in the relay belongs to us as well and must
+ * be free'd
  */
 static void snd_des(prte_oob_tcp_send_t *ptr)
 {
+    if (NULL != ptr->msg) {
+        PMIX_RELEASE(ptr->msg);
+    }
     if (NULL != ptr->data) {
         free(ptr->data);
     }
@@ -588,14 +622,19 @@ static void rcv_cons(prte_oob_tcp_recv_t *ptr)
 {
     memset(&ptr->hdr, 0, sizeof(prte_oob_tcp_hdr_t));
     ptr->hdr_recvd = false;
+    ptr->data = NULL;
     ptr->rdptr = NULL;
     ptr->rdbytes = 0;
 }
-PMIX_CLASS_INSTANCE(prte_oob_tcp_recv_t, pmix_list_item_t, rcv_cons, NULL);
-
-static void err_cons(prte_oob_tcp_msg_error_t *ptr)
+/* the payload buffer belongs to the recv object until somebody takes it: the
+ * two paths that hand it on (deliver locally, relay onward) clear the pointer
+ * first, so anything still here - a message dropped as a stale incarnation, or
+ * a partial recv abandoned when the peer was closed - is ours to free
+ */
+static void rcv_des(prte_oob_tcp_recv_t *ptr)
 {
-    ptr->rmsg = NULL;
-    ptr->snd = NULL;
+    if (NULL != ptr->data) {
+        free(ptr->data);
+    }
 }
-PMIX_CLASS_INSTANCE(prte_oob_tcp_msg_error_t, pmix_object_t, err_cons, NULL);
+PMIX_CLASS_INSTANCE(prte_oob_tcp_recv_t, pmix_list_item_t, rcv_cons, rcv_des);

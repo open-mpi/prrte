@@ -58,6 +58,11 @@ typedef struct prte_ras_base_t {
     int multiplier;
     bool launch_orted_on_hn;
     bool simulated;
+    /* set once the DVM's base allocation has been established (the first
+     * allocation to complete). Used to detect that a subsequent job must
+     * reuse the existing allocation rather than re-run discovery. This is
+     * independent of whether the HNP node itself is part of the allocation. */
+    bool allocation_established;
 } prte_ras_base_t;
 
 PRTE_EXPORT extern prte_ras_base_t prte_ras_base;
@@ -83,9 +88,59 @@ PRTE_EXPORT void prte_ras_base_allocate(int fd, short args, void *cbdata);
 
 PRTE_EXPORT void prte_ras_base_modify(int fd, short args, void *cbdata);
 
+/* Notify the active RAS modules that a shrink campaign has completed so they
+ * can release the freed resources back to the scheduler. Cycles across every
+ * selected module, calling the shrink_complete entry point on each that
+ * provides one. */
+PRTE_EXPORT void prte_ras_base_shrink_complete(prte_shrink_campaign_t *campaign);
+
+PRTE_EXPORT void prte_ras_base_release_allocation(prte_session_t *session);
+
+/* Tear down a reservation: drop its hold on its nodes (clearing the
+ * node->session backpointer so the nodes revert to the default pool) and
+ * deregister it so it can no longer be targeted. When return_to_scheduler is
+ * true, member nodes carrying a daemon are additionally shrunk out of the DVM
+ * and handed back to the scheduler; otherwise the nodes simply become
+ * unreserved within the session. */
+PRTE_EXPORT void prte_ras_base_teardown_reservation(prte_session_t *session,
+                                                    bool return_to_scheduler);
+
+/* Apply the namespace-termination inheritance disposition of every reservation
+ * when the namespace owning jdata terminates. NONE/DEFAULT fire when the owning
+ * namespace exits; CHILD/CHILD_DEFAULT fire when the last derived child of the
+ * owning namespace exits. The *_DEFAULT variants unreserve into the session
+ * rather than returning nodes to the scheduler. */
+PRTE_EXPORT void prte_ras_base_check_reservations_on_term(prte_job_t *jdata);
+
 PRTE_EXPORT int prte_ras_base_add_hosts(prte_job_t *jdata);
 
+/* Render the node specification carried by a PMIX_ALLOC_NODE_LIST-style info
+ * (a string, a regex, or a regex2) into a comma-delimited node-name string the
+ * caller must free. Returns PMIX_ERR_BAD_PARAM for any other value type. */
+PRTE_EXPORT pmix_status_t prte_ras_base_parse_node_list(pmix_info_t *info,
+                                                        char **ndstring);
+
+/* Add the named nodes to the global pool, marking each PRTE_NODE_STATE_ADDED,
+ * and register them with the destination reservation (which withholds them
+ * from general use). Pass NULL or the default session to leave them in the
+ * general pool. Returns a PRRTE code. */
+PRTE_EXPORT int prte_ras_base_insert_node_string(char *ndstring,
+                                                 prte_session_t *dest);
+
 PRTE_EXPORT char *prte_ras_base_flag_string(prte_node_t *node);
+
+PRTE_EXPORT void prte_ras_base_activate_dvm_grow(void);
+
+PRTE_EXPORT int prte_ras_base_prepare_dvm_shrink(prte_pmix_server_req_t *req,
+                                                 pmix_rank_t *ranks,
+                                                 int32_t nranks,
+                                                 prte_shrink_campaign_t **campaign);
+
+PRTE_EXPORT int prte_ras_base_commit_dvm_shrink(prte_shrink_campaign_t *campaign);
+
+PRTE_EXPORT void prte_ras_base_abort_dvm_shrink(prte_shrink_campaign_t *campaign);
+
+PRTE_EXPORT void prte_ras_base_complete_request(prte_pmix_server_req_t *req);
 
 END_C_DECLS
 

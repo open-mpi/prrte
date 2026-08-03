@@ -54,8 +54,10 @@ bool prte_get_attribute(pmix_list_t *attributes, prte_attribute_key_t key, void 
     {
         if (key == kv->key) {
             if (kv->data.type != type) {
+                pmix_output(0, "PRTE ERROR: attribute %s holds %s, requested as %s",
+                            prte_attr_key_to_str(key), PMIx_Data_type_string(kv->data.type),
+                            PMIx_Data_type_string(type));
                 PRTE_ERROR_LOG(PRTE_ERR_TYPE_MISMATCH);
-                pmix_output(0, "KV %s TYPE %s", PMIx_Data_type_string(kv->data.type), PMIx_Data_type_string(type));
                 return false;
             }
             if (NULL != data) {
@@ -170,6 +172,23 @@ int prte_prepend_attribute(pmix_list_t *attributes, prte_attribute_key_t key, bo
     return PRTE_SUCCESS;
 }
 
+int prte_append_attribute(pmix_list_t *attributes, prte_attribute_key_t key, bool local,
+                          void *data, pmix_data_type_t type)
+{
+    prte_attribute_t *kv;
+    int rc;
+
+    kv = PMIX_NEW(prte_attribute_t);
+    kv->key = key;
+    kv->local = local;
+    if (PRTE_SUCCESS != (rc = prte_attr_load(kv, data, type))) {
+        PMIX_RELEASE(kv);
+        return rc;
+    }
+    pmix_list_append(attributes, &kv->super);
+    return PRTE_SUCCESS;
+}
+
 void prte_remove_attribute(pmix_list_t *attributes, prte_attribute_key_t key)
 {
     prte_attribute_t *kv;
@@ -279,6 +298,32 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "PRTE_APP_PES_PER_PROC";
         case PRTE_APP_PPR:
             return "PRTE_APP_PPR";
+        case PRTE_APP_MAPBY:
+            return "PRTE_APP_MAPBY";
+        case PRTE_APP_RANKBY:
+            return "PRTE_APP_RANKBY";
+        case PRTE_APP_BINDTO:
+            return "PRTE_APP_BINDTO";
+        case PRTE_APP_MAP_FILE:
+            return "PRTE_APP_MAP_FILE";
+        case PRTE_APP_DIST_DEVICE:
+            return "PRTE_APP_DIST_DEVICE";
+        case PRTE_APP_HWT_CPUS:
+            return "PRTE_APP_HWT_CPUS";
+        case PRTE_APP_CORE_CPUS:
+            return "PRTE_APP_CORE_CPUS";
+        case PRTE_APP_CPUSET:
+            return "PRTE_APP_CPUSET";
+        case PRTE_APP_BINDING_LIMIT:
+            return "PRTE_APP_BINDING_LIMIT";
+        case PRTE_APP_RESOLVED_MAPBY:
+            return "PRTE_APP_RESOLVED_MAPBY";
+        case PRTE_APP_RESOLVED_RANKBY:
+            return "PRTE_APP_RESOLVED_RANKBY";
+        case PRTE_APP_RESOLVED_BINDTO:
+            return "PRTE_APP_RESOLVED_BINDTO";
+        case PRTE_APP_LAST_MAPPER:
+            return "PRTE_APP_LAST_MAPPER";
 
         case PRTE_NODE_USERNAME:
             return "NODE-USERNAME";
@@ -406,7 +451,7 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
         case PRTE_JOB_APPEND_ENVAR:
             return "PRTE_JOB_APPEND_ENVAR";
         case PRTE_JOB_ADD_ENVAR:
-            return "PRTE_APP_ADD_ENVAR";
+            return "PRTE_JOB_ADD_ENVAR";
         case PRTE_JOB_APP_SETUP_DATA:
             return "PRTE_JOB_APP_SETUP_DATA";
         case PRTE_JOB_OUTPUT_TO_DIRECTORY:
@@ -477,6 +522,8 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "EXEC-AGENT";
         case PRTE_JOB_NOAGG_HELP:
             return "DO-NOT-AGGREGATE-HELP";
+        case PRTE_JOB_REPORT_CHILD_SEP:
+            return "REPORT-CHILD-JOBS-SEPARATELY";
         case PRTE_JOB_COLOCATE_PROCS:
             return "COLOCATE PROCS";
         case PRTE_JOB_COLOCATE_NPERPROC:
@@ -531,6 +578,12 @@ const char *prte_attr_key_to_str(prte_attribute_key_t key)
             return "ALLOCATION DISPLAYED";
         case PRTE_JOB_DO_NOT_SPAWN:
             return "DO_NOT_SPAWN";
+        case PRTE_JOB_SPAWN_TARGET:
+            return "SPAWN_TARGET";
+
+        case PRTE_JOB_OUTPUT_FILE_PATTERN:
+            return "JOB-OUTPUT-FILE-PATTERN";
+
         case PRTE_PROC_NOBARRIER:
             return "PROC-NOBARRIER";
         case PRTE_PROC_PRIOR_NODE:
@@ -742,11 +795,18 @@ int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type)
     case PMIX_ENVAR:
         envar = (pmix_envar_t *) data;
         if (NULL != envar) {
+            /* clear both fields as they are released: only the ones the new
+             * value supplies were being reassigned, so reloading an
+             * attribute with an envar that carries no value (or no name)
+             * left a pointer to freed storage behind - and the destructor
+             * then freed it again */
             if (NULL != kv->data.data.envar.envar) {
                 free(kv->data.data.envar.envar);
+                kv->data.data.envar.envar = NULL;
             }
             if (NULL != kv->data.data.envar.value) {
                 free(kv->data.data.envar.value);
+                kv->data.data.envar.value = NULL;
             }
             if (NULL != envar->envar) {
                 kv->data.data.envar.envar = strdup(envar->envar);
@@ -759,9 +819,15 @@ int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type)
         break;
 
     case PMIX_DATA_ARRAY:
+        /* release any array this attribute is already carrying, and hand
+         * back a PRTE status like every other branch here does */
+        if (NULL != kv->data.data.darray) {
+            PMIX_VALUE_DESTRUCT(&kv->data);
+            kv->data.type = type;
+            kv->data.data.darray = NULL;
+        }
         rc = PMIx_Data_copy((void**)&kv->data.data.darray, data, PMIX_DATA_ARRAY);
-        return rc;
-        break;
+        return prte_pmix_convert_status(rc);
 
     default:
         PRTE_ERROR_LOG(PRTE_ERR_NOT_SUPPORTED);
@@ -1106,6 +1172,34 @@ char* prte_print_job_flags(struct prte_job_t *ptr)
     }
     if (PRTE_FLAG_TEST(p, PRTE_JOB_FLAG_ERR_REPORTED)) {
         PMIx_Argv_append_nosize(&tmp, "ERROR-REPORTED");
+    }
+    ans = PMIx_Argv_join(tmp, '|');
+    PMIx_Argv_free(tmp);
+    return ans;
+}
+
+char* prte_print_session_flags(struct prte_session_t *ptr)
+{
+    prte_session_t *p = (prte_session_t*)ptr;
+    char **tmp = NULL;
+    char *ans;
+
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_DYNAMIC)) {
+        PMIx_Argv_append_nosize(&tmp, "DYNAMIC");
+    } else {
+        PMIx_Argv_append_nosize(&tmp, "STATIC");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_RESERVED)) {
+        PMIx_Argv_append_nosize(&tmp, "RESERVED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_DETACHED)) {
+        PMIx_Argv_append_nosize(&tmp, "DETACHED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_PAUSED)) {
+        PMIx_Argv_append_nosize(&tmp, "PAUSED");
+    }
+    if (PRTE_FLAG_TEST(p, PRTE_SESSION_FLAG_SCHEDULER)) {
+        PMIx_Argv_append_nosize(&tmp, "SCHEDULER");
     }
     ans = PMIx_Argv_join(tmp, '|');
     PMIx_Argv_free(tmp);

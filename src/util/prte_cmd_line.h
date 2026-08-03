@@ -31,6 +31,12 @@
 #ifdef HAVE_UNISTD_H
 #    include <unistd.h>
 #endif
+#ifdef HAVE_SYS_TYPES_H
+#    include <sys/types.h>
+#endif
+#ifdef HAVE_SYS_STAT_H
+#    include <sys/stat.h>
+#endif
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -70,7 +76,6 @@ BEGIN_C_DECLS
 #define PRTE_CLI_SET_SID                "set-sid"                   // none
 #define PRTE_CLI_REPORT_PID             "report-pid"                // required
 #define PRTE_CLI_REPORT_URI             "report-uri"                // required
-#define PRTE_CLI_TEST_SUICIDE           "test-suicide"              // none
 #define PRTE_CLI_DEFAULT_HOSTFILE       "default-hostfile"          // required
 #define PRTE_CLI_SINGLETON              "singleton"                 // required
 #define PRTE_CLI_KEEPALIVE              "keepalive"                 // required
@@ -114,6 +119,9 @@ BEGIN_C_DECLS
 #define PRTE_CLI_DISABLE_RECOVERY       "disable-recovery"          // none
 #define PRTE_CLI_MEM_ALLOC_KIND			"memory-alloc-kinds"        // required
 #define PRTE_CLI_GPU_SUPPORT			"gpu-support"				// required
+#define PRTE_CLI_TARGET_ALLOC           "alloc-id"                  // required
+#define PRTE_CLI_ALLOC_REFID            "alloc-refid"               // required
+#define PRTE_CLI_SESSION_ID             "session-id"                // required
 
 // Placement options
 #define PRTE_CLI_MAPBY                  "mapby"                     // required
@@ -141,7 +149,7 @@ BEGIN_C_DECLS
 #define PRTE_CLI_DVM                    "dvm"                       // optional
 
 // Daemon-specific CLI options
-#define PRTE_CLI_PUBSUB_SERVER          "prte-server"               // required
+#define PRTE_CLI_PUBSUB_SERVER          "pubsub-server"             // required
 #define PRTE_CLI_CONTROLLER_URI         "dvm-master-uri"            // required
 #define PRTE_CLI_PARENT_URI             "parent-uri"                // required
 #define PRTE_CLI_TREE_SPAWN             "tree-spawn"                // required
@@ -220,7 +228,12 @@ BEGIN_C_DECLS
 #define PRTE_CLI_REPORT_STATE       "report-state-on-timeout"       // optional arg
 #define PRTE_CLI_STACK_TRACES       "get-stack-traces"              // optional arg
 #define PRTE_CLI_REPORT_CHILD_SEP   "report-child-jobs-separately"  // optional arg
-#define PRTE_CLI_AGG_HELP           "aggregate-help"                // optional arg
+// the full name is what the runtime-options help text and the MCA param
+// description both document; the option matcher accepts any unambiguous
+// prefix, so the shorter "aggregate-help" still works. Naming the SHORT
+// form here had the opposite effect - a directive longer than the name
+// matches no prefix of it, so the documented spelling was rejected.
+#define PRTE_CLI_AGG_HELP           "aggregate-help-messages"       // optional arg
 #define PRTE_CLI_NOTIFY_ERRORS      "notifyerrors"                  // optional flag
 #define PRTE_CLI_OUTPUT_PROCTABLE   "output-proctable"              // optional arg
 
@@ -255,6 +268,90 @@ BEGIN_C_DECLS
 #define PRTE_CLI_NOCOPY     "nocopy"
 #define PRTE_CLI_RAW        "raw"
 #define PRTE_CLI_PATTERN    "pattern"
+
+/*
+ * The value of a qualifier declared above with a trailing '=' - PE=2,
+ * FILE=path, LIMIT=4 - is read with pmix_cli_qualifier_value(), which comes
+ * from PMIx alongside PMIX_CHECK_CLI_OPTION: the two belong together,
+ * because the matcher accepts any unambiguous prefix of a qualifier's name
+ * and the caller therefore cannot know how long the name it matched was.
+ * Never index past the qualifier's full spelling to reach its value.
+ *
+ * There is deliberately no local fallback for a PMIx that lacks it.  A
+ * second implementation of a rule this easy to get wrong is a second thing
+ * to keep right; configure refuses such a PMIx instead.
+ */
+
+/*
+ * Interpreters for option values that more than one tool accepts.  These
+ * live here, and not in a tool's main(), because a tool's main() cannot be
+ * unit tested - see test/unit/tools.
+ */
+
+/**
+ * Interpret the optional value carried by a boolean directive or qualifier.
+ *
+ * Every boolean directive of "--output", "--display" and "--rtos" may be
+ * written bare ("tag") or with a value ("tag=0", "tag=false", "tag=no").
+ * The bare form is the assertion; the value form says the same thing out
+ * loud, and is the only way to say the opposite.
+ *
+ * A value that is neither true nor false is REFUSED rather than read as
+ * false.  The truth test underneath reports anything it does not recognize
+ * as false, so "tag=maybe" would otherwise mean "no tags" - and "tag=0"
+ * used to mean "tags", since the value was not looked at at all.  The
+ * caller reports the error, since only the caller knows which directive of
+ * which option was being written.
+ *
+ * @param value  the text after the '=' - NULL or empty for the bare form
+ * @param flag   the truth the directive carries; bare == true
+ *
+ * @retval PRTE_SUCCESS
+ * @retval PRTE_ERR_BAD_PARAM  the value is not a truth value
+ */
+PRTE_EXPORT int prte_cli_bool_value(const char *value, bool *flag);
+
+/**
+ * Interpret the value of "--pid": either a decimal PID, or "file:<path>"
+ * naming a file whose first token is one.
+ *
+ * @param value     the option's value
+ * @param pid       filled in on success
+ * @param filename  if non-NULL, set to the path within @c value when the
+ *                  "file:" form was used (borrowed, not a copy), else NULL.
+ *                  Callers use it to name the file in an error message.
+ *
+ * @retval PRTE_SUCCESS
+ * @retval PRTE_ERR_BAD_PARAM          neither form, or out of range
+ * @retval PRTE_ERR_FILE_OPEN_FAILURE  the named file could not be opened
+ * @retval PRTE_ERR_FILE_READ_FAILURE  the file held no readable PID
+ */
+PRTE_EXPORT int prte_parse_pid_option(const char *value, pid_t *pid,
+                                      const char **filename);
+
+/**
+ * Append the contents of an appfile to an argument vector, one app
+ * context per line, ':'-delimited as if they had been typed.
+ *
+ * @param filename  the appfile
+ * @param argv      argv to append to - may already hold the tool's own
+ *                  arguments, and is created if it points at NULL
+ *
+ * @retval PRTE_SUCCESS
+ * @retval PRTE_ERR_FILE_OPEN_FAILURE
+ */
+PRTE_EXPORT int prte_load_appfile(const char *filename, char ***argv);
+
+/**
+ * Interpret an octal umask string, as handed to a daemon in
+ * PRTE_DAEMON_UMASK_VALUE.
+ *
+ * @return true (and fills @c mask) only for a complete, in-range octal
+ *         value - an empty or trailing-garbage string is refused rather
+ *         than silently read as 0, which would leave every file the
+ *         daemon creates world-writable.
+ */
+PRTE_EXPORT bool prte_parse_umask(const char *value, mode_t *mask);
 
 END_C_DECLS
 

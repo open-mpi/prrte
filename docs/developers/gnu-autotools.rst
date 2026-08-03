@@ -1,6 +1,6 @@
 .. _developers-installing-autotools-label:
 
-Manually installing the GNU Autootools
+Manually installing the GNU Autotools
 ======================================
 
 There is enough detail in building the GNU Autotools that it warrants
@@ -88,7 +88,7 @@ to at least the versions listed below.
    :class: error
 
    The table below is almost certainly wrong; it has all the values
-   from Open MPI.  Need to update the table below with the appropriate
+   from PRRTE.  Need to update the table below with the appropriate
    values for PRRTE.
 
 .. list-table::
@@ -223,7 +223,7 @@ Installing the GNU Autotools from source
           Autotools manually if you can't use your operating system
           packaging system to install them for you.
 
-The GNU Autotools sources can be can be downloaded from:
+The GNU Autotools sources can be downloaded from:
 
 * https://ftp.gnu.org/gnu/autoconf/
 * https://ftp.gnu.org/gnu/automake/

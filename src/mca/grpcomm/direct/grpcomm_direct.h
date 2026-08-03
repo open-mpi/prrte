@@ -18,6 +18,8 @@
 
 #include "prte_config.h"
 
+#include "src/class/pmix_bitmap.h"
+
 #include "src/mca/grpcomm/grpcomm.h"
 
 BEGIN_C_DECLS
@@ -28,6 +30,9 @@ typedef struct {
     pmix_object_t super;
     // list of ongoing operations, defined in grpcomm_direct_xcast.c
     pmix_list_t ops;
+    // FIFO of completion callbacks for master-originated broadcasts awaiting
+    // relay back to the master (see grpcomm_direct_xcast.c)
+    pmix_list_t pending_completions;
     // ID of the last known completed (in our subtree) operation
     size_t op_id_completed;
     // op_id_completed when we were last promoted
@@ -48,7 +53,51 @@ typedef struct {
     pmix_list_t fence_ops;
     // track ongoiong group operations - list of prte_grpcomm_group_t
     pmix_list_t group_ops;
+    // A short memory of group operations we have already released - list of
+    // prte_grpcomm_group_memo_t, capped at PRTE_GRPCOMM_GROUP_MEMO_MAX. A
+    // contribution can arrive after the release that retired its tracker has
+    // already been processed here; without this, get_tracker() would take it
+    // as the first contribution to a brand-new operation and build a tracker
+    // that nothing will ever complete or delete.
+    pmix_list_t completed_group_ops;
+    // The collective recovery epoch for this daemon. A daemon failure
+    // invalidates every in-flight rollup, because how many contributions each
+    // daemon expects is derived from the routing tree. Recovery is a
+    // simultaneous restart across the DVM, and this counter is what tells one
+    // round from the next, so a contribution still in flight from before the
+    // failure can be recognized as stale. Shared by fence and group: one
+    // failure, one restart, one epoch.
+    uint32_t recovery_epoch;
 } prte_grpcomm_direct_component_t;
+
+#define PRTE_GRPCOMM_GROUP_MEMO_MAX 64
+
+typedef struct {
+    pmix_list_item_t super;
+    char *groupID;
+    pmix_group_operation_t op;
+} prte_grpcomm_group_memo_t;
+PMIX_CLASS_DECLARATION(prte_grpcomm_group_memo_t);
+
+/* Was this process hosted by a daemon that has since failed? A wildcard rank
+ * names a whole namespace rather than one process and so is never answered
+ * here - use prte_grpcomm_direct_procs_lost() for a set that may contain one.
+ * Exported so the unit test can drive it against a synthetic failed set. */
+PRTE_MODULE_EXPORT bool prte_grpcomm_direct_proc_departed(const pmix_proc_t *proc);
+
+/* Did this set of participants lose anyone to a failed daemon? Unlike the
+ * single-process test, a wildcard entry is expanded through the job map, so
+ * a collective whose membership is written as a whole namespace is answered
+ * correctly. */
+PRTE_MODULE_EXPORT bool prte_grpcomm_direct_procs_lost(const pmix_proc_t *procs, size_t nprocs);
+
+/* Advance the recovery epoch and restart every in-flight collective at it.
+ * Idempotent: an epoch at or below the current one does nothing. */
+PRTE_MODULE_EXPORT void prte_grpcomm_direct_advance_epoch(uint32_t to);
+
+/* Per-collective halves of the restart, called only by the above. */
+void prte_grpcomm_direct_group_restart(void);
+void prte_grpcomm_direct_fence_restart(void);
 
 PRTE_MODULE_EXPORT extern prte_grpcomm_direct_component_t prte_mca_grpcomm_direct_component;
 extern prte_grpcomm_base_module_t prte_grpcomm_direct_module;
@@ -81,6 +130,12 @@ typedef struct {
     size_t naddmembers;
     pmix_proc_t *final_order;
     size_t nfinal;
+    // Set when a participant asked for PMIX_GROUP_FT_COLLECTIVE: a construct
+    // that loses a member should complete on the survivors rather than abort.
+    // Accumulated by sticky-OR as contributions merge, so it means "some
+    // surviving participant asked for it" - a participant that requested it
+    // and then died before its contribution rolled up cannot be seen here.
+    bool ft_collective;
 } prte_grpcomm_direct_group_signature_t;
 PRTE_MODULE_EXPORT PMIX_CLASS_DECLARATION(prte_grpcomm_direct_group_signature_t);
 
@@ -103,6 +158,15 @@ typedef struct {
     size_t nexpected;
     /* number reported in */
     size_t nreported;
+    // Which child subtrees have reported, keyed the same way the group
+    // tracker does it - see the note there. A fence replays its
+    // contributions on a fault too, so the same duplicate-proofing applies.
+    pmix_bitmap_t reported_slots;
+    bool self_reported;
+    bool converged;
+    bool aborting;
+    // this daemon's own contribution, saved so a fault can replay it
+    pmix_data_buffer_t *my_contribution;
     /* controls values */
     int timeout;
     /* callback function */
@@ -123,14 +187,28 @@ typedef struct {
     pmix_rank_t *dmns;
     /** number of participating daemons */
     size_t ndmns;
-    /** my index in the dmns array */
-    unsigned long my_rank;
     /* type of collective */
     bool bootstrap;
 
     /*** NON-BOOTSTRAP TRACKERS ***/
     size_t nexpected;  // number of buckets expected
     size_t nreported;  // number reported in
+    // A contribution is identified by which of our routing-tree child
+    // subtrees it arrived from, not merely counted: a bare counter cannot
+    // tell two messages from one child apart from one message from each of
+    // two, which is exactly what a replay after a fault produces. The slot
+    // index is prte_rml_get_subtree_index() of the sender, the same mapping
+    // prte_rml_get_num_contributors() uses to compute nexpected, so the two
+    // agree by construction. Our own contribution has no subtree index and
+    // is tracked separately.
+    pmix_bitmap_t reported_slots;
+    bool self_reported;
+    // set once the rollup has been answered (released by the controller, or
+    // rolled up to our parent) so a straggler cannot drive it a second time
+    bool converged;
+    // set when an abort has been broadcast for this op but the tracker has
+    // not yet been deleted by the returning release
+    bool aborting;
 
     /*** BOOTSTRAP TRACKERS ***/
     // "leaders" are group members reporting as
@@ -148,9 +226,21 @@ typedef struct {
     size_t nfollowers_reported;  // number reported in
 
     /* controls values */
-    bool assignID;
     int timeout;
-    size_t memsize;
+    // the controller arms a timer for "timeout" seconds once a participant
+    // has asked for one, so a collective that can no longer converge fails
+    // its participants instead of hanging them
+    prte_event_t tev;
+    bool tev_active;
+    // This daemon's own contribution, kept so a fault can replay it: recovery
+    // resets every tracker and each daemon re-injects what it originally
+    // contributed. NULL on a daemon that is only relaying for its subtree.
+    pmix_data_buffer_t *my_contribution;
+    // Members lost with a failed daemon, filled in by the controller when a
+    // fault-tolerant construct completes on the survivors, and carried in the
+    // release so each daemon can tell its own clients who went missing.
+    pmix_proc_t *departed;
+    size_t ndeparted;
     void *grpinfo;  // info list of group info
     void *endpts;   // info list of endpts
     /* callback function */
@@ -181,6 +271,12 @@ PMIX_CLASS_DECLARATION(prte_pmix_fence_caddy_t);
 PRTE_MODULE_EXPORT extern
 int prte_grpcomm_direct_xcast(prte_rml_tag_t tag,
                               pmix_data_buffer_t *msg);
+
+PRTE_MODULE_EXPORT extern
+int prte_grpcomm_direct_xcast_nb(prte_rml_tag_t tag,
+                                 pmix_data_buffer_t *msg,
+                                 prte_grpcomm_xcast_complete_fn_t cbfunc,
+                                 void *cbdata);
 
 PRTE_MODULE_EXPORT extern
 void prte_grpcomm_direct_xcast_recv(int status, pmix_proc_t *sender,

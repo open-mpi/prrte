@@ -1,13 +1,18 @@
 Launching with LSF
 ==================
 
+.. warning:: Problems have been reported with using the most recent releases of LSF, in particular
+             the version supplied with IBM Spectrum LSF Version 10.1 Fix Pack 15.
+             The suggested workaround is to use an older release of the LSF 10.1 package or to
+             configure PRRTE without LSF support.
+
 PRRTE supports the LSF resource manager.
 
 Verify LSF support
 ------------------
 
 The ``prte_info`` command can be used to determine whether or not an
-installed Open MPI includes LSF support:
+installed PRRTE includes LSF support:
 
 .. code-block::
 
@@ -28,7 +33,7 @@ Launching
 When properly configured, PRRTE obtains both the list of hosts and
 how many processes to start on each host from LSF directly.  Hence, it
 is unnecessary to specify the ``--hostfile``, ``--host``, or ``-n``
-options to ``mpirun``.  PRRTE will use LSF-native mechanisms
+options to ``prterun``.  PRRTE will use LSF-native mechanisms
 to launch and kill processes (``ssh`` is not required).
 
 For example:

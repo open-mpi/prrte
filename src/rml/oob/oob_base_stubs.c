@@ -22,6 +22,7 @@
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_printf.h"
 #include "src/mca/errmgr/errmgr.h"
+#include "src/mca/ess/base/base.h"
 #include "src/rml/rml.h"
 #include "src/mca/state/state.h"
 #include "src/threads/pmix_threads.h"
@@ -76,6 +77,21 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
     /* do we have a route to this peer (could be direct)? */
     PMIX_LOAD_NSPACE(hop.nspace, PRTE_PROC_MY_NAME->nspace);
     hop.rank = prte_rml_get_route(msg->dst.rank);
+    if (PMIX_RANK_INVALID == hop.rank && PRTE_PROC_MY_HNP->rank != msg->dst.rank) {
+        /* The routing tree has no next hop toward this target - it sits behind
+         * a hole we cannot get any closer to.  Report that to the sender rather
+         * than dragging an invalid rank through the lookup below.  A message
+         * for the HNP is the exception: it is allowed to fall through to the
+         * direct-to-HNP attempt just below, which is the last resort when our
+         * whole ancestor chain has died. */
+        pmix_output_verbose(4, prte_oob_base.output,
+                            "%s oob:base:send no route to %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            PRTE_NAME_PRINT(&msg->dst));
+        msg->status = PRTE_ERR_NO_PATH_TO_TARGET;
+        PRTE_RML_SEND_COMPLETE(msg);
+        return;
+    }
     /* do we know this hop? */
     if (NULL == (peer = prte_oob_tcp_peer_lookup(&hop))) {
         /* if this message is going to the HNP, send it direct */
@@ -87,9 +103,14 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
             }
         }
         // see if we know the contact info for it
+        /* the macro reports a PMIx status, not a PRRTE error code */
         PRTE_MODEX_RECV_VALUE_OPTIONAL(rc, PMIX_PROC_URI, &hop, (char **) &uri, PMIX_STRING);
-        if (PRTE_SUCCESS == rc && NULL != uri) {
+        if (PMIX_SUCCESS == rc && NULL != uri) {
             peer = process_uri(uri);
+            /* process_uri only reads (and temporarily splits) the string - the
+             * copy the modex handed us is ours to release */
+            free(uri);
+            uri = NULL;
             if (NULL == peer) {
                 /* that is just plain wrong */
                 pmix_output_verbose(5, prte_oob_base.output,
@@ -97,25 +118,42 @@ void prte_oob_base_send_nb(int fd, short args, void *cbdata)
                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                     PRTE_NAME_PRINT(&msg->dst));
 
-                if (prte_prteds_term_ordered || prte_finalizing || prte_abnormal_term_ordered) {
-                    /* just ignore the problem */
-                    PMIX_RELEASE(msg);
-                    return;
+                /* Complete the send, do not merely release it: the callback is
+                 * how the originator learns the message died. Releasing frees
+                 * the buffer and tells nobody - invisible for the default
+                 * callback, a silently lost message for anything that tracks
+                 * completion (all of RELM). */
+                if (!prte_prteds_term_ordered && !prte_finalizing
+                    && !prte_abnormal_term_ordered) {
+                    PRTE_ACTIVATE_PROC_STATE(&hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
                 }
+                msg->status = PRTE_ERR_ADDRESSEE_UNKNOWN;
+                PRTE_RML_SEND_COMPLETE(msg);
+                return;
+            }
+        } else if (prte_bootstrap_setup) {
+            /* In a bootstrapped DVM no nidmap has distributed peer URIs during
+             * formation, and after a lifeline heals our new parent (a former
+             * grandparent) was never pre-synthesized.  Derive the next hop's
+             * contact URI from the configuration - the same synthesis prted
+             * used for our original parent - and connect to it. */
+            char *synth = NULL;
+            if (PRTE_SUCCESS == prte_ess_base_bootstrap_peer_uri(hop.rank, &synth)
+                && NULL != synth) {
+                peer = process_uri(synth);
+                free(synth);
+            }
+        }
+        if (NULL == peer) {
+            // unable to send it - as above, complete rather than release so
+            // the originator's callback runs with a status
+            if (!prte_prteds_term_ordered && !prte_finalizing
+                && !prte_abnormal_term_ordered) {
+                PMIX_ERROR_LOG(rc);
                 PRTE_ACTIVATE_PROC_STATE(&hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
-                PMIX_RELEASE(msg);
-                return;
             }
-        } else {
-            // unable to send it
-             if (prte_prteds_term_ordered || prte_finalizing || prte_abnormal_term_ordered) {
-                /* just ignore the problem */
-                PMIX_RELEASE(msg);
-                return;
-            }
-            PMIX_ERROR_LOG(rc);
-            PRTE_ACTIVATE_PROC_STATE(&hop, PRTE_PROC_STATE_UNABLE_TO_SEND_MSG);
-            PMIX_RELEASE(msg);
+            msg->status = PRTE_ERR_ADDRESSEE_UNKNOWN;
+            PRTE_RML_SEND_COMPLETE(msg);
             return;
        }
    }
@@ -159,12 +197,9 @@ send:
  * Obtain a uri for initial connection purposes
  *
  * During initial wireup, we can only transfer contact info on the daemon
- * command line. This limits what we can send to a string representation of
- * the actual contact info, which gets sent in a uri-like form. Not every
- * oob module can support this transaction, so this function will loop
- * across all oob components/modules, letting each add to the uri string if
- * it supports bootstrap operations. An error will be returned in the cbfunc
- * if NO component can successfully provide a contact.
+ * command line, so we render it as a compact, uri-like string: our process
+ * name followed by the TCP endpoints (IPv4 and, if enabled, IPv6) we are
+ * listening on. Returns *uri == NULL if we have no usable connection.
  *
  * Note: since there is a limit to what an OS will allow on a cmd line, we
  * impose a limit on the length of the resulting uri via an MCA param. The
@@ -354,6 +389,7 @@ static void set_addr(pmix_proc_t *peer, char **uris)
         ports = strrchr(tcpuri, ':');
         if (NULL == ports) {
             PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+            PMIx_Argv_free(masks);
             free(tcpuri);
             continue;
         }
@@ -380,12 +416,15 @@ static void set_addr(pmix_proc_t *peer, char **uris)
 
         /* cycle across the provided addrs */
         for (j = 0; NULL != addrs[j]; j++) {
-            if (NULL == masks[j]) {
-                /* Missing mask information */
-                pmix_output_verbose(2, prte_oob_base.output,
-                                    "%s oob:tcp: uri missing mask information.",
-                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-                return;
+            int if_mask;
+            /* A mask may be absent - e.g., from a contact URI synthesized by
+             * the bootstrap path, which cannot know the peer's interface mask.
+             * Treat a missing/empty mask as a /0, i.e. universally reachable,
+             * rather than rejecting the address. */
+            if (NULL == masks || NULL == masks[j] || '\0' == masks[j][0]) {
+                if_mask = 0;
+            } else {
+                if_mask = atoi(masks[j]);
             }
             /* if they gave us "localhost", then just take the first conn on our list */
             if (0 == strcasecmp(addrs[j], "localhost")) {
@@ -424,13 +463,15 @@ static void set_addr(pmix_proc_t *peer, char **uris)
             if (PRTE_SUCCESS
                 != (rc = parse_uri(af_family, host, ports,
                                    (struct sockaddr_storage *) &(maddr->addr)))) {
+                /* one unparseable address is not a reason to tear down the
+                 * peer: it may well be an established one with a live socket
+                 * and queued sends, and the remaining addresses in this URI may
+                 * be perfectly usable. Drop just this address and carry on. */
                 PRTE_ERROR_LOG(rc);
                 PMIX_RELEASE(maddr);
-                pmix_list_remove_item(&prte_oob_base.peers, &pr->super);
-                PMIX_RELEASE(pr);
-                return;
+                continue;
             }
-            maddr->if_mask = atoi(masks[j]);
+            maddr->if_mask = if_mask;
 
             pmix_output_verbose(20, prte_oob_base.output,
                                 "%s set_peer: peer %s is listening on net %s port %s",
@@ -439,6 +480,7 @@ static void set_addr(pmix_proc_t *peer, char **uris)
             pmix_list_append(&pr->addrs, &maddr->super);
         }
         PMIx_Argv_free(addrs);
+        PMIx_Argv_free(masks);
         free(tcpuri);
     }
 }

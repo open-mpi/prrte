@@ -181,6 +181,12 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 #define PRTE_RML_TAG_RELM_STATE           78
 #define PRTE_RML_TAG_RELM_LINK            79
 
+/* daemon return / revival (the bootstrap "unheal" path): a rebooted daemon
+ * announces itself to the HNP with DAEMON_RETURNED; the HNP broadcasts
+ * DAEMON_REVIVED so every daemon re-inserts the returned rank into its tree */
+#define PRTE_RML_TAG_DAEMON_RETURNED      80
+#define PRTE_RML_TAG_DAEMON_REVIVED       81
+
 #define PRTE_RML_TAG_MAX                 100
 
 #define PRTE_RML_TAG_NTOH(t) ntohl(t)
@@ -225,6 +231,11 @@ typedef struct {
     pmix_data_buffer_t *dbuf;
     /* msg seq number */
     uint32_t seq_num;
+    /* boot epoch (incarnation) of the origin. Defaults to this process's own
+     * epoch when a message originates here; a relayed message carries the
+     * original sender's epoch, copied from the received wire header. Lets a
+     * hop drop traffic from a stale incarnation of a rebooted bootstrap rank. */
+    uint64_t epoch;
 } prte_rml_send_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_rml_send_t);
 
@@ -314,6 +325,13 @@ typedef struct {
     //
     // Similar reasoning applies to our parent.
     bool promoted;
+
+    // The mirror of promoted, set by the unheal path: a daemon that had
+    // departed returned, re-inserting itself above us, so our ancestor list
+    // grew and our subtree shrank. As with promotion, handlers should treat
+    // the re-homing children as new, because a child that briefly routed
+    // through the grandparent must discard that lineage.
+    bool demoted;
 
     bool ancestors_changed;
     pmix_data_array_t prev_ancestors; // pmix_rank_t

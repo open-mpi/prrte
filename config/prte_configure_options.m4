@@ -96,7 +96,7 @@ AC_ARG_ENABLE(debug-symbols,
 AC_MSG_CHECKING([if want developer-level compiler pickyness])
 AC_ARG_ENABLE(devel-check,
     AS_HELP_STRING([--enable-devel-check],
-                   [enable developer-level compiler pickyness when building PRRTE (default: disabled)]))
+                   [enable developer-level compiler pickyness when building PRRTE (default: enabled for git repo debug builds, disabled otherwise)]))
 if test "$enable_devel_check" = "yes"; then
     AC_MSG_RESULT([yes])
     WANT_PICKY_COMPILER=1
@@ -135,20 +135,23 @@ AC_DEFINE_UNQUOTED(PRTE_MEMORY_SANITIZERS, $WANT_MEMORY_SANITIZERS,
                    [Whether or not we are using memory sanitizers])
 
 #
-# Do we want to install the internal devel headers?
+# There was a --with-devel-headers option here, installing PRRTE's internal
+# headers under $(includedir)/prte for "authors doing deeper integration".
+# It is gone, because there is nothing those headers can be compiled
+# against: PRRTE ships no linkable library at all -- it is a set of
+# executables -- so an installed header set has no consumer.  The option is
+# an inheritance from ORTE, which lived inside Open MPI and did have one.
 #
-AC_MSG_CHECKING([if want to install project-internal header files])
-AC_ARG_WITH(devel-headers,
-    AS_HELP_STRING([--with-devel-headers],
-                   [Normal PRTE users/applications do not need this.  Developer headers are only necessary for authors doing deeper integration (default: disabled).]))
-if test "$with_devel_headers" = "yes"; then
-    AC_MSG_RESULT([yes])
-    WANT_INSTALL_HEADERS=1
-else
-    AC_MSG_RESULT([no])
-    WANT_INSTALL_HEADERS=0
-fi
-AM_CONDITIONAL(WANT_INSTALL_HEADERS, test "$WANT_INSTALL_HEADERS" = 1)
+# It had also stopped working.  The generated headers (prte_config.h and
+# version.h) were collected into a nodist_headers variable that no _HEADERS
+# variable referenced, so they were never installed -- while
+# prte_config_top.h and prte_config_bottom.h, which each #error unless
+# PRTE_CONFIG_H is already defined, were.  Since every PRRTE header opens
+# with #include "prte_config.h", nothing in the installed tree could be
+# compiled.  Separately, the mca framework Makefile.am files set
+# nobase_prte_HEADERS *outside* the conditional, so their headers installed
+# on every build whether the option was given or not.
+#
 
 #
 # Do we want the pretty-print stack trace feature?
@@ -405,12 +408,16 @@ fi
 AM_CONDITIONAL(PRTE_WANT_LEGACY_TOOLS, test "$PRTE_WANT_LEGACY_TOOLS" = 1)
 PRTE_SUMMARY_ADD([Miscellaneous], [Install legacy tools], [], [$prte_legacy_tools])
 
-# use header "shims" for 3rd-party libraries to test-build
-# the PLM launchers
-AC_MSG_CHECKING([if want to test-build PLM launchers that require 3rd-party headers/libraries])
+# Build the resource-manager components that an ordinary developer machine
+# cannot build, so that they are at least compiled somewhere.  Some of them
+# (plm/ras) need header "shims" standing in for a 3rd-party library; others
+# (ess/lsf, ess/pals) need nothing but the gate opened, because their whole
+# dependency on that RM is a getenv - which is exactly why they are the ones
+# that quietly stop compiling.
+AC_MSG_CHECKING([if want to test-build launcher components that require 3rd-party headers/libraries])
 AC_ARG_ENABLE([testbuild-launchers],
     [AS_HELP_STRING([--enable-testbuild-launchers],
-        [Test-build PLM launchers that require 3rd-party headers/libraries (default: disabled)])])
+        [Test-build launcher components (plm/ras/ess) that require 3rd-party headers/libraries (default: disabled)])])
 if test "$enable_testbuild_launchers" = "yes"; then
     AC_MSG_RESULT([yes])
     prte_testbuild_launchers=1
@@ -422,6 +429,7 @@ else
 fi
 AC_DEFINE_UNQUOTED([PRTE_TESTBUILD_LAUNCHERS], [$prte_testbuild_launchers],
                    [Enable testbuild PLM launchers (default: disabled)])
+PRTE_SUMMARY_ADD([Miscellaneous], [Testbuild launchers], [], [$prte_testbuild_launchers_msg])
 
 # Optionally add a prefix to all the PRTE executable and library names
 AC_MSG_CHECKING([if want custom PRTE binary prefix])
@@ -442,7 +450,5 @@ AC_MSG_RESULT([$PRTE_BINARY_PREFIX])
 AC_SUBST(PRTE_BINARY_PREFIX)
 AC_DEFINE_UNQUOTED([PRTE_BINARY_PREFIX], ["$PRTE_BINARY_PREFIX"],
                    [The prefix to use with PRTE binaries and libraries])
-
-PRTE_SUMMARY_ADD([Miscellaneous], [Testbuild launchers], [], [$prte_testbuild_launchers_msg])
 
 ])dnl

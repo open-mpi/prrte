@@ -38,6 +38,7 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
     pmix_rank_t *vpids = NULL;
     uint8_t u8;
     int n, m, ndaemons, nbytes;
+    pmix_rank_t span;
     bool compressed;
     char **names = NULL;
     char **aliases = NULL, **als;
@@ -58,13 +59,34 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
         return rc;
     }
 
-    /* pack a flag indicating if we are in a managed allocation */
-    if (prte_managed_allocation) {
-        u8 = 1;
-    } else {
-        u8 = 0;
+    /* Pack the size of the daemon vpid space, [0, span). This can be larger
+     * than the number of live daemons packed below: a DVM shrink leaves a
+     * permanent hole in the vpid space (the DVM never reuses a daemon vpid),
+     * so the departed daemon has no entry in the name/vpid lists. Receivers
+     * need this exact span - not the live count - so their routing tree covers
+     * the same rank space the HNP uses, and so they can identify the holes as
+     * permanently-dead ranks to route around (#2491).
+     *
+     * The span must cover every vpid we actually pack below. num_daemons is
+     * normally that span, but it can transiently lag the pool: a bootstrap
+     * daemon that departed and rebooted still has its node->daemon entry (so it
+     * is packed), yet num_daemons is not restored until the daemon formally
+     * reports its (re)launch. Encoding num_daemons as the span in that window
+     * would exclude the top vpid, corrupting the receiver's routing tree. So
+     * pre-scan the pool for the highest daemon vpid and use span =
+     * max(num_daemons, highest_vpid + 1) - large enough to cover every packed
+     * daemon while still preserving a top-of-range shrink hole. */
+    span = prte_process_info.num_daemons;
+    for (n = 0; n < pool->size; n++) {
+        nptr = (prte_node_t *) pmix_pointer_array_get_item(pool, n);
+        if (NULL == nptr || NULL == nptr->daemon) {
+            continue;
+        }
+        if (nptr->daemon->name.rank + 1 > span) {
+            span = nptr->daemon->name.rank + 1;
+        }
     }
-    rc = PMIx_Data_pack(PRTE_PROC_MY_NAME, buffer, &u8, 1, PMIX_UINT8);
+    rc = PMIx_Data_pack(PRTE_PROC_MY_NAME, buffer, &span, 1, PMIX_PROC_RANK);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         return rc;
@@ -77,9 +99,14 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
      * all just yet. However, even the largest systems won't
      * have more than a million nodes for quite some time,
      * so for now we'll just allocate enough space to hold
-     * them all. Someone can optimize this further later */
-    nbytes = prte_process_info.num_daemons * sizeof(pmix_rank_t);
+     * them all. Someone can optimize this further later. Size
+     * the buffer to the span so it holds every packed vpid. */
+    nbytes = span * sizeof(pmix_rank_t);
     vpids = (pmix_rank_t *) malloc(nbytes);
+    if (NULL == vpids) {
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
 
     ndaemons = 0;
     for (n = 0; n < pool->size; n++) {
@@ -151,6 +178,7 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
         return rc;
     }
     free(bo.bytes);
+    bo.bytes = NULL;
 
     /* construct the string of aliases for compression */
     raw = PMIx_Argv_join(aliases, ';');
@@ -183,8 +211,16 @@ int prte_util_nidmap_create(pmix_pointer_array_t *pool, pmix_data_buffer_t *buff
         return rc;
     }
     free(bo.bytes);
+    bo.bytes = NULL;
 
-    /* compress the vpids */
+    /* compress the vpids. Only the entries we actually filled: the buffer is
+     * sized to the vpid *span*, which exceeds the daemon count whenever the
+     * DVM carries a shrink hole, and the tail past ndaemons is uninitialized
+     * heap. The receiver reads one vpid per packed node name, so those bytes
+     * were never wanted - they were just being compressed and shipped to
+     * every daemon (and made the compressed and uncompressed encodings
+     * disagree about the object's length). */
+    nbytes = ndaemons * sizeof(pmix_rank_t);
     if (PMIx_Data_compress((uint8_t *) vpids, nbytes, (uint8_t **) &bo.bytes, &sz)) {
         /* mark that this was compressed */
         compressed = true;
@@ -219,6 +255,7 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
 {
     uint8_t u8;
     pmix_rank_t *vpid = NULL;
+    pmix_rank_t ndmns = 0;
     int cnt, n;
     bool compressed;
     size_t sz;
@@ -243,17 +280,13 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
         prte_hnp_is_allocated = false;
     }
 
-    /* unpack the flag indicating if we are in managed allocation */
+    /* unpack the size of the daemon vpid space (may exceed the live daemon
+     * count when the DVM carries shrunk-out vpid holes - see nidmap_create) */
     cnt = 1;
-    rc = PMIx_Data_unpack(PRTE_PROC_MY_NAME, buf, &u8, &cnt, PMIX_UINT8);
+    rc = PMIx_Data_unpack(PRTE_PROC_MY_NAME, buf, &ndmns, &cnt, PMIX_PROC_RANK);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         goto cleanup;
-    }
-    if (1 == u8) {
-        prte_managed_allocation = true;
-    } else {
-        prte_managed_allocation = false;
     }
 
     /* unpack compression flag for node names */
@@ -362,6 +395,23 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
 
     /* get the daemon job object */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons) {
+        /* should never happen - we are a daemon reading our own DVM's map */
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        rc = PRTE_ERR_NOT_FOUND;
+        goto cleanup;
+    }
+
+    /* the three arrays are built in lockstep by nidmap_create, so anything
+     * shorter than the node-name list means the message is not one of ours -
+     * and the loop below indexes all three by the same subscript */
+    if (NULL == names || NULL == aliases || NULL == vpid
+        || PMIx_Argv_count(names) > PMIx_Argv_count(aliases)
+        || (size_t) PMIx_Argv_count(names) > sz / sizeof(pmix_rank_t)) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        rc = PRTE_ERR_BAD_PARAM;
+        goto cleanup;
+    }
 
     /* get our topology */
     t = (prte_topology_t *) pmix_pointer_array_get_item(prte_node_topologies, 0);
@@ -400,7 +450,9 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
             nd->aliases = PMIx_Argv_split(aliases[n], ',');
         }
         /* set the topology - always default to homogeneous
-         * as that is the most common scenario */
+         * as that is the most common scenario. Retain it: the node holds a
+         * counted reference so the topology cannot go away underneath it */
+        PMIX_RETAIN(t);
         nd->topology = t;
         /* record the daemon on it */
         proc = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, vpid[n]);
@@ -412,16 +464,46 @@ int prte_util_decode_nidmap(pmix_data_buffer_t *buf)
             daemons->num_procs++;
             pmix_pointer_array_set_item(daemons->procs, proc->name.rank, proc);
         }
-        PMIX_RETAIN(nd);
+        /* the node backpointer is borrowed, not retained (see
+         * prte_proc_destruct) */
         proc->node = nd;
         PMIX_RETAIN(proc);
         nd->daemon = proc;
     }
 
-    /* update num procs */
-    if (prte_process_info.num_daemons != daemons->num_procs) {
-        prte_process_info.num_daemons = daemons->num_procs;
-        /* update the routing tree */
+    /* Record any vpid holes as departed ranks. The DVM spans [0, ndmns) daemon
+     * vpids, but a shrunk-out (or not-yet-present bootstrap) daemon leaves a
+     * hole with no entry above, so daemons->procs has a gap at that rank.
+     * Marking the gap makes this daemon's routing tree route around the hole
+     * exactly as the HNP and the surviving daemons do - closing the gap that a
+     * brand-new daemon (empty failure set) would otherwise have (#2491). On an
+     * unshrunk, fully-present DVM ndmns equals the live count, so nothing is
+     * marked and behavior is unchanged. */
+    bool newdead = false;
+    for (pmix_rank_t r = 0; r < ndmns; r++) {
+        if (NULL != pmix_pointer_array_get_item(daemons->procs, r)) {
+            continue;
+        }
+        // In a bootstrapped DVM a vpid hole is not necessarily permanent: the
+        // node can reboot and its daemon return with the same rank. Record it
+        // as absent (clearable by the unheal path) rather than dead. In a
+        // launched/elastic DVM the hole is permanent (#2491) and goes to
+        // dead_dmns exactly as before.
+        if (prte_bootstrap_setup) {
+            if (!pmix_bitmap_is_set_bit(&prte_rml_base.absent_dmns, r)) {
+                pmix_bitmap_set_bit(&prte_rml_base.absent_dmns, r);
+                newdead = true;
+            }
+        } else if (!pmix_bitmap_is_set_bit(&prte_rml_base.dead_dmns, r)) {
+            pmix_bitmap_set_bit(&prte_rml_base.dead_dmns, r);
+            newdead = true;
+        }
+    }
+
+    /* update num daemons and (re)build the routing tree if the vpid span grew
+     * or a new hole appeared */
+    if (prte_process_info.num_daemons != ndmns || newdead) {
+        prte_process_info.num_daemons = ndmns;
         prte_rml_compute_routing_tree();
     }
 
@@ -432,6 +514,11 @@ cleanup:
     }
     if (NULL != names) {
         PMIx_Argv_free(names);
+    }
+    /* the alias list was leaked on every single decode, including the clean
+     * one - and every daemon decodes a nidmap on each DVM update */
+    if (NULL != aliases) {
+        PMIx_Argv_free(aliases);
     }
     return rc;
 }

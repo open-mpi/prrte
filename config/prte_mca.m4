@@ -56,6 +56,17 @@ AC_DEFUN([PRTE_MCA],[
         [AS_HELP_STRING([--enable-mca-no-build=LIST],
                         [Comma-separated list of <type>-<component> pairs
                          that will not be built.  Example: "--enable-mca-no-build=maffinity,btl-portals" will disable building all maffinity components and the "portals" btl components.])])
+    #
+    # The default DSO list is every component that can end up linked
+    # against a third-party library.  Keeping them out of libprrte keeps
+    # that dependency out of every PRRTE tool -- and it is what lets
+    # --enable-testbuild-launchers work at all: a run-time loadable
+    # plugin may carry the unresolved symbols left behind by a
+    # declaration-only stub header (it simply fails to dlopen), while a
+    # shared library linked into an executable may not.  ras-flux and
+    # ras-slurm are here for the latter reason: both compile JSON
+    # parsing against jansson.
+    #
     AC_ARG_ENABLE(mca-dso,
         AS_HELP_STRING([--enable-mca-dso=LIST],
                        [Comma-separated list of types and/or
@@ -63,7 +74,7 @@ AC_DEFUN([PRTE_MCA],[
                         run-time loadable components (as opposed to
                         statically linked in), if supported on this
                         platform.]),
-                        [], [enable_mca_dso=ess-alps,plm-alps,plm-lsf,plm-tm,ras-alps,ras-lsf])
+                        [], [enable_mca_dso=plm-lsf,ras-flux,ras-lsf,ras-slurm])
     AC_ARG_ENABLE(mca-static,
         AS_HELP_STRING([--enable-mca-static=LIST],
                        [Comma-separated list of types and/or
@@ -234,15 +245,61 @@ AC_DEFUN([PRTE_MCA],[
 
 ])
 
+# _MCA_TRACK_PRIORITY_RANGE(priority)
+# -----------------------------------
+# Fold the given priority into the running
+# mca_component_max_priority / mca_component_min_priority values.  Both
+# must be defined (to the empty string, if this is the first priority
+# seen) before invoking this macro.
+m4_define([_MCA_TRACK_PRIORITY_RANGE],
+    [m4_ifval(mca_component_max_priority,
+         [m4_if(m4_eval([$1] > mca_component_max_priority), [1],
+                [m4_define([mca_component_max_priority], [$1])])dnl
+          m4_if(m4_eval([$1] < mca_component_min_priority), [1],
+                [m4_define([mca_component_min_priority], [$1])])],
+         [m4_define([mca_component_max_priority], [$1])dnl
+          m4_define([mca_component_min_priority], [$1])])])
+
+# _MCA_EMIT_COMPONENT_IF_PRIORITY(framework_name, component_name, priority)
+# ------------------------------------------------------------------------
+# Emit component_name (preceded by a separator, if it is not the first
+# component emitted) if and only if its priority is the given priority.
+# mca_component_separator must be defined to the empty string before
+# the first invocation of this macro.
+m4_define([_MCA_EMIT_COMPONENT_IF_PRIORITY],
+    [m4_if(m4_eval(PRTE_EVAL_ARG([MCA_prte_]$1[_]$2[_PRIORITY]) == [$3]), [1],
+           [mca_component_separator[]$2[]m4_define([mca_component_separator], [, ])])])
+
 # MCA_ORDER_COMPONENT_LIST(framework_name)
+# ----------------------------------------
+# Define component_list to be the framework's m4-configure component
+# list, ordered from highest to lowest
+# MCA_prte_<framework>_<component>_PRIORITY.  Every component in the
+# list must have a priority.
 AC_DEFUN([MCA_ORDER_COMPONENT_LIST], [
     m4_foreach(mca_component, [mca_prte_$1_m4_config_component_list],
                [m4_ifval(mca_component,
                     [m4_ifdef([MCA_prte_]$1[_]mca_component[_PRIORITY], [],
                          [m4_fatal([MCA_prte_$1_]mca_component[_PRIORITY not found, but required.])])])])
+dnl Find the highest and lowest priorities in the framework.
+    m4_define([mca_component_max_priority], [])dnl
+    m4_define([mca_component_min_priority], [])dnl
+    m4_foreach([mca_component], [mca_prte_$1_m4_config_component_list],
+               [m4_ifval(mca_component,
+                    [_MCA_TRACK_PRIORITY_RANGE(PRTE_EVAL_ARG([MCA_prte_]$1[_]mca_component[_PRIORITY]))])])dnl
+dnl Walk the priorities from highest to lowest, emitting the components
+dnl that have each priority.  Walking the priorities (vs. sorting the
+dnl components) means that components of equal priority are emitted in
+dnl the same relative order in which they appear in the original list.
+    m4_define([mca_component_separator], [])dnl
     m4_define([component_list],
-              [esyscmd([config/prte_mca_priority_sort.pl] m4_foreach([mca_component], [mca_prte_$1_m4_config_component_list],
-                        [m4_ifval(mca_component, [mca_component ]PRTE_EVAL_ARG([MCA_prte_]$1[_]mca_component[_PRIORITY ]))]))])
+        m4_dquote(m4_ifval(mca_component_max_priority,
+            [m4_for([mca_component_priority],
+                    mca_component_max_priority, mca_component_min_priority, -1,
+                [m4_foreach([mca_component], [mca_prte_$1_m4_config_component_list],
+                    [m4_ifval(mca_component,
+                         [_MCA_EMIT_COMPONENT_IF_PRIORITY($1, mca_component,
+                                                          mca_component_priority)])])])])))
 ])
 
 AC_DEFUN([MCA_CHECK_IGNORED_PRIORITY], [

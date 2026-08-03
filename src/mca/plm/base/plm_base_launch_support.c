@@ -40,7 +40,6 @@
 
 #include "src/class/pmix_pointer_array.h"
 #include "src/hwloc/hwloc-internal.h"
-#include "src/include/hash_string.h"
 #include "src/pmix/pmix-internal.h"
 #include "src/prted/pmix/pmix_server.h"
 
@@ -144,6 +143,8 @@ void prte_plm_base_daemons_reported(int fd, short args, void *cbdata)
                 continue;
             }
             if (NULL == node->topology) {
+                /* the node holds a counted reference to the topology */
+                PMIX_RETAIN(t);
                 node->topology = t;
                 node->available = prte_hwloc_base_filter_cpus(node->topology->topo);
             }
@@ -151,32 +152,30 @@ void prte_plm_base_daemons_reported(int fd, short args, void *cbdata)
         }
     }
 
-    /* if this is an unmanaged allocation, then set the default
-     * slots on each node as directed or using default
+    /* Size every node in this job's session, then total them.  A node whose
+     * count was GIVEN to us - by a resource manager, or by an explicit
+     * "slots=" - keeps it; only a node that arrived without one is sized
+     * here, from its topology or as prte_set_slots directs.  The total is
+     * therefore always the sum of the job's own nodes: summing a
+     * whole-allocation figure instead would be wrong for any job mapping
+     * onto a reservation rather than the default pool.
+     * prte_set_slots_override is the deliberate escape hatch - it re-sizes
+     * even the nodes whose counts were given.
      */
-    if (!prte_managed_allocation || prte_set_slots_override) {
-        caddy->jdata->total_slots_alloc = 0;
-        for (i = 0; i < caddy->jdata->session->nodes->size; i++) {
-            node = (prte_node_t *) pmix_pointer_array_get_item(caddy->jdata->session->nodes, i);
-            if (NULL == node) {
-                continue;
-            }
-            if (!PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN)) {
-                PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                     "%s plm:base:setting slots for node %s by %s",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name,
-                                     prte_set_slots));
-                prte_plm_base_set_slots(node);
-            }
-            caddy->jdata->total_slots_alloc += node->slots;
+    caddy->jdata->total_slots_alloc = 0;
+    for (i = 0; i < caddy->jdata->session->nodes->size; i++) {
+        node = (prte_node_t *) pmix_pointer_array_get_item(caddy->jdata->session->nodes, i);
+        if (NULL == node) {
+            continue;
         }
-    } else {
-        /* for managed allocations, the total slots allocated is fixed at time of allocation */
-        caddy->jdata->total_slots_alloc = prte_ras_base.total_slots_alloc;
-    }
-
-    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_ALLOC, NULL, PMIX_BOOL)) {
-        prte_ras_base_display_alloc(caddy->jdata);
+        if (!PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN) || prte_set_slots_override) {
+            PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                                 "%s plm:base:setting slots for node %s by %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name,
+                                 prte_set_slots));
+            prte_plm_base_set_slots(node);
+        }
+        caddy->jdata->total_slots_alloc += node->slots;
     }
 
     /* progress the job */
@@ -191,9 +190,39 @@ void prte_plm_base_allocation_complete(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     prte_node_t *node;
+    int rc;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(caddy);
+
+    /* In a bootstrapped DVM the daemons were started independently on every
+     * node and are already phoning home - there is nothing for us to launch.
+     * We therefore establish the virtual machine directly from the allocated
+     * node pool (assigning vpids, building the routing tree, and setting the
+     * expected daemon count) and then simply wait: as each running daemon
+     * reports in, prte_plm_base_daemon_callback advances the state machine to
+     * DAEMONS_REPORTED and on to VM_READY.
+     *
+     * This special handling applies ONLY to the daemon job (the one-time DVM
+     * formation). Application jobs launched later into the running DVM must
+     * follow the normal path: their LAUNCH_DAEMONS step calls setup_vm, finds
+     * every daemon already present ("no new daemons required"), and advances
+     * itself to DAEMONS_REPORTED. Taking the bootstrap branch for an app job
+     * would strand it in DAEMONS_LAUNCHED with nothing left to report in. */
+    if (prte_bootstrap_setup &&
+        caddy->jdata == prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace)) {
+        caddy->jdata->state = PRTE_JOB_STATE_ALLOCATION_COMPLETE;
+        rc = prte_plm_base_setup_virtual_machine(caddy->jdata);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            PRTE_ACTIVATE_JOB_STATE(caddy->jdata, PRTE_JOB_STATE_FAILED_TO_START);
+            PMIX_RELEASE(caddy);
+            return;
+        }
+        caddy->jdata->state = PRTE_JOB_STATE_DAEMONS_LAUNCHED;
+        PMIX_RELEASE(caddy);
+        return;
+    }
 
     /* if we don't want to launch, then we at least want
      * to map so we can see where the procs would have
@@ -208,6 +237,7 @@ void prte_plm_base_allocation_complete(int fd, short args, void *cbdata)
             return;
         }
         prte_rmaps_base.require_hwtcpus = !prte_hwloc_base_core_cpus(node->topology->topo);
+        prte_rmaps_base.have_cores = prte_hwloc_base_has_cores(node->topology->topo);
         PRTE_ACTIVATE_JOB_STATE(caddy->jdata, PRTE_JOB_STATE_DAEMONS_REPORTED);
     } else {
         /* move the state machine along */
@@ -266,6 +296,7 @@ void prte_plm_base_vm_ready(int fd, short args, void *cbdata)
     if (NULL != node && NULL != node->topology &&
         NULL != node->topology->topo) {
         prte_rmaps_base.require_hwtcpus = !prte_hwloc_base_core_cpus(node->topology->topo);
+        prte_rmaps_base.have_cores = prte_hwloc_base_has_cores(node->topology->topo);
     }
 
     /* position any required files */
@@ -312,7 +343,23 @@ static void spawn_timeout_cb(int fd, short event, void *cbdata)
          *something* if it does */
         timeout = -1;
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TIMEOUT_EVENT, (void **) &timer, PMIX_POINTER)) {
+    /* we are aborting the job, so clear BOTH of its timers. The one that
+     * just fired is the SPAWN timeout - clearing only the job timeout (as
+     * this used to) left our own timer registered on the job while
+     * silently cancelling the user's --timeout */
+    timer = NULL;
+    if (prte_get_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT_EVENT, (void **) &timer, PMIX_POINTER) &&
+        NULL != timer) {
+        prte_event_evtimer_del(timer->ev);
+        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                             "%s plm:base:launch deleting spawn timeout for job %s",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace)));
+        PMIX_RELEASE(timer);
+        prte_remove_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT_EVENT);
+    }
+    timer = NULL;
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TIMEOUT_EVENT, (void **) &timer, PMIX_POINTER) &&
+        NULL != timer) {
         prte_event_evtimer_del(timer->ev);
         PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                              "%s plm:base:launch deleting timeout for job %s",
@@ -478,7 +525,8 @@ static void stack_trace_timeout(int sd, short args, void *cbdata)
     int rc;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
-    /* clear the timer */
+    /* clear the job timer - it fired to get us here, but job_timeout_cb
+     * leaves its timer object attached to the job */
     timer = NULL;
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TIMEOUT_EVENT, (void **) &timer, PMIX_POINTER)
         && NULL != timer) {
@@ -486,6 +534,15 @@ static void stack_trace_timeout(int sd, short args, void *cbdata)
         /* timer is an prte_timer_t object */
         PMIX_RELEASE(timer);
         prte_remove_attribute(&jdata->attributes, PRTE_JOB_TIMEOUT_EVENT);
+    }
+    /* and clear OUR timer - the stack-trace wait - so it is neither leaked
+     * nor left dangling on the job */
+    timer = NULL;
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TRACE_TIMEOUT_EVENT, (void **) &timer,
+                           PMIX_POINTER) && NULL != timer) {
+        prte_event_evtimer_del(timer->ev);
+        PMIX_RELEASE(timer);
+        prte_remove_attribute(&jdata->attributes, PRTE_JOB_TRACE_TIMEOUT_EVENT);
     }
 
     /* abort the job */
@@ -839,6 +896,18 @@ void prte_plm_base_launch_apps(int fd, short args, void *cbdata)
     /* update job state */
     caddy->jdata->state = caddy->job_state;
 
+    /* if a shrink campaign is active, hold this job until all targeted
+     * daemons have departed the DVM to avoid sending launch data to a dying
+     * daemon (shrink campaigns are only ever created in elastic mode, so the
+     * explicit guard keeps the non-elastic launch path identical) */
+    if (prte_elastic_mode && !pmix_list_is_empty(&prte_shrink_campaigns)) {
+        jdata->state = PRTE_JOB_STATE_WAITING_FOR_DAEMONS;
+        PMIX_RETAIN(jdata);
+        pmix_pointer_array_add(prte_prelaunch_held_jobs, jdata);
+        PMIX_RELEASE(caddy);
+        return;
+    }
+
     PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                          "%s plm:base:launch_apps for job %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          PRTE_JOBID_PRINT(jdata->nspace)));
@@ -867,6 +936,25 @@ void prte_plm_base_launch_apps(int fd, short args, void *cbdata)
     return;
 }
 
+/* completion of the nspace registration for a do-not-launch job -
+ * executes on the PRRTE progress thread */
+static void donotlaunch_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_job_t *jdata = (prte_job_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        PRTE_ERROR_LOG(prte_pmix_convert_status(status));
+    }
+    /* if we are persistent, then we remain alive - otherwise, declare
+     * all jobs complete and terminate */
+    if (prte_persistent) {
+        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
+    } else {
+        prte_never_launched = true;
+        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALL_JOBS_COMPLETE);
+    }
+}
+
 void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
@@ -883,18 +971,14 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
 
     /* if we don't want to launch the apps, now is the time to leave */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
-        /* go ahead and register the job */
-        rc = prte_pmix_server_register_nspace(jdata);
+        /* go ahead and register the job - the completion callback
+         * advances the job state once the registration is done */
+        rc = prte_pmix_server_register_nspace(jdata, donotlaunch_reg_complete, jdata);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
-        }
-        /* if we are persistent, then we remain alive - otherwise, declare
-         * all jobs complete and terminate */
-        if (prte_persistent) {
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_TERMINATED);
-        } else {
-            prte_never_launched = true;
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALL_JOBS_COMPLETE);
+            /* the callback will never fire - advance the state
+             * ourselves */
+            donotlaunch_reg_complete(PMIX_SUCCESS, jdata);
         }
         PMIX_RELEASE(caddy);
         return;
@@ -917,6 +1001,183 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
 
     /* cleanup */
     PMIX_RELEASE(caddy);
+}
+
+/* Send the failure to a requester that is a separate tool.
+ *
+ * Note what travels: the FACTS, not the prose.  The message has to come out
+ * in the requester's own voice - a prun user must be told that "prun" could
+ * not launch their application, not that "prte" could not - and only the
+ * requester knows its own name.  So the tool renders it, with the same
+ * prte_render_launch_failure() the DVM would have used.
+ *
+ * It cannot come as the job's output either: a tool has no IOF sink for
+ * this job yet, since it learns the nspace from the very response we are
+ * about to send.  What it does have is a handler it registered for exactly
+ * this code before it ever called PMIx_Spawn (see prun_common.c).  Aim the
+ * event at that one tool with a custom range, so no other tool attached to
+ * the DVM sees it. */
+static void notify_launch_failure(pmix_proc_t *proxy, prte_proc_t *pptr,
+                                  const char *app, const char *cwd, const char *nodename)
+{
+    pmix_proc_t affected;
+    pmix_data_array_t darray;
+    pmix_info_t *iptr;
+    size_t ninfo;
+    void *tinfo;
+    int32_t code;
+    int rc;
+
+    PMIX_INFO_LIST_START(tinfo);
+    /* target this notification solely to the tool that asked for the job */
+    PMIX_INFO_LIST_ADD(rc, tinfo, PMIX_EVENT_CUSTOM_RANGE, proxy, PMIX_PROC);
+    /* which proc failed, so the tool can name the rank */
+    PMIX_LOAD_PROCID(&affected, pptr->name.nspace, pptr->name.rank);
+    PMIX_INFO_LIST_ADD(rc, tinfo, PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
+    /* where it failed */
+    if (NULL != nodename) {
+        PMIX_INFO_LIST_ADD(rc, tinfo, PMIX_HOSTNAME, (void *) nodename, PMIX_STRING);
+    }
+    /* and what it was trying to run there.  The tool knows the apps it
+     * submitted, but not which one this rank belonged to, so say. */
+    if (NULL != app) {
+        PMIX_INFO_LIST_ADD(rc, tinfo, "prte.launch.failed.app", (void *) app, PMIX_STRING);
+    }
+    if (NULL != cwd) {
+        PMIX_INFO_LIST_ADD(rc, tinfo, "prte.launch.failed.wdir", (void *) cwd, PMIX_STRING);
+    }
+    /* the code that selects the message.  Deliberately NOT converted: it is
+     * whatever the odls stashed in the proc's exit_code, and the renderer
+     * switches on both PMIx statuses and PRRTE codes - which no longer
+     * collide, now that PRRTE's are based at PMIX_EXTERNAL_ERR_BASE. */
+    code = pptr->exit_code;
+    PMIX_INFO_LIST_ADD(rc, tinfo, "prte.launch.failed.code", &code, PMIX_INT32);
+    /* we are on the progress thread and about to make the blocking call, so
+     * the loop-breaking marker is mandatory here - see the golden rule in
+     * the top-level AGENTS.md */
+    PMIX_INFO_LIST_ADD(rc, tinfo, "prte.notify.donotloop", NULL, PMIX_BOOL);
+
+    PMIX_INFO_LIST_CONVERT(rc, tinfo, &darray);
+    PMIX_INFO_LIST_RELEASE(tinfo);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return;
+    }
+    iptr = (pmix_info_t *) darray.array;
+    ninfo = darray.size;
+
+    /* Blocking form: the write to the tool must be queued before the spawn
+     * response that follows it, or the tool is released and gone before the
+     * message arrives.  Waiting is what orders the two. */
+    PMIx_Notify_event(PMIX_ERR_JOB_FAILED_TO_LAUNCH, &prte_process_info.myproc,
+                      PMIX_RANGE_CUSTOM, iptr, ninfo, NULL, NULL);
+    PMIX_INFO_FREE(iptr, ninfo);
+}
+
+/* Write the diagnostic to the failed job's error stream.
+ *
+ * This is the path for a requester that is this very process - prterun,
+ * which is both the DVM and the tool.  Rendering here is rendering in the
+ * requester's voice, because it is the same process, and the delivery lands
+ * on the user's terminal honoring whatever output routing they asked for
+ * (which a bare pmix_output would not). */
+static void deliver_launch_failure(prte_proc_t *pptr, const char *app, const char *cwd,
+                                   const char *nodename)
+{
+    pmix_byte_object_t bo;
+    pmix_proc_t source;
+    pmix_status_t rc;
+    char *msg;
+
+    msg = prte_render_launch_failure(pptr->exit_code, app, cwd, nodename, pptr->name.rank);
+    if (NULL == msg) {
+        /* this code says nothing by design - PMIX_ERR_SILENT and friends */
+        return;
+    }
+
+    /* attribute the output to the proc that failed */
+    PMIX_LOAD_PROCID(&source, pptr->name.nspace, pptr->name.rank);
+    PMIX_BYTE_OBJECT_CONSTRUCT(&bo);
+    bo.bytes = msg;
+    bo.size = strlen(msg);
+    /* Passing a NULL callback makes PMIx block on its OWN lock, so no PRRTE
+     * object is touched from the PMIx thread - the same deliberate exception
+     * check_complete_resume() takes, and for the same reason: the API borrows
+     * the source proc and the byte object BY POINTER and both live on this
+     * stack.  The cost is bounded - a purely PMIx-internal write with no host
+     * upcall, on a path that only runs once a launch has already failed. */
+    rc = PMIx_server_IOF_deliver(&source, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
+    if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
+        PMIX_ERROR_LOG(rc);
+    }
+    free(msg);
+}
+
+/* Tell the requester why its launch failed.
+ *
+ * The DVM knows exactly what went wrong - which proc, on which node, with
+ * which error - and that has always been rendered as a sentence naming all
+ * three.  But only later, as the PMIX_EVENT_TEXT_MESSAGE carried on the
+ * job-end event.  A requester whose *spawn* failed never sees that: the
+ * failed spawn response is what releases it from PMIx_Spawn, and it is gone
+ * well before the event is raised - having no nspace, it never even
+ * registered the handler that would have received it.  So a mistyped
+ * executable produced nothing but
+ *
+ *     PMIx_Spawn failed (-181): PMIX_ERR_JOB_FAILED_TO_LAUNCH
+ *
+ * while the sentence naming the executable sat unread on the HNP.  On a
+ * single node the failing daemon's own stderr used to cover for that, since
+ * it is the user's terminal; on any other node it did not, and the user was
+ * told only that something, somewhere, had gone wrong.
+ *
+ * So say it here, before the response goes out and while the requester is
+ * still parked inside its spawn call.
+ *
+ * Which way it goes turns on the launch proxy, because that - not
+ * PRTE_JOB_DVM_JOB, which only a PMIX_REQUESTOR_IS_TOOL spawn sets - is
+ * what actually distinguishes the two shapes: prterun records ITSELF as the
+ * proxy, while a prun records its own tool procID. */
+static void report_launch_failure(prte_job_t *jdata)
+{
+    prte_proc_t *pptr = NULL;
+    prte_app_context_t *app;
+    pmix_proc_t *proxy = NULL;
+    const char *appname = NULL, *wdir = NULL, *nodename = NULL;
+
+    /* The errmgr records the first proc to fail.  Without one there is no
+     * failure of ours to describe - an allocation or mapping failure, say,
+     * which whoever detected it has already reported. */
+    if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_ABORTED_PROC, (void **) &pptr,
+                            PMIX_POINTER) || NULL == pptr) {
+        return;
+    }
+    /* say it once.  This is the same one-shot the job-end path respects, so
+     * claiming it here also keeps dvm_notify() from repeating us later - in
+     * its own voice, which is the voice we are here to avoid. */
+    if (PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_ERR_REPORTED)) {
+        return;
+    }
+    PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_ERR_REPORTED);
+
+    app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, pptr->app_idx);
+    if (NULL != app) {
+        appname = app->app;
+        wdir = app->cwd;
+    }
+    if (NULL != pptr->node) {
+        nodename = pptr->node->name;
+    }
+
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY, (void **) &proxy, PMIX_PROC)
+        && NULL != proxy && !PMIX_CHECK_PROCID(proxy, PRTE_PROC_MY_NAME)) {
+        notify_launch_failure(proxy, pptr, appname, wdir, nodename);
+    } else {
+        deliver_launch_failure(pptr, appname, wdir, nodename);
+    }
+    if (NULL != proxy) {
+        PMIX_PROC_RELEASE(proxy);
+    }
 }
 
 int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
@@ -943,6 +1204,12 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
     /* if the response has already been sent, don't do it again */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_SPAWN_NOTIFIED, NULL, PMIX_BOOL)) {
         return PRTE_SUCCESS;
+    }
+
+    /* a status is all the requester is going to get out of this response,
+     * so tell it what actually happened while it is still listening */
+    if (PMIX_SUCCESS != status) {
+        report_launch_failure(jdata);
     }
 
     /* if the requestor was a tool, use PMIx to notify them of
@@ -996,7 +1263,8 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
             PMIX_ERROR_LOG(rc);
             PRTE_UPDATE_EXIT_STATUS(rc);
             PMIX_INFO_LIST_RELEASE(tinfo);
-            PMIX_PROC_RELEASE(nptr);
+            /* NOTE: nptr was already released when it was added to the
+             * info list above - do NOT release it again here */
             return rc;
         } else {
             iptr = (pmix_info_t *) darray.array;
@@ -1055,6 +1323,15 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
         PMIX_DATA_BUFFER_RELEASE(answer);
         return rc;
     }
+
+    /* the requestor has now been told, so record it - this is what makes the
+     * "already responded" test at the top of this function mean anything on
+     * the relay path. Only the local-notification branch above used to set it
+     * (inside pmix_server_notify_spawn), so a process that answered by sending
+     * would answer again on every later call - and each of those extra
+     * responses arrives at a requestor whose request is long retired */
+    prte_set_attribute(&jdata->attributes, PRTE_JOB_SPAWN_NOTIFIED,
+                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
 
     return PRTE_SUCCESS;
 }
@@ -1181,7 +1458,7 @@ static void progress_daemons(prte_job_t *daemons,
     prte_job_t *jdata;
     prte_proc_t *daemon;
     prte_topology_t *t;
-    pmix_rank_t j;
+    pmix_rank_t j, src;
 
     if (show_progress &&
         (0 == daemons->num_reported % 100 ||
@@ -1214,19 +1491,66 @@ static void progress_daemons(prte_job_t *daemons,
             PRTE_ACTIVATE_JOB_STATE(daemons, PRTE_JOB_STATE_DAEMONS_REPORTED);
         }
         if (prte_homo_nodes && 1 < daemons->num_procs) {
-            // ensure that all topologies point to the one
-            // returned by daemon rank=1 as it might be different
-            // from where prterun is executing (e.g., login node)
-            daemon = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, 1);
-            if (NULL == daemon->node->topology) {
-                // should never happen
-            }
-            t = daemon->node->topology;
-            for (j=2; j < daemons->num_procs; j++) {
+            // all the daemon nodes are declared identical, so they must all
+            // point at the topology reported by a DAEMON - not at our own,
+            // as prterun may be executing somewhere else entirely (e.g., a
+            // login node). Normally that is daemon rank=1, the only daemon
+            // that reports a topology under homo_nodes. However, rank 1 need
+            // not still exist - an elastic shrink can remove it - so take the
+            // topology from the first daemon that is still ALIVE and has one.
+            // The survivors inherited rank 1's topology when they reported in,
+            // so a daemon launched by a later grow (which reports no topology
+            // of its own, as it is not rank 1) still inherits the correct one.
+            //
+            // The aliveness test is what makes that fallback mean anything. A
+            // shrink deliberately keeps the departed daemon's proc object in
+            // the array - daemon vpids are never reused, so its rank stays
+            // reserved - and only unsets ALIVE and marks it TERMINATED. It
+            // leaves the proc's ->node back-pointer, and that node keeps the
+            // topology it was given. Scanning without checking ALIVE would
+            // therefore keep sourcing the topology from a daemon that left the
+            // DVM, which is both wrong in principle and indistinguishable from
+            // the hardcoded rank-1 behavior this replaced.
+            t = NULL;
+            src = PMIX_RANK_INVALID;
+            for (j = 1; j < daemons->num_procs; j++) {
                 daemon = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, j);
-                if (NULL == daemon) {
+                if (NULL == daemon || !PRTE_FLAG_TEST(daemon, PRTE_PROC_FLAG_ALIVE) ||
+                    NULL == daemon->node || NULL == daemon->node->topology) {
                     continue;
                 }
+                t = daemon->node->topology;
+                src = j;
+                break;
+            }
+            if (NULL == t) {
+                // no daemon has a topology - we have nothing to propagate and
+                // must not substitute our own, so leave things be
+                PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                return;
+            }
+            for (j = 1; j < daemons->num_procs; j++) {
+                if (j == src) {
+                    continue;
+                }
+                daemon = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, j);
+                if (NULL == daemon || !PRTE_FLAG_TEST(daemon, PRTE_PROC_FLAG_ALIVE) ||
+                    NULL == daemon->node) {
+                    /* a departed daemon's node is no longer part of the DVM -
+                     * do not hand it a topology reference to hold */
+                    continue;
+                }
+                if (daemon->node->topology == t) {
+                    // already inherited it - recomputing the cpu filter from
+                    // the same topology would just yield the same bitmap
+                    continue;
+                }
+                /* the node holds a counted reference to its topology, so
+                 * drop the old one and take a reference on the new */
+                if (NULL != daemon->node->topology) {
+                    PMIX_RELEASE(daemon->node->topology);
+                }
+                PMIX_RETAIN(t);
                 daemon->node->topology = t;
                 /* update the node's available processors */
                 if (NULL != daemon->node->available) {
@@ -1282,6 +1606,20 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             prted_failed_launch = true;
             goto CLEANUP;
         }
+        /* A returning daemon (the bootstrap unheal path): its node rebooted and
+         * it is reporting in again after we recorded it COMM_FAILED and
+         * decremented num_daemons on its death. Restore the count so the nidmap
+         * span [0, num_daemons) and every daemon-count-derived computation are
+         * correct again -- otherwise the launch nidmap encodes a shorter span
+         * than the live daemon set and re-poisons the returned daemon (it decodes
+         * its own rank, or a peer beyond the truncated span, as a dead hole).
+         * Only a daemon that had actually failed reaches this: a first launch or
+         * a grow target is not COMM_FAILED here, so formation and grow are
+         * unaffected, and once set RUNNING below a duplicate report cannot
+         * double-count. Gated on bootstrap, the only mode a daemon can return in. */
+        if (prte_bootstrap_setup && PRTE_PROC_STATE_COMM_FAILED == daemon->state) {
+            ++prte_process_info.num_daemons;
+        }
         daemon->state = PRTE_PROC_STATE_RUNNING;
         /* record that this daemon is alive */
         PRTE_FLAG_SET(daemon, PRTE_PROC_FLAG_ALIVE);
@@ -1303,7 +1641,44 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             prted_failed_launch = true;
             goto CLEANUP;
         }
+        /* a daemon can report in more than once (the bootstrap unheal path),
+         * so release any prior URI before recording the new one */
+        if (NULL != daemon->rml_uri) {
+            free(daemon->rml_uri);
+        }
         daemon->rml_uri = strdup(cnctinfo.data.string);
+        PMIX_VALUE_DESTRUCT(&cnctinfo);
+
+        /* unload the rendezvous URI of that node's PMIx server. Nothing in
+         * PRRTE connects to it - daemons talk over the RML, using the URI
+         * above. We record it so that a TOOL can ask us where the server on
+         * a given node is (a hostname- or nodeid-qualified PMIX_SERVER_URI
+         * query). Storing it against the daemon's name is what makes that
+         * query work: it fetches with PMIx_Get() keyed on exactly this
+         * name, the same way the PMIX_PROC_URI above is fetched.
+         *
+         * A daemon that could not report one packs a NULL, which is not an
+         * error - the query then answers NOT_FOUND for that node, as it did
+         * for every node before this was collected at all. */
+        PMIX_VALUE_CONSTRUCT(&cnctinfo);
+        cnctinfo.type = PMIX_STRING;
+        idx = 1;
+        ret = PMIx_Data_unpack(NULL, buffer, &cnctinfo.data.string, &idx, PMIX_STRING);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            PMIX_VALUE_DESTRUCT(&cnctinfo);
+            prted_failed_launch = true;
+            goto CLEANUP;
+        }
+        if (NULL != cnctinfo.data.string) {
+            ret = PMIx_Store_internal(&dname, PMIX_SERVER_URI, &cnctinfo);
+            if (PMIX_SUCCESS != ret) {
+                PMIX_ERROR_LOG(ret);
+                PMIX_VALUE_DESTRUCT(&cnctinfo);
+                prted_failed_launch = true;
+                goto CLEANUP;
+            }
+        }
         PMIX_VALUE_DESTRUCT(&cnctinfo);
 
         /* unpack the node name */
@@ -1355,7 +1730,19 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
             goto CLEANUP;
         }
         if (NULL != alias) {
-            daemon->node->aliases = PMIx_Argv_split(alias, ',');
+            char **dalias;
+            int na;
+            /* MERGE the daemon's aliases into whatever we already recorded -
+             * do NOT overwrite the array. We may have just added the
+             * allocation's name for this node (and/or its non-fqdn form)
+             * above, and those are exactly the names a hostfile/dash-host
+             * spec will use to refer to this node. Replacing the array would
+             * both leak it and lose those names, breaking node matching */
+            dalias = PMIx_Argv_split(alias, ',');
+            for (na = 0; NULL != dalias && NULL != dalias[na]; na++) {
+                PMIx_Argv_append_unique_nosize(&daemon->node->aliases, dalias[na]);
+            }
+            PMIx_Argv_free(dalias);
             free(alias);
         }
 
@@ -1451,6 +1838,13 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                                         "%s TOPOLOGY ALREADY RECORDED IN POSN %d - %s DIFFS FOUND",
                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), i,
                                         (NULL == diff) ? "NO" : "SOME");
+                    /* the node holds a counted reference to its topology -
+                     * a daemon can report in more than once (bootstrap
+                     * unheal), so release any prior reference first */
+                    if (NULL != daemon->node->topology) {
+                        PMIX_RELEASE(daemon->node->topology);
+                    }
+                    PMIX_RETAIN(t);
                     daemon->node->topology = t;
                     found = true;
                     /* update the node's available processors */
@@ -1476,6 +1870,12 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                 pmix_output_verbose(5, prte_plm_base_framework.framework_output,
                                     "%s ADDING NEW TOPOLOGY AT POSN %d",
                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), t->index);
+                /* the array above holds the creation reference; the node
+                 * takes a counted reference of its own */
+                if (NULL != daemon->node->topology) {
+                    PMIX_RELEASE(daemon->node->topology);
+                }
+                PMIX_RETAIN(t);
                 daemon->node->topology = t;
                 daemon->node->available = prte_hwloc_base_filter_cpus(t->topo);
                 prte_hwloc_base_setup_summary(t->topo);
@@ -1540,16 +1940,17 @@ void prte_plm_base_daemon_failed(int st, pmix_proc_t *sender, pmix_data_buffer_t
         goto finish;
     }
 
-    /* unpack the exit status */
+    /* unpack the exit status. This is already a plain status - the senders
+     * on this tag report either a decoded exit status (ssh_wait_daemon) or a
+     * PRTE error code (remote_spawn), never a raw waitpid() status, so it
+     * must NOT be run through WEXITSTATUS */
     n = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &status, &n, PMIX_STATUS);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         status = PRTE_ERROR_DEFAULT_EXIT_CODE;
-        PRTE_UPDATE_EXIT_STATUS(PRTE_ERROR_DEFAULT_EXIT_CODE);
-    } else {
-        PRTE_UPDATE_EXIT_STATUS(WEXITSTATUS(status));
     }
+    PRTE_UPDATE_EXIT_STATUS(status);
 
     /* find the daemon and update its state/status */
     if (NULL == (daemon = (prte_proc_t *) pmix_pointer_array_get_item(jdatorted->procs, vpid))) {
@@ -1561,7 +1962,9 @@ void prte_plm_base_daemon_failed(int st, pmix_proc_t *sender, pmix_data_buffer_t
 
 finish:
     if (NULL == daemon) {
-        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_PROC_STATE_FAILED_TO_START);
+        /* we don't know which daemon this was, so fail the daemon job -
+         * note that this takes a JOB state, not a PROC state */
+        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FAILED_TO_START);
         return;
     } else {
         PRTE_ACTIVATE_PROC_STATE(&daemon->name, PRTE_PROC_STATE_FAILED_TO_START);
@@ -1595,8 +1998,9 @@ int prte_plm_base_setup_prted_cmd(int *argc, char ***argv)
  */
 int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, int *proc_vpid_index)
 {
-    char *param = NULL, **tmpv;
+    char *param = NULL, *ptr, *name, *value;
     int i, j, cnt, offset;
+    size_t nlen;
     prte_job_t *jdata;
     unsigned long num_procs;
     bool ignore;
@@ -1626,11 +2030,6 @@ int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, in
         pmix_argv_append(argc, argv, "--uniform-nodes");
     }
 
-    /* the following is not an mca param */
-    if (NULL != getenv("PRTE_TEST_PRTED_SUICIDE")) {
-        pmix_argv_append(argc, argv, "--test-suicide");
-    }
-
     /* tell the orted what ESS component to use */
     if (NULL != ess) {
         pmix_argv_append(argc, argv, "--prtemca");
@@ -1642,7 +2041,6 @@ int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, in
     pmix_argv_append(argc, argv, "--prtemca");
     pmix_argv_append(argc, argv, "ess_base_nspace");
     pmix_argv_append(argc, argv, prte_process_info.myproc.nspace);
-    free(param);
 
     /* setup to pass the vpid */
     if (NULL != proc_vpid_index) {
@@ -1678,43 +2076,59 @@ int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, in
     }
 
     /* look for any envars that relate to us and pass
-     * them along on the cmd line */
+     * them along on the cmd line - unless we were told not to */
     offset = strlen("PRTE_MCA_");
-    for (i=0; NULL != environ[i]; i++) {
+    for (i=0; prte_plm_globals.pass_environ_mca_params && NULL != environ[i]; i++) {
         if (0 == strncmp(environ[i], "PMIX_MCA_", offset) ||
             0 == strncmp(environ[i], "PRTE_MCA_", offset)) {
-            tmpv = PMIx_Argv_split(environ[i], '=');
+            /* split at the FIRST '=' only - the value itself is allowed to
+             * contain '=' signs, and splitting on all of them would silently
+             * truncate the value (and hand us a NULL value for an empty one) */
+            ptr = strchr(environ[i], '=');
+            if (NULL == ptr) {
+                /* not an assignment - nothing we can pass along */
+                continue;
+            }
+            nlen = (size_t)(ptr - environ[i]);
+            name = (char *) malloc(nlen + 1);
+            if (NULL == name) {
+                continue;
+            }
+            memcpy(name, environ[i], nlen);
+            name[nlen] = '\0';
+            value = ptr + 1;
             ignore = false;
             for (j=0; NULL != skips[j]; j++) {
-                if (0 == strncmp(&tmpv[0][offset], skips[j], strlen(skips[j])) ||
-                    0 == strcmp(&tmpv[0][offset], "plm")) {
-                    ignore = true;;
+                if (0 == strncmp(&name[offset], skips[j], strlen(skips[j])) ||
+                    0 == strcmp(&name[offset], "plm")) {
+                    ignore = true;
                     break;
                 }
             }
             if (ignore) {
+                free(name);
                 continue;
             }
 
             /* check for duplicate */
             ignore = false;
             for (j = 0; j < *argc; j++) {
-                if (0 == strcmp((*argv)[j], &tmpv[0][offset])) {
+                if (0 == strcmp((*argv)[j], &name[offset])) {
                     ignore = true;
                     break;
                 }
             }
             if (!ignore) {
                 /* pass it along */
-                if (0 == strncmp(tmpv[0], "PRTE_MCA_", offset)) {
+                if (0 == strncmp(name, "PRTE_MCA_", offset)) {
                     pmix_argv_append(argc, argv, "--prtemca");
                 } else {
                     pmix_argv_append(argc, argv, "--pmixmca");
                 }
-                pmix_argv_append(argc, argv, &tmpv[0][offset]);
-                pmix_argv_append(argc, argv, tmpv[1]);
+                pmix_argv_append(argc, argv, &name[offset]);
+                pmix_argv_append(argc, argv, value);
             }
-            PMIx_Argv_free(tmpv);
+            free(name);
         }
     }
 
@@ -1807,15 +2221,18 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
     prte_job_map_t *map = NULL;
     int rc, i;
     prte_job_t *daemons;
-    pmix_list_t nodes, tnodes;
+    pmix_list_t nodes;
     pmix_list_item_t *item, *next;
     prte_app_context_t *app;
     bool one_filter = false;
     int num_nodes;
-    bool default_hostfile_used;
-    char *hosts = NULL;
     bool singleton = false;
     bool multi_sim = false;
+    bool grow_request = false;
+    bool have_grow_requester = false;
+    pmix_rank_t vpid;
+    pmix_proc_t grow_requester;
+    char *grow_alloc_id = NULL, *grow_req_id = NULL;
 
     PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                          "%s plm:base:setup_vm",
@@ -1844,7 +2261,79 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_EXTEND_DVM, NULL, PMIX_BOOL)) {
         // nodes have been added, so extend the DVM
         prte_remove_attribute(&jdata->attributes, PRTE_JOB_EXTEND_DVM);
-        goto construct;
+        /* Reset the per-launch daemon accounting. The initial-VM path zeroes
+         * these further below, but the grow path skips that code and would
+         * otherwise accumulate num_new_daemons across successive grows and
+         * reuse a stale daemon_vpid_start - corrupting the grow campaign's
+         * target list and suppressing its completion event (#2491). */
+        map->num_new_daemons = 0;
+        map->daemon_vpid_start = PMIX_RANK_INVALID;
+        /* A grow launches daemons on the nodes THIS request added, and only
+         * those: an allocation request naming node4 must start a daemon on
+         * node4 alone. Every producer of a grow (the no-scheduler
+         * ras_base_insert_node_string, ras/slurm's extend, and the
+         * add-host/add-hostfile path in ras/hosts) marks its new nodes
+         * PRTE_NODE_STATE_ADDED for exactly this purpose, so select on that
+         * - the same rule the dynamic-spawn branch below applies.
+         *
+         * Scanning the whole node pool instead (as this used to, by falling
+         * into the construct: label) silently absorbed any other daemon-less
+         * node into the grow. A shrink is the way that happens: releasing a
+         * reservation reverts its nodes to the default pool as UP with no
+         * daemon, so the next grow - of some entirely unrelated node -
+         * relaunched a daemon on the node the user had just shrunk away.
+         *
+         * Note this deliberately does NOT apply the app-context filtering
+         * done under construct:. A grown node is granted by an explicit
+         * request and must join regardless of any static -host/hostfile
+         * spec given when the DVM was started. */
+        for (i = 1; i < prte_node_pool->size; i++) {
+            node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, i);
+            if (NULL == node) {
+                continue;
+            }
+            if (PRTE_NODE_STATE_ADDED != node->state) {
+                PMIX_OUTPUT_VERBOSE((10, prte_plm_base_framework.framework_output,
+                                     "%s plm_base:setup_vm NODE %s NOT PART OF THIS GROW",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
+                continue;
+            }
+            PMIX_OUTPUT_VERBOSE((10, prte_plm_base_framework.framework_output,
+                                 "%s plm_base:setup_vm GROW ADDING NODE %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
+            PMIX_RETAIN(node);
+            pmix_list_append(&nodes, &node->super);
+        }
+        /* Remember who asked, before the process: loop drains the list. A
+         * grow that turns out to need no new daemon at all - every node it
+         * was granted already has one - still has to tell its requester that
+         * the DVM now reflects the request. Nothing will be launched, so no
+         * campaign is recorded and the launch fence never rises, which means
+         * grow_drain() would never run and the requester would wait out its
+         * timeout on an operation that had in fact already succeeded. */
+        grow_request = true;
+        PMIX_LIST_FOREACH(nptr, &nodes, prte_node_t) {
+            if (NULL != nptr->session &&
+                PMIX_RANK_INVALID != nptr->session->requestor.rank) {
+                PMIX_XFER_PROCID(&grow_requester, &nptr->session->requestor);
+                grow_alloc_id = nptr->session->alloc_refid;
+                grow_req_id = nptr->session->user_refid;
+                have_grow_requester = true;
+                break;
+            }
+        }
+        if (0 == pmix_list_get_size(&nodes)) {
+            /* the grow brought in no node needing a daemon */
+            PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                                 "%s plm:base:setup_vm no new daemons required",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+            PMIX_DESTRUCT(&nodes);
+            /* mark that the daemons have reported so we can proceed */
+            daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
+            PRTE_FLAG_UNSET(daemons, PRTE_JOB_FLAG_UPDATED);
+            return PRTE_SUCCESS;
+        }
+        goto process;
     }
 
     /* if this is a dynamic spawn, then we don't make any changes to
@@ -1863,6 +2352,7 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
             node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
             if (NULL == node) {
                 PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                PMIX_LIST_DESTRUCT(&nodes);
                 return PRTE_ERR_NOT_FOUND;
             }
             pmix_pointer_array_add(map->nodes, (void *) node);
@@ -1961,6 +2451,7 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
             node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
             if (NULL == node) {
                 PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                PMIX_LIST_DESTRUCT(&nodes);
                 return PRTE_ERR_NOT_FOUND;
             }
             if (0 < node->num_procs) {
@@ -1977,6 +2468,7 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
              * anyone else...then we have a big problem
              */
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+            PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_FATAL;
         }
         goto process;
@@ -1994,6 +2486,7 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
         node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
         if (NULL == node) {
             PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+            PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_NOT_FOUND;
         }
         pmix_pointer_array_add(map->nodes, (void *) node);
@@ -2007,148 +2500,25 @@ int prte_plm_base_setup_virtual_machine(prte_job_t *jdata)
      */
     map->num_new_daemons = 0;
 
-    /* if this is an unmanaged allocation, then we use
-     * the nodes that were specified for the union of
-     * all apps - there is no need to collect all
-     * available nodes and "filter" them
+    /* Construct the list of nodes this launch may use: everything in the
+     * node pool, filtered through the union of the app specs.  The pool is
+     * the allocation - whether a resource manager handed it to us or it was
+     * built from -host/-hostfile/the default hostfile at allocation time -
+     * so it is the authoritative node set, and the specs only narrow it.
+     *
+     * There used to be a second path here for an unmanaged allocation which
+     * built the VM from the app specs alone rather than from the pool. It
+     * could only ever shrink to nothing when there were no specs to read,
+     * which is precisely the case under a resource manager: nobody passes
+     * -host inside a SLURM allocation, so the DVM formed with the head node
+     * alone and every other allocated node sat unused. Everything that path
+     * consulted - a rank/seq file, -host, -hostfile, the default hostfile -
+     * is already read into the pool by ras/hosts at allocation time, so
+     * filtering the pool reaches the same set for those cases too.
+     *
+     * The grow and dynamic-spawn paths do not come through here: they
+     * select only the nodes their own request brought in.
      */
-    if (!prte_managed_allocation) {
-        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                             "%s setup:vm: working unmanaged allocation",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        default_hostfile_used = false;
-        PMIX_CONSTRUCT(&tnodes, pmix_list_t);
-        hosts = NULL;
-        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_FILE, (void **) &hosts, PMIX_STRING)) {
-            /* use the file, if provided */
-            PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                 "%s using rank/seqfile %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                 hosts));
-            if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(&tnodes, hosts))) {
-                PRTE_ERROR_LOG(rc);
-                free(hosts);
-                return rc;
-            }
-            free(hosts);
-        } else {
-            for (i = 0; i < jdata->apps->size; i++) {
-                if (NULL
-                    == (app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i))) {
-                    continue;
-                }
-                /* if the app provided a dash-host, then use those nodes */
-                hosts = NULL;
-                if (prte_get_attribute(&app->attributes, PRTE_APP_DASH_HOST, (void **) &hosts,
-                                       PMIX_STRING)) {
-                    PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                         "%s using dash_host", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-                    if (PRTE_SUCCESS
-                        != (rc = prte_util_add_dash_host_nodes(&tnodes, hosts, false))) {
-                        PRTE_ERROR_LOG(rc);
-                        free(hosts);
-                        return rc;
-                    }
-                    free(hosts);
-                } else if (prte_get_attribute(&app->attributes, PRTE_APP_HOSTFILE, (void **) &hosts,
-                                              PMIX_STRING)) {
-                    /* otherwise, if the app provided a hostfile, then use that */
-                    PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                         "%s using hostfile %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                         hosts));
-                    if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(&tnodes, hosts))) {
-                        PRTE_ERROR_LOG(rc);
-                        free(hosts);
-                        return rc;
-                    }
-                    free(hosts);
-                } else if (NULL != prte_default_hostfile) {
-                    if (!default_hostfile_used) {
-                        /* fall back to the default hostfile, if provided */
-                        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                             "%s using default hostfile %s",
-                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                             prte_default_hostfile));
-                        if (PRTE_SUCCESS
-                            != (rc = prte_util_add_hostfile_nodes(&tnodes,
-                                                                  prte_default_hostfile))) {
-                            PRTE_ERROR_LOG(rc);
-                            return rc;
-                        }
-                        /* only include it once */
-                        default_hostfile_used = true;
-                    }
-                }
-            }
-        }
-
-        /* cycle thru the resulting list, finding the nodes on
-         * the node pool array while removing ourselves
-         * and all nodes that are down or otherwise unusable
-         */
-        while (NULL != (item = pmix_list_remove_first(&tnodes))) {
-            nptr = (prte_node_t *) item;
-            PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output, "%s checking node %s",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), nptr->name));
-            for (i = 0; i < prte_node_pool->size; i++) {
-                node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, i);
-                if (NULL == node) {
-                    continue;
-                }
-                if (!prte_nptr_match(node, nptr)) {
-                    continue;
-                }
-                /* have a match - now see if we want this node */
-                /* ignore nodes that are marked as do-not-use for this mapping */
-                if (PRTE_NODE_STATE_DO_NOT_USE == node->state) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_plm_base_framework.framework_output,
-                                         "NODE %s IS MARKED NO_USE", node->name));
-                    /* reset the state so it can be used another time */
-                    node->state = PRTE_NODE_STATE_UP;
-                    break;
-                }
-                if (PRTE_NODE_STATE_DOWN == node->state) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_plm_base_framework.framework_output,
-                                         "NODE %s IS MARKED DOWN", node->name));
-                    break;
-                }
-                if (PRTE_NODE_STATE_NOT_INCLUDED == node->state) {
-                    PMIX_OUTPUT_VERBOSE((10, prte_plm_base_framework.framework_output,
-                                         "NODE %s IS MARKED NO_INCLUDE", node->name));
-                    break;
-                }
-                /* if this node is us, ignore it */
-                if (0 == node->index) {
-                    PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                         "%s ignoring myself", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-                    break;
-                }
-                /* we want it - add it to list */
-                PMIX_RETAIN(node);
-                pmix_list_append(&nodes, &node->super);
-            }
-            PMIX_RELEASE(nptr);
-        }
-        PMIX_LIST_DESTRUCT(&tnodes);
-        /* if we didn't get anything, then we are the only node in the
-         * allocation - so there is nothing else to do as no other
-         * daemons are to be launched
-         */
-        if (0 == pmix_list_get_size(&nodes)) {
-            PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                 "%s plm:base:setup_vm only HNP in allocation",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            PMIX_DESTRUCT(&nodes);
-            /* mark that the daemons have reported so we can proceed */
-            daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
-            PRTE_FLAG_UNSET(daemons, PRTE_JOB_FLAG_UPDATED);
-            return PRTE_SUCCESS;
-        }
-        /* continue processing */
-        goto process;
-    }
-
-construct:
-    /* construct a list of available nodes */
     for (i = 1; i < prte_node_pool->size; i++) {
         if (NULL != (node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, i))) {
             /* ignore nodes that are marked as do-not-use for this mapping */
@@ -2208,6 +2578,7 @@ construct:
         node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
         if (NULL == node) {
             PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+            PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_NOT_FOUND;
         }
         PMIX_RETAIN(node);
@@ -2220,6 +2591,7 @@ construct:
         if (PRTE_SUCCESS != (rc = prte_rmaps_base_filter_nodes(app, &nodes, false))
             && rc != PRTE_ERR_TAKE_NEXT_OPTION) {
             PRTE_ERROR_LOG(rc);
+            PMIX_LIST_DESTRUCT(&nodes);
             return rc;
         }
         if (PRTE_SUCCESS == rc) {
@@ -2230,13 +2602,16 @@ construct:
 
     if (one_filter) {
         /* at least one filtering option was executed, so
-         * remove all nodes that were not mapped
-         */
+         * remove all nodes that were not mapped. Retain nodes that
+         * were dynamically added after the DVM started - they were
+         * granted by an explicit grow request, so the static specs
+         * (which predate them) cannot speak to their inclusion */
         item = pmix_list_get_first(&nodes);
         while (item != pmix_list_get_end(&nodes)) {
             next = pmix_list_get_next(item);
             node = (prte_node_t *) item;
-            if (!PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_MAPPED)) {
+            if (!PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_MAPPED) &&
+                PRTE_NODE_STATE_ADDED != node->state) {
                 pmix_list_remove_item(&nodes, item);
                 PMIX_RELEASE(item);
             } else {
@@ -2294,6 +2669,11 @@ process:
             break;
         }
         node = (prte_node_t *) item;
+        /* if this node was dynamically added, reset its state now
+         * that it is being absorbed into the DVM */
+        if (PRTE_NODE_STATE_ADDED == node->state) {
+            node->state = PRTE_NODE_STATE_UP;
+        }
         /* if this node is already in the map, skip it */
         if (NULL != node->daemon) {
             num_nodes++;
@@ -2312,16 +2692,36 @@ process:
         proc = PMIX_NEW(prte_proc_t);
         if (NULL == proc) {
             PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
         PMIX_LOAD_NSPACE(proc->name.nspace, PRTE_PROC_MY_NAME->nspace);
-        if (PMIX_RANK_VALID - 1 <= daemons->num_procs) {
+        /* Choose this daemon's vpid.
+         *
+         * Normally we hand out the next unused one. In a BOOTSTRAPPED DVM we
+         * do not get to choose: every daemon computed its own vpid from the
+         * configuration file (prte_bootstrap_my_identity) before it ever
+         * contacted us, and prted_report_launch looks a reporting daemon up in
+         * daemons->procs by the rank it claims for itself. So the HNP has to
+         * arrive at the same answer independently, from the same authority -
+         * ras/bootstrap recorded that canonical rank as the node's pool index.
+         * Handing out a sequential vpid instead only agrees with what the
+         * daemons call themselves by accident of the order the configuration
+         * happens to list nodes in; where it disagrees, the HNP either
+         * attaches a daemon to the wrong node or fails to find it at all. */
+        if (prte_bootstrap_setup && 0 < node->index) {
+            vpid = (pmix_rank_t) node->index;
+        } else {
+            vpid = daemons->num_procs;
+        }
+        if (PMIX_RANK_VALID - 1 <= vpid) {
             /* no more daemons available */
             pmix_show_help("help-prte-rmaps-base.txt", "out-of-vpids", true);
             PMIX_RELEASE(proc);
+            PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
-        proc->name.rank = daemons->num_procs; /* take the next available vpid */
+        proc->name.rank = vpid;
         PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                              "%s plm:base:setup_vm add new daemon %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name)));
@@ -2329,9 +2729,20 @@ process:
         if (0
             > (rc = pmix_pointer_array_set_item(daemons->procs, proc->name.rank, (void *) proc))) {
             PRTE_ERROR_LOG(rc);
+            PMIX_RELEASE(proc);
+            PMIX_LIST_DESTRUCT(&nodes);
             return rc;
         }
-        ++daemons->num_procs;
+        /* num_procs is the vpid SPAN - the count only because vpids are
+         * normally handed out consecutively. Grow it to cover the vpid we just
+         * used rather than blindly incrementing, so a canonical rank cannot
+         * leave num_procs short of the highest daemon in the job (which would
+         * truncate the nidmap span and every daemon-count-derived
+         * computation). For a sequentially assigned vpid this is exactly the
+         * increment it replaces. */
+        if (daemons->num_procs <= proc->name.rank) {
+            daemons->num_procs = proc->name.rank + 1;
+        }
         PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                              "%s plm:base:setup_vm assigning new daemon %s to node %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name),
@@ -2339,9 +2750,8 @@ process:
         /* point the node to the daemon */
         node->daemon = proc;
         PMIX_RETAIN(proc); /* maintain accounting */
-        /* point the proc to the node and maintain accounting */
+        /* point the proc at the node - borrowed, not retained */
         proc->node = node;
-        PMIX_RETAIN(node);
         if (prte_plm_globals.daemon_nodes_assigned_at_launch) {
             PRTE_FLAG_SET(node, PRTE_NODE_FLAG_LOC_VERIFIED);
         } else {
@@ -2360,6 +2770,10 @@ process:
             }
         }
     }
+
+    /* the loop above normally drains the list, but it breaks out early once
+     * prte_max_vm_size nodes have been counted - so release whatever is left */
+    PMIX_LIST_DESTRUCT(&nodes);
 
     if (prte_process_info.num_daemons != daemons->num_procs) {
         /* more daemons are being launched - update the routing tree to
@@ -2390,5 +2804,500 @@ process:
         }
     }
 
+    if (prte_elastic_mode && grow_request && 0 == map->num_new_daemons) {
+        /* the grow needed no daemon - the DVM already reflects the request,
+         * so report completion now rather than leaving the requester to time
+         * out waiting for a fence that will never be raised */
+        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                             "%s plm:base:setup_vm grow required no new daemons",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        if (have_grow_requester) {
+            prte_plm_base_dvm_mod_notify(&grow_requester, grow_alloc_id,
+                                         grow_req_id, true, PMIX_SUCCESS);
+        }
+        return PRTE_SUCCESS;
+    }
+
+    /* The launch fence only operates when the DVM is permitted to grow/shrink.
+     * Outside elastic mode the DVM is fixed-size, so no campaign is recorded
+     * and the fence is never raised — leaving the normal launch path, and the
+     * normal daemon-failure handling, completely unchanged. */
+    if (prte_elastic_mode && 0 < map->num_new_daemons) {
+        prte_grow_campaign_t *gcamp;
+        pmix_rank_t gr;
+        int gk;
+
+        /* Record this launch campaign so the launch fence can be resolved on
+         * a per-daemon basis: each new daemon either reports home (success)
+         * or its launch fails (comm-failure / failed-to-start), and only
+         * those specific ranks affect this campaign.  This avoids an
+         * unrelated daemon loss consuming the fence, and lets concurrent
+         * campaigns be tracked independently.  The new daemons were assigned
+         * consecutive vpids starting at map->daemon_vpid_start (see the
+         * daemon-creation loop above). */
+        gcamp = PMIX_NEW(prte_grow_campaign_t);
+        gcamp->ntargets = map->num_new_daemons;
+        gcamp->targets = (pmix_rank_t *) malloc(gcamp->ntargets * sizeof(pmix_rank_t));
+        for (gk = 0, gr = map->daemon_vpid_start; gk < gcamp->ntargets; gk++, gr++) {
+            gcamp->targets[gk] = gr;
+        }
+        /* Record the requester for the spec's phase-two completion event.  The
+         * RAS reservation machinery sets each reserved node's ->session
+         * backpointer (add_nodes_to_session), and that session carries the
+         * requestor and the allocation ids.
+         *
+         * Scan ALL the targets for the first one carrying a requestor rather
+         * than trusting the first: a grow launches a daemon onto every node
+         * that lacks one, which is not necessarily limited to the nodes this
+         * request reserved.  In particular a node that was shrunk out of the
+         * DVM reverts to the default pool with its ->session cleared, and the
+         * next grow re-absorbs it - taking the lowest new vpid, and hence the
+         * daemon_vpid_start slot.  Reading only that node left the campaign
+         * with no requester, so a perfectly successful grow emitted no
+         * completion event at all and the requester waited forever.
+         *
+         * The initial DVM bring-up and a scheduler-driven push have no
+         * requestor on any node (the default session, or an invalid requestor
+         * rank), so have_requester stays false and grow_drain() emits no event
+         * for them - which is correct, as nobody asked for those. */
+        {
+            int gt;
+            for (gt = 0; gt < gcamp->ntargets && !gcamp->have_requester; gt++) {
+                prte_proc_t *dproc = (prte_proc_t *)
+                    pmix_pointer_array_get_item(daemons->procs, gcamp->targets[gt]);
+                prte_session_t *sess =
+                    (NULL != dproc && NULL != dproc->node) ? dproc->node->session : NULL;
+                if (NULL != sess && PMIX_RANK_INVALID != sess->requestor.rank) {
+                    PMIX_XFER_PROCID(&gcamp->requester, &sess->requestor);
+                    gcamp->alloc_id = (NULL != sess->alloc_refid) ? strdup(sess->alloc_refid) : NULL;
+                    gcamp->req_id = (NULL != sess->user_refid) ? strdup(sess->user_refid) : NULL;
+                    gcamp->have_requester = true;
+                }
+            }
+        }
+        pmix_list_append(&prte_grow_campaigns, &gcamp->super);
+        prte_dvm_launch_fence += map->num_new_daemons;
+    }
+
     return PRTE_SUCCESS;
+}
+
+void prte_plm_base_dvm_mod_notify(const pmix_proc_t *requester,
+                                  const char *alloc_id,
+                                  const char *req_id,
+                                  bool success,
+                                  pmix_status_t cause)
+{
+#if PRTE_HAVE_DVM_MOD_EVENTS
+    pmix_status_t code = success ? PMIX_DVM_IS_READY : PMIX_ERR_DVM_MOD;
+    pmix_info_t *rinfo;
+    pmix_data_array_t parray;
+    pmix_proc_t ptarg;
+    size_t nrinfo, idx;
+    pmix_status_t rc;
+
+    /* Assemble a directed (custom-range) notification to the requester only,
+     * mirroring the PMIX_ALLOC_TIMEOUT_WARNING delivery: custom range plus the
+     * allocation id, the requester's own request id when one was supplied, and
+     * — on failure — the underlying cause so the requester can distinguish
+     * what went wrong rather than only that something did.  The event also
+     * carries "prte.notify.donotloop" so our own notify_event server upcall
+     * short-circuits instead of thread-shifting and re-xcasting it: the
+     * requester is a tool local to this HNP, so PMIx delivers the event
+     * locally and no broadcast is needed.  Without the marker the upcall
+     * would defer its work onto this progress thread while the blocking
+     * PMIx_Notify_event below is parked here waiting for it -- a self-deadlock
+     * (see the AGENTS.md rule on locally-originated event notifications). */
+    nrinfo = 3;  /* custom range + alloc id + donotloop marker */
+    if (NULL != req_id) {
+        nrinfo++;
+    }
+    if (!success) {
+        nrinfo++;
+    }
+    PMIX_INFO_CREATE(rinfo, nrinfo);
+    idx = 0;
+    PMIX_LOAD_PROCID(&ptarg, requester->nspace, requester->rank);
+    parray.type = PMIX_PROC;
+    parray.size = 1;
+    parray.array = &ptarg;
+    /* PMIX_INFO_LOAD deep-copies the data, so the stack copies are fine */
+    PMIX_INFO_LOAD(&rinfo[idx++], PMIX_EVENT_CUSTOM_RANGE, &parray, PMIX_DATA_ARRAY);
+    PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_ID, (void *) alloc_id, PMIX_STRING);
+    /* keep delivery local: do not loop back through our own server upcall */
+    PMIX_INFO_LOAD(&rinfo[idx++], "prte.notify.donotloop", NULL, PMIX_BOOL);
+    if (NULL != req_id) {
+        PMIX_INFO_LOAD(&rinfo[idx++], PMIX_ALLOC_REQ_ID, (void *) req_id, PMIX_STRING);
+    }
+    if (!success) {
+        /* carry the underlying failure status; PMIX_JOB_TERM_STATUS is the
+         * standard pmix_status_t-typed info key (reconcile the carrier with
+         * PMIx PR openpmix#3917 should it define a dedicated DVM-mod cause
+         * key) */
+        PMIX_INFO_LOAD(&rinfo[idx++], PMIX_JOB_TERM_STATUS, &cause, PMIX_STATUS);
+    }
+    rc = PMIx_Notify_event(code, PRTE_PROC_MY_NAME, PMIX_RANGE_CUSTOM,
+                           rinfo, nrinfo, NULL, NULL);
+    if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
+        PMIX_ERROR_LOG(rc);
+    }
+    PMIX_INFO_FREE(rinfo, nrinfo);
+#else
+    /* The installed PMIx defines neither DVM modification event code, so the
+     * completion notification is compiled out per the spec's backward-
+     * compatibility clause.  The DVM still grows/shrinks; only the event is
+     * omitted. */
+    PRTE_HIDE_UNUSED_PARAMS(requester, alloc_id, req_id, success, cause);
+#endif
+}
+
+void prte_plm_base_fence_release(void)
+{
+    int hi;
+    prte_job_t *held;
+    prte_shrink_campaign_t *scamp, *snext;
+    prte_grow_campaign_t *gcamp, *gnext;
+
+    /* SUCCESS release — reached only when the global fence has dropped to
+     * zero, i.e. every grow and shrink campaign has completed successfully.
+     * Both classes of held job are admitted.  The only path that *fails* a
+     * held job is prte_plm_base_abort_premap_held() on a grow failure. */
+    for (hi = 0; hi < prte_held_jobs->size; hi++) {
+        held = (prte_job_t *) pmix_pointer_array_get_item(prte_held_jobs, hi);
+        if (NULL == held) {
+            continue;
+        }
+        pmix_pointer_array_set_item(prte_held_jobs, hi, NULL);
+        PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_VM_READY);
+        PMIX_RELEASE(held);
+    }
+
+    for (hi = 0; hi < prte_prelaunch_held_jobs->size; hi++) {
+        held = (prte_job_t *) pmix_pointer_array_get_item(prte_prelaunch_held_jobs, hi);
+        if (NULL == held) {
+            continue;
+        }
+        pmix_pointer_array_set_item(prte_prelaunch_held_jobs, hi, NULL);
+        if (prte_plm_base_job_needs_remap(held)) {
+            prte_plm_base_reset_proc_map(held);
+            PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_MAP);
+        } else {
+            PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_LAUNCH_APPS);
+        }
+        PMIX_RELEASE(held);
+    }
+
+    /* Campaigns are removed individually as they drain, so both lists should
+     * be empty here.  Sweep each defensively anyway — and sweep both kinds,
+     * not just shrink — so a future change that can leave a residual campaign
+     * behind cannot wedge the fence. */
+    PMIX_LIST_FOREACH_SAFE(scamp, snext, &prte_shrink_campaigns, prte_shrink_campaign_t) {
+        pmix_list_remove_item(&prte_shrink_campaigns, &scamp->super);
+        PMIX_RELEASE(scamp);
+    }
+    PMIX_LIST_FOREACH_SAFE(gcamp, gnext, &prte_grow_campaigns, prte_grow_campaign_t) {
+        pmix_list_remove_item(&prte_grow_campaigns, &gcamp->super);
+        PMIX_RELEASE(gcamp);
+    }
+}
+
+void prte_plm_base_abort_premap_held(void)
+{
+    int hi;
+    prte_job_t *held;
+
+    /* GROW-FAILURE abort — fail every job parked at the VM_READY -> MAP
+     * boundary, immediately and independent of the fence value, so a grow
+     * failure aborts its pre-map waiters even while a concurrent shrink keeps
+     * the fence nonzero.  The pre-launch held jobs are deliberately left
+     * untouched: they wait only on a shrink, never on the grow (spec
+     * conformance #4). */
+    for (hi = 0; hi < prte_held_jobs->size; hi++) {
+        held = (prte_job_t *) pmix_pointer_array_get_item(prte_held_jobs, hi);
+        if (NULL == held) {
+            continue;
+        }
+        pmix_pointer_array_set_item(prte_held_jobs, hi, NULL);
+        PRTE_ACTIVATE_JOB_STATE(held, PRTE_JOB_STATE_NEVER_LAUNCHED);
+        PMIX_RELEASE(held);
+    }
+}
+
+void prte_plm_base_grow_drain(bool success)
+{
+    prte_grow_campaign_t *camp;
+
+    /* Resolve all in-progress grow campaigns at once and drop their entire
+     * contribution from the launch fence.  This is called from exactly the
+     * two safe points: from vm_ready on the all-success path (after the
+     * WIREUP xcast, so held jobs are only admitted once the new daemons are
+     * wired up), and from the failure path when one of the launched daemons
+     * dies.  Each drained campaign emits its phase-two completion event to its
+     * requester — PMIX_DVM_IS_READY on success, PMIX_ERR_DVM_MOD on failure. */
+    while (NULL != (camp = (prte_grow_campaign_t *)
+                               pmix_list_remove_first(&prte_grow_campaigns))) {
+        prte_dvm_launch_fence -= camp->ntargets;
+        if (camp->have_requester) {
+            /* the specific daemon-failure status is not threaded down to this
+             * layer yet, so report a generic cause on failure (reconcile by
+             * passing the dying daemon's status as a follow-up) */
+            prte_plm_base_dvm_mod_notify(&camp->requester, camp->alloc_id,
+                                         camp->req_id, success,
+                                         success ? PMIX_SUCCESS : PMIX_ERROR);
+        }
+        PMIX_RELEASE(camp);
+    }
+    if (success) {
+        /* admit the held jobs only once the *global* fence is clear — a
+         * concurrent shrink may still hold it nonzero */
+        if (0 == prte_dvm_launch_fence) {
+            prte_plm_base_fence_release();
+        }
+    } else {
+        /* a grow failure fails the whole pre-map held-job set immediately,
+         * regardless of the fence value, so a concurrent shrink cannot later
+         * admit a job whose grow dependency has failed; the shrink-only
+         * pre-launch held jobs are left parked */
+        prte_plm_base_abort_premap_held();
+    }
+}
+
+/* Return a node that has been torn out of the DVM (by a completed shrink or a
+ * rolled-back grow) to a pristine, never-launched state so a later grow can
+ * relaunch a daemon on it.  Clearing the daemon backpointer alone is not enough:
+ * the launch machinery keys off per-node flags and the persistent daemon-job
+ * map, and stale values there make a re-grow silently misbehave.  Specifically,
+ * PRTE_NODE_FLAG_DAEMON_LAUNCHED left set makes every plm launcher skip the node
+ * ("daemon already exists"), so the new prted is never spawned; and leaving the
+ * node in the daemon map lets setup_vm add it a second time, duplicating it in
+ * the VM.  Reset both here. */
+void prte_plm_base_reset_dvm_node(prte_node_t *node)
+{
+    prte_job_t *daemons;
+    prte_node_t *nptr;
+    int i;
+
+    if (NULL == node) {
+        return;
+    }
+
+    PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_DAEMON_LAUNCHED);
+    PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_LOC_VERIFIED);
+
+    daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons || NULL == daemons->map) {
+        return;
+    }
+    for (i = 0; i < daemons->map->nodes->size; i++) {
+        nptr = (prte_node_t *) pmix_pointer_array_get_item(daemons->map->nodes, i);
+        if (nptr != node) {
+            continue;
+        }
+        pmix_pointer_array_set_item(daemons->map->nodes, i, NULL);
+        if (0 < daemons->map->num_nodes) {
+            --daemons->map->num_nodes;
+        }
+        PMIX_RELEASE(node); /* the map held a retain */
+        break;
+    }
+}
+
+/* Roll a failed grow campaign back out of the DVM so a failed grow leaves the
+ * DVM at its exact pre-grow membership rather than half-extended (spec
+ * conformance #5).  `trigger` is the rank whose death triggered the failure;
+ * the errmgr has already marked it not-alive and decremented num_daemons, and
+ * its routing is repaired here.  Every *other* target is handled by whether a
+ * daemon actually came up:
+ *
+ *   - a target that started (PRTE_PROC_FLAG_ALIVE) is terminated using the same
+ *     PRTE_DAEMON_SHRINK_CMD machinery the DVM shrink path uses; its departure
+ *     is then reconciled on the normal daemon-loss path as it exits;
+ *   - a target that never started has no daemon to signal, so its launch-time
+ *     daemon-count bump is reverted here (no comm-failure event will arrive for
+ *     it).
+ *
+ * In all cases the node is reset out of the DVM's usable set (see
+ * prte_plm_base_reset_dvm_node).  The new nodes carry no application procs — the
+ * jobs that would have used them were held at the fence, never launched.  The
+ * teardown is strictly campaign-scoped: it touches only the ranks in this
+ * campaign's ``targets`` array. */
+static void grow_rollback(prte_grow_campaign_t *camp, pmix_rank_t trigger)
+{
+    prte_job_t *daemons;
+    prte_proc_t *dproc;
+    prte_node_t *node;
+    pmix_rank_t *kill;
+    int32_t nkill = 0;
+    int t;
+
+    daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons) {
+        return;
+    }
+    kill = (pmix_rank_t *) malloc(camp->ntargets * sizeof(pmix_rank_t));
+    if (NULL == kill) {
+        return;
+    }
+
+    /* repair routing for the daemon whose loss triggered the failure — the
+     * errmgr's own route_lost call is skipped because grow_target_failed()
+     * reports the death as handled (so the errmgr does not abort the DVM) */
+    prte_rml_route_lost(trigger);
+
+    for (t = 0; t < camp->ntargets; t++) {
+        pmix_rank_t r = camp->targets[t];
+        if (PMIX_RANK_INVALID == r) {
+            continue;
+        }
+        dproc = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, r);
+        if (NULL == dproc) {
+            continue;
+        }
+        node = dproc->node;
+        if (r != trigger) {
+            if (PRTE_FLAG_TEST(dproc, PRTE_PROC_FLAG_ALIVE)) {
+                /* a started daemon — terminate it via the shrink command */
+                kill[nkill++] = r;
+            } else {
+                /* never started: no comm-failure event will arrive, so revert
+                 * its launch-time daemon-count bump here */
+                if (0 < prte_process_info.num_daemons) {
+                    --prte_process_info.num_daemons;
+                }
+            }
+        }
+        /* detach the node from the DVM's usable set */
+        if (NULL != node) {
+            if (NULL != node->session && node->session != prte_default_session) {
+                node->session = NULL;
+            }
+            if (node->daemon == dproc) {
+                node->daemon = NULL;
+                PMIX_RELEASE(dproc);
+            }
+            /* return the node to a pristine, never-launched state so a later
+             * grow can relaunch a daemon on it (clears the launch flags and
+             * drops it from the daemon-job map) */
+            prte_plm_base_reset_dvm_node(node);
+        }
+    }
+
+    if (0 < nkill) {
+        pmix_data_buffer_t msg;
+        prte_daemon_cmd_flag_t cmd = PRTE_DAEMON_SHRINK_CMD;
+        pmix_status_t rc;
+
+        PMIX_DATA_BUFFER_CONSTRUCT(&msg);
+        rc = PMIx_Data_pack(NULL, &msg, &cmd, 1, PMIX_UINT8);
+        if (PMIX_SUCCESS == rc) {
+            rc = PMIx_Data_pack(NULL, &msg, &nkill, 1, PMIX_INT32);
+        }
+        if (PMIX_SUCCESS == rc) {
+            rc = PMIx_Data_pack(NULL, &msg, kill, nkill, PMIX_PROC_RANK);
+        }
+        if (PMIX_SUCCESS == rc) {
+            if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &msg))) {
+                PRTE_ERROR_LOG(rc);
+            }
+        } else {
+            PMIX_ERROR_LOG(rc);
+        }
+        PMIX_DATA_BUFFER_DESTRUCT(&msg);
+    }
+    free(kill);
+}
+
+bool prte_plm_base_grow_target_failed(pmix_rank_t rank)
+{
+    prte_grow_campaign_t *camp;
+    int t;
+
+    /* Outside elastic mode there are no grow campaigns and the daemon loss is
+     * the errmgr's to handle exactly as it always has — never report it as
+     * handled here, so the normal DVM-failure path is preserved. */
+    if (!prte_elastic_mode) {
+        return false;
+    }
+
+    /* A daemon has died.  Only act if it was actually the target of an
+     * in-progress grow campaign — an unrelated daemon loss must not consume
+     * the launch fence (and must be left to the errmgr's normal handling).
+     * If it was a grow target, that campaign is compromised: roll it back out
+     * of the DVM, drop its fence contribution, notify its requester of the
+     * failure, and abort the pre-map held jobs.  The teardown is scoped to the
+     * matched campaign, so any concurrent grow keeps its own daemons and
+     * completes normally (spec conformance #5). */
+    PMIX_LIST_FOREACH(camp, &prte_grow_campaigns, prte_grow_campaign_t) {
+        for (t = 0; t < camp->ntargets; t++) {
+            if (camp->targets[t] != rank) {
+                continue;
+            }
+            pmix_list_remove_item(&prte_grow_campaigns, &camp->super);
+            prte_dvm_launch_fence -= camp->ntargets;
+            grow_rollback(camp, rank);
+            if (camp->have_requester) {
+                /* the specific daemon-failure status is not threaded down to
+                 * this layer yet, so report a generic cause */
+                prte_plm_base_dvm_mod_notify(&camp->requester, camp->alloc_id,
+                                             camp->req_id, false, PMIX_ERROR);
+            }
+            PMIX_RELEASE(camp);
+            /* any grow failure fails the whole pre-map held-job set */
+            prte_plm_base_abort_premap_held();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool prte_plm_base_job_needs_remap(prte_job_t *jdata)
+{
+    prte_shrink_campaign_t *camp;
+    prte_proc_t *proc;
+    int p, t;
+
+    PMIX_LIST_FOREACH(camp, &prte_shrink_campaigns, prte_shrink_campaign_t) {
+        for (p = 0; p < jdata->procs->size; p++) {
+            proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, p);
+            if (NULL == proc || NULL == proc->node || NULL == proc->node->daemon) continue;
+            for (t = 0; t < camp->ntargets; t++) {
+                if (camp->targets[t] == proc->node->daemon->name.rank) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void prte_plm_base_reset_proc_map(prte_job_t *jdata)
+{
+    int p, np;
+    prte_proc_t *proc;
+    prte_node_t *node;
+    prte_app_context_t *app;
+
+    for (p = 0; p < jdata->procs->size; p++) {
+        proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, p);
+        if (NULL == proc) continue;
+        node = proc->node;
+        if (NULL != node) {
+            for (np = 0; np < node->procs->size; np++) {
+                if (pmix_pointer_array_get_item(node->procs, np) == proc) {
+                    pmix_pointer_array_set_item(node->procs, np, NULL);
+                    node->num_procs--;
+                    app = (prte_app_context_t *)
+                        pmix_pointer_array_get_item(jdata->apps, proc->app_idx);
+                    if (NULL == app || !PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL)) {
+                        node->slots_inuse--;
+                    }
+                    break;
+                }
+            }
+        }
+        pmix_pointer_array_set_item(jdata->procs, p, NULL);
+        PMIX_RELEASE(proc);
+    }
+    jdata->num_procs = 0;
+    jdata->num_launched = 0;
 }

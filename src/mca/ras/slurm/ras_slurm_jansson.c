@@ -24,7 +24,11 @@
 #include <limits.h>
 #include <sys/wait.h>
 
-#include <jansson.h>
+#if PRTE_TESTBUILD_LAUNCHERS
+#    include "src/mca/ras/base/testbuild_jansson.h"
+#else
+#    include <jansson.h>
+#endif
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/util/pmix_output.h"
@@ -55,7 +59,8 @@ typedef struct {
 /*
  * Parse a numeric-object field from JSON and store it as a string in a hash table.
  *
- * Expects the the JSON object at key in job to have
+ * If the field is absent or null, returns PRTE_ERR_NOT_FOUND so optional job
+ * attributes can be omitted. Otherwise, expects the JSON object at key to have
  * "set", "infinite", and "number" fields. Stores the result
  * in values_table:
  * - unset -> string determined by PRTE_SLURM_UNSET_NUM_MARKER
@@ -75,7 +80,10 @@ static int prte_ras_slurm_get_json_numobj_field(json_t *job, const char *key, pm
     int pmix_err = PMIX_SUCCESS;
 
     json_t *field = json_object_get(job, key);
-    if (NULL == field || !json_is_object(field)) {
+    if (NULL == field || json_is_null(field)) {
+        return PRTE_ERR_NOT_FOUND;
+    }
+    if (!json_is_object(field)) {
         return PRTE_ERR_JSON_PARSE_FAILURE;
     }
 
@@ -345,7 +353,8 @@ bool prte_ras_slurm_have_jansson(void)
  * parses the returned JSON using Jansson, and inserts selected numeric and
  * string fields into the provided hash table.
  *
- * String fields are validated to ensure they do not contain control characters.
+ * Missing, null, and empty optional fields are skipped. String fields that are
+ * present are validated to ensure they do not contain control characters.
  *
  * @param[in,out] values_table Pointer to a PMIx hash table to populate with extracted values.
 
@@ -379,8 +388,12 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
     /* We've extracted a valid "jobs" section. now extract the complex numeric
     * fields that have "set", "infinite", and "number" subfields */
-    for(size_t i = 0; i < NUM_OBJ_SUBFIELD_COUNT; i++) {
+    for(size_t i = 0; i < NUM_OBJ_FIELD_COUNT; i++) {
         err = prte_ras_slurm_get_json_numobj_field(job, num_obj_fields[i], values_table);
+        if (PRTE_ERR_NOT_FOUND == err) {
+            err = PRTE_SUCCESS;
+            continue;
+        }
         if (PRTE_SUCCESS != err) {
             PRTE_ERROR_LOG(err);
             goto cleanup;
@@ -393,7 +406,10 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
 
         json_t *str_field = json_object_get(job, str_fields[i]);
 
-        if(NULL == str_field || !json_is_string(str_field)) {
+        if(NULL == str_field || json_is_null(str_field)) {
+            continue;
+        }
+        if(!json_is_string(str_field)) {
             err = PRTE_ERR_JSON_PARSE_FAILURE;
             PRTE_ERROR_LOG(err);
             goto cleanup;
@@ -402,6 +418,10 @@ int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table)
         const char *str = json_string_value(str_field);
         size_t str_len = json_string_length(str_field);
         bool has_control_chars;
+
+        if (0 == str_len) {
+            continue;
+        }
 
         /* Do not accept string if contains control characters */
         err = prte_ras_slurm_token_has_control_chars(str, str_len, &has_control_chars);
@@ -732,11 +752,23 @@ int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *
 
         prte_node_t *node = PMIX_NEW(prte_node_t);
 
-        node->state = PRTE_NODE_STATE_UP;
+        /* These nodes are being added to a DVM that is already running, so
+         * they must carry the mark the DVM extension selects on: a grow
+         * launches daemons on the nodes in PRTE_NODE_STATE_ADDED and only
+         * those (prte_plm_base_setup_virtual_machine). Handing them over as
+         * plain UP - the state an initial discovery uses - left every node
+         * Slurm granted us sitting in the pool with no daemon on it, so the
+         * extend added resources the DVM could never use. The other producers
+         * of a grow (ras/hosts, the no-scheduler insert path, and the
+         * reused-node branch of this component) all mark ADDED for exactly
+         * this reason. */
+        node->state = PRTE_NODE_STATE_ADDED;
         node->name = nodename_dyn;
         node->slots_inuse = 0;
         node->slots_max = 0;
         node->slots = slots;
+        /* derived from the allocation Slurm just granted - authoritative */
+        PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
 
         pmix_list_append(node_list, &node->super);
 
@@ -751,6 +783,181 @@ int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *
     if(NULL != root) {
         json_decref(root);
     }
+
+    return err;
+}
+
+/**
+ * Synchronize a session's node list with a reduced Slurm allocation.
+ *
+ * Nodes no longer present in the allocation are appended to
+ * removed_nodes.
+ *
+ * @param[in] slurm_jobid Slurm job identifier.
+ * @param[in,out] session Session to update.
+ * @param[out] removed_nodes Receives detached nodes; must be empty.
+ */
+int prte_ras_slurm_detach_nodes(const char *slurm_jobid, prte_session_t *session, pmix_pointer_array_t *removed_nodes)
+{
+    if (NULL == slurm_jobid || NULL == removed_nodes ||
+        NULL == session || NULL == session->nodes || 
+        0 != removed_nodes->size) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    int err = PRTE_SUCCESS;
+
+    err = prte_ras_slurm_validate_jobid(slurm_jobid);
+
+    if(PRTE_SUCCESS != err) {
+        PRTE_ERROR_LOG(err);
+        return err;
+    }
+
+    pmix_pointer_array_t matched_nodes, unmatched_nodes;
+    PMIX_CONSTRUCT(&matched_nodes, pmix_pointer_array_t);
+    PMIX_CONSTRUCT(&unmatched_nodes, pmix_pointer_array_t);
+
+    json_t *root = NULL;
+
+    err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, &root);
+
+    if(PRTE_SUCCESS != err) {
+        goto cleanup;
+    }
+
+    json_t *job_resources = json_object_get(root, "job_resources");
+
+    if(NULL == job_resources || !json_is_object(job_resources)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    json_t *nodes = json_object_get(job_resources, "nodes");
+
+    if(NULL == nodes || !json_is_object(nodes)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    json_t *allocation = json_object_get(nodes, "allocation");
+
+    if (NULL == allocation || !json_is_array(allocation)) {
+        err = PRTE_ERR_JSON_PARSE_FAILURE;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    size_t new_alloc_size = json_array_size(allocation);
+    size_t session_nodes_size = 0;
+
+    for (int i = 0; i < session->nodes->size; i++) {
+        prte_node_t *node_ptr = (prte_node_t *)pmix_pointer_array_get_item(session->nodes, i);
+
+        if (NULL != node_ptr) {
+            pmix_pointer_array_add(&unmatched_nodes, node_ptr);
+            session_nodes_size++;
+        }
+    }
+
+    /* sanity checks, as we rely on these assumptions implicitly later */
+    if (0 == new_alloc_size || 0 == session_nodes_size 
+        || new_alloc_size >= session_nodes_size) {
+        err = PRTE_ERR_BAD_PARAM;
+        PRTE_ERROR_LOG(err);
+        goto cleanup;
+    }
+
+    /* retrieve surviving nodes in Slurm-provided order */
+
+    for (size_t i = 0; i < new_alloc_size; i++) {
+        json_t *node_obj = json_array_get(allocation, i);
+
+        if (!json_is_object(node_obj)) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        json_t *nodename = json_object_get(node_obj, "name");
+
+        if (NULL == nodename || !json_is_string(nodename)) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        const char *nodename_string = json_string_value(nodename);
+
+        if (NULL == nodename_string || '\0' == nodename_string[0]) {
+            err = PRTE_ERR_JSON_PARSE_FAILURE;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+
+        int session_node_idx = (int)i;
+        bool found = false;
+
+        /* find the equivalent node in the list of unmatched nodes. 
+         * We expect (but do not strictly require) the ordering here
+         * to be favorable; i.e. node at index i should be the
+         * one we are looking for */
+        for (int j = 0; j < unmatched_nodes.size; j++) {
+            prte_node_t *curr = (prte_node_t *)pmix_pointer_array_get_item(&unmatched_nodes, (int)session_node_idx);
+            
+            if (NULL != curr && NULL != curr->name &&
+                0 == strcmp(curr->name, nodename_string)) {
+                found = true;
+                pmix_pointer_array_add(&matched_nodes, curr);
+                pmix_pointer_array_set_item(&unmatched_nodes, session_node_idx, NULL);
+                break;
+            }
+            
+            if(++session_node_idx >= unmatched_nodes.size) {
+                session_node_idx = 0;
+            }
+        }
+
+        if(!found) {
+            err = PRTE_ERR_NOT_FOUND;
+            PRTE_ERROR_LOG(err);
+            goto cleanup;
+        }
+    }
+
+    /* success, clear out old entries and reconstruct the node list*/
+
+    pmix_pointer_array_remove_all(session->nodes);
+
+    for (int i = 0; i < matched_nodes.size; i++) {
+        prte_node_t *curr = (prte_node_t *)pmix_pointer_array_get_item(&matched_nodes, i);
+        if(NULL != curr) {
+            pmix_pointer_array_set_item(session->nodes, i, curr);
+        }
+    }
+
+    pmix_pointer_array_remove_all(&matched_nodes);
+
+    for (int i = 0; i < unmatched_nodes.size; i++) {
+        prte_node_t *curr = (prte_node_t *)pmix_pointer_array_get_item(&unmatched_nodes, i);
+        if(NULL != curr) {
+            pmix_pointer_array_add(removed_nodes, curr);
+        }
+    }
+
+    pmix_pointer_array_remove_all(&unmatched_nodes);
+
+cleanup:
+
+    if(NULL != root) {
+        json_decref(root);
+    }
+
+    PMIX_DESTRUCT(&matched_nodes);
+    PMIX_DESTRUCT(&unmatched_nodes);
 
     return err;
 }
@@ -778,6 +985,7 @@ int prte_ras_slurm_check_resources(const char *slurm_jobid)
 
     bool running = false;
     bool pending = false;
+    bool cancelled = false;
 
     err = prte_ras_slurm_get_jobinfo_json(slurm_jobid, &job_info);
 
@@ -814,19 +1022,27 @@ int prte_ras_slurm_check_resources(const char *slurm_jobid)
         else if (strcmp(state, "PENDING") == 0) {
             pending = true;
         }
+
+        else if (strcmp(state, "CANCELLED") == 0) {
+            cancelled = true;
+        }
     }
 
     json_decref(job_info);
     job_info = NULL;
 
-    /* Should be mutually exclusive */
-    if ((running && pending) || (!running && !pending)) {
+    /* Exactly one recognized Slurm state is expected here. */
+    int recognized_states = (running ? 1 : 0) + (pending ? 1 : 0) + (cancelled ? 1 : 0);
+
+    if (1 != recognized_states) {
         err = PRTE_ERR_SLURM_BAD_JOB_STATUS;
         PRTE_ERROR_LOG(err);
         goto cleanup;
     }
 
-    if(!running) {
+    if(cancelled) {
+        err = PRTE_ERR_JOB_CANCELLED;
+    } else if(!running) {
         err = PRTE_ERR_RESOURCE_BUSY;
     }
 

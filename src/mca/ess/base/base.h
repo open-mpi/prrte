@@ -48,11 +48,6 @@ PRTE_EXPORT extern pmix_mca_base_framework_t prte_ess_base_framework;
  */
 PRTE_EXPORT int prte_ess_base_select(void);
 
-/*
- * stdout/stderr buffering control parameter
- */
-PRTE_EXPORT extern int prte_ess_base_std_buffering;
-
 PRTE_EXPORT extern int prte_ess_base_num_procs;
 PRTE_EXPORT extern char *prte_ess_base_nspace;
 PRTE_EXPORT extern char *prte_ess_base_vpid;
@@ -61,33 +56,49 @@ PRTE_EXPORT extern pmix_list_t prte_ess_base_signals;
 /*
  * Internal helper functions used by components
  */
-PRTE_EXPORT int prte_ess_env_get(void);
-
 PRTE_EXPORT int prte_ess_base_std_prolog(void);
+
+/* Establish this daemon's name from the identity its launcher published.
+ *
+ * The nspace is taken verbatim from prte_ess_base_nspace.  The rank is
+ * prte_ess_base_vpid plus a per-node offset: an RM hands every daemon it
+ * starts the same base vpid, and they tell themselves apart by the node index
+ * that RM exports (@c offset_envar - SLURM_NODEID, PALS_NODEID, ...).  Pass
+ * NULL for @c offset_envar when the launcher assigns each daemon its vpid
+ * directly, as ssh does.  @c offset_adjust is added to that index, because LSF
+ * numbers its tasks from one and everyone else from zero.
+ *
+ * Every input is validated and a bad one is refused with a diagnostic naming
+ * it.  That matters more than it looks: the natural shorthand here is
+ * strtoul/atoi with no check, which quietly turns any garbage into 0 - and
+ * rank 0 is the DVM controller, so the daemon adopts the HNP's identity and
+ * the DVM comes apart later in ways that point nowhere near the bad input. */
+PRTE_EXPORT int prte_ess_base_set_identity(const char *offset_envar, int offset_adjust);
 
 PRTE_EXPORT int prte_ess_base_prted_setup(void);
 PRTE_EXPORT int prte_ess_base_prted_finalize(void);
 
 PRTE_EXPORT pmix_status_t prte_ess_base_setup_signals(char *signals);
 
-/* Detect whether or not this proc is bound - if not,
- * see if it should bind itself
- */
-PRTE_EXPORT int prte_ess_base_proc_binding(void);
+/* read a bootstrap configuration file and publish the local daemon's
+ * identity/role into the environment; sets *is_controller true iff this node
+ * is the DVM controller */
+PRTE_EXPORT int prte_ess_base_bootstrap_params(void);
+PRTE_EXPORT int prte_ess_base_bootstrap(bool *is_controller);
 
-/*
- * Put functions
- */
-PRTE_EXPORT int prte_ess_env_put(int32_t num_procs, int32_t num_local_procs, char ***env);
-
-/* read a bootstrap configuration file */
-PRTE_EXPORT int prte_ess_base_bootstrap(void);
+/* Synthesize the RML contact URI of the daemon holding @c rank, entirely from
+ * the bootstrap configuration, so a daemon can reach a peer before any nidmap
+ * has been distributed.  Used by prted to reach its initial parent in a deep
+ * radix tree, and by the OOB to reach a peer it must route through but whose
+ * contact info it does not yet know - most importantly the new parent (a former
+ * grandparent) adopted after a lost lifeline heals the tree.  On success @c *uri
+ * is a malloc'd string the caller frees. */
+PRTE_EXPORT int prte_ess_base_bootstrap_peer_uri(pmix_rank_t rank, char **uri);
 
 typedef struct {
     pmix_list_item_t super;
     char *signame;
     int signal;
-    bool can_forward;
 } prte_ess_base_signal_t;
 PMIX_CLASS_DECLARATION(prte_ess_base_signal_t);
 

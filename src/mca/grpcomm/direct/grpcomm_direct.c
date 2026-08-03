@@ -49,6 +49,7 @@ prte_grpcomm_base_module_t prte_grpcomm_direct_module = {
     .finalize = finalize,
     .fault_handler = fault_handler,
     .xcast = prte_grpcomm_direct_xcast,
+    .xcast_nb = prte_grpcomm_direct_xcast_nb,
     .fence = prte_grpcomm_direct_fence,
     .group = prte_grpcomm_direct_group
 };
@@ -63,6 +64,7 @@ static int init(void)
                    prte_grpcomm_xcast_t);
     PMIX_CONSTRUCT(&prte_mca_grpcomm_direct_component.fence_ops, pmix_list_t);
     PMIX_CONSTRUCT(&prte_mca_grpcomm_direct_component.group_ops, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_mca_grpcomm_direct_component.completed_group_ops, pmix_list_t);
 
     /* xcast receives */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST,
@@ -94,6 +96,7 @@ static void finalize(void)
     PMIX_DESTRUCT(&prte_mca_grpcomm_direct_component.xcast_ops);
     PMIX_LIST_DESTRUCT(&prte_mca_grpcomm_direct_component.fence_ops);
     PMIX_LIST_DESTRUCT(&prte_mca_grpcomm_direct_component.group_ops);
+    PMIX_LIST_DESTRUCT(&prte_mca_grpcomm_direct_component.completed_group_ops);
 
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST_ACK);
@@ -104,9 +107,103 @@ static void finalize(void)
     return;
 }
 
+bool prte_grpcomm_direct_proc_departed(const pmix_proc_t *proc)
+{
+    prte_job_t *jdata;
+    prte_proc_t *p;
+
+    if (PMIX_RANK_WILDCARD == proc->rank || PMIX_RANK_INVALID == proc->rank) {
+        return false;
+    }
+    if (pmix_bitmap_is_clear(&prte_rml_base.failed_dmns)) {
+        /* nothing has failed, so nothing can have departed - and this keeps
+         * the common, fault-free path from walking the job map at all */
+        return false;
+    }
+    jdata = prte_get_job_data_object(proc->nspace);
+    if (NULL == jdata) {
+        return true;
+    }
+    p = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, proc->rank);
+    if (NULL == p || NULL == p->node || NULL == p->node->daemon) {
+        /* we cannot place it any more, which is what a node being torn down
+         * looks like - treat it as gone rather than as an error */
+        return true;
+    }
+    return pmix_bitmap_is_set_bit(&prte_rml_base.failed_dmns,
+                                  p->node->daemon->name.rank);
+}
+
+bool prte_grpcomm_direct_procs_lost(const pmix_proc_t *procs, size_t nprocs)
+{
+    prte_job_t *jdata;
+    prte_proc_t *p;
+    size_t n;
+    int i;
+
+    if (pmix_bitmap_is_clear(&prte_rml_base.failed_dmns)) {
+        return false;
+    }
+    for (n = 0; n < nprocs; n++) {
+        if (PMIX_RANK_WILDCARD != procs[n].rank) {
+            if (prte_grpcomm_direct_proc_departed(&procs[n])) {
+                return true;
+            }
+            continue;
+        }
+        /* a wildcard names the whole namespace, so ask whether any of it was
+         * on a failed daemon. Skipping these would quietly excuse a
+         * collective whose membership is written as a namespace - which is
+         * the common spelling - from noticing it lost anyone at all. */
+        jdata = prte_get_job_data_object(procs[n].nspace);
+        if (NULL == jdata) {
+            return true;
+        }
+        for (i = 0; i < jdata->procs->size; i++) {
+            p = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, i);
+            if (NULL == p || NULL == p->node || NULL == p->node->daemon) {
+                continue;
+            }
+            if (pmix_bitmap_is_set_bit(&prte_rml_base.failed_dmns,
+                                       p->node->daemon->name.rank)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void prte_grpcomm_direct_advance_epoch(uint32_t to)
+{
+    if (to <= prte_mca_grpcomm_direct_component.recovery_epoch) {
+        return;
+    }
+    prte_mca_grpcomm_direct_component.recovery_epoch = to;
+
+    pmix_output_verbose(1, prte_grpcomm_base_framework.framework_output,
+                        "%s grpcomm:direct restarting collectives at epoch %u",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (unsigned) to);
+
+    prte_grpcomm_direct_fence_restart();
+    prte_grpcomm_direct_group_restart();
+}
+
 static void fault_handler(const prte_rml_recovery_status_t* status)
 {
     prte_grpcomm_direct_xcast_fault_handler(status);
+    /* Each collective first decides what it cannot recover and fails that
+     * outright, marking those trackers so the restart below leaves them
+     * alone... */
     prte_grpcomm_direct_fence_fault_handler(status);
     prte_grpcomm_direct_group_fault_handler(status);
+    /* ...then everything still in flight restarts together. The restart has
+     * to be DVM-wide and simultaneous: a daemon that resets and re-sends into
+     * a parent that did not would have its subtree counted twice and another
+     * not at all, which is a quietly wrong result rather than a hang. The
+     * global scope is what provides that - one broadcast, same order
+     * everywhere, after the routing tree has been repaired. */
+    if (PRTE_RML_FAULT_SCOPE_GLOBAL == status->scope) {
+        prte_grpcomm_direct_advance_epoch(
+            prte_mca_grpcomm_direct_component.recovery_epoch + 1);
+    }
 }

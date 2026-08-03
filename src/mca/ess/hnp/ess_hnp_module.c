@@ -41,15 +41,12 @@
 #include "src/class/pmix_hash_table.h"
 #include "src/class/pmix_list.h"
 #include "src/event/event-internal.h"
-#include "src/include/hash_string.h"
-
 #include "src/hwloc/hwloc-internal.h"
 #include "src/pmix/pmix-internal.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_basename.h"
 #include "src/util/pmix_fd.h"
 #include "src/util/pmix_if.h"
-#include "src/util/malloc.h"
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_environ.h"
@@ -169,6 +166,11 @@ static int rte_init(int argc, char **argv)
     jdata = PMIX_NEW(prte_job_t);
     PMIX_LOAD_NSPACE(jdata->nspace, PRTE_PROC_MY_NAME->nspace);
     ret = prte_set_job_data_object(jdata);
+    if (PRTE_SUCCESS != ret) {
+        PRTE_ERROR_LOG(ret);
+        error = "prte_set_job_data_object";
+        goto error;
+    }
 
     /* set the schizo personality to "prte" by default */
     jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy("prte");
@@ -207,7 +209,7 @@ static int rte_init(int argc, char **argv)
     PMIX_LOAD_PROCID(&proc->name, PRTE_PROC_MY_NAME->nspace, PRTE_PROC_MY_NAME->rank);
     proc->pid = prte_process_info.pid;
     proc->state = PRTE_PROC_STATE_RUNNING;
-    PMIX_RETAIN(node); /* keep accounting straight */
+    /* the node backpointer is borrowed, not retained */
     proc->node = node;
     pmix_pointer_array_set_item(jdata->procs, PRTE_PROC_MY_NAME->rank, proc);
 
@@ -361,14 +363,17 @@ static int rte_init(int argc, char **argv)
     t = PMIX_NEW(prte_topology_t);
     t->topo = prte_hwloc_topology;
     t->index = pmix_pointer_array_add(prte_node_topologies, t);
+    /* the node holds a counted reference to the topology */
+    PMIX_RETAIN(t);
     node->topology = t;
     node->available = prte_hwloc_base_filter_cpus(prte_hwloc_topology);
     if (15 < pmix_output_get_verbosity(prte_ess_base_framework.framework_output)) {
         char *output = NULL;
         pmix_output(0, "%s Topology Info:", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
-        prte_hwloc_print(&output, "\t", prte_hwloc_topology);
-        pmix_output(0, "%s", output);
-        free(output);
+        if (PRTE_SUCCESS == prte_hwloc_print(&output, "\t", prte_hwloc_topology)) {
+            pmix_output(0, "%s", output);
+            free(output);
+        }
     }
 
     /* Open/select the odls */
@@ -437,12 +442,21 @@ static int rte_finalize(void)
 {
     /* first stage shutdown of the errmgr, deregister the handler but keep
      * the required facilities until the rml is offline */
-    prte_errmgr.finalize();
+    if (NULL != prte_errmgr.finalize) {
+        prte_errmgr.finalize();
+    }
 
     /* close frameworks */
     (void) pmix_mca_base_framework_close(&prte_filem_base_framework);
     (void) pmix_mca_base_framework_close(&prte_grpcomm_base_framework);
     (void) pmix_mca_base_framework_close(&prte_iof_base_framework);
+    /* mapping is over, so rmaps can go here - the close frees the base's
+     * hwloc bitmaps and runs each mapper's finalize. The ras framework we
+     * also opened is NOT closed here: a session destructor asks it to
+     * release the underlying allocation, and the sessions are torn down
+     * after this function returns, so prte_finalize closes it once that
+     * teardown is done. */
+    (void) pmix_mca_base_framework_close(&prte_rmaps_base_framework);
     (void) pmix_mca_base_framework_close(&prte_plm_base_framework);
     if (!prte_abnormal_term_ordered) {
         /* make sure our local procs are dead */
