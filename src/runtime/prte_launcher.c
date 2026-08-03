@@ -436,7 +436,7 @@ int prte_launch(int argc, char *argv[])
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (rc = prte_register_params())) {
         if (PRTE_ERR_SILENT != rc) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
+            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte register params",
                            PRTE_ERROR_NAME(rc), rc);
         }
@@ -488,7 +488,7 @@ int prte_launch(int argc, char *argv[])
         // parse the file and add its context to the argv array
         fp = fopen(opt->values[0], "r");
         if (NULL == fp) {
-            pmix_show_help("help-prun", "appfile-failure", true, opt->values[0]);
+            pmix_show_help("help-prun.txt", "appfile-failure", true, opt->values[0]);
             return 1;
         }
         first = true;
