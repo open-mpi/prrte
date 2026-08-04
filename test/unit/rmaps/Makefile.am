@@ -24,7 +24,7 @@ test_rmaps_SOURCES = \
     test_seq.c             \
     test_rank_file.c
 
-test_rmaps_LDADD = $(top_builddir)/src/libprrte.la
+test_rmaps_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 # The synthetic hwloc topologies used to exercise map/rank/bind patterns
 # without a live DVM now live in the shared test/topologies directory

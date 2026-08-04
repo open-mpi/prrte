@@ -52,7 +52,7 @@ mcacomponent_LTLIBRARIES = $(component_install)
 prte_mca_ras_flux_la_SOURCES = $(sources)
 prte_mca_ras_flux_la_CPPFLAGS = $(ras_flux_CPPFLAGS) $(ras_flux_jansson_CPPFLAGS)
 prte_mca_ras_flux_la_LDFLAGS = -module -avoid-version $(ras_flux_LDFLAGS) $(ras_flux_jansson_LDFLAGS)
-prte_mca_ras_flux_la_LIBADD = $(top_builddir)/src/libprrte.la \
+prte_mca_ras_flux_la_LIBADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la \
     $(ras_flux_LIBS) $(ras_flux_jansson_LIBS)
 
 noinst_LTLIBRARIES = $(component_noinst)

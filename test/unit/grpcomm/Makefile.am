@@ -12,7 +12,7 @@ check_PROGRAMS = test_grpcomm
 test_grpcomm_SOURCES = \
     test_grpcomm.c
 
-test_grpcomm_LDADD = $(top_builddir)/src/libprrte.la
+test_grpcomm_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 # A few cases reach at grpcomm/direct's own symbols - its module entry
 # points and the classes it defines.  Those are linkable only when the

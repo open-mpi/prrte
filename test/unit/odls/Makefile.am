@@ -12,7 +12,7 @@ check_PROGRAMS = test_odls
 test_odls_SOURCES = \
     test_odls.c
 
-test_odls_LDADD = $(top_builddir)/src/libprrte.la
+test_odls_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_odls
 

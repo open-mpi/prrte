@@ -12,6 +12,6 @@ check_PROGRAMS = test_tools
 test_tools_SOURCES = \
     test_tools.c
 
-test_tools_LDADD = $(top_builddir)/src/libprrte.la
+test_tools_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_tools

@@ -12,7 +12,7 @@ check_PROGRAMS = test_errmgr
 test_errmgr_SOURCES = \
     test_errmgr.c
 
-test_errmgr_LDADD = $(top_builddir)/src/libprrte.la
+test_errmgr_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_errmgr
 

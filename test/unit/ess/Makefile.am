@@ -12,7 +12,7 @@ check_PROGRAMS = test_ess
 test_ess_SOURCES = \
     test_ess.c
 
-test_ess_LDADD = $(top_builddir)/src/libprrte.la
+test_ess_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_ess
 

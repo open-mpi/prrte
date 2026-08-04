@@ -12,6 +12,6 @@ check_PROGRAMS = test_event
 test_event_SOURCES = \
     test_event.c
 
-test_event_LDADD = $(top_builddir)/src/libprrte.la
+test_event_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_event

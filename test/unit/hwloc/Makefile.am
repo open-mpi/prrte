@@ -12,6 +12,6 @@ check_PROGRAMS = test_hwloc
 test_hwloc_SOURCES = \
     test_hwloc.c
 
-test_hwloc_LDADD = $(top_builddir)/src/libprrte.la
+test_hwloc_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_hwloc

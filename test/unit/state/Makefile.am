@@ -12,7 +12,7 @@ check_PROGRAMS = test_state
 test_state_SOURCES = \
     test_state.c
 
-test_state_LDADD = $(top_builddir)/src/libprrte.la
+test_state_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_state
 

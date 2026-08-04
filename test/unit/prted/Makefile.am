@@ -12,7 +12,7 @@ check_PROGRAMS = test_prted
 test_prted_SOURCES = \
     test_prted.c
 
-test_prted_LDADD = $(top_builddir)/src/libprrte.la
+test_prted_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_prted
 

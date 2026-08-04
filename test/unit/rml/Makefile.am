@@ -12,12 +12,12 @@ check_PROGRAMS = test_rml test_rml_routing
 test_rml_SOURCES = \
     test_rml.c
 
-test_rml_LDADD = $(top_builddir)/src/libprrte.la
+test_rml_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 test_rml_routing_SOURCES = \
     test_rml_routing.c
 
-test_rml_routing_LDADD = $(top_builddir)/src/libprrte.la
+test_rml_routing_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_rml test_rml_routing
 

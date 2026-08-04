@@ -20,7 +20,7 @@ test_schizo_SOURCES = \
 
 noinst_HEADERS = test_schizo.h
 
-test_schizo_LDADD = $(top_builddir)/src/libprrte.la
+test_schizo_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_schizo
 

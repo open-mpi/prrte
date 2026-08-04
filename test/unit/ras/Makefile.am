@@ -54,7 +54,7 @@ else
 test_ras_CPPFLAGS += -DPRTE_TEST_RAS_PMIX=1
 endif
 
-test_ras_LDADD = $(top_builddir)/src/libprrte.la
+test_ras_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_ras
 

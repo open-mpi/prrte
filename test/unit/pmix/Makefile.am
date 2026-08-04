@@ -12,6 +12,6 @@ check_PROGRAMS = test_pmix
 test_pmix_SOURCES = \
     test_pmix.c
 
-test_pmix_LDADD = $(top_builddir)/src/libprrte.la
+test_pmix_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_pmix

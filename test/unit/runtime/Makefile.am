@@ -12,7 +12,7 @@ check_PROGRAMS = test_runtime
 test_runtime_SOURCES = \
     test_runtime.c
 
-test_runtime_LDADD = $(top_builddir)/src/libprrte.la
+test_runtime_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_runtime
 

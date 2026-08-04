@@ -12,7 +12,7 @@ check_PROGRAMS = test_iof
 test_iof_SOURCES = \
     test_iof.c
 
-test_iof_LDADD = $(top_builddir)/src/libprrte.la
+test_iof_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_iof
 

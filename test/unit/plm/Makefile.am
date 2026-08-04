@@ -12,7 +12,7 @@ check_PROGRAMS = test_plm
 test_plm_SOURCES = \
     test_plm.c
 
-test_plm_LDADD = $(top_builddir)/src/libprrte.la
+test_plm_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_plm
 

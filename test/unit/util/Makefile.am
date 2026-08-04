@@ -12,6 +12,6 @@ check_PROGRAMS = test_util
 test_util_SOURCES = \
     test_util.c
 
-test_util_LDADD = $(top_builddir)/src/libprrte.la
+test_util_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_util
