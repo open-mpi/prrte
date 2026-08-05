@@ -76,6 +76,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 #include "types.h"
 
 #include "src/prted/prted.h"
@@ -273,6 +274,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     prte_state_caddy_t *state = (prte_state_caddy_t *) cbdata;
     uint32_t job_id = UINT32_MAX;
     prte_session_t *session = NULL;
+    int32_t num_session_nodes;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(state);
@@ -397,7 +399,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
         PMIx_Argv_append_nosize(&nodelist_argv, node->name);
     }
     if (0 == PMIx_Argv_count(nodelist_argv)) {
-        pmix_show_help("help-plm-slurm.txt", "no-hosts-in-list", true);
+        prte_show_help("help-plm-slurm.txt", "no-hosts-in-list", true);
         rc = PRTE_ERR_FAILED_TO_START;
         goto cleanup;
     }
@@ -450,10 +452,17 @@ static void launch_daemons(int fd, short args, void *cbdata)
     pmix_argv_append(&argc, &argv, tmp);
     free(tmp);
 
+    num_session_nodes = 0;
+    for (n = 0; n < session->nodes->size; n++) {
+        if (NULL != pmix_pointer_array_get_item(session->nodes, n)) {
+            ++num_session_nodes;
+        }
+    }
+
     /* if we are using all nodes in the job, then srun doesn't
      * require any further arguments
      */
-    if (map->num_new_daemons < session->nodes->size) {
+    if (map->num_new_daemons < num_session_nodes) {
         pmix_asprintf(&tmp, "--nodes=%lu", (unsigned long) map->num_new_daemons);
         pmix_argv_append(&argc, &argv, tmp);
         free(tmp);
@@ -624,7 +633,7 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
 
     /* need to check that we are at least version 17.11 */
     if (prte_mca_plm_slurm_component.ancient) {
-        pmix_show_help("help-plm-slurm.txt", "ancient-version", true,
+        prte_show_help("help-plm-slurm.txt", "ancient-version", true,
                        prte_mca_plm_slurm_component.major,
                        prte_mca_plm_slurm_component.minor);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
@@ -672,21 +681,37 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
         /* an orted must have died unexpectedly - report
          * that the daemon has failed so we exit
          */
-        pmix_show_help("help-plm-slurm.txt", "srun-failed", true,
+        prte_show_help("help-plm-slurm.txt", "srun-failed", true,
                        proc->exit_code);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
     } else {
         /* otherwise, check to see if this is the primary pid */
         if (primary_srun_pid == proc->pid) {
-            /* in this case, we just want to fire the proper trigger so
-             * mpirun can exit
-             */
-            PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
-                                 "%s plm:slurm: primary daemons complete!",
-                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            /* need to set the #terminated value to avoid an incorrect error msg */
-            jdata->num_terminated = jdata->num_procs;
-            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+            if (prte_debug_daemons_flag || prte_leave_session_attached) {
+                /* the prted stayed attached instead of forking off and
+                 * daemonizing, so the process srun is tracking really is
+                 * the persistent daemon - its clean exit means the DVM
+                 * is genuinely gone. Fire the proper trigger so mpirun
+                 * can exit.
+                 */
+                PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
+                                     "%s plm:slurm: primary daemons complete!",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                /* need to set the #terminated value to avoid an incorrect error msg */
+                jdata->num_terminated = jdata->num_procs;
+                PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
+            } else {
+                /* the prted forked and daemonized (the default): srun was
+                 * only ever tracking the fork's parent, which exits as
+                 * soon as the real daemon signals it is up and running.
+                 * A clean exit here is that hand-off, not termination -
+                 * daemon loss is instead caught when its RML connection
+                 * to the HNP actually drops. */
+                PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
+                                     "%s plm:slurm: primary srun exited after "
+                                     "daemon hand-off",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+            }
         }
     }
 
@@ -710,7 +735,7 @@ static int plm_slurm_start_proc(int argc, char **argv,
     PRTE_HIDE_UNUSED_PARAMS(argc);
 
     if (NULL == exec_argv) {
-        pmix_show_help("help-plm-slurm.txt", "no-srun", true);
+        prte_show_help("help-plm-slurm.txt", "no-srun", true);
         return PRTE_ERR_SILENT;
     }
 

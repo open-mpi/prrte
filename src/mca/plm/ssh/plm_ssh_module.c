@@ -84,6 +84,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/base/base.h"
@@ -697,6 +698,16 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
     } else {
         full_orted_cmd = orted_cmd;
     }
+    if (NULL == full_orted_cmd) {
+        /* prte_launch_agent named nothing to run - an empty
+         * --prtemca prte_launch_agent "" gets here. There is no command to
+         * ssh, so say so rather than strdup(NULL) */
+        prte_show_help("help-plm-ssh.txt", "no-launch-agent", true);
+        free(orted_prefix);
+        PMIx_Argv_free(final_argv);
+        PMIx_Argv_free(argv);
+        return PRTE_ERR_SILENT;
+    }
     if (NULL != orted_prefix) {
         pmix_asprintf(&tmp, "%s %s", orted_prefix, full_orted_cmd);
         free(orted_prefix);
@@ -753,7 +764,7 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
 
     value = PMIx_Argv_join(argv, ' ');
     if (sysconf(_SC_ARG_MAX) < (int) strlen(value)) {
-        pmix_show_help("help-plm-ssh.txt", "cmd-line-too-long", true, strlen(value),
+        prte_show_help("help-plm-ssh.txt", "cmd-line-too-long", true, strlen(value),
                        sysconf(_SC_ARG_MAX));
         free(value);
         PMIx_Argv_free(argv);
@@ -1176,7 +1187,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
          * As we cannot run in this situation, pretty print the error
          * and return an error code.
          */
-        pmix_show_help("help-plm-ssh.txt", "deadlock-params", true,
+        prte_show_help("help-plm-ssh.txt", "deadlock-params", true,
                        prte_mca_plm_ssh_component.num_concurrent, map->num_new_daemons);
         PRTE_ERROR_LOG(PRTE_ERR_FATAL);
         rc = PRTE_ERR_SILENT;

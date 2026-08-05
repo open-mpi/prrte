@@ -73,8 +73,13 @@ the user's output directives. The iof framework's own write machinery
 (sinks, `prte_iof_base_write_output`, write handlers) is used almost
 entirely for the **stdin** direction — writing bytes down a local proc's
 stdin pipe. Keep that split in mind; it is the single biggest thing the
-historical [`README.txt`](README.txt) and the stale docstrings in
-[`iof.h`](iof.h) get wrong relative to today's code.
+a since-removed `README.txt` and the docstrings in [`iof.h`](iof.h) used
+to get wrong relative to today's code. Both have now been corrected — the
+README was a 2007 e-mail thread describing `prte_iof_base_endpoint_t` and
+`prte_iof_svc_sub_t`, structures this tree has not had for many years, and
+it was the origin of the "STDIN=0, STDOUT=1" enumeration every guide here
+had to warn readers off; it has been removed, and `iof.h`'s prose now
+describes the code that is actually there.
 
 There is **no proxy-to-proxy traffic**: a daemon never sends output to
 another daemon. Everything funnels HNP-ward and the HNP fans back out —
@@ -90,8 +95,7 @@ master](#a-tool-is-not-always-on-the-master).
 iof/
   iof.h                     # the module vtable (init/push/pull/close/complete/finalize/push_stdin)
   iof_types.h               # prte_iof_tag_t + the PRTE_IOF_* stream/flow/tool tag bitmask
-  README.txt                # HISTORICAL notes (2007-era design) — largely stale, read with care
-  base/
+  base/                     # the shared machinery — see base/AGENTS.md
     base.h                  # framework struct, the sink/read/write/proc/deliver structs, all the macros
     iof_base_frame.c        # open/close/register; MCA param; prte_iof_base_output; all class instances
     iof_base_select.c       # pick-ONE selection (highest priority query wins)
@@ -134,7 +138,7 @@ struct prte_iof_base_module_2_0_0_t {
 | `push` | **Capture output.** Tie a local read fd (the read end of a proc's `stdout` or `stderr` pipe, distinguished by `src_tag`) to a read event that forwards whatever appears. | `prte_iof_base_setup_parent` (from `odls`) |
 | `pull` | **Register a stdin sink.** Tie a local write fd (the write end of a proc's `stdin` pipe) to a sink so data addressed to that proc's stdin gets written down it. Only `PRTE_IOF_STDIN` is supported. | `prte_iof_base_setup_parent` |
 | `close` | Tear down the read events and/or sink for the named peer for the streams in `source_tag`; drop the proc from `procs` once all three are gone. | teardown paths |
-| `complete` | Job finished: purge any lingering `prte_iof_proc_t`s belonging to `jdata->nspace`. | `state` machine on `JOB`/`PROC` completion |
+| `complete` | Job finished: purge any lingering `prte_iof_proc_t`s belonging to `jdata->nspace` — releasing each one's stream slots **before** the proc, because the proc and its read events reference each other (see [`base/AGENTS.md`](base/AGENTS.md)). | `state` machine on `JOB`/`PROC` completion |
 | `finalize` | Cancel the RML receive and destruct the `procs` list. | framework close |
 | `push_stdin` | **Inject stdin.** Deliver a chunk of stdin to a target proc (or wildcard). In the `hnp` module that means routing it — to the hosting daemon over RML, or to a local proc's sink. In the `prted` module it means relaying to the HNP, which is the only process that can do the routing. Implemented in **both**; a tool can attach to any daemon. | PMIx server glue (`pmix_server_gen.c`) |
 
@@ -248,7 +252,18 @@ This is the heart of the **stdin / output-to-fd** path:
   - **partial write** → re-base the chunk with
     `prte_iof_base_adjust_short_write` (slide the unwritten tail to the
     front **and** drop `numbytes` by what went out), prepend, retry;
-  - `numbytes == 0` chunk → close the stream by releasing the sink.
+  - `numbytes == 0` chunk → release the sentinel chunk, then close the
+    stream by releasing the sink.
+
+  **A chunk the handler is looking at is off the list.** Every handler
+  starts with `pmix_list_remove_first`, so from that moment the chunk
+  belongs to the handler and nothing else will free it — in particular,
+  releasing the sink/write event frees only what is *still queued*. All
+  three handlers used to return on the zero-byte sentinel without
+  releasing it, leaking one `PRTE_IOF_BASE_TAGGED_OUT_MAX`-sized chunk per
+  closed stdin stream, which on a persistent DVM is per proc per job
+  forever. Either release the chunk or put it back; there is no third
+  option.
 
   If the backlog ever exceeds `prte_iof_base_output_limit` it declares IOF
   hopelessly behind and fires `PRTE_JOB_STATE_FORCED_EXIT`. To avoid
@@ -303,9 +318,14 @@ Called by `odls` around the `fork()` of each app proc:
 
 - **`prte_iof_base_setup_prefork(opts)`** — before fork: create the
   `stdout` pipe (or a pty if `usepty` and PTY support is compiled in),
-  the `stderr` pipe, and — only if `opts->connect_stdin` — the `stdin`
-  pipe. `connect_stdin` is set true only for the proc that receives stdin
-  (normally rank 0); everyone else gets `/dev/null`.
+  then — only if `opts->connect_stdin` — the `stdin` pipe, then the
+  `stderr` pipe. `connect_stdin` is set true only for the proc that
+  receives stdin (normally rank 0); everyone else gets `/dev/null`.
+  On a failure partway through it **closes the descriptors it already
+  created** and returns `PRTE_ERR_SYS_LIMITS_PIPES`: the caller only reads
+  those fields on success, so nobody else could close them, and leaking
+  two per failed launch is what turns one transient `EMFILE` in a daemon
+  into every later launch on that node failing too.
 - **`prte_iof_base_setup_child(opts, env)`** — in the child after fork:
   `dup2` the pipe ends onto fds 0/1/2, disable echo on a pty, and wire
   `stdin` to `/dev/null` when not connected.
@@ -322,7 +342,9 @@ Called by `odls` around the `fork()` of each app proc:
   (`prte_iof.push_stdin(...)`, `prte_iof.complete(...)`).
 - `PRTE_RML_TAG_IOF_HNP` — daemons → HNP (forwarded output, XON/XOFF, and
   stdin a daemon is relaying on behalf of a tool attached to it; the leading
-  stream tag is what tells the three apart).
+  stream tag is what tells the three apart, and it is the **only** thing
+  that can — an XON/XOFF message is nothing *but* that tag, so it has to be
+  screened before the receiver reaches for a proc).
 - `PRTE_RML_TAG_IOF_PROXY` — HNP → daemons (stdin, xcast stdin to all, and
   output relayed to the daemon hosting a launching tool; again the leading
   stream tag distinguishes them).
@@ -391,30 +413,104 @@ bitmask:
 | `PRTE_IOF_PULL` / `PRTE_IOF_CLOSE` | `0x4000` / `0x8000` | tool requests |
 
 Because tags are bit flags, tests are always `tag & PRTE_IOF_STDOUT`, and
-`close`/`push` handle multiple stream bits in one call. The old
-`iof.h` comment listing `STDIN=0, STDOUT=1, …` describes a **retired**
-enumeration — ignore it; `iof_types.h` is authoritative.
+`close`/`push` handle multiple stream bits in one call. `iof_types.h` is
+authoritative; a `STDIN=0, STDOUT=1, …` enumeration you may find in an old
+tree or an old commit is **retired**.
 
 ---
 
 ## Flow control
 
-stdin can outrun a slow reader. The framework applies simple XON/XOFF
-back-pressure keyed on `PRTE_IOF_MAX_INPUT_BUFFERS` (50 queued chunks):
+stdin can outrun a slow reader, so the framework applies XON/XOFF
+back-pressure keyed on `PRTE_IOF_MAX_INPUT_BUFFERS` (50 queued chunks).
+**It reaches all the way back to the producer, and it did not always** —
+until PMIx grew `PMIx_server_IOF_flow_control` the whole mechanism was a
+signal the HNP logged and discarded. If you are reading an older tree, or
+an older copy of this guide, that is what it is describing.
 
-- On a daemon, when `prte_iof_base_write_output` reports the stdin sink
-  backlog has crossed 50 (or a write errors out),
-  `prte_iof_prted_send_xonxoff(PRTE_IOF_XOFF)` tells the HNP to stop
-  sending, latched by `prte_mca_iof_prted_component.xoff`. When the
-  backlog drains below 50, the daemon sends `PRTE_IOF_XON`.
-- On the HNP, `push_stdin` to a *local* proc returns
-  `PRTE_ERR_OUT_OF_RESOURCE` when its own sink passes the same threshold,
-  which propagates back to stop the read that is producing stdin.
+The producer is never ours. stdin originates in a PMIx server's read of
+its own stdin, or in a tool's `PMIx_IOF_push`, so the only way to slow it
+is to ask PMIx to stop it at the source. That is what
+`PMIx_server_IOF_flow_control` does: it leaves the read un-armed, so the
+bytes stay in the producer's own input stream and the OS applies the
+back-pressure. **Nothing is buffered on behalf of a suspended stream and
+nothing is dropped** — an XOFF is not permission to lose data.
+
+The two halves, which are separate mechanisms that happen to share a
+vocabulary:
+
+- **A daemon** whose stdin sink crosses 50 (or whose write errors out)
+  calls `prte_iof_prted_send_xonxoff(PRTE_IOF_XOFF)`, latched by
+  `prte_mca_iof_prted_component.xoff`, and sends `PRTE_IOF_XON` when the
+  backlog drains. `prte_iof_hnp_recv` screens the
+  `PRTE_IOF_XON | PRTE_IOF_XOFF` mask ahead of everything else and turns
+  it into a wildcard `PMIx_server_IOF_flow_control` call. Wildcard because
+  the message says only *that* this daemon is behind, never which producer
+  filled it — so every process feeding us stdin is suspended, which is the
+  conservative reading.
+- **The HNP's own local procs** never involve the RML at all.
+  `push_stdin` returns `PRTE_ERR_OUT_OF_RESOURCE` when a local sink passes
+  the same threshold, latched by `prte_mca_iof_hnp_component.xoff`, and
+  the glue in
+  [`src/prted/pmix/pmix_server_gen.c`](../../prted/pmix/pmix_server_gen.c)
+  turns that into `PMIX_ERR_IOF_XOFF` on the `push_stdin` completion —
+  which PMIx reads as "I have the data, suspend the stream". The matching
+  release is `release_flow_control()` in
+  [`hnp/iof_hnp.c`](hnp/iof_hnp.c).
+
+**Every XOFF must be paired with an XON, and that is on us.** PMIx has no
+status meaning "resume": a suspension persists until somebody calls the
+API with `xoff` false. So a release has to run on *every* path a
+backed-up sink can leave that state by — not just the one where it
+drains, but the ones where it is torn down. `release_flow_control()` is
+called from the `check:` and `finish:` arms of `stdin_write_handler`
+**and** from `hnp_close`/`hnp_complete`, which release a stdin sink
+directly and never reach the write handler at all — which is exactly the
+case that matters, since a sink is backed up precisely when its proc
+stopped reading, and that is the proc a teardown is likely to be
+retiring. It is a no-op when no XOFF is outstanding, so it is safe to
+call from anywhere, which is what lets it be called from everywhere it
+must be.
+
+**The blast radius is the job, not the DVM** — know why, because it is
+not obvious and it is what makes the failure tolerable. PMIx keeps no
+sticky suspension state: `pmix_iof_flow_control` walks the peers that
+exist *at the moment of the call* and pushes the request to them, and
+the only durable state is the `xoff` flag on the read event inside the
+producer itself. The producer is `prun`, which is per-job, so a
+suspension it is still carrying dies when it does. A `prun` that
+connects afterwards has never been told anything and starts reading
+normally. So the worst an unreleased XOFF can do is hang **that** job;
+the next one is unaffected, and the first sink to drain clears the stale
+latch. Do not read that as license to skip a release — a hung job is
+still a bug, and the reasoning above is a property of PMIx's current
+design rather than a guarantee it owes us. The dockerswarm suite counts
+the two and fails on a mismatch rather than merely checking that flow
+control happened.
+
+The oscillation is expected. Several procs take stdin at different rates,
+so one draining proc can turn the producers back on while another is
+still behind; the one still behind asserts XOFF again on its next write.
+That is the intended failure mode — the alternative to oscillating is
+stalling, and nothing is dropped either way. The prted module's `CHECK`
+block carries the same caveat in its own comment.
 
 `prte_iof_base_output_limit` (MCA param `iof_base_output_limit`, default
-`INT_MAX`) is the harder ceiling: if a sink's backlog exceeds it, the
-write handler concludes something is permanently wedged and forces the
-job to exit.
+`INT_MAX`) is still the harder ceiling underneath all of this: if a
+sink's backlog exceeds it, the write handler concludes something is
+permanently wedged and fires `PRTE_JOB_STATE_FORCED_EXIT`. With flow
+control working, reaching it means the producer ignored the suspension,
+not merely that the reader is slow.
+
+**Against a PMIx that predates the capability** (`PRTE_PMIX_IOF_FLOW_CONTROL`
+is 0, from `PRTE_CHECK_PMIX_CAP([IOF_FLOW_CONTROL])` in
+`config/prte_setup_pmix.m4`) every one of these paths compiles away and
+the old behavior returns: the message is consumed quietly, the sink
+queues, and `iof_base_output_limit` is the only bound. What is **not**
+conditional is that the HNP screen the tag first — a flow-control message
+carries no proc and no payload, so falling through to the output unpack
+reports the daemon's XOFF to the user as a corrupted message, which is
+what used to happen every time a process read its stdin slowly.
 
 ---
 
@@ -441,8 +537,8 @@ no other thread touching this state. Consequences:
 ## Conventions and gotchas
 
 - **`push` is output, `pull` is stdin.** Repeat it until it sticks. The
-  docstrings in [`iof.h`](iof.h) and the [`README.txt`](README.txt) are
-  historical and describe a design that no longer matches the code.
+  names are the historical ones and they read backwards; [`iof.h`](iof.h)
+  now says so explicitly at both prototypes.
 - **The PMIx server does the actual output.** `stdout`/`stderr` bytes are
   handed to `PMIx_server_IOF_deliver`; terminal writing, `--output`
   tagging, per-rank files, and tool "pull" copies are the PMIx server's
@@ -460,6 +556,11 @@ no other thread touching this state. Consequences:
   `PRTE_PROC_STATE_IOF_COMPLETE` — the state machine waits on this before
   fully reaping a proc. Don't null a read-event slot without going through
   that check.
+- **The proc and its read events reference each other.** Releasing the
+  proc alone frees neither; the streams have to go first, and only while a
+  reference to the proc is still held. Every teardown path in this
+  framework obeys that, and it is the single easiest thing to get wrong
+  here — see [`base/AGENTS.md`](base/AGENTS.md), *Ownership*.
 - **Stdin does not come from a terminal read here.** Older trees carried
   declarations (`prte_iof_base_flush`, `prte_iof_hnp_stdin_cb`,
   `prte_iof_hnp_stdin_check`, the `stdinsig` event) from when `mpirun` read
@@ -484,9 +585,11 @@ what *is* exercisable without them:
 
 - the tag-bitmask invariants (`STDMERGE`/`STDOUTALL`/`STDALL` equal the OR
   of their parts; control flags don't collide with stream bits);
-- the module vtable contract (HNP wires all seven slots; `prted` leaves
-  `push_stdin` `NULL`);
-- the component name strings (`"hnp"`, `"prted"`);
+- the module vtable contract — **both** components wire all seven slots,
+  including `push_stdin` (it was `NULL` in `prted` until #2568);
+- the component name strings (`"hnp"`, `"prted"`), asked of the framework
+  rather than of a module symbol, so a `--enable-mca-dso` build still runs
+  the case;
 - constructor defaults / destructor safety for the five core classes;
 - the **producer side** of the sink engine —
   `prte_iof_base_write_output`'s backlog accounting, byte copy, zero-byte
@@ -495,13 +598,32 @@ what *is* exercisable without them:
 - the chunk-splitting of an oversized write (every chunk within
   `PRTE_IOF_BASE_TAGGED_OUT_MAX`, the pieces reassembling to the original
   bytes) and the negative-count degradation to the close sentinel;
-- the **consumer side**'s one pure piece —
-  `prte_iof_base_adjust_short_write`, driven by draining a chunk through a
-  run of short writes and comparing the bytes that came out with the bytes
-  that went in (the #2579 failure mode is duplication, so the byte count is
-  the assertion that matters);
+- the **consumer side** for real: `prte_iof_base_write_handler` driven
+  against a live pipe, asserting that the payload arrives intact and that
+  the zero-byte sentinel behind it closes the fd (the reader sees EOF).
+  This is the only case that runs a write handler rather than a piece of
+  one, and it is what holds the sentinel branch — where all three handlers
+  leaked their chunk — still;
+- `prte_iof_base_adjust_short_write` in isolation, driven by draining a
+  chunk through a run of short writes and comparing the bytes that came out
+  with the bytes that went in (the #2579 failure mode is duplication, so
+  the byte count is the assertion that matters);
+- the proc/read-event reference cycle: dropping the list's reference frees
+  nothing while a stream is open, and the stream-first teardown order is
+  what makes the proc's own release safe;
+- the flow-control message's shape: the `XON`/`XOFF` tags share no bit with
+  any stream tag, and a flow-control buffer really does end after the tag —
+  which is why the HNP must branch on the mask before unpacking a proc;
 - the `prte_iof_base_fd_always_ready` predicate (pipe vs. regular file vs.
-  `/dev/null`).
+  `/dev/null`);
+- `prte_iof_base_setup_prefork`'s descriptor bookkeeping, driven by burning
+  the descriptor table down to three free slots so the stdin pipe cannot be
+  created: the call must fail *and* hand back the stdout pipe it already
+  made. It runs last because it lowers `RLIMIT_NOFILE` for its duration.
+
+The test opens `prte_event_base` (the sink macros assign their libevent
+events to it) and `PMIx_server_init`s (`PMIx_Data_pack` refuses to run
+before PMIx is up) — both are what a real daemon has when this code runs.
 
 The end-to-end capture/relay/inject behavior is covered by the integration
 harness (`prte --daemonize` → `prun` → `pterm`), not by `make check`.
@@ -531,9 +653,13 @@ the actual terminal write happens downstream in the PMIx server.
 
 ## Where to go next
 
-Each component directory has its own `AGENTS.md`:
+Each subdirectory has its own `AGENTS.md`:
 
 - [`hnp/AGENTS.md`](hnp/AGENTS.md) — the HNP hub: collects all output,
   emits it, injects stdin. Read this first.
 - [`prted/AGENTS.md`](prted/AGENTS.md) — the per-daemon relay: captures
   local output and forwards it; delivers stdin locally.
+- [`base/AGENTS.md`](base/AGENTS.md) — the shared machinery: who owns
+  what, the sink write engine up close, the fork-time descriptor rules,
+  and an inventory of the fields here that are declared but dead. Read it
+  before editing anything under `base/`.

@@ -34,6 +34,7 @@
 #include "src/util/nidmap.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "grpcomm_direct.h"
 #include "src/mca/grpcomm/base/base.h"
@@ -263,14 +264,12 @@ void prte_grpcomm_direct_xcast_recv(
     op_t* op = find_op(&sig);
     if(NULL == op){
         op = insert_forwarded_op(&sig);
-        if(PMIX_SUCCESS != unpack_msg(buffer, op)){
-            pmix_list_remove_item(&XCAST.ops, &op->super);
-            PMIX_RELEASE(op);
-            return;
-        }
         /* If we are the master and this is one of our own broadcasts, attach the
          * completion callback queued for it in begin_xcast (FIFO).  Remote-origin
-         * broadcasts queue nothing, so they never consume an entry. */
+         * broadcasts queue nothing, so they never consume an entry.  This has to
+         * happen before the unpack below can abandon the op: the FIFO is
+         * positional, so an entry left on it once its broadcast has been dropped
+         * would be handed to the next broadcast the master makes. */
         if(PRTE_PROC_IS_MASTER && NULL != sender &&
            sender->rank == PRTE_PROC_MY_NAME->rank &&
            !pmix_list_is_empty(&XCAST.pending_completions)){
@@ -279,6 +278,11 @@ void prte_grpcomm_direct_xcast_recv(
             op->cbfunc = pc->cbfunc;
             op->cbdata = pc->cbdata;
             PMIX_RELEASE(pc);
+        }
+        if(PMIX_SUCCESS != unpack_msg(buffer, op)){
+            pmix_list_remove_item(&XCAST.ops, &op->super);
+            PMIX_RELEASE(op);
+            return;
         }
     }
 
@@ -383,7 +387,7 @@ void prte_grpcomm_direct_xcast_fault_handler(
         XCAST.op_id_completed_at_promotion =
             XCAST.op_id_completed;
     }
-    if(status->parent_changed || status->promoted){
+    if(status->parent_changed || status->promoted || status->demoted){
         // Avoid confusing new parent by accidentally acking with
         // the valid ack id. They'll tell us what id to use.
         op_t* op;
@@ -391,7 +395,7 @@ void prte_grpcomm_direct_xcast_fault_handler(
             op->ack_id_up = PMIX_RANK_INVALID;
         }
     }
-    if(status->children_changed || status->promoted){
+    if(status->children_changed || status->promoted || status->demoted){
         const pmix_rank_t* prev_children =
             (const pmix_rank_t*) status->prev_children.array;
         const pmix_rank_t* children =
@@ -413,9 +417,10 @@ void prte_grpcomm_direct_xcast_fault_handler(
             // If any children have reported back, we have no way of knowing if
             // it was the surviving children or a failed child. So we will need
             // to start a new ack round.
-            // If promoted, avoid late ack arrivals from old children causing
-            // confusion by also starting a new round.
-            bool new_ack_round = op->nreported > 0 || status->promoted;
+            // If promoted/demoted, avoid late ack arrivals from old children
+            // causing confusion by also starting a new round.
+            bool new_ack_round =
+                op->nreported > 0 || status->promoted || status->demoted;
             if(new_ack_round) op->ack_id_down++;
             op->nreported = 0;
 
@@ -431,7 +436,12 @@ void prte_grpcomm_direct_xcast_fault_handler(
             for(size_t i = 0; i < prte_rml_base.children.size; i++){
                 if(PMIX_RANK_INVALID == children[i]){
                     continue;
-                } else if(children[i] != prev_children[i]){
+                } else if(children[i] != prev_children[i] || status->demoted){
+                    // When demoted, we don't know if an old child that followed
+                    // us believed for some short window to have had a different
+                    // parent, which could have caused them to discard the
+                    // original forward. So always replay the op to every child
+                    // when demoted.
                     forward_op_to(op, children[i]);
                 } else if(new_ack_round){
                     request_ack(children[i], &op->sig, op->ack_id_down);
@@ -650,10 +660,18 @@ static op_t* insert_forwarded_op(signature_t* sig) {
 }
 
 static void forward_op(op_t* op){
+    /* The daemon job object can be gone by the time a broadcast is being
+     * forwarded - teardown retires it while the last xcasts (the halt, the
+     * job-end notifications) are still moving - so this cannot be an
+     * unchecked dereference. Its absence says nothing about whether to
+     * forward; only the do-not-launch attribute does, and without the job
+     * object nobody set it. */
     prte_job_t* daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    bool skip = prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH,
-                                   NULL, PMIX_BOOL);
-    if(skip) return;
+    if(NULL != daemons &&
+       prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH,
+                          NULL, PMIX_BOOL)){
+        return;
+    }
 
     op->replay_pending_parent = false;
     op->nexpected = prte_rml_base.n_children;
@@ -771,7 +789,7 @@ static void process_msg(op_t* op){
             (uint8_t**) &decomp_msg.bytes, &decomp_msg.size
         );
         if(!success){
-            pmix_show_help("help-prte-runtime.txt", "failed-to-uncompress",
+            prte_show_help("help-prte-runtime.txt", "failed-to-uncompress",
                            true, prte_process_info.nodename);
             PMIX_BYTE_OBJECT_DESTRUCT(&decomp_msg);
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);

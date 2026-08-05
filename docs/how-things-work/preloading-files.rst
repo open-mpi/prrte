@@ -51,9 +51,40 @@ Two directives change this:
 * The ``filem_raw_flatten_directory_trees`` MCA parameter reduces *every*
   preloaded file to its basename, so nothing lands in a subdirectory.
 
-An archive |mdash| a file whose name ends in ``.tar``, ``.bz`` or ``.gz``
+An archive |mdash| a file whose name ends in ``.tar``, ``.tar.gz``,
+``.tgz``, ``.gz``, ``.tar.bz2``, ``.tbz``, ``.tbz2``, ``.bz2`` or ``.bz``
 |mdash| is unpacked, and it is the *contents* that are placed, at the paths
 the archive names them by, relative to the working directory.
+
+A preloaded file keeps its permissions, so a helper script staged
+alongside a job's data arrives executable.
+
+
+Names that would step outside the working directory are refused
+---------------------------------------------------------------
+
+Because a preloaded file is always placed *inside* the working directory,
+the name it is delivered under has to stay inside it.  A leading ``./`` or
+``../`` is simply removed |mdash| ``--preload-files ../inputs/mesh.dat``
+delivers ``inputs/mesh.dat``, which is the useful reading.  A ``..``
+anywhere else in the name has no such reading: ``a/../../mesh.dat`` names a
+file two levels *above* the directory the job asked for it in, on every
+node at once.  Such a request is refused before anything is staged:
+
+.. code:: sh
+
+   shell$ prun -n 4 --preload-files a/../../mesh.dat ./solver
+   --------------------------------------------------------------------------
+   A file requested for preloading cannot be delivered under the name it was
+   given:
+
+      File: a/../../mesh.dat
+   ...
+   --------------------------------------------------------------------------
+
+Name the file by a path relative to the directory it should appear in, or
+by an absolute path |mdash| in which case it is delivered under its
+basename.
 
 
 Existing files are never overwritten

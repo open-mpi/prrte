@@ -5,7 +5,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -53,11 +53,11 @@ typedef struct {
     prte_event_t ev;
     int fd;
     prte_filem_raw_outbound_t *outbound;
-    prte_app_idx_t app_idx;
     bool pending;
     char *src;
     char *file;
     int32_t type;
+    uint32_t mode;
     int32_t nchunk;
     int status;
     pmix_rank_t nrecvd;
@@ -66,13 +66,13 @@ PMIX_CLASS_DECLARATION(prte_filem_raw_xfer_t);
 
 typedef struct {
     pmix_list_item_t super;
-    prte_app_idx_t app_idx;
     prte_event_t ev;
     bool pending;
     int fd;
     char *file;
     char *fullpath;
     int32_t type;
+    uint32_t mode;
     char **link_pts;
     pmix_list_t outputs;
 } prte_filem_raw_incoming_t;

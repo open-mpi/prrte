@@ -46,6 +46,7 @@ It is **not** a Docker Swarm in the orchestration sense — just ten plain
 | `jobinfo.c` | A bare PMIx client for the **direct-modex** paths (`jobinfo` in the install): `publish`/`fetch`/`fetchkey`. Drives `src/prted/pmix/pmix_server_fence.c` from a daemon that hosts none of the target job's procs. |
 | `proctable.c` | A bare PMIx client for the **proc-table and server-URI queries** (`proctable` in the install): `procs`/`localprocs`/`serveruri`. Those are the only callers of `prte_pmix_convert_state()`, and the local-vs-global proc-table split has no meaning on one host. Drives `src/pmix`. |
 | `groupcon.c` | A bare PMIx client that drives a **group construct/destruct** (`groupcon` in the install): every rank contributes a local cid, asks for a context id, constructs, reads every peer's contribution back, destructs. Drives `grpcomm/direct`'s `grp_release` on daemons that merely *received* the broadcast. See §15. |
+| `envspawn.c` | A PMIx client that spawns a child job carrying one of every **envar directive** (`envspawn` in the install): SET/ADD/UNSET/PREPEND/APPEND, pinned to a named host, with the child reporting the environment it actually got into a file on its own node. Those directives have no command-line surface — they arrive only on a spawn request — and `odls` applies them on whichever daemon forks the process, so the child has to land somewhere the parent is not. Drives `prte_odls_base_process_envars`. |
 | `slowcat.c` | A deliberately **slow** stdin reader (`slowcat` in the install, no PMIx dependency): copies stdin to a file in small reads with a pause between them, so the daemon feeding it keeps hitting *partial* writes. That is the only way to reach the iof short-write path. |
 | `fake-slurm.py` | A stand-in SLURM control plane (`sbatch`/`scontrol`/`scancel`) so `ras/slurm`'s elastic modify surface can be exercised. See §12. |
 
@@ -405,6 +406,29 @@ what was piped in) and the md5 second. It runs twice, once with the rank on
 node2 and once on node1, because the HNP and the daemon carry **separate**
 copies of the write handler — the HNP copy was fixed upstream in 2025 and
 the daemon copy was missed.
+
+A third pass runs `slowcat` slower still (64 bytes every 4 ms), which is
+what pushes the daemon's stdin backlog past `PRTE_IOF_MAX_INPUT_BUFFERS`
+(50 chunks) and makes it send the HNP an **XON/XOFF** message. That message
+is nothing but the stream tag, on the same RML tag forwarded output uses,
+and the HNP used to unpack the tag and then reach straight for a proc — so
+an ordinary slow reader put a PMIx unpack error on the user's terminal. The
+case asserts delivery is still exact *and* that the HNP's log gained no
+unpack error. Do not weaken the reader's pace: at `cat` speed, or even at
+the pace the two cases above use, the backlog may never cross 50 and the
+case passes without having tested anything.
+
+A fourth pass runs the same reader with `--prtemca iof_base_verbose 1` and
+**counts** the two halves of the flow control in the HNP's log. That is
+the case that covers `PMIx_server_IOF_flow_control` actually being
+reached, and it is a count rather than a grep on purpose: PMIx has no
+status meaning "resume", so an implementation that asserts XOFF fifty
+times and releases once looks identical to a correct one under a presence
+test — and the job it produces is *hung*, not slow. The case fails if the
+counts differ, if flow control never engaged at all (which would mean the
+reader was too fast and the case proved nothing), or if a byte went
+missing across the suspensions. See the framework guide's *Flow control*
+section for where each half lives.
 
 **Grow** (`elastic grow node2:2,node3:2`): phase-1 `PMIX_SUCCESS`, then phase-2
 `PMIX_DVM_IS_READY`, and `prted` now running on node2 and node3.

@@ -152,8 +152,6 @@ typedef struct {
     pmix_rank_t *dmns;
     /** number of participating daemons */
     size_t ndmns;
-    /** my index in the dmns array */
-    unsigned long my_rank;
     /* number of buckets expected */
     size_t nexpected;
     /* number reported in */
@@ -169,6 +167,12 @@ typedef struct {
     pmix_data_buffer_t *my_contribution;
     /* controls values */
     int timeout;
+    // the controller arms a timer for "timeout" seconds once a participant
+    // has asked for one. Nothing else bounds a fence: the PMIx server library
+    // deletes its own timeout the moment it hands the request to us, so that
+    // a late answer cannot come back to a tracker it already released.
+    prte_event_t tev;
+    bool tev_active;
     /* callback function */
     pmix_modex_cbfunc_t cbfunc;
     /* user-provided callback data */
@@ -310,6 +314,14 @@ void prte_grpcomm_direct_fence_release(int status, pmix_proc_t *sender,
 PRTE_MODULE_EXPORT extern
 void prte_grpcomm_direct_fence_fault_handler(const prte_rml_recovery_status_t* status);
 
+/* Find the tracker for this fence signature, optionally creating it. A new
+ * tracker resolves the signature to its participating daemons and sizes the
+ * rollup accordingly, and comes back NULL - with nothing left on the tracker
+ * list - if that cannot be done. Exported so the unit test can drive it. */
+PRTE_MODULE_EXPORT
+prte_grpcomm_fence_t *prte_grpcomm_direct_fence_get_tracker(prte_grpcomm_direct_fence_signature_t *sig,
+                                                            bool create);
+
 /* group functions */
 PRTE_MODULE_EXPORT extern
 int prte_grpcomm_direct_group(pmix_group_operation_t op, char *grpid,
@@ -319,6 +331,17 @@ int prte_grpcomm_direct_group(pmix_group_operation_t op, char *grpid,
 
 PRTE_MODULE_EXPORT extern
 void prte_grpcomm_direct_group_fault_handler(const prte_rml_recovery_status_t* status);
+
+/* Fill in a group signature from the directives a participant supplied,
+ * along with the timeout, local status, group info and endpoint data that
+ * ride alongside it. The signature takes a COPY of every array a directive
+ * carries - the directives belong to the PMIx server that handed them to us.
+ * Exported so the unit test can drive it against a synthetic directive set. */
+PRTE_MODULE_EXPORT
+pmix_status_t prte_grpcomm_direct_group_parse_directives(prte_grpcomm_direct_group_signature_t *sig,
+                                                         const pmix_info_t *directives, size_t ndirs,
+                                                         int *timeout, pmix_status_t *st,
+                                                         void *grpinfo, void *endpts);
 
 PRTE_MODULE_EXPORT extern
 void prte_grpcomm_direct_grp_recv(int status, pmix_proc_t *sender,

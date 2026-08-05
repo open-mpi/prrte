@@ -49,6 +49,41 @@ static int fence_sig_unpack(pmix_data_buffer_t *buffer,
                             prte_grpcomm_direct_fence_signature_t **sig);
 static void check_complete(prte_grpcomm_fence_t *coll);
 
+/* Work out how many contributions this daemon has to collect for a fence:
+ * one per child subtree holding a participant, plus our own if we are one.
+ *
+ * create_dmns() has one answer it gives without an array: a signature naming
+ * the daemon job itself is "every daemon in the DVM", reported as a count
+ * with a NULL array.  There is nothing to walk in that case, but the answer
+ * is known exactly - each of our children heads a subtree holding at least
+ * one daemon, and we are a participant ourselves.  A NULL array with a zero
+ * count is the opposite statement, "no daemons at all", and falls through to
+ * the general case, which reads it as zero.
+ *
+ * Called again on every recovery, because both terms move: a failure can
+ * take our children and can take participants. */
+static void set_nexpected(prte_grpcomm_fence_t *coll)
+{
+    size_t n;
+
+    if (NULL == coll->dmns && 0 < coll->ndmns) {
+        coll->nexpected = prte_rml_base.n_children + 1;
+        return;
+    }
+
+    coll->nexpected = prte_rml_get_num_contributors(coll->dmns, coll->ndmns);
+
+    /* see if I am in the array of participants - note that I may
+     * be in the rollup tree even though I'm not participating
+     * in the collective itself */
+    for (n = 0; n < coll->ndmns; n++) {
+        if (coll->dmns[n] == PRTE_PROC_MY_NAME->rank) {
+            coll->nexpected++;
+            break;
+        }
+    }
+}
+
 int prte_grpcomm_direct_fence(const pmix_proc_t procs[], size_t nprocs,
                               const pmix_info_t info[], size_t ninfo, char *data,
                               size_t ndata, pmix_modex_cbfunc_t cbfunc, void *cbdata)
@@ -131,16 +166,55 @@ static void abort_fence_op(prte_grpcomm_fence_t *coll, pmix_status_t st)
     coll->aborting = true;
 }
 
+/* The controller's guard timer for a fence a participant put a deadline on.
+ * Firing it completes every participant with PMIX_ERR_TIMEOUT rather than
+ * leaving them blocked in PMIx_Fence forever.
+ *
+ * Nothing else is watching. The PMIx server library arms a timeout of its own
+ * while it gathers the local contributions, but deletes it the moment the
+ * request is handed to us - deliberately, so that an answer arriving after it
+ * fired cannot reach a tracker it has already released. From that point the
+ * deadline the caller asked for exists only here. */
+static void fence_timeout(int sd, short args, void *cbdata)
+{
+    prte_grpcomm_fence_t *coll = (prte_grpcomm_fence_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(coll);
+    coll->tev_active = false;
+    if (coll->converged || coll->aborting) {
+        return;
+    }
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
+                         "%s grpcomm:direct:fence timeout after %d seconds",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), coll->timeout));
+    coll->status = PMIX_ERR_TIMEOUT;
+    abort_fence_op(coll, PMIX_ERR_TIMEOUT);
+}
+
 void prte_grpcomm_direct_fence_restart(void)
 {
     prte_grpcomm_fence_t *coll, *nxt;
     pmix_data_buffer_t *framed;
-    size_t n;
     int rc;
 
     PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.fence_ops,
                            prte_grpcomm_fence_t) {
         if (coll->aborting) {
+            continue;
+        }
+        /* A collective the controller has already answered is finished:
+         * its release is on the wire, ordered ahead of anything we could
+         * send now, and every daemon will retire its tracker when that
+         * release lands. Re-running the rollup here would answer it a
+         * second time - a second release broadcast, a second context id
+         * consumed, and a second registration of the same group on every
+         * daemon. Note this is a test only the controller can apply:
+         * "converged" on any other daemon means it rolled its aggregate up
+         * to its parent, and re-sending that aggregate is precisely what
+         * recovery is for, since the failure may have been what swallowed
+         * it. */
+        if (PRTE_PROC_IS_MASTER && coll->converged) {
             continue;
         }
 
@@ -155,13 +229,7 @@ void prte_grpcomm_direct_fence_restart(void)
         /* recompute what the repaired tree owes us - dmns stays the full
          * pre-fault set, and get_num_contributors() already skips the daemons
          * now known to have failed */
-        coll->nexpected = prte_rml_get_num_contributors(coll->dmns, coll->ndmns);
-        for (n = 0; n < coll->ndmns; n++) {
-            if (coll->dmns[n] == PRTE_PROC_MY_NAME->rank) {
-                coll->nexpected++;
-                break;
-            }
-        }
+        set_nexpected(coll);
 
         PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
                              "%s grpcomm:direct:fence restarting at epoch %u, "
@@ -221,7 +289,7 @@ void prte_grpcomm_direct_fence_fault_handler(const prte_rml_recovery_status_t* s
         if (PRTE_PROC_IS_MASTER && 0 == status->failed_ranks.size) {
             PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.fence_ops,
                                    prte_grpcomm_fence_t) {
-                if (!coll->aborting) {
+                if (!coll->aborting && !coll->converged) {
                     abort_fence_op(coll, PMIX_ERR_LOST_CONNECTION);
                 }
             }
@@ -234,7 +302,8 @@ void prte_grpcomm_direct_fence_fault_handler(const prte_rml_recovery_status_t* s
     }
     PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.fence_ops,
                            prte_grpcomm_fence_t) {
-        if (coll->aborting) {
+        /* already answered, or already being torn down */
+        if (coll->aborting || coll->converged) {
             continue;
         }
         if (!prte_grpcomm_direct_procs_lost(coll->sig->signature, coll->sig->sz)) {
@@ -254,8 +323,11 @@ static void fence(int sd, short args, void *cbdata)
 {
     prte_pmix_fence_caddy_t *cd = (prte_pmix_fence_caddy_t *) cbdata;
     prte_grpcomm_direct_fence_signature_t sig;
-    prte_grpcomm_fence_t *coll;
+    prte_grpcomm_fence_t *coll = NULL;
     int rc;
+    /* what our own participants are told if this contribution never makes
+     * it into the rollup - PMIX_SUCCESS means it did */
+    pmix_status_t st = PMIX_SUCCESS;
     pmix_data_buffer_t *relay, *framed, bkt;
     pmix_byte_object_t bo;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
@@ -269,17 +341,18 @@ static void fence(int sd, short args, void *cbdata)
     /* compute the signature of this collective */
     PMIX_CONSTRUCT(&sig, prte_grpcomm_direct_fence_signature_t);
     sig.sz = cd->nprocs;
-    sig.signature = (pmix_proc_t *) malloc(sig.sz * sizeof(pmix_proc_t));
-    memcpy(sig.signature, cd->procs, sig.sz * sizeof(pmix_proc_t));
+    if (0 < sig.sz) {
+        PMIX_PROC_CREATE(sig.signature, sig.sz);
+        memcpy(sig.signature, cd->procs, sig.sz * sizeof(pmix_proc_t));
+    }
 
     /* retrieve an existing tracker, create it if not
      * already found. The fence module is responsible
      * for releasing it upon completion of the collective */
     coll = get_tracker(&sig, true);
     if (NULL == coll) {
-        PMIX_DESTRUCT(&sig);
-        PMIX_RELEASE(cd);
-        return;
+        st = PMIX_ERR_NOT_FOUND;
+        goto done;
     }
     coll->cbfunc = cd->cbfunc;
     coll->cbdata = cd->cbdata;
@@ -295,23 +368,25 @@ static void fence(int sd, short args, void *cbdata)
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(relay);
-        PMIX_RELEASE(cd);
-        return;
+        st = prte_pmix_convert_rc(rc);
+        goto done;
     }
 
     // pack the info structs
     rc = PMIx_Data_pack(NULL, relay, &cd->ninfo, 1, PMIX_SIZE);
     if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(relay);
-        PMIX_RELEASE(cd);
-        return;
+        st = rc;
+        goto done;
     }
     if (0 < cd->ninfo) {
         rc = PMIx_Data_pack(NULL, relay, cd->info, cd->ninfo, PMIX_INFO);
         if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
             PMIX_DATA_BUFFER_RELEASE(relay);
-            PMIX_RELEASE(cd);
-            return;
+            st = rc;
+            goto done;
         }
     }
 
@@ -323,9 +398,10 @@ static void fence(int sd, short args, void *cbdata)
     rc = PMIx_Data_copy_payload(relay, &bkt);
     PMIX_DATA_BUFFER_DESTRUCT(&bkt);
     if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(relay);
-        PMIX_RELEASE(cd);
-        return;
+        st = rc;
+        goto done;
     }
 
     /* Keep our own contribution so a fault can replay it: recovery resets
@@ -341,8 +417,8 @@ static void fence(int sd, short args, void *cbdata)
         PMIX_DATA_BUFFER_RELEASE(coll->my_contribution);
         coll->my_contribution = NULL;
         PMIX_DATA_BUFFER_RELEASE(relay);
-        PMIX_RELEASE(cd);
-        return;
+        st = rc;
+        goto done;
     }
 
     /* stamp it with the current epoch and send that */
@@ -351,8 +427,8 @@ static void fence(int sd, short args, void *cbdata)
     PMIX_DATA_BUFFER_RELEASE(relay);
     if (PRTE_SUCCESS != rc) {
         PMIX_DATA_BUFFER_RELEASE(framed);
-        PMIX_RELEASE(cd);
-        return;
+        st = prte_pmix_convert_rc(rc);
+        goto done;
     }
 
     /* send this to ourselves for processing */
@@ -362,8 +438,35 @@ static void fence(int sd, short args, void *cbdata)
 
     PRTE_RML_SEND(rc, PRTE_PROC_MY_NAME->rank, framed,
                   PRTE_RML_TAG_FENCE);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        PMIX_DATA_BUFFER_RELEASE(framed);
+        st = prte_pmix_convert_rc(rc);
+    }
+
+done:
+    /* the signature we computed is ours - the tracker keeps a copy of its
+     * own - so it must go back on every path out of here */
+    PMIX_DESTRUCT(&sig);
+
+    if (PMIX_SUCCESS != st) {
+        /* Our contribution never entered the rollup, so no release is coming
+         * to complete the clients waiting in PMIx_Fence - and this daemon
+         * returned PRTE_SUCCESS from the entry point, so nothing upstream
+         * knows to fail them either. Complete them here with the reason, and
+         * take them off the tracker first so that a release arriving later
+         * (the controller can still abort the fence) cannot complete them a
+         * second time. The tracker itself is left in place: it is what any
+         * such release still has to find. */
+        if (NULL != coll) {
+            coll->cbfunc = NULL;
+            coll->cbdata = NULL;
+        }
+        if (NULL != cd->cbfunc) {
+            cd->cbfunc(st, NULL, 0, cd->cbdata, NULL, NULL);
+        }
+    }
     PMIX_RELEASE(cd);
-    return;
 }
 
 void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
@@ -373,6 +476,7 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
     int32_t cnt;
     int rc, timeout, slot;
     uint32_t stamp;
+    struct timeval tv;
     size_t n, ninfo;
     pmix_status_t st;
     pmix_info_t *info = NULL;
@@ -499,6 +603,19 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
         }
     }
 
+    /* Arm the deadline, if a participant asked for one. Only on the
+     * controller: it is the one daemon every rollup reaches, so it is the
+     * only one that can tell a fence that will never converge from one that
+     * simply has not yet. */
+    if (PRTE_PROC_IS_MASTER && !coll->tev_active && 0 < coll->timeout) {
+        prte_event_evtimer_set(prte_event_base, &coll->tev, fence_timeout, coll);
+        tv.tv_sec = coll->timeout;
+        tv.tv_usec = 0;
+        coll->tev_active = true;
+        PMIX_POST_OBJECT(coll);
+        prte_event_evtimer_add(&coll->tev, &tv);
+    }
+
     /* transfer any data */
     rc = PMIx_Data_copy_payload(&coll->bucket, buffer);
     if (PMIX_SUCCESS != rc) {
@@ -550,6 +667,11 @@ static void check_complete(prte_grpcomm_fence_t *coll)
         return;
     }
     coll->converged = true;
+    /* the fence resolved, so the guard timer has done its job */
+    if (coll->tev_active) {
+        prte_event_del(&coll->tev);
+        coll->tev_active = false;
+    }
 
     if (PRTE_PROC_IS_MASTER) {
         PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
@@ -711,6 +833,13 @@ void prte_grpcomm_direct_fence_release(int status, pmix_proc_t *sender,
     /* execute the callback */
     if (NULL != coll->cbfunc) {
         coll->cbfunc(ret, bo.bytes, bo.size, coll->cbdata, relcb, bo.bytes);
+    } else {
+        /* Nobody here was waiting on this fence: we hold a tracker because we
+         * relayed for our subtree, not because we had a participant of our
+         * own. The gathered data is still ours to free - relcb is the only
+         * other thing that frees it, and it only ever runs because the
+         * callback above was handed it. */
+        PMIX_BYTE_OBJECT_DESTRUCT(&bo);
     }
     pmix_list_remove_item(&prte_mca_grpcomm_direct_component.fence_ops, &coll->super);
     PMIX_RELEASE(coll);
@@ -721,7 +850,6 @@ static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *
 {
     prte_grpcomm_fence_t *coll;
     int rc;
-    size_t n;
 
     /* search the existing tracker list to see if this already exists */
     PMIX_LIST_FOREACH(coll, &prte_mca_grpcomm_direct_component.fence_ops, prte_grpcomm_fence_t) {
@@ -748,30 +876,37 @@ static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *
     // we have to know the participating procs
     coll->sig = PMIX_NEW(prte_grpcomm_direct_fence_signature_t);
     coll->sig->sz = sig->sz;
-    coll->sig->signature = (pmix_proc_t *) malloc(coll->sig->sz * sizeof(pmix_proc_t));
-    memcpy(coll->sig->signature, sig->signature, coll->sig->sz * sizeof(pmix_proc_t));
+    if (0 < coll->sig->sz) {
+        PMIX_PROC_CREATE(coll->sig->signature, coll->sig->sz);
+        memcpy(coll->sig->signature, sig->signature, coll->sig->sz * sizeof(pmix_proc_t));
+    }
     pmix_list_append(&prte_mca_grpcomm_direct_component.fence_ops, &coll->super);
 
     /* now get the daemons involved */
     if (PRTE_SUCCESS != (rc = create_dmns(sig, &coll->dmns, &coll->ndmns))) {
         PRTE_ERROR_LOG(rc);
+        /* a tracker with no daemon set can never be completed, and leaving it
+         * on the list is worse than losing it: the next fence of the same
+         * signature would find this one, see a rollup that expects nothing,
+         * and answer with data it never gathered */
+        pmix_list_remove_item(&prte_mca_grpcomm_direct_component.fence_ops, &coll->super);
+        PMIX_RELEASE(coll);
         return NULL;
     }
 
     /* count the number of contributions we should get */
-    coll->nexpected = prte_rml_get_num_contributors(coll->dmns, coll->ndmns);
-
-    /* see if I am in the array of participants - note that I may
-     * be in the rollup tree even though I'm not participating
-     * in the collective itself */
-    for (n = 0; n < coll->ndmns; n++) {
-        if (coll->dmns[n] == PRTE_PROC_MY_NAME->rank) {
-            coll->nexpected++;
-            break;
-        }
-    }
+    set_nexpected(coll);
 
     return coll;
+}
+
+/* Same, for a caller outside this file. Exported only so the unit test can
+ * build a tracker and inspect what the rollup was sized to expect, which is
+ * where a fence goes wrong long before any message moves. */
+prte_grpcomm_fence_t *prte_grpcomm_direct_fence_get_tracker(prte_grpcomm_direct_fence_signature_t *sig,
+                                                            bool create)
+{
+    return get_tracker(sig, create);
 }
 
 static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
@@ -802,6 +937,22 @@ static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
                          "%s grpcomm:direct:fence:create_dmns called with %s signature size %" PRIsize_t "",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          (NULL == sig->signature) ? "NULL" : "NON-NULL", sig->sz));
+
+    /* A signature has to name somebody. This is not reachable from a local
+     * client - the PMIx server hands us the participants it aggregated - but
+     * the signature also arrives off the wire, where a truncated message
+     * unpacks to an empty one. The test below would then read signature[0]
+     * of an array that is NULL; and an entry with no nspace is worse than
+     * that, because PMIX_CHECK_NSPACE answers "yes" for an empty nspace
+     * against anything, so it would be taken for a fence over the daemon job
+     * and sized to expect the whole DVM. Refuse it: the caller drops the
+     * message, which is the right answer for one we cannot read. */
+    if (0 == sig->sz || NULL == sig->signature ||
+        PMIX_NSPACE_INVALID(sig->signature[0].nspace)) {
+        *dmns = NULL;
+        *ndmns = 0;
+        return PRTE_ERR_BAD_PARAM;
+    }
 
     /* if the target jobid is our own,
      * then all daemons are participating */

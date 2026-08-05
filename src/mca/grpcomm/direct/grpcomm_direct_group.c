@@ -34,6 +34,7 @@
 #include "src/util/nidmap.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "grpcomm_direct.h"
 #include "src/mca/grpcomm/base/base.h"
@@ -72,6 +73,126 @@ static int pack_epoch_frame(pmix_data_buffer_t *framed, pmix_data_buffer_t *body
         return prte_pmix_convert_status(rc);
     }
     return PRTE_SUCCESS;
+}
+
+/* Take a copy of a proc array a directive carried into the signature.
+ *
+ * The array belongs to the caller: the directives come straight from the
+ * PMIx server upcall, and PMIx frees them - the darray and the array inside
+ * it - once the operation completes. The signature's destructor frees
+ * whatever the signature holds, so pointing at the caller's array would have
+ * us free it out from under PMIx and have PMIx free it a second time. Every
+ * other populator of these fields (the tracker cache in get_tracker(), the
+ * unpack of an arriving signature) already allocates, so this keeps the
+ * ownership rule uniform: the signature owns its arrays, always. */
+static pmix_status_t copy_directive_procs(const pmix_info_t *dir,
+                                          pmix_proc_t **procs, size_t *nprocs)
+{
+    pmix_data_array_t *darray;
+
+    if (PMIX_DATA_ARRAY != dir->value.type) {
+        /* nothing usable was given - not an error, just no members */
+        return PMIX_SUCCESS;
+    }
+    darray = dir->value.data.darray;
+    if (NULL == darray || NULL == darray->array || 0 == darray->size) {
+        return PMIX_SUCCESS;
+    }
+    /* The element type has to be checked, not assumed: this array reaches us
+     * from a client's info array, and the copy below is sized in
+     * pmix_proc_t. An array of anything smaller would have us read past the
+     * end of it - by a factor, not by a few bytes. */
+    if (PMIX_PROC != darray->type) {
+        PMIX_ERROR_LOG(PMIX_ERR_TYPE_MISMATCH);
+        return PMIX_ERR_TYPE_MISMATCH;
+    }
+    if (NULL != *procs) {
+        /* a second directive of the same key - the PMIx server aggregates
+         * these, so this should not happen, but do not strand the first */
+        PMIX_PROC_FREE(*procs, *nprocs);
+    }
+    PMIX_PROC_CREATE(*procs, darray->size);
+    if (NULL == *procs) {
+        *nprocs = 0;
+        return PMIX_ERR_NOMEM;
+    }
+    memcpy(*procs, darray->array, darray->size * sizeof(pmix_proc_t));
+    *nprocs = darray->size;
+    return PMIX_SUCCESS;
+}
+
+/* Scan the directives a participant gave us, filling in the signature and the
+ * values collected alongside it. Split out of group() so it can be exercised
+ * without a DVM - it reads nothing but its arguments. */
+pmix_status_t prte_grpcomm_direct_group_parse_directives(prte_grpcomm_direct_group_signature_t *sig,
+                                                         const pmix_info_t *directives, size_t ndirs,
+                                                         int *timeout, pmix_status_t *st,
+                                                         void *grpinfo, void *endpts)
+{
+    pmix_status_t rc;
+    size_t i;
+
+    for (i = 0; i < ndirs; i++) {
+        /* see if they want a context id assigned */
+        if (PMIX_CHECK_KEY(&directives[i], PMIX_GROUP_ASSIGN_CONTEXT_ID)) {
+            sig->assignID = PMIX_INFO_TRUE(&directives[i]);
+
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_GROUP_BOOTSTRAP)) {
+            PMIX_VALUE_GET_NUMBER(rc, &directives[i].value, sig->bootstrap, size_t);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                return rc;
+            }
+
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_LOCAL_COLLECTIVE_STATUS)) {
+            PMIX_VALUE_GET_NUMBER(rc, &directives[i].value, *st, pmix_status_t);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                return rc;
+            }
+
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_TIMEOUT)) {
+            PMIX_VALUE_GET_NUMBER(rc, &directives[i].value, *timeout, int);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                return rc;
+            }
+
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_GROUP_ADD_MEMBERS)) {
+            // there is only one of these as it is aggregated by the
+            // PMIx server library
+            rc = copy_directive_procs(&directives[i], &sig->addmembers, &sig->naddmembers);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                return rc;
+            }
+
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_GROUP_INFO)) {
+            rc = PMIx_Info_list_xfer(grpinfo, &directives[i]);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+            }
+
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_PROC_DATA)) {
+            rc = PMIx_Info_list_xfer(endpts, &directives[i]);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+            }
+
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_GROUP_FINAL_MEMBERSHIP_ORDER)) {
+            rc = copy_directive_procs(&directives[i], &sig->final_order, &sig->nfinal);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                return rc;
+            }
+#if PRTE_PMIX_HAVE_GROUP_FT
+        } else if (PMIX_CHECK_KEY(&directives[i], PMIX_GROUP_FT_COLLECTIVE)) {
+            sig->ft_collective = PMIX_INFO_TRUE(&directives[i]);
+#endif
+        }
+    }
+
+    return PMIX_SUCCESS;
 }
 
 static prte_grpcomm_group_t *get_tracker(prte_grpcomm_direct_group_signature_t *sig, bool create);
@@ -214,7 +335,12 @@ static void request_group_cancel(prte_pmix_grp_caddy_t *cd)
      * carries one even though nothing filters it against the epoch */
     rc = PMIx_Data_pack(NULL, relay, &prte_mca_grpcomm_direct_component.recovery_epoch, 1, PMIX_UINT32);
     if (PMIX_SUCCESS == rc) {
+        /* note this one answers in PRTE codes, and we acknowledge in PMIx
+         * statuses - the two agree only on success */
         rc = pack_signature(relay, &sig);
+        if (PRTE_SUCCESS != rc) {
+            rc = prte_pmix_convert_rc(rc);
+        }
     }
     PMIX_DESTRUCT(&sig);
     if (PMIX_SUCCESS != rc) {
@@ -288,6 +414,20 @@ void prte_grpcomm_direct_group_restart(void)
         /* a bootstrap has no rollup to restart, and an operation already being
          * torn down by an abort is not going to converge either way */
         if (coll->bootstrap || coll->aborting) {
+            continue;
+        }
+        /* A collective the controller has already answered is finished:
+         * its release is on the wire, ordered ahead of anything we could
+         * send now, and every daemon will retire its tracker when that
+         * release lands. Re-running the rollup here would answer it a
+         * second time - a second release broadcast, a second context id
+         * consumed, and a second registration of the same group on every
+         * daemon. Note this is a test only the controller can apply:
+         * "converged" on any other daemon means it rolled its aggregate up
+         * to its parent, and re-sending that aggregate is precisely what
+         * recovery is for, since the failure may have been what swallowed
+         * it. */
+        if (PRTE_PROC_IS_MASTER && coll->converged) {
             continue;
         }
 
@@ -371,7 +511,7 @@ void prte_grpcomm_direct_group_fault_handler(const prte_rml_recovery_status_t* s
         if (PRTE_PROC_IS_MASTER && 0 == status->failed_ranks.size) {
             PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.group_ops,
                                    prte_grpcomm_group_t) {
-                if (coll->aborting) {
+                if (coll->aborting || coll->converged) {
                     continue;
                 }
                 pmix_output_verbose(1, prte_grpcomm_base_framework.framework_output,
@@ -397,7 +537,8 @@ void prte_grpcomm_direct_group_fault_handler(const prte_rml_recovery_status_t* s
          * is what covers an operation it holds no tracker for yet. */
         PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.group_ops,
                                prte_grpcomm_group_t) {
-            if (coll->aborting) {
+            /* already answered, or already being torn down */
+            if (coll->aborting || coll->converged) {
                 continue;
             }
             if (coll->bootstrap) {
@@ -429,7 +570,6 @@ static void group(int sd, short args, void *cbdata)
     prte_pmix_grp_caddy_t *cd = (prte_pmix_grp_caddy_t*)cbdata;
     prte_grpcomm_direct_group_signature_t sig;
     prte_grpcomm_group_t *coll;
-    size_t i;
     pmix_data_buffer_t *relay, *framed;
     pmix_status_t rc, st = PMIX_SUCCESS;
     int timeout = 0;
@@ -467,61 +607,11 @@ static void group(int sd, short args, void *cbdata)
     grpinfo = PMIx_Info_list_start();
 
     /* check the directives */
-    for (i = 0; i < cd->ndirs; i++) {
-        /* see if they want a context id assigned */
-        if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_GROUP_ASSIGN_CONTEXT_ID)) {
-            sig.assignID = PMIX_INFO_TRUE(&cd->directives[i]);
-
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_GROUP_BOOTSTRAP)) {
-            PMIX_VALUE_GET_NUMBER(rc, &cd->directives[i].value, sig.bootstrap, size_t);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                PMIX_DESTRUCT(&sig);
-                goto error;
-            }
-
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_LOCAL_COLLECTIVE_STATUS)) {
-            PMIX_VALUE_GET_NUMBER(rc, &cd->directives[i].value, st, pmix_status_t);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                PMIX_DESTRUCT(&sig);
-                goto error;
-            }
-
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_TIMEOUT)) {
-            PMIX_VALUE_GET_NUMBER(rc, &cd->directives[i].value, timeout, int);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                PMIX_DESTRUCT(&sig);
-                goto error;
-            }
-
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_GROUP_ADD_MEMBERS)) {
-            // there is only one of these as it is aggregated by the
-            // PMIx server library
-            sig.addmembers = (pmix_proc_t*)cd->directives[i].value.data.darray->array;
-            sig.naddmembers = cd->directives[i].value.data.darray->size;
-
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_GROUP_INFO)) {
-            rc = PMIx_Info_list_xfer(grpinfo, &cd->directives[i]);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-            }
-
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_PROC_DATA)) {
-            rc = PMIx_Info_list_xfer(endpts, &cd->directives[i]);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-            }
-
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_GROUP_FINAL_MEMBERSHIP_ORDER)) {
-            sig.final_order = (pmix_proc_t*)cd->directives[i].value.data.darray->array;
-            sig.nfinal = cd->directives[i].value.data.darray->size;
-#if PRTE_PMIX_HAVE_GROUP_FT
-        } else if (PMIX_CHECK_KEY(&cd->directives[i], PMIX_GROUP_FT_COLLECTIVE)) {
-            sig.ft_collective = PMIX_INFO_TRUE(&cd->directives[i]);
-#endif
-        }
+    rc = prte_grpcomm_direct_group_parse_directives(&sig, cd->directives, cd->ndirs,
+                                                    &timeout, &st, grpinfo, endpts);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_DESTRUCT(&sig);
+        goto error;
     }
 
     /* a local client is starting this operation, which is proof that any
@@ -544,13 +634,13 @@ static void group(int sd, short args, void *cbdata)
 
     /* pack the signature */
     rc = pack_signature(relay, &sig);
-    // protect the inbound directives
-    sig.addmembers = NULL;
-    sig.naddmembers = 0;
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_RELEASE(relay);
         PMIX_DESTRUCT(&sig);
+        /* the error label answers our caller, which reads PMIx statuses -
+         * and this one is a PRTE code */
+        rc = prte_pmix_convert_rc(rc);
         goto error;
     }
 
@@ -652,6 +742,7 @@ static void group(int sd, short args, void *cbdata)
     if (PRTE_SUCCESS != rc) {
         PMIX_DATA_BUFFER_RELEASE(framed);
         PMIX_DESTRUCT(&sig);
+        rc = prte_pmix_convert_rc(rc);
         goto error;
     }
     relay = framed;
@@ -994,7 +1085,19 @@ void prte_grpcomm_direct_grp_recv(int status, pmix_proc_t *sender,
  * shrink underneath a tracker that has already counted more than it ends up
  * needing. The "converged" latch is what keeps that safe: without it a
  * straggler arriving after completion would drive a second release broadcast,
- * consuming another context id, or a second rollup to our parent. */
+ * consuming another context id, or a second rollup to our parent.
+ *
+ * A bootstrap needs one more guard than that. Its two expected counts are not
+ * known when the tracker is created - they are filled in from the first
+ * *leader* to arrive, which is the only contribution that carries the leader
+ * count (PMIX_GROUP_BOOTSTRAP) and the add-members that set nfollowers. A
+ * tracker created by a follower therefore starts with both counts at zero, and
+ * a ">=" test against zero is satisfied by that single follower: the operation
+ * would converge on one contribution, before any leader has been heard from,
+ * and answer with the empty membership it has assembled so far. nleaders is
+ * the discriminator because a bootstrap always has at least one leader by
+ * definition, whereas nfollowers is legitimately zero for a bootstrap with no
+ * add-members. */
 static void check_complete(prte_grpcomm_group_t *coll)
 {
     int rc;
@@ -1014,8 +1117,9 @@ static void check_complete(prte_grpcomm_group_t *coll)
     }
 
     /* see if everyone has reported */
-    if (!((coll->bootstrap && (coll->nleaders_reported >= coll->nleaders &&
-                               coll->nfollowers_reported >= coll->nfollowers)) ||
+    if (!((coll->bootstrap && 0 < coll->nleaders &&
+           (coll->nleaders_reported >= coll->nleaders &&
+            coll->nfollowers_reported >= coll->nfollowers)) ||
           (!coll->bootstrap && coll->nreported >= coll->nexpected))) {
         return;
     }
@@ -1149,8 +1253,9 @@ static void check_complete(prte_grpcomm_group_t *coll)
                 }
                 // did we lose anyone?
                 if (nfinal != pmix_list_get_size(&nmlist)) {
-                    pmix_show_help("help-prte-runtime.txt", "bad-final-order", true);
+                    prte_show_help("help-prte-runtime.txt", "bad-final-order", true);
                     coll->status = PMIX_ERR_BAD_PARAM;
+                    PMIX_LIST_DESTRUCT(&nmlist);
                     goto answer;
                 }
                 // just overwrite the final array
@@ -1245,6 +1350,7 @@ answer:
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
                 return;
             }
             if (0 < ninfo) {
@@ -1252,6 +1358,7 @@ answer:
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
+                    PMIX_DATA_ARRAY_DESTRUCT(&darray);
                     return;
                 }
             }
@@ -1265,6 +1372,7 @@ answer:
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
                 return;
             }
             if (0 < ninfo) {
@@ -1272,6 +1380,7 @@ answer:
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
+                    PMIX_DATA_ARRAY_DESTRUCT(&darray);
                     return;
                 }
             }
@@ -1325,6 +1434,7 @@ answer:
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
                 return;
             }
             if (0 < ninfo) {
@@ -1332,6 +1442,7 @@ answer:
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
+                    PMIX_DATA_ARRAY_DESTRUCT(&darray);
                     return;
                 }
             }
@@ -1345,6 +1456,7 @@ answer:
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(reply);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
                 return;
             }
             if (0 < ninfo) {
@@ -1352,6 +1464,7 @@ answer:
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
                     PMIX_DATA_BUFFER_RELEASE(reply);
+                    PMIX_DATA_ARRAY_DESTRUCT(&darray);
                     return;
                 }
             }
@@ -2180,12 +2293,12 @@ static prte_grpcomm_group_t *get_tracker(prte_grpcomm_direct_group_signature_t *
     // save the participating procs
     coll->sig->nmembers = sig->nmembers;
     if (0 < sig->nmembers) {
-        coll->sig->members = (pmix_proc_t *) malloc(coll->sig->nmembers * sizeof(pmix_proc_t));
+        PMIX_PROC_CREATE(coll->sig->members, coll->sig->nmembers);
         memcpy(coll->sig->members, sig->members, coll->sig->nmembers * sizeof(pmix_proc_t));
     }
     coll->sig->naddmembers = sig->naddmembers;
     if (0 < sig->naddmembers) {
-        coll->sig->addmembers = (pmix_proc_t *) malloc(coll->sig->naddmembers * sizeof(pmix_proc_t));
+        PMIX_PROC_CREATE(coll->sig->addmembers, coll->sig->naddmembers);
         memcpy(coll->sig->addmembers, sig->addmembers, coll->sig->naddmembers * sizeof(pmix_proc_t));
     }
     // save any final membership order that was given - the match path

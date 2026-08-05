@@ -15,7 +15,7 @@
  * Copyright (c) 2019      Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2020      Cisco Systems, Inc.  All rights reserved
- * Copyright (c) 2021-2022 Nanook Consulting.  All rights reserved.
+ * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -43,19 +43,10 @@ PRTE_EXPORT extern pmix_mca_base_framework_t prte_filem_base_framework;
  */
 PRTE_EXPORT int prte_filem_base_select(void);
 
-/*
- * cmds for base receive
- */
-typedef uint8_t prte_filem_cmd_flag_t;
-#define PRTE_FILEM_CMD                    PMIX_UINT8
-#define PRTE_FILEM_GET_PROC_NODE_NAME_CMD 1
-#define PRTE_FILEM_GET_REMOTE_PATH_CMD    2
-
 /**
  * Globals
  */
 PRTE_EXPORT extern prte_filem_base_module_t prte_filem;
-PRTE_EXPORT extern bool prte_filem_base_is_active;
 
 /**
  * 'None' component functions
@@ -79,13 +70,23 @@ int prte_filem_base_none_preposition_files(prte_job_t *jdata, prte_filem_complet
 int prte_filem_base_none_link_local_files(prte_job_t *jdata, prte_app_context_t *app);
 
 /**
- * Some utility functions
+ * Path safety helpers - see filem_base_fns.c
  */
-/* base comm functions */
-PRTE_EXPORT int prte_filem_base_comm_start(void);
-PRTE_EXPORT int prte_filem_base_comm_stop(void);
-PRTE_EXPORT void prte_filem_base_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
-                                      prte_rml_tag_t tag, void *cbdata);
+/* Skip any leading "./" or "../" components of a relative path, returning
+ * a pointer into the string given. A name that merely starts with a dot
+ * (".bashrc") is left alone.
+ */
+PRTE_EXPORT const char *prte_filem_base_strip_leading_dots(const char *path);
+
+/* True if any component of the path is "..", i.e. following it would step
+ * above the directory the file is meant to land in.
+ */
+PRTE_EXPORT bool prte_filem_base_has_dotdot(const char *path);
+
+/* Single-quote a path for use in a shell command line. Returns newly
+ * allocated storage the caller must free, or NULL if out of memory.
+ */
+PRTE_EXPORT char *prte_filem_base_shell_quote(const char *path);
 
 END_C_DECLS
 

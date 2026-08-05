@@ -31,6 +31,7 @@
 #include "src/mca/mca.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ras/base/base.h"
@@ -55,11 +56,8 @@
 prte_plm_globals_t prte_plm_globals = {
     .base_nspace = NULL,
     .next_jobid = 0,
-    .daemonlaunchstart = {0, 0},
-    .tree_spawn_cmd = PMIX_DATA_BUFFER_STATIC_INIT,
     .daemon_nodes_assigned_at_launch = true,
-    .pass_environ_mca_params = true,
-    .node_regex_threshold = 0
+    .pass_environ_mca_params = true
 };
 
 /*
@@ -85,13 +83,16 @@ static int mca_plm_base_register(pmix_mca_base_register_flag_t flags)
 {
     PRTE_HIDE_UNUSED_PARAMS(flags);
 
-    prte_plm_globals.node_regex_threshold = 1024;
-    (void) pmix_mca_base_framework_var_register(&prte_plm_base_framework,
-                                                "node_regex_threshold",
-                                                "Only pass the node regex on the orted command line if smaller than this threshold",
-                                                PMIX_MCA_BASE_VAR_TYPE_SIZE_T,
-                                                &prte_plm_globals.node_regex_threshold);
-
+    /* NOTE: there is deliberately no "plm_node_regex_threshold" parameter
+     * here any more.  It was registered, documented as controlling whether
+     * the node regex went onto the prted command line, and read by nothing
+     * at all - the regex is passed through the launch message, not the
+     * command line, and has been for years.  A knob that does nothing is
+     * worse than no knob: a user who hits a too-long command line sets it,
+     * sees no change, and has no way to tell a broken setting from a wrong
+     * diagnosis.  (The same reasoning retired plm_ssh_delay.)  The real
+     * remedy for an over-long command line is
+     * plm_ssh_pass_environ_mca_params 0, which help-plm-ssh.txt names. */
     /* Note that we break abstraction rules here by listing a
      specific PLM here in the base.  This is necessary, however,
      due to extraordinary circumstances:
@@ -135,6 +136,9 @@ static int prte_plm_base_close(void)
 
     if (NULL != prte_plm_globals.base_nspace) {
         free(prte_plm_globals.base_nspace);
+        /* the tool-attach path in plm_base_receive reads this to mint a
+         * nspace, so leave a NULL rather than a freed pointer behind */
+        prte_plm_globals.base_nspace = NULL;
     }
 
     return pmix_mca_base_framework_components_close(&prte_plm_base_framework, NULL);
@@ -283,7 +287,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     }
 
     // otherwise, this is an error
-    pmix_show_help("help-plm-base.txt", "no-available-pls", true);
+    prte_show_help("help-plm-base.txt", "no-available-pls", true);
     PRTE_ACTIVATE_JOB_STATE(state->jdata, PRTE_JOB_STATE_FAILED_TO_START);
     PMIX_RELEASE(state);
 }

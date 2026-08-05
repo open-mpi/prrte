@@ -120,7 +120,18 @@ static void grow_campaign_destruct(prte_grow_campaign_t *p)
 }
 PMIX_CLASS_INSTANCE(prte_grow_campaign_t, pmix_list_item_t,
                     grow_campaign_construct, grow_campaign_destruct);
-bool prte_persistent = true;
+/* "this DVM outlives any one job" - true for a DVM started by prte, false
+ * for the one prterun stands up around a single job.
+ *
+ * Every process establishes this for itself: the HNP works it out in
+ * prte(), and a daemon is TOLD by the HNP on its command line (registered
+ * as the prte_persistent MCA parameter, appended by
+ * prte_plm_base_prted_append_basic_args). It used to default to true and
+ * be assigned only in prte(), which a daemon never runs - so every daemon
+ * believed it was persistent no matter how the DVM was started. Default
+ * false so that a daemon which somehow learns nothing sizes itself for the
+ * job in front of it rather than for the largest case. */
+bool prte_persistent = false;
 bool prte_allow_run_as_root = false;
 bool prte_fwd_environment = false;
 bool prte_show_launch_progress = false;
@@ -1111,8 +1122,11 @@ static void session_des(prte_session_t *s)
         PMIX_RELEASE(s->owner_job);
         s->owner_job = NULL;
     }
-    // remove this from the global array
-    if (0 <= s->index) {
+    // remove this from the global array, if it still exists - a session
+    // whose last reference is released after prte_sessions itself has
+    // already been torn down (e.g. a ras component's finalize, which
+    // runs after prte_finalize's own session sweep) has nothing to clear
+    if (0 <= s->index && NULL != prte_sessions) {
         pmix_pointer_array_set_item(prte_sessions, s->index, NULL);
     }
 }
@@ -1191,6 +1205,14 @@ void prte_session_add_owner(prte_session_t *session,
 
     /* the default session is owned by everyone - nothing to record */
     if (NULL == session || session == prte_default_session) {
+        return;
+    }
+    /* An EMPTY namespace must never enter the owner set. PMIx_Check_nspace
+     * answers "true" whenever either side is empty - that is its wildcard
+     * rule - so an empty entry here makes prte_session_is_owned_by() say yes
+     * to every namespace that ever asks, silently retiring the reservation's
+     * ownership gate. A caller with nothing to record has nothing to grant. */
+    if (PMIX_NSPACE_INVALID(nspace)) {
         return;
     }
     if (NULL != session->owners) {

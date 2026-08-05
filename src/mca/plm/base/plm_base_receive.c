@@ -57,6 +57,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/proc_info.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_show_help.h"
 #include "types.h"
 
 #include "src/mca/plm/base/base.h"
@@ -217,10 +218,13 @@ static int resolve_spawn_targets(prte_job_t *jdata, pmix_proc_t *requestor,
                 }
             }
         }
-        /* the spawned job becomes an owner of the reservation it targets, so
-         * it may in turn spawn further jobs onto those nodes (no-op for the
-         * default session) */
-        prte_session_add_owner(s, jdata->nspace);
+        /* The spawned job becomes an owner of the reservation it targets, so
+         * it may in turn spawn further jobs onto those nodes - but NOT here:
+         * the job has no namespace yet (the HNP assigns it in
+         * prte_plm_base_setup_job, which is also where the grant is now
+         * made). Recording it at this point wrote an EMPTY namespace into the
+         * owner set, and an empty namespace matches every other one, so the
+         * first job spawned into a reservation opened it to everybody. */
         start = p + 1;
     }
 
@@ -291,14 +295,13 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
     /* jdata MUST start NULL: the ANSWER_LAUNCH error path reads it, and we
      * can reach that path before (or without) it ever being assigned - e.g.,
      * when the job object fails to unpack */
-    prte_job_t *jdata = NULL, *parent;
+    prte_job_t *jdata = NULL, *parent, *daemons;
     /* true while the freshly unpacked job object belongs to nobody but us -
      * cleared once it has been handed to a session/parent/the job pool */
     bool own_jdata = false;
     pmix_data_buffer_t *answer;
     pmix_rank_t vpid;
-    prte_proc_t *proc;
-    prte_node_t *node;
+    prte_proc_t *proc, *dproc;
     prte_proc_state_t state;
     prte_exit_code_t exit_code;
     int32_t rc = PRTE_SUCCESS, ret;
@@ -427,6 +430,13 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             jdata->uid = tooluid;
             jdata->gid = toolgid;
             rc = prte_set_job_data_object(jdata);
+            if (PRTE_SUCCESS != rc) {
+                PRTE_ERROR_LOG(rc);
+                PMIX_RELEASE(jdata);
+                jdata = NULL;
+                free(tmp);
+                goto CLEANUP;
+            }
             app = PMIX_NEW(prte_app_context_t);
             if (NULL != tmp) {
                 app->argv = PMIx_Argv_split(tmp, ' ');
@@ -443,15 +453,35 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             proc->pid = pid;
             proc->state = PRTE_PROC_STATE_RUNNING;
             pmix_pointer_array_set_item(jdata->procs, name.rank, proc);
-            // find the node it is on
-            node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, sender->rank);
-            if (NULL == node) {
-                PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-                rc = PRTE_ERR_NOT_FOUND;
-                goto CLEANUP;
+            /* Find the node the tool is on: it connected through the daemon
+             * that is reporting it, so ask that DAEMON where it is.
+             *
+             * This used to index prte_node_pool by the reporting daemon's
+             * rank, which is only right while daemon vpids and node-pool
+             * indices happen to run in step. They need not: the pool holds
+             * every node the allocation named, including ones no daemon was
+             * ever launched on (filtered out by a -host/hostfile spec, marked
+             * DO_NOT_USE, or shrunk away), while vpids are handed out only to
+             * nodes that get a daemon. One such node ahead of the reporter is
+             * enough to name the wrong node - or, past the end of the pool,
+             * none at all.
+             *
+             * Not knowing where a tool sits is also not a reason to bring the
+             * DVM down, which is what the old NOT_FOUND did: it fell through
+             * to the master's CLEANUP, which activates FORCED_EXIT. Record
+             * what we know and carry on. */
+            daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+            dproc = (NULL == daemons) ? NULL
+                  : (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, sender->rank);
+            if (NULL != dproc && NULL != dproc->node) {
+                /* the node backpointer is borrowed, not retained */
+                proc->node = dproc->node;
+            } else {
+                pmix_output_verbose(5, prte_plm_base_framework.framework_output,
+                                    "%s plm:base:receive tool %s attached via unknown daemon %s",
+                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&name),
+                                    PRTE_NAME_PRINT(sender));
             }
-            /* the node backpointer is borrowed, not retained */
-            proc->node = node;
             jdata->num_procs = 1;
         }
         /* setup the response */
@@ -512,7 +542,7 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
         tmp = PMIx_Argv_join(jdata->personality, ',');
         jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(tmp);
         if (NULL == jdata->schizo) {
-            pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, tmp);
+            prte_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, tmp);
             free(tmp);
             rc = PRTE_ERR_NOT_FOUND;
             goto ANSWER_LAUNCH;
@@ -627,16 +657,17 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
         }
 
 moveon:
-        /* from here on the job is referenced by the session (and shortly by
-         * the parent's child list and the global job pool), so the error
-         * paths below must NOT free it out from under them */
-        own_jdata = false;
-        jdata->session = session;
-        pmix_pointer_array_add(jdata->session->jobs, jdata);
-
-        /* a job reaching a reservation through the legacy single-session
+        /* A job reaching a reservation through the legacy single-session
          * attributes (no spawn-target list) must still pass the ownership
-         * check and become an owner of that reservation */
+         * check.  Vet it BEFORE the job is handed to the session below: a
+         * rejected request that has already been added to session->jobs
+         * stays there for the life of the session (that array borrows its
+         * entries, so nothing ever removes or releases it), leaving a
+         * phantom job the session teardown will walk.
+         *
+         * The matching GRANT - the spawned job becoming an owner itself, so
+         * it can spawn onto those nodes in turn - happens in
+         * prte_plm_base_setup_job, once the job has a namespace to record. */
         if (NULL == jdata->target_sessions && NULL != session &&
             session != prte_default_session &&
             (PRTE_SESSION_FLAG_RESERVED & session->flags)) {
@@ -644,8 +675,14 @@ moveon:
                 rc = PRTE_ERR_PERM;
                 goto ANSWER_LAUNCH;
             }
-            prte_session_add_owner(session, jdata->nspace);
         }
+
+        /* from here on the job is referenced by the session (and shortly by
+         * the parent's child list and the global job pool), so the error
+         * paths below must NOT free it out from under them */
+        own_jdata = false;
+        jdata->session = session;
+        pmix_pointer_array_add(jdata->session->jobs, jdata);
 
         /* get the parent's job object */
         if (NULL != (parent = prte_get_job_data_object(nptr->nspace)) &&

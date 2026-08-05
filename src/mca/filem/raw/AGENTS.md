@@ -67,8 +67,8 @@ the working directory instead of recreating their directory tree.
 | Class | Lives on | Role |
 |-------|----------|------|
 | `prte_filem_raw_outbound_t` | HNP | One preposition request. Holds the list of `xfers`, the aggregate `status`, and the caller's `cbfunc`/`cbdata`. When its `xfers` list drains, the callback fires. |
-| `prte_filem_raw_xfer_t` | HNP | One file being sent. Carries the read `fd`, the libevent `ev` (the caddy field — **named `ev`** as required), `src` (local path, for dup detection), `file` (remote-relative path), `type`, `nchunk` (next chunk index), and `nrecvd` (how many daemons have acked). |
-| `prte_filem_raw_incoming_t` | daemon | One file being received. Carries the write `fd`, `ev`, `file`/`fullpath`, `type`, the `outputs` list of pending write buffers, and `link_pts` (the paths, relative to the session dir, to place). |
+| `prte_filem_raw_xfer_t` | HNP | One file being sent. Carries the read `fd`, the libevent `ev` (the caddy field — **named `ev`** as required), `src` (local path, for dup detection), `file` (remote-relative path), `type`, `mode` (the source file's permission bits), `nchunk` (next chunk index), and `nrecvd` (how many daemons have acked). |
+| `prte_filem_raw_incoming_t` | daemon | One file being received. Carries the write `fd`, `ev`, `file`/`fullpath`, `type`, `mode`, the `outputs` list of pending write buffers, and `link_pts` (the paths, relative to the session dir, to place). |
 | `prte_filem_raw_output_t` | daemon | One received chunk: `numbytes` + a `PRTE_FILEM_RAW_CHUNK_MAX` data buffer, queued on an incoming file's `outputs` list for the write handler. |
 
 `xfer` and `incoming` both embed `ev` and use `PRTE_PMIX_THREADSHIFT` /
@@ -84,8 +84,11 @@ RML recv** on `PRTE_RML_TAG_FILEM_BASE` bound to `recv_files` (this fires
 on every node — HNP and daemons — since the HNP is also a target of its
 own broadcast). If it is the HNP, it also constructs `outbound_files` and
 `positioned_files` and posts a second persistent recv on
-`PRTE_RML_TAG_FILEM_BASE_RESP` bound to `recv_ack`. `raw_finalize` drains
-and destructs those lists.
+`PRTE_RML_TAG_FILEM_BASE_RESP` bound to `recv_ack`. `raw_finalize`
+**cancels both recvs** and then drains and destructs those lists — in an
+`--enable-mca-dso` build the framework close that follows unloads this
+component, so a recv left posted is an RML callback pointing into memory
+that is about to be unmapped.
 
 Three file-scoped lists hold all state:
 `outbound_files`/`positioned_files` (HNP) and `incoming_files` (every
@@ -106,7 +109,10 @@ The framework entry point on the master. Steps:
      (`app->app`, `app->argv[0]`, and `PRTE_APP_SSNDIR_CWD` are all
      updated) so the staged copy is what actually executes.
    - `PRTE_APP_PRELOAD_FILES`: split on `,`; infer the `target_flag` from
-     the suffix (`.tar`→TAR, `.bz`→BZIP, `.gz`→GZIP, else FILE); compute
+     the suffix at the **end** of the name (`.tar.gz`/`.tgz`/`.gz`→GZIP,
+     `.tar.bz2`/`.tbz`/`.bz2`→BZIP, `.tar`→TAR, else FILE — reading from
+     the *first* dot instead left `run.v2.tar.gz` classified as a plain
+     file that was never unpacked); compute
      the `remote_target` — the basename if flattening **or if the file was
      named by an absolute path**, else the relative path as given; then
      strip any leading `./`/`../` components so nothing escapes above the
@@ -119,18 +125,36 @@ The framework entry point on the master. Steps:
      somewhere the app never asked for and scatters directories through the
      user's own directory. A relative specification is kept as-is because
      that is exactly the name the app will open.
-2. Check for two *different* files that would land under the same relative
-   name (`/data/a/mesh.dat` and `/data/b/mesh.dat` both basename to
-   `mesh.dat`). Only one could ever be delivered, so this fires the
-   callback with `PRTE_ERR_PRELOAD_CONFLICT` instead of silently letting
-   the second overwrite the first in the session dir.
+2. **Validate every delivered name**, then check for clashes:
+   - A name that is empty, `.`, or contains a `..` component anywhere is
+     refused (`preload-bad-path`, callback status `PRTE_ERR_BAD_PARAM`).
+     Stripping the *leading* dot directories does not make a name safe:
+     `a/../../f` has none at the front and still resolves two levels above
+     the session directory, where the receive path would create it with
+     `O_TRUNC` over whatever is there — on every node.
+   - Two *different* files that would land under the same relative name
+     (`/data/a/mesh.dat` and `/data/b/mesh.dat` both basename to
+     `mesh.dat`). Only one could ever be delivered, so this fires the
+     callback with `PRTE_ERR_PRELOAD_CONFLICT` instead of silently letting
+     the second overwrite the first in the session dir.
+
+   Both checks run over `fs->remote_target` **after** it has been
+   normalized, which is why normalization happens once when the file set is
+   built rather than later when the xfer is created: the clash check would
+   otherwise miss `./foo` against `foo`.
 3. If nothing was collected, fire the callback and return `PRTE_SUCCESS`.
 4. Create one `outbound` object, stash `cbfunc`/`cbdata`, append it to
    `outbound_files`.
 5. For each file set, **de-duplicate**: skip anything whose `src` already
-   appears in `positioned_files` (already sent) or in any in-flight
-   `outbound->xfers` (already queued). This is why the same file
-   referenced by multiple apps is broadcast only once.
+   appears in `positioned_files` **and reached at least as many daemons as
+   the DVM has now**, or appears in any in-flight `outbound->xfers`
+   (already queued). This is why the same file referenced by multiple apps
+   is broadcast only once — and why an **elastic** DVM that grew since the
+   last broadcast sends it again: the daemons that joined afterwards never
+   saw it, and skipping the resend would launch procs there with the file
+   simply absent, with no error anywhere. Any stale `positioned_files`
+   entry for a file being resent is dropped so the list cannot accumulate
+   one dead record per grow.
 6. `open()` the source `O_RDONLY`, set it `O_NONBLOCK`, build a
    `prte_filem_raw_xfer_t`, and `PRTE_PMIX_THREADSHIFT` it to
    `send_chunk`.
@@ -145,12 +169,18 @@ completion is signalled later through the callback.
 Runs on the progress thread, re-arming itself until EOF:
 
 1. `read()` up to `PRTE_FILEM_RAW_CHUNK_MAX` (16 KB) bytes. On `EAGAIN`/
-   `EINTR`, re-add the event and retry. On a hard error, force
-   `numbytes = 0` to flush an EOF downstream.
-2. If `prte_dvm_abort_ordered`, drop the xfer and stop.
+   `EINTR`, re-add the event and retry. On a hard error, record
+   `PRTE_ERR_FILE_READ_FAILURE` on the xfer and force `numbytes = 0` to
+   flush an EOF downstream — the receivers cannot tell a truncated file
+   from a complete one and will ack it as staged, so this is the only
+   place that knows the bytes never left.
+2. If `prte_dvm_abort_ordered`, retire the xfer and stop.
 3. Pack a buffer `{file(string), nchunk(int32), data(numbytes bytes)}`;
-   on the **first chunk** (`nchunk == 0`) also append the `type` so the
-   receiver knows how to handle it.
+   on the **first chunk** (`nchunk == 0`) also append the `type` and the
+   source file's `mode`, which is everything the receiver is told about
+   the file. The mode matters: without it the receiver had to guess, and
+   it guessed `0600` for anything not flagged as the job's executable, so
+   `--preload-files helper.sh` delivered a script the ranks could not run.
 4. `prte_grpcomm.xcast(PRTE_RML_TAG_FILEM_BASE, &chunk)` — broadcast to
    **all daemons at once**. Increment `nchunk`.
 5. If `numbytes == 0` this was the EOF chunk: close the fd and stop.
@@ -164,11 +194,33 @@ zero-byte broadcast that tells receivers to close and finalize.
 
 Each daemon sends an ack `{file, status}` per file. `recv_ack` finds the
 matching `xfer` in `outbound_files`, records any non-success status, and
-bumps `xfer->nrecvd`. When `nrecvd == prte_process_info.num_daemons` the
+bumps `xfer->nrecvd`. When `nrecvd >= prte_process_info.num_daemons` the
 file is fully positioned: `xfer_complete` moves the xfer from
 `outbound->xfers` to `positioned_files`. When an outbound's `xfers` list
 is empty, its `cbfunc` fires (this is the state machine's `files_ready`)
 and the outbound is released.
+
+`>=`, not `==`: `num_daemons` is read fresh on every ack, so a daemon
+leaving the DVM mid-transfer can lower it *past* a count already reached,
+and an exactly-equal test would then never fire.
+
+**Every exit from a transfer goes through `xfer_retire()`**, which is the
+one place that unlinks the xfer from `outbound->xfers` and, when that list
+empties, fires the completion callback and releases the outbound. Its
+`positioned` argument says whether the transfer actually reached every
+daemon: `true` parks the xfer on `positioned_files` so a later job in this
+DVM does not resend the same bytes, `false` releases it, because a file
+that failed on the way out was never delivered and recording it as
+positioned would make the next job skip a file that is not there.
+`xfer_complete()` is just `xfer_retire(..., true)`.
+
+A bailout that only closes the fd and returns — which every pack and
+`xcast` failure in `send_chunk` used to do — leaves the xfer on the
+outbound's list with **no further event scheduled for it** and no ack ever
+coming, so the completion callback never fires and the job wedges at
+`VM_READY` forever. Releasing it in place instead (the old
+`prte_dvm_abort_ordered` path) is worse: the outbound's list is left
+walking freed memory.
 
 ---
 
@@ -179,14 +231,19 @@ and the outbound is released.
 Fires on `PRTE_RML_TAG_FILEM_BASE` for each broadcast chunk:
 
 1. Unpack `{file, nchunk}`; if `nchunk < 0` treat as EOF (`nbytes = 0`),
-   else unpack the byte payload; on chunk 0 also unpack `type`.
+   else unpack the byte payload; on chunk 0 also unpack `type` and `mode`.
+   A name carrying a `..` component is refused here too, even though the
+   sender is supposed to have refused it already — this is the side that
+   would do the `O_TRUNC`.
 2. Find or create the matching `prte_filem_raw_incoming_t` in
    `incoming_files`.
-3. **On chunk 0**: compute `top` (first path component), build `fullpath`
-   under `prte_process_info.top_session_dir`, create the parent
-   directory, and `open()` the target for writing — `O_RDWR|O_CREAT|
-   O_TRUNC`, mode `S_IRWXU` for an EXE (so it stays executable) else
-   `S_IRUSR|S_IWUSR`. Then threadshift the incoming to `write_handler`.
+3. **On chunk 0**: build `fullpath` under
+   `prte_process_info.top_session_dir`, create the parent directory, and
+   `open()` the target for writing — `O_RDWR|O_CREAT|O_TRUNC` with the
+   sender's `mode` (plus `S_IRUSR|S_IWUSR` so we can write what we are
+   about to write), followed by an `fchmod` because `open()` applies the
+   mode only on create and trims it by our umask. Then threadshift the
+   incoming to `write_handler`.
 4. Copy the payload into a fresh `prte_filem_raw_output_t`, append it to
    `incoming->outputs`, and (if not already pending) activate the write
    event.
@@ -218,10 +275,18 @@ level up from where the files actually were.)
 
 ### `link_archive` — enumerate archive contents
 
-Runs `tar tf <fullpath>` via `popen`, reads each path, skips directories
-and `.deps` trees, and appends every real file path to `inbnd->link_pts`.
-Because different apps may share a directory tree but need different
-files, each individual file becomes its own link point.
+Runs `tar tf <fullpath>` via `popen`, reads each path, skips directories,
+`.deps` trees, and any member that is absolute or steps up through `..`
+(tar refuses to extract those, so there is nothing there to place), and
+appends every remaining file path to `inbnd->link_pts`. Because different
+apps may share a directory tree but need different files, each individual
+file becomes its own link point. A non-zero `pclose` status means the
+listing failed, which is reported rather than acked as a delivery.
+
+**Both archive commands go through a shell** (`system` for the extract,
+`popen` for the listing), so the path is passed through
+`prte_filem_base_shell_quote()`. Without it a perfectly ordinary
+`my data.tar.gz` reaches `tar` as two arguments and the extract fails.
 
 ### `send_complete(file, status)`
 
@@ -244,6 +309,13 @@ working directory:
 3. For each wanted file, find the matching `incoming` entry and, for each
    of its `link_pts`, `place_file()` it from `top_session_dir` into
    **`app->cwd`** (creating intermediate dirs as needed).
+4. Then check that every wanted file *had* an entry. It always should —
+   the HNP does not advance the job past pre-positioning until every daemon
+   has acked every file — but when the elastic dedup was wrong (see step 5
+   of `raw_preposition_files`) this is precisely where a job arrived with a
+   file that was never sent, and the only symptom was the app failing to
+   open it. It now names the missing file (`preload-not-staged`) and fails
+   the launch.
 
 `app->cwd` is the whole point: it is the directory every one of this app's
 procs will start in, whatever put them there — the user's cwd, `--wdir`, or
@@ -277,18 +349,45 @@ already resilient for the not-in-flight case.
   already-sent checks in `raw_preposition_files` compare against both
   `positioned_files` and in-flight `outbound->xfers`; keep both, or the
   same file gets broadcast repeatedly across successive jobs in a DVM.
+  The comparison is `same_source()` — `stat` identity, not `strcmp` —
+  because `./mesh.dat` and `mesh.dat` are the same file and two apps of one
+  job may name it each way. Read as different files they dedup as two
+  transfers *and*, worse, trip the clash check as "two different files
+  under one delivered name" and refuse a launch that was fine.
 - **Chunk-0 carries the metadata.** File `type` (and the fd-open
   decision) rides only on the first chunk; the zero-byte final chunk
   triggers finalize. Don't reorder or coalesce these.
 - **Paths are forced relative** on both the send side (basename for an
-  absolute spec, leading `./`/`../` stripped from a relative one) and the
-  write side (rooted at `top_session_dir`, then at `app->cwd`). This is a
-  security property — staging must never let a user overwrite an absolute
-  path on a remote node. Preserve it.
+  absolute spec, leading `./`/`../` stripped from a relative one, a `..`
+  anywhere else refused) and the write side (rooted at `top_session_dir`,
+  then at `app->cwd`). This is a security property — staging must never
+  let a user overwrite an arbitrary path on a remote node. Preserve it,
+  and express it through the base helpers
+  (`prte_filem_base_strip_leading_dots` / `..._has_dotdot`) rather than
+  open-coding the walk: it was open-coded twice here and the copies had
+  drifted, which is how the clash check came to compare `./foo` against
+  `foo` and see two different files.
 - **`raw` owns `PRTE_RML_TAG_FILEM_BASE`.** It posts its own recv in
-  `raw_init` rather than using the base `filem_base_receive.c` service;
-  don't start the base comm service alongside it or the two will collide
-  on the tag.
+  `raw_init`. The base used to carry a second, never-posted service on that
+  same tag; it has been removed rather than left as a collision waiting to
+  happen. If a future component needs its own receive, give it its own tag.
+- **`raw_fault_handler` runs on daemons too**, where `outbound_files` was
+  never constructed (`raw_init` only builds it on the master). Guard any
+  new use of the HNP-only lists with `PRTE_PROC_IS_MASTER` —
+  `raw_preposition_files` now refuses outright off the master for the same
+  reason: appending to a list that was never constructed is not a failure
+  that announces itself.
+- **A PMIx status is not a PRTE status.** The receive path acks failures
+  back to the HNP, where the value becomes the completion callback's
+  status and then a job state; convert with `prte_pmix_convert_status()`
+  before it goes on the wire.
+- **The archive path blocks the progress thread.** `write_handler` runs
+  `tar` through `system()` (and `link_archive` through `popen()`) while the
+  daemon's event loop waits. It also `chdir`s the whole process for the
+  duration. Nothing else can run meanwhile, which is exactly why nothing
+  else observes the changed cwd — but a very large archive stalls the
+  daemon. If that ever matters, move the extraction off the progress
+  thread rather than trying to make the `chdir` safe.
 - **On an error, unlink an object from its list *before* releasing it.**
   Several receive-side error paths add an `incoming` (or `xfer`) to a
   file-scoped list and, on a later failure, must both
@@ -361,15 +460,22 @@ travels back as the failing proc's exit code so
 `prte_render_launch_failure()` can say it again in the **tool's** voice —
 a daemon's stderr on a remote node usually reaches nobody.
 
+The placed copy carries the **staged file's permission bits**, `fchmod`'d
+after creation so the daemon's umask cannot trim a mode the user chose.
+Those bits are the source file's, carried across in chunk 0 — before they
+were sent, the staged copy was `0600` and a preloaded script arrived
+unrunnable.
+
 ### Never hand the user's directory to `pmix_os_dirpath_create`
 
 It **chmods a path that already exists** to the mode it was given. Calling
 it unconditionally on the working directory silently reduced the user's own
 cwd to `0700`. `place_file` therefore `stat`s first and only creates a
 directory that is missing, with `S_IRWXU|S_IRWXG|S_IRWXO` so the user's
-umask decides. The copied file's mode is likewise `0644`/`0755` before
-umask, carrying nothing across but whether the staged file was executable
-(which is all the staging path knows).
+umask decides. The copied *file* is the other way round — it takes the
+staged file's exact permission bits and is `fchmod`'d so the umask cannot
+touch them, because those bits are the user's own and were carried across
+the wire for exactly that reason.
 
 ## `create_link` returns SUCCESS only when it means it
 
@@ -399,10 +505,14 @@ real cross-daemon path is covered by the dockerswarm harness
 (`contrib/dockerswarm/run-tests.sh`): `--preload-binary` compiles a marker
 binary on node1 only and runs it on node2+node3; `--preload-files` writes a
 data file on node1 only and has the remote ranks read it back by its bare
-relative name out of their working directory; and the collision case plants
-a *different* file of that name on one node and requires the launch to be
-refused with that node's data intact. All three can only pass if the bytes
-were actually staged and placed. Run them (or an equivalent multi-node
-test) after touching the send/receive/placement paths — the
-`test/unit/filem` unit test only exercises the base classes and the "none"
-module, not delivery.
+relative name out of their working directory; a relative `sub/pf.dat`
+proves the directory component survives and is recreated; a `0755` script
+proves the mode crossed with the bytes; an archive named
+`"my run.v2.tar.gz"` proves both the shell quoting and the end-of-name
+suffix classification; the collision case plants a *different* file of that
+name on one node and requires the launch to be refused with that node's
+data intact; and a `..` inside the delivered name must be refused rather
+than resolved. None of them can pass unless the bytes were actually staged
+and placed. Run them (or an equivalent multi-node test) after touching the
+send/receive/placement paths — the `test/unit/filem` unit test covers the
+base classes, the "none" module, and the naming rules, but not delivery.

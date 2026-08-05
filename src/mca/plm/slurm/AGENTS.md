@@ -76,7 +76,12 @@ If `srun` can't be run or the version can't be parsed, it declines.
    `prte_plm_base_prted_append_basic_args(..., "slurm", &proc_vpid_index)`.
    Substitute `map->daemon_vpid_start` into the vpid slot — SLURM starts
    the tasks and each daemon offsets from this base to compute its own
-   vpid. `prte_plm_base_wrap_args` quotes multi-word args (in case srun is
+   vpid. That base is recomputed by `setup_virtual_machine` on **every**
+   launch, and this component is one of the three reasons it must be: a
+   stale base (left over from DVM formation) tells the daemons of a later
+   `--add-host` launch to claim ranks that live daemons already own. `ssh`
+   never sees it, so the invariant is pinned in `test/unit/plm`, not in
+   the swarm. `prte_plm_base_wrap_args` quotes multi-word args (in case srun is
    wrapped by a script).
 4. Read the prefix(es) from the daemon job object and exec via
    `plm_slurm_start_proc`. Set state `DAEMONS_LAUNCHED`. On any error jump
@@ -109,9 +114,18 @@ meaningless (it's srun's, not the failed proc's). The callback:
 - Refuses to proceed against an `ancient` SLURM (`ancient-version`).
 - On non-zero exit → `srun-failed` help + activate
   `DAEMONS_TERMINATED`.
-- On clean exit of the **primary** srun → fire `DAEMONS_TERMINATED` (set
-  `num_terminated = num_procs` first to avoid a bogus error message) so
-  `prun`/the HNP can exit.
+- On clean exit of the **primary** srun, whether that means the DVM is
+  gone depends on whether the `prted`s daemonized. By default a `prted`
+  forks and detaches (see `src/tools/prted/AGENTS.md`), and its parent —
+  the process srun actually tracks as the task — exits as soon as the
+  real daemon signals it is up, long before the daemon itself does. So a
+  clean exit here is normally just that hand-off, not termination: it is
+  ignored, and real daemon loss is instead caught when the daemon's RML
+  connection to the HNP drops. Only with `--debug-daemons` or
+  `--leave-session-attached` (no forking, `prted` stays attached) does
+  srun genuinely track the daemon's own lifetime, so only then does a
+  clean exit fire `DAEMONS_TERMINATED` (set `num_terminated = num_procs`
+  first to avoid a bogus error message) so `prun`/the HNP can exit.
 
 `plm_slurm_terminate_prteds` similarly special-cases the "we never
 launched additional daemons" case (`primary_pid_set == false`) by firing
@@ -144,14 +158,6 @@ the daemons, not srun).
 - **Environment purge in the child is mandatory** — SLURM forwards the
   full environment; leaving `PMIX_`/`PRTE_` vars in breaks tool
   connections and duplicates command-line settings.
-- **Known wart: the "are we using the whole allocation?" test compares a
-  count against a capacity.** `map->num_new_daemons < session->nodes->size`
-  reads `size` from a `pmix_pointer_array_t`, which is the *allocated*
-  slot count, not the number of nodes in the session. The effect today is
-  benign (the explicit `--nodes`/`--nodelist` is emitted more often than
-  intended, which srun accepts), but anyone fixing it must re-test the
-  elastic grow path on a real SLURM system — dropping the explicit node
-  list changes which nodes srun picks.
 - Multi-node behavior that does not need SLURM (tree-spawn, throttling,
   the prted command line) is covered by
   [`contrib/dockerswarm`](../../../../contrib/dockerswarm/); the
