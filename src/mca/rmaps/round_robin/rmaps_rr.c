@@ -52,8 +52,12 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
     pmix_list_t node_list;
     int32_t num_slots;
     int rc;
-    pmix_mca_base_component_t *c = &prte_mca_rmaps_round_robin_component;
-    bool initial_map = true;
+    /* Reset the per-node "mapped" flags only on the genuine first mapping pass.
+     * In per-app dispatch this module is entered once per app context; treating
+     * each entry as an initial map would re-clear the flags on nodes a previous
+     * app already added, causing those nodes to be appended to the job map a
+     * second time.  An empty job map marks the true first pass. */
+    bool initial_map = (0 == jdata->map->num_nodes);
 
     /* this mapper can only handle initial launch
      * when rr mapping is desired - allow
@@ -65,15 +69,12 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
                             PRTE_JOBID_PRINT(jdata->nspace));
         return PRTE_ERR_TAKE_NEXT_OPTION;
     }
-    if (NULL != jdata->map->req_mapper
-        && 0 != strcasecmp(jdata->map->req_mapper, c->pmix_mca_component_name)) {
-        /* a mapper has been specified, and it isn't me */
-        pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
-                            "mca:rmaps:rr: job %s not using rr mapper",
-                            PRTE_JOBID_PRINT(jdata->nspace));
-        return PRTE_ERR_TAKE_NEXT_OPTION;
-    }
-    if (PRTE_MAPPING_RR < PRTE_GET_MAPPING_POLICY(jdata->map->mapping)) {
+    /* The policy is what selects the mapper - there is no separate "use this
+     * component" request, because the two could disagree and neither answer
+     * would be right. This reads the resolved options rather than the job
+     * map: in per-app dispatch each app answers for itself, and asking the
+     * job meant an app's own directive never reached the mapper it implies */
+    if (PRTE_MAPPING_RR < PRTE_GET_MAPPING_POLICY(options->map)) {
         /* I don't know how to do these - defer */
         pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
                             "mca:rmaps:rr: job %s not using rr mapper",
@@ -85,19 +86,23 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
                         "mca:rmaps:rr: mapping job %s",
                         PRTE_JOBID_PRINT(jdata->nspace));
 
-    /* flag that I did the mapping */
-    if (NULL != jdata->map->last_mapper) {
-        free(jdata->map->last_mapper);
-    }
-    jdata->map->last_mapper = strdup(c->pmix_mca_component_name);
-
     /* start at the beginning... */
-    jdata->num_procs = 0;
+    /* Zero the job-wide count only when we were handed the whole job. The
+     * per-app (MPMD) dispatch calls us once per app, and resetting here
+     * would leave jdata->num_procs holding just the last app's count while
+     * jdata->procs holds every app's procs - a mismatch the job packer and
+     * unpacker disagree about, corrupting the launch message. */
+    if (options->app_idx < 0) {
+        jdata->num_procs = 0;
+    }
 
     /* cycle through the app_contexts, mapping them sequentially */
     for (i = 0; i < jdata->apps->size; i++) {
         app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i);
         if (NULL == app) {
+            continue;
+        }
+        if (options->app_idx >= 0 && (int)i != options->app_idx) {
             continue;
         }
 
@@ -131,20 +136,14 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
                                      num_slots, app->num_procs,
                                      options);
         } else {
+            /* an object mapping. There is deliberately no fallback here:
+             * we map by an object only because the user asked for it, so
+             * being unable to is an error rather than a licence to place
+             * the job by some other rule. byobj says so itself and returns
+             * PRTE_ERR_SILENT. */
             rc = prte_rmaps_rr_byobj(jdata, app, &node_list,
                                      num_slots, app->num_procs,
                                      options);
-            if (PRTE_ERR_NOT_FOUND == rc) {
-                /* if the mapper couldn't map by this object because
-                 * it isn't available, but the error allows us to try
-                 * byslot, then do so
-                 */
-                PRTE_SET_MAPPING_POLICY(jdata->map->mapping, PRTE_MAPPING_BYSLOT);
-                options->map = PRTE_MAPPING_BYSLOT;
-                rc = prte_rmaps_rr_byslot(jdata, app, &node_list,
-                                          num_slots, app->num_procs,
-                                          options);
-            }
         }
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
@@ -162,8 +161,12 @@ static int prte_rmaps_rr_map(prte_job_t *jdata,
          */
         PMIX_LIST_DESTRUCT(&node_list);
     }
-    /* calculate the ranks for this job */
-    rc = prte_rmaps_base_compute_vpids(jdata, options);
+    /* calculate the ranks for this job - in per-app dispatch mode
+     * (app_idx >= 0) the base computes the vpids with the correct
+     * cross-app numbering, so skip it here to avoid colliding ranks */
+    if (options->app_idx < 0) {
+        rc = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
+    }
 
     return rc;
 

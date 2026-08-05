@@ -172,3 +172,58 @@ values:
   Option:  %s <MCA param name> <param value>
 
 Please provide the missing values and try again.
+#
+[alloc-target-conflict]
+The allocation upon which a job is to be executed can be named in
+only one way. The following options are alternative spellings of
+that same target, and therefore cannot be combined:
+
+  --%-12s the numeric ID of the session holding the allocation
+  --%-12s the ID assigned to the allocation by the host environment
+  --%-12s the reference ID given when the allocation was requested
+
+Please specify only one of them and try again.
+#
+[bad-session-id]
+The value provided for the following command line option must be an
+unsigned 32-bit integer:
+
+  Option:  --%s
+  Value:   %s
+
+Please correct your command line and try again.
+#
+[non-boolean-value]
+A boolean directive was given a value that is neither true nor false:
+
+  Option:     --%s
+  Directive:  %s
+  Value:      %s
+
+A boolean directive may be written bare - which asserts it - or with an
+explicit truth value:
+
+  <directive>        the directive is requested
+  <directive>=1      the same, said explicitly
+  <directive>=0      the directive is NOT requested
+
+True may also be written "T", "Y", "TRUE", "YES" or "ENABLE", and false
+"F", "N", "FALSE", "NO" or "DISABLE" - case-insensitively, and as whole
+words ("TR" is not an abbreviation of "TRUE").
+
+Please correct your command line and try again.
+#
+[conflicting-job-directives]
+The same directive was given twice, asking for opposite things:
+
+  Option:     --%s
+  Directive:  %s
+  Given as:   %s
+  and as:     %s
+
+This option describes the job as a whole, so on an MPMD command line it
+may be written in any app context and applies to all of them - which is
+also why two app contexts cannot ask for different answers.
+
+There is no way to honor both. Please give the directive once, or give the
+same value everywhere, and try again.

@@ -72,8 +72,6 @@ PRTE_EXPORT int prte_state_base_set_job_state_callback(prte_job_state_t state,
 
 PRTE_EXPORT int prte_state_base_remove_job_state(prte_job_state_t state);
 
-PRTE_EXPORT void prte_util_print_job_state_machine(void);
-
 PRTE_EXPORT void prte_state_base_activate_proc_state(pmix_proc_t *proc, prte_proc_state_t state);
 
 PRTE_EXPORT int prte_state_base_add_proc_state(prte_proc_state_t state, prte_state_cbfunc_t cbfunc);
@@ -83,14 +81,10 @@ PRTE_EXPORT int prte_state_base_set_proc_state_callback(prte_proc_state_t state,
 
 PRTE_EXPORT int prte_state_base_remove_proc_state(prte_proc_state_t state);
 
-PRTE_EXPORT void prte_util_print_proc_state_machine(void);
-
 /* common state processing functions */
 PRTE_EXPORT void prte_state_base_local_launch_complete(int fd, short argc, void *cbdata);
-PRTE_EXPORT void prte_state_base_cleanup_job(int fd, short argc, void *cbdata);
 PRTE_EXPORT void prte_state_base_report_progress(int fd, short argc, void *cbdata);
 PRTE_EXPORT void prte_state_base_track_procs(int fd, short argc, void *cbdata);
-PRTE_EXPORT void prte_state_base_check_all_complete(int fd, short args, void *cbdata);
 PRTE_EXPORT void prte_state_base_check_fds(prte_job_t *jdata);
 PRTE_EXPORT void prte_state_base_notify_data_server(pmix_proc_t *target);
 

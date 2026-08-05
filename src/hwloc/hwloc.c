@@ -13,6 +13,9 @@
 
 #include "prte_config.h"
 
+#include <errno.h>
+#include <limits.h>
+
 #include "src/hwloc/hwloc-internal.h"
 #include "src/include/constants.h"
 #include "src/mca/base/pmix_base.h"
@@ -31,7 +34,6 @@
  */
 bool prte_hwloc_base_inited = false;
 hwloc_topology_t prte_hwloc_topology = NULL;
-hwloc_cpuset_t prte_hwloc_my_cpuset = NULL;
 prte_hwloc_base_map_t prte_hwloc_base_map = PRTE_HWLOC_BASE_MAP_NONE;
 prte_hwloc_base_mbfa_t prte_hwloc_base_mbfa = PRTE_HWLOC_BASE_MBFA_WARN;
 prte_binding_policy_t prte_hwloc_default_binding_policy = 0;
@@ -39,25 +41,18 @@ char *prte_hwloc_default_cpu_list = NULL;
 char *prte_hwloc_base_topo_file = NULL;
 int prte_hwloc_base_output = -1;
 bool prte_hwloc_default_use_hwthread_cpus = false;
-bool prte_hwloc_synthetic_topo = false;
-
-hwloc_obj_type_t prte_hwloc_levels[] = {
-    HWLOC_OBJ_MACHINE,
-    HWLOC_OBJ_NUMANODE,
-    HWLOC_OBJ_PACKAGE,
-    HWLOC_OBJ_L3CACHE,
-    HWLOC_OBJ_L2CACHE,
-    HWLOC_OBJ_L1CACHE,
-    HWLOC_OBJ_CORE,
-    HWLOC_OBJ_PU
-};
 
 static char *prte_hwloc_base_binding_policy = NULL;
 static int verbosity = 0;
 static char *default_cpu_list = NULL;
 static bool bind_to_core = false;
 static bool bind_to_socket = false;
-static char *enum_values = NULL;
+/* Each string MCA parameter needs its own backing store: the MCA layer
+ * keeps the address we hand it, reports the current value through it,
+ * and frees it at finalize. Two parameters sharing one variable means
+ * each reports the other's value. */
+static char *mem_alloc_policy = NULL;
+static char *mem_bind_failure_action = NULL;
 
 int prte_hwloc_base_register(void)
 {
@@ -105,24 +100,23 @@ int prte_hwloc_base_register(void)
                                      "example, if \"local_only\" is used and local NUMA domain memory is exhausted, a new "
                                      "memory allocation may cause paging.",
                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                     &enum_values);
+                                     &mem_alloc_policy);
     if (0 > ret) {
         return ret;
     }
-    if (NULL != enum_values) {
-        if (0 == strncasecmp(enum_values, "none", strlen("none"))) {
+    if (NULL != mem_alloc_policy) {
+        if (0 == strcasecmp(mem_alloc_policy, "none")) {
             prte_hwloc_base_map = PRTE_HWLOC_BASE_MAP_NONE;
-        } else if (0 == strncasecmp(enum_values, "local_only", strlen("local_only"))) {
+        } else if (0 == strcasecmp(mem_alloc_policy, "local_only")) {
             prte_hwloc_base_map = PRTE_HWLOC_BASE_MAP_LOCAL_ONLY;
         } else {
             pmix_show_help("help-prte-hwloc-base.txt", "invalid binding_policy", true,
-                           enum_values);
+                           "memory allocation", mem_alloc_policy);
             return PRTE_ERR_SILENT;
         }
     }
 
     /* hwloc_base_bind_failure_action */
-    enum_values = NULL;
     prte_hwloc_base_mbfa = PRTE_HWLOC_BASE_MBFA_WARN;
     ret = pmix_mca_base_var_register("prte", "hwloc", "default", "mem_bind_failure_action",
                                      "What PRTE will do if it explicitly tries to bind memory to a specific NUMA "
@@ -133,20 +127,20 @@ int prte_hwloc_base_register(void)
                                      "(possibly with degraded performance).  A value of \"error\" means that PRTE "
                                      "will abort the job if this happens.",
                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                     &enum_values);
+                                     &mem_bind_failure_action);
     if (0 > ret) {
         return ret;
     }
-    if (NULL != enum_values) {
-        if (0 == strncasecmp(enum_values, "silent", strlen("silent"))) {
+    if (NULL != mem_bind_failure_action) {
+        if (0 == strcasecmp(mem_bind_failure_action, "silent")) {
             prte_hwloc_base_mbfa = PRTE_HWLOC_BASE_MBFA_SILENT;
-        } else if (0 == strncasecmp(enum_values, "warn", strlen("warn"))) {
+        } else if (0 == strcasecmp(mem_bind_failure_action, "warn")) {
             prte_hwloc_base_mbfa = PRTE_HWLOC_BASE_MBFA_WARN;
-        } else if (0 == strncasecmp(enum_values, "error", strlen("error"))) {
+        } else if (0 == strcasecmp(mem_bind_failure_action, "error")) {
             prte_hwloc_base_mbfa = PRTE_HWLOC_BASE_MBFA_ERROR;
         } else {
             pmix_show_help("help-prte-hwloc-base.txt", "invalid binding_policy", true,
-                           enum_values);
+                           "memory bind failure action", mem_bind_failure_action);
             return PRTE_ERR_SILENT;
         }
     }
@@ -176,11 +170,14 @@ int prte_hwloc_base_register(void)
                                               PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
     (void) pmix_mca_base_var_register_synonym(ret, "prte", "hwloc", "default", "binding_policy",
                                               PMIX_MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
+    /* The MCA layer owns whatever this variable points at and frees it at
+     * finalize, so the deprecated shortcuts have to hand it heap memory -
+     * a string literal here becomes a free() of read-only storage. */
     if (NULL == prte_hwloc_base_binding_policy) {
         if (bind_to_core) {
-            prte_hwloc_base_binding_policy = "core";
+            prte_hwloc_base_binding_policy = strdup("core");
         } else if (bind_to_socket) {
-            prte_hwloc_base_binding_policy = "package";
+            prte_hwloc_base_binding_policy = strdup("package");
         }
     }
 
@@ -216,9 +213,16 @@ int prte_hwloc_base_register(void)
 
 
     if (NULL != default_cpu_list) {
-        if (NULL != (ptr = strrchr(default_cpu_list, ':'))) {
+        /* The MCA layer owns this string and reports the parameter's value
+         * through it, so parse a copy: splitting the modifier off in place
+         * makes prte_info and every later reader see a truncated value the
+         * user never set. */
+        prte_hwloc_default_cpu_list = strdup(default_cpu_list);
+        if (NULL == prte_hwloc_default_cpu_list) {
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+        if (NULL != (ptr = strrchr(prte_hwloc_default_cpu_list, ':'))) {
             *ptr = '\0';
-            prte_hwloc_default_cpu_list = strdup(default_cpu_list);
             ++ptr;
             if (0 == strcasecmp(ptr, "HWTCPUS")) {
                 prte_hwloc_default_use_hwthread_cpus = true;
@@ -227,10 +231,10 @@ int prte_hwloc_base_register(void)
             } else {
                 pmix_show_help("help-prte-hwloc-base.txt", "bad-processor-type", true,
                                default_cpu_list, ptr);
+                free(prte_hwloc_default_cpu_list);
+                prte_hwloc_default_cpu_list = NULL;
                 return PRTE_ERR_BAD_PARAM;
             }
-        } else {
-            prte_hwloc_default_cpu_list = strdup(default_cpu_list);
         }
     }
 
@@ -257,11 +261,23 @@ int prte_hwloc_base_open(void)
     }
     prte_hwloc_base_inited = true;
 
-    /* check the provided default binding policy for correctness - specifically want to ensure
-     * there are no disallowed qualifiers and setup the global param */
-    if (PRTE_SUCCESS
-        != (rc = prte_hwloc_base_set_binding_policy(NULL, prte_hwloc_base_binding_policy))) {
-        return rc;
+    /* Check the provided default binding policy for correctness - specifically want to ensure
+     * there are no disallowed qualifiers and setup the global param.
+     *
+     * A bad value here is fatal, exactly as a bad "mem_alloc_policy" or
+     * "mem_bind_failure_action" is in prte_hwloc_base_register() above. It
+     * did not used to be: prte_init() discarded this function's return, so
+     * "--prtemca bindto bogus" printed "the specified binding policy is not
+     * recognized" and then launched the job anyway with the default binding
+     * - having told the user their request was refused. The command-line
+     * spelling of the same mistake ("--bind-to bogus") has always been
+     * fatal, so the two were answering differently for one typo. */
+    rc = prte_hwloc_base_set_binding_policy(NULL, prte_hwloc_base_binding_policy);
+    if (PRTE_SUCCESS != rc) {
+        /* the parser has already said precisely what is wrong with the
+         * value, so keep prte_init() from wrapping that in a generic
+         * "internal failure" report on top of it */
+        return PRTE_ERR_SILENT;
     }
 
     return PRTE_SUCCESS;
@@ -275,13 +291,29 @@ void prte_hwloc_base_close(void)
 
     if (NULL != prte_hwloc_default_cpu_list) {
         free(prte_hwloc_default_cpu_list);
+        /* several subsystems test this for NULL to decide whether the DVM
+         * was given a cpu-set; leaving a dangling pointer here makes any
+         * post-finalize reader read freed memory */
+        prte_hwloc_default_cpu_list = NULL;
     }
 
-    /* destroy the topology */
-    if (NULL != prte_hwloc_topology) {
-        hwloc_topology_destroy(prte_hwloc_topology);
-        prte_hwloc_topology = NULL;
-    }
+    /* Drop our reference to the local topology WITHOUT destroying it.
+     *
+     * prte_hwloc_topology is not ours to free by the time we get here. The
+     * only two callers of prte_hwloc_base_get_topology() - ess/hnp and the
+     * shared daemon bring-up - each immediately wrap it in a prte_topology_t
+     * and add that to prte_node_topologies, and THAT object's destructor
+     * releases the userdata and destroys the topology. So the array owns
+     * every topology it holds, the local one included, and this global is a
+     * borrowed alias of one of its entries.
+     *
+     * Destroying it here as well is a double free, which is exactly why this
+     * function ended up with no callers at all: it could not be called
+     * either before the array release (the array would then destroy freed
+     * memory) or after it (we would). Clearing the alias instead is correct
+     * in both orders, so the ordering stops being a trap.
+     */
+    prte_hwloc_topology = NULL;
 
     /* All done */
     prte_hwloc_base_inited = false;
@@ -466,105 +498,40 @@ prte_hwloc_print_buffers_t *prte_hwloc_get_print_buffer(void)
 
     if (NULL == ptr) {
         ptr = (prte_hwloc_print_buffers_t *) malloc(sizeof(prte_hwloc_print_buffers_t));
+        if (NULL == ptr) {
+            return NULL;
+        }
         for (i = 0; i < PRTE_HWLOC_PRINT_NUM_BUFS; i++) {
             ptr->buffers[i] = (char *) malloc((PRTE_HWLOC_PRINT_MAX_SIZE + 1) * sizeof(char));
+            if (NULL == ptr->buffers[i]) {
+                /* hand back what we got so the cleanup below is well-defined */
+                while (0 < i) {
+                    free(ptr->buffers[--i]);
+                }
+                free(ptr);
+                return NULL;
+            }
         }
         ptr->cntr = 0;
         ret = pmix_tsd_setspecific(print_tsd_key, (void *) ptr);
+        if (PRTE_SUCCESS != ret) {
+            buffer_cleanup(ptr);
+            return NULL;
+        }
     }
 
     return (prte_hwloc_print_buffers_t *) ptr;
 }
 
-char *prte_hwloc_base_print_locality(prte_hwloc_locality_t locality)
-{
-    prte_hwloc_print_buffers_t *ptr;
-    int idx;
-
-    ptr = prte_hwloc_get_print_buffer();
-    if (NULL == ptr) {
-        return prte_hwloc_print_null;
-    }
-    /* cycle around the ring */
-    if (PRTE_HWLOC_PRINT_NUM_BUFS == ptr->cntr) {
-        ptr->cntr = 0;
-    }
-
-    idx = 0;
-
-    if (PRTE_PROC_ON_LOCAL_CLUSTER(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'C';
-        ptr->buffers[ptr->cntr][idx++] = 'L';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_CU(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'C';
-        ptr->buffers[ptr->cntr][idx++] = 'U';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_NODE(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'N';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_PACKAGE(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'S';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_NUMA(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'N';
-        ptr->buffers[ptr->cntr][idx++] = 'M';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_L3CACHE(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'L';
-        ptr->buffers[ptr->cntr][idx++] = '3';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_L2CACHE(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'L';
-        ptr->buffers[ptr->cntr][idx++] = '2';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_L1CACHE(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'L';
-        ptr->buffers[ptr->cntr][idx++] = '1';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_CORE(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'C';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (PRTE_PROC_ON_LOCAL_HWTHREAD(locality)) {
-        ptr->buffers[ptr->cntr][idx++] = 'H';
-        ptr->buffers[ptr->cntr][idx++] = 'w';
-        ptr->buffers[ptr->cntr][idx++] = 't';
-        ptr->buffers[ptr->cntr][idx++] = ':';
-    }
-    if (0 < idx) {
-        ptr->buffers[ptr->cntr][idx - 1] = '\0';
-    } else if (PRTE_PROC_NON_LOCAL & locality) {
-        ptr->buffers[ptr->cntr][idx++] = 'N';
-        ptr->buffers[ptr->cntr][idx++] = 'O';
-        ptr->buffers[ptr->cntr][idx++] = 'N';
-        ptr->buffers[ptr->cntr][idx++] = '\0';
-    } else {
-        /* must be an unknown locality */
-        ptr->buffers[ptr->cntr][idx++] = 'U';
-        ptr->buffers[ptr->cntr][idx++] = 'N';
-        ptr->buffers[ptr->cntr][idx++] = 'K';
-        ptr->buffers[ptr->cntr][idx++] = '\0';
-    }
-
-    return ptr->buffers[ptr->cntr];
-}
 
 int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
 {
     int i;
     prte_binding_policy_t tmp;
-    char **quals, *myspec, *ptr, *p2;
+    char **quals, *myspec, *ptr, *p2, *endp;
     prte_job_t *jdata = (prte_job_t *) jdat;
     uint16_t u16;
+    long lval;
 
     /* set default */
     tmp = 0;
@@ -574,6 +541,16 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
         return PRTE_SUCCESS;
     }
 
+    /* A job we cannot record the answer on has to be refused before we parse
+     * anything, not after: the "report" and "limit=N" qualifiers write to
+     * jdata->attributes as they are read, so failing this check at the end
+     * left them on a job whose binding was never set - the same ordering
+     * mistake the policy word above used to make. */
+    if (NULL != jdata && NULL == jdata->map) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
     myspec = strdup(spec); // protect the input
 
     /* check for qualifiers */
@@ -581,6 +558,64 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
     if (NULL != ptr) {
         *ptr = '\0';
         ++ptr;
+    }
+
+    /* Resolve the policy word FIRST, before any qualifier can record itself
+     * on the job: a spec whose policy does not parse must leave the job
+     * exactly as it found it.
+     *
+     * An empty policy word - the ":qualifier" form, with no policy at all -
+     * means "keep whatever binding policy would otherwise apply, but with
+     * these qualifiers". That is what "--map-by :OVERSUBSCRIBE" has always
+     * meant on the mapping side, and it has to mean the same here. It did
+     * not: pmix_check_cli_option() compares only min(strlen(a), strlen(b))
+     * characters, so an empty string matches the first option it is tested
+     * against - which is "none". "--bind-to :overload-allowed" therefore
+     * disabled binding outright, silently, and took the default mapping
+     * policy down with it. Leaving the policy bits at zero here means
+     * PRTE_BINDING_POLICY_IS_SET() still answers "no" and
+     * PRTE_SET_DEFAULT_BINDING_POLICY() later fills the policy in while
+     * preserving the qualifier half of the word. */
+    if ('\0' != myspec[0]) {
+        if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NONE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NONE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_HWT)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_CORE)) {
+            /* honor the user's "core" unless the topology has no cores at all;
+             * a core that holds a single hwthread is still a core to bind to */
+            if (!prte_rmaps_base.have_cores) {
+                PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
+            } else {
+                PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_CORE);
+            }
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L1CACHE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L1CACHE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L2CACHE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L2CACHE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L3CACHE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L3CACHE);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NUMA)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NUMA);
+
+        } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_PACKAGE)) {
+            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_PACKAGE);
+
+        } else {
+            pmix_show_help("help-prte-hwloc-base.txt", "invalid binding_policy", true, "binding",
+                           spec);
+            free(myspec);
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+
+    if (NULL != ptr) {
         quals = PMIx_Argv_split(ptr, ':');
         for (i = 0; NULL != quals[i]; i++) {
             if (PMIX_CHECK_CLI_OPTION(quals[i], PRTE_CLI_IF_SUPP)) {
@@ -597,6 +632,7 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
                 if (NULL == jdata) {
                     pmix_show_help("help-prte-rmaps-base.txt", "unsupported-default-modifier", true,
                                    "binding policy", quals[i]);
+                    PMIx_Argv_free(quals);
                     free(myspec);
                     return PRTE_ERR_SILENT;
                 }
@@ -607,18 +643,38 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
                 if (NULL == jdata) {
                     pmix_show_help("help-prte-rmaps-base.txt", "unsupported-default-modifier", true,
                                    "binding policy", quals[i]);
+                    PMIx_Argv_free(quals);
                     free(myspec);
                     return PRTE_ERR_SILENT;
                 }
-                /* Numeric value must immediately follow '=' (LIMIT=2) */
-                u16 = strtol(&quals[i][6], &p2, 10);
-                if ('\0' != *p2) {
-                    /* missing the value or value is invalid */
+                /* Numeric value follows the '=' (LIMIT=2). Do not index past
+                 * the qualifier's full spelling - the name may be abbreviated
+                 * to any unambiguous prefix, so "L=2" is this same option */
+                p2 = pmix_cli_qualifier_value(quals[i]);
+                if (NULL == p2) {
+                    /* missing the value */
                     pmix_show_help("help-prte-rmaps-base.txt", "invalid-value", true,
                                    "binding limit", "LIMIT", quals[i]);
                     PMIx_Argv_free(quals);
+                    free(myspec);
                     return PRTE_ERR_SILENT;
                 }
+                /* the attribute is a uint16, so a value that does not fit has
+                 * to be rejected here - truncating it silently would bind to
+                 * a limit the user never asked for */
+                errno = 0;
+                lval = strtol(p2, &endp, 10);
+                if (endp == p2 || '\0' != *endp || 0 != errno ||
+                    0 >= lval || UINT16_MAX < lval) {
+                    /* value is not a number, has trailing garbage, or is out
+                     * of range (a limit of zero is meaningless) */
+                    pmix_show_help("help-prte-rmaps-base.txt", "invalid-value", true,
+                                   "binding limit", "LIMIT", quals[i]);
+                    PMIx_Argv_free(quals);
+                    free(myspec);
+                    return PRTE_ERR_SILENT;
+                }
+                u16 = (uint16_t) lval;
                 prte_set_attribute(&jdata->attributes, PRTE_JOB_BINDING_LIMIT, PRTE_ATTR_GLOBAL,
                                    &u16, PMIX_UINT16);
 
@@ -632,50 +688,12 @@ int prte_hwloc_base_set_binding_policy(void *jdat, char *spec)
         }
         PMIx_Argv_free(quals);
     }
-
-    if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NONE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NONE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_HWT)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_CORE)) {
-        if (prte_rmaps_base.require_hwtcpus) {
-            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_HWTHREAD);
-        } else {
-            PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_CORE);
-        }
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L1CACHE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L1CACHE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L2CACHE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L2CACHE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_L3CACHE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_L3CACHE);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_NUMA)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_NUMA);
-
-    } else if (PMIX_CHECK_CLI_OPTION(myspec, PRTE_CLI_PACKAGE)) {
-        PRTE_SET_BINDING_POLICY(tmp, PRTE_BIND_TO_PACKAGE);
-
-    } else {
-        pmix_show_help("help-prte-hwloc-base.txt", "invalid binding_policy", true, "binding",
-                       spec);
-        free(myspec);
-        return PRTE_ERR_BAD_PARAM;
-    }
     free(myspec);
 
     if (NULL == jdata) {
         prte_hwloc_default_binding_policy = tmp;
     } else {
-        if (NULL == jdata->map) {
-            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-            return PRTE_ERR_BAD_PARAM;
-        }
+        /* jdata->map was checked on the way in */
         jdata->map->binding = tmp;
     }
     return PRTE_SUCCESS;

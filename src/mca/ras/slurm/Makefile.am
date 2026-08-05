@@ -32,10 +32,18 @@ sources = \
         ras_slurm_component.c \
         ras_slurm_module.c \
         ras_slurm_modify_common.c \
+        ras_slurm_modify_cancel.c \
         ras_slurm_modify_extend.c \
-        ras_slurm_modify_release.c 
+        ras_slurm_modify_release.c \
+        ras_slurm_modify_release_tracker.c \
+        ras_slurm_modify_release_tracker.h
 
-if PRTE_HAVE_JANSSON
+# PRTE_WANT_JANSSON_SOURCE is true when jansson was found OR when
+# --enable-testbuild-launchers was given.  In the latter case the real parser
+# compiles against the declarations in base/testbuild_jansson.h, so this ~1000
+# line file is at least syntax-checked on machines with no jansson; such a
+# build must not be run (see src/mca/ras/AGENTS.md).
+if PRTE_WANT_JANSSON_SOURCE
 sources += \
         ras_slurm_jansson.c
 else

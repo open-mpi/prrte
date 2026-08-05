@@ -28,20 +28,23 @@ headers += \
         include/constants.h \
         include/types.h \
         include/prte_frameworks.h \
-        include/hash_string.h \
-        include/prefetch.h \
         include/prte_config_top.h \
         include/prte_config_bottom.h \
         include/prte_portable_platform.h \
         include/prte_portable_platform_real.h \
         include/prte_stdint.h \
         include/prte_stdatomic.h \
-        include/prte_socket_errno.h \
-        include/align.h
+        include/prte_socket_errno.h
 
-nodist_headers += \
-        include/prte_config.h \
-        include/version.h
+# prte_config.h and version.h are deliberately absent from the list above.
+# They are generated into the build tree, and AC_CONFIG_HEADERS /
+# AC_CONFIG_FILES already own them.  They used to be collected into a
+# nodist_headers variable that no _HEADERS variable ever referenced -- so
+# they were never installed, which is one of the reasons the
+# --with-devel-headers option that would have installed them produced a
+# tree that could not be compiled.  That option is gone; see
+# config/prte_configure_options.m4.
+
 #Add prte binary prefix
 lib@PRTE_BINARY_PREFIX@prrte_la_SOURCES += \
         $(headers) \

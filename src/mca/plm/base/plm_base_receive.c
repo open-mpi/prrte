@@ -68,6 +68,169 @@
 
 static bool recv_issued = false;
 
+/* The writers for the PRTE_PLM_UPDATE_PROC_STATE body.  They sit here, in
+ * the same file as prte_plm_base_recv() which is their only reader, because
+ * the wire has no format version: the pair has to change together, and one
+ * writer next to the reader is what makes that a mechanical rather than an
+ * archaeological exercise.  See base.h for the format. */
+int prte_plm_base_pack_state_for_proc(pmix_data_buffer_t *alert, prte_proc_t *child)
+{
+    int rc;
+
+    /* pack the child's vpid */
+    rc = PMIx_Data_pack(NULL, alert, &child->name.rank, 1, PMIX_PROC_RANK);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+    /* pack the pid */
+    rc = PMIx_Data_pack(NULL, alert, &child->pid, 1, PMIX_PID);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+    /* pack its state */
+    rc = PMIx_Data_pack(NULL, alert, &child->state, 1, PMIX_UINT32);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+    /* pack its exit code */
+    rc = PMIx_Data_pack(NULL, alert, &child->exit_code, 1, PMIX_INT32);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+
+    return PRTE_SUCCESS;
+}
+
+int prte_plm_base_pack_state_update(pmix_data_buffer_t *alert, prte_job_t *jobdat,
+                                    bool skip_reported)
+{
+    int rc, i;
+    prte_proc_t *child;
+    pmix_rank_t null = PMIX_RANK_INVALID;
+
+    /* pack the jobid */
+    rc = PMIx_Data_pack(NULL, alert, &jobdat->nspace, 1, PMIX_PROC_NSPACE);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+    if (NULL != prte_local_children) {
+        for (i = 0; i < prte_local_children->size; i++) {
+            child = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+            if (NULL == child) {
+                continue;
+            }
+            /* if this child is part of the job... */
+            if (!PMIX_CHECK_NSPACE(child->name.nspace, jobdat->nspace)) {
+                continue;
+            }
+            /* ...and, if the caller is reporting a normal termination,
+             * has not already been reported */
+            if (skip_reported && PRTE_FLAG_TEST(child, PRTE_PROC_FLAG_TERM_REPORTED)) {
+                continue;
+            }
+            rc = prte_plm_base_pack_state_for_proc(alert, child);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                return rc;
+            }
+            if (skip_reported) {
+                PRTE_FLAG_SET(child, PRTE_PROC_FLAG_TERM_REPORTED);
+            }
+        }
+    }
+    /* flag that this job is complete so the receiver can know */
+    rc = PMIx_Data_pack(NULL, alert, &null, 1, PMIX_PROC_RANK);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+
+    return PRTE_SUCCESS;
+}
+
+/* Resolve the PRTE_JOB_SPAWN_TARGET list (a comma-delimited list of
+ * PMIX_ALLOC_ID strings, with an empty token denoting the default session)
+ * into the job's validated target_sessions set. The requester must own every
+ * named reservation. On success the spawned job becomes an owner of each
+ * targeted reservation and jdata->session is set to the primary (first)
+ * targeted session. Returns a PRTE error code on failure. */
+static int resolve_spawn_targets(prte_job_t *jdata, pmix_proc_t *requestor,
+                                 char *target_str)
+{
+    char *p, *start, saved;
+    prte_session_t *s, **tlist = NULL, *primary = NULL;
+    size_t ntl = 0;
+    bool done = false;
+
+    start = target_str;
+    for (p = target_str; !done; p++) {
+        if (',' != *p && '\0' != *p) {
+            continue;
+        }
+        saved = *p;
+        *p = '\0';
+        if ('\0' == saved) {
+            done = true;
+        }
+        /* an empty token denotes the default session */
+        if ('\0' == *start) {
+            s = prte_default_session;
+        } else {
+            s = prte_get_session_object_from_id(start);
+            if (NULL == s) {
+                free(tlist);
+                return PRTE_ERR_NOT_FOUND;
+            }
+        }
+        /* the requester may target only the default session and reservations
+         * its namespace owns (the scheduler excepted) */
+        if (!prte_session_is_owned_by(s, requestor->nspace)) {
+            free(tlist);
+            return PRTE_ERR_PERM;
+        }
+        /* add to the target set, de-duplicating */
+        {
+            size_t k;
+            bool present = false;
+            for (k = 0; k < ntl; k++) {
+                if (tlist[k] == s) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                prte_session_t **t2 = (prte_session_t **)
+                    realloc(tlist, (ntl + 1) * sizeof(prte_session_t *));
+                if (NULL == t2) {
+                    free(tlist);
+                    return PRTE_ERR_OUT_OF_RESOURCE;
+                }
+                tlist = t2;
+                tlist[ntl++] = s;
+                if (NULL == primary) {
+                    primary = s;
+                }
+            }
+        }
+        /* the spawned job becomes an owner of the reservation it targets, so
+         * it may in turn spawn further jobs onto those nodes (no-op for the
+         * default session) */
+        prte_session_add_owner(s, jdata->nspace);
+        start = p + 1;
+    }
+
+    jdata->target_sessions = tlist;
+    jdata->num_target_sessions = ntl;
+    /* primary session: first targeted, or default if only invalid was named */
+    jdata->session = (NULL != primary) ? primary : prte_default_session;
+    return PRTE_SUCCESS;
+}
+
 int prte_plm_base_comm_start(void)
 {
     if (recv_issued) {
@@ -112,7 +275,11 @@ int prte_plm_base_comm_stop(void)
     return PRTE_SUCCESS;
 }
 
-/* process incoming messages in order of receipt */
+/* process incoming messages in order of receipt
+ *
+ * NOTE: THIS OCCURS INSIDE OF AN EVENT AND IS
+ * THEREFORE THREAD-SAFE
+ */
 void prte_plm_base_recv(int status, pmix_proc_t *sender,
                         pmix_data_buffer_t *buffer,
                         prte_rml_tag_t tag, void *cbdata)
@@ -121,7 +288,13 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
     int32_t count;
     pmix_nspace_t job;
     prte_session_t *session;
-    prte_job_t *jdata, *parent;
+    /* jdata MUST start NULL: the ANSWER_LAUNCH error path reads it, and we
+     * can reach that path before (or without) it ever being assigned - e.g.,
+     * when the job object fails to unpack */
+    prte_job_t *jdata = NULL, *parent;
+    /* true while the freshly unpacked job object belongs to nobody but us -
+     * cleared once it has been handed to a session/parent/the job pool */
+    bool own_jdata = false;
     pmix_data_buffer_t *answer;
     pmix_rank_t vpid;
     prte_proc_t *proc;
@@ -131,8 +304,10 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
     int32_t rc = PRTE_SUCCESS, ret;
     uint32_t ui32, *ui32_ptr;
     prte_app_context_t *app, *child_app;
-    pmix_proc_t name, *nptr;
+    pmix_proc_t name, *nptr = NULL;
     pid_t pid;
+    uid_t tooluid = PRTE_INVALID_UID;
+    gid_t toolgid = PRTE_INVALID_GID;
     bool debugging, found;
     int i, room, *rmptr = &room;
     char *tmp;
@@ -226,11 +401,31 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
                 free(tmp);
                 goto CLEANUP;
             }
+            // and who is running it
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                free(tmp);
+                goto CLEANUP;
+            }
+            tooluid = (uid_t) ui32;
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                free(tmp);
+                goto CLEANUP;
+            }
+            toolgid = (gid_t) ui32;
 
             // need to add the tool job
             jdata = PMIX_NEW(prte_job_t);
             PMIX_LOAD_NSPACE(jdata->nspace, name.nspace);
             PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
+            /* record who is running the tool - see prte_session_is_owned_by */
+            jdata->uid = tooluid;
+            jdata->gid = toolgid;
             rc = prte_set_job_data_object(jdata);
             app = PMIX_NEW(prte_app_context_t);
             if (NULL != tmp) {
@@ -255,7 +450,7 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
                 rc = PRTE_ERR_NOT_FOUND;
                 goto CLEANUP;
             }
-            PMIX_RETAIN(node);
+            /* the node backpointer is borrowed, not retained */
             proc->node = node;
             jdata->num_procs = 1;
         }
@@ -304,6 +499,9 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             goto ANSWER_LAUNCH;
         }
 
+        /* we own it until it is handed to a container below */
+        own_jdata = true;
+
         /* record the sender so we know who to respond to */
         PMIX_LOAD_PROCID(&jdata->originator, sender->nspace, sender->rank);
 
@@ -327,6 +525,32 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
             rc = PRTE_ERR_NOT_FOUND;
             goto ANSWER_LAUNCH;
+        }
+
+        /* The job belongs to whoever asked for it. Identity descends the job
+         * tree from the tool that started it, so an allocation an application
+         * requests is recorded against the user who launched that application
+         * - not left anonymous because the job itself never presented
+         * credentials. */
+        parent = prte_get_job_data_object(nptr->nspace);
+        if (NULL != parent) {
+            jdata->uid = parent->uid;
+            jdata->gid = parent->gid;
+        }
+
+        /* A spawn-target list takes precedence and may name multiple sessions
+         * (the union of allocations the job may map onto). Resolve it, validate
+         * ownership of each, cache the set on the job, and continue. */
+        tmp = NULL;
+        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_SPAWN_TARGET, (void **) &tmp, PMIX_STRING) &&
+            NULL != tmp) {
+            rc = resolve_spawn_targets(jdata, nptr, tmp);
+            free(tmp);
+            if (PRTE_SUCCESS != rc) {
+                goto ANSWER_LAUNCH;
+            }
+            session = jdata->session;
+            goto moveon;
         }
 
         /* If an alloc id was given specifying the session within which
@@ -403,8 +627,25 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
         }
 
 moveon:
+        /* from here on the job is referenced by the session (and shortly by
+         * the parent's child list and the global job pool), so the error
+         * paths below must NOT free it out from under them */
+        own_jdata = false;
         jdata->session = session;
         pmix_pointer_array_add(jdata->session->jobs, jdata);
+
+        /* a job reaching a reservation through the legacy single-session
+         * attributes (no spawn-target list) must still pass the ownership
+         * check and become an owner of that reservation */
+        if (NULL == jdata->target_sessions && NULL != session &&
+            session != prte_default_session &&
+            (PRTE_SESSION_FLAG_RESERVED & session->flags)) {
+            if (!prte_session_is_owned_by(session, nptr->nspace)) {
+                rc = PRTE_ERR_PERM;
+                goto ANSWER_LAUNCH;
+            }
+            prte_session_add_owner(session, jdata->nspace);
+        }
 
         /* get the parent's job object */
         if (NULL != (parent = prte_get_job_data_object(nptr->nspace)) &&
@@ -438,6 +679,7 @@ moveon:
             }
         }
         PMIX_PROC_RELEASE(nptr);
+        nptr = NULL;
 
         PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                              "%s plm:base:receive adding hosts",
@@ -488,11 +730,45 @@ moveon:
                              "%s plm:base:receive - error on launch: %d",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), rc));
 
+        /* Capture the requester's room number *before* we dispose of the job
+         * object below - it lives on that object, and it is the only handle
+         * the requester has on this request. Without it,
+         * pmix_server_launch_resp() cannot match the response to anything and
+         * simply drops it, leaving the requester (e.g., prun) waiting for a
+         * completion that will never come. We may have no job object at all
+         * here - e.g., if the request failed to unpack. */
+        found = false;
+        if (NULL != jdata &&
+            prte_get_attribute(&jdata->attributes, PRTE_JOB_ROOM_NUM,
+                               (void **) &rmptr, PMIX_INT)) {
+            found = true;
+        }
+
+        /* release the launch proxy procID if we retrieved one */
+        if (NULL != nptr) {
+            PMIX_PROC_RELEASE(nptr);
+            nptr = NULL;
+        }
+
+        /* if we unpacked a job object and never handed it to anyone - a
+         * malformed request, an unknown session, a rejected ownership check -
+         * then we are the only holder and it would otherwise leak */
+        if (own_jdata && NULL != jdata) {
+            PMIX_RELEASE(jdata);
+            jdata = NULL;
+            own_jdata = false;
+        }
+
         /* setup the response */
         PMIX_DATA_BUFFER_CREATE(answer);
 
-        /* pack the error code to be returned */
-        rc = PMIx_Data_pack(NULL, answer, &rc, 1, PMIX_INT32);
+        /* Pack the error code to be returned. The requester hands this
+         * straight to PMIx (see pmix_server_notify_spawn), and every other
+         * producer of a spawn response passes a PMIx status, so convert out
+         * of PRRTE's numbering scheme here - the two overlap, so an
+         * unconverted code arrives at the tool as some other, real error. */
+        ret = prte_pmix_convert_rc(rc);
+        rc = PMIx_Data_pack(NULL, answer, &ret, 1, PMIX_INT32);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
         }
@@ -504,8 +780,8 @@ moveon:
             PMIX_ERROR_LOG(rc);
         }
 
-        /* pack the room number of the request */
-        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_ROOM_NUM, (void **) &rmptr, PMIX_INT)) {
+        /* pack the room number of the request, if we were able to recover it */
+        if (found) {
             rc = PMIx_Data_pack(NULL, answer, &room, 1, PMIX_INT);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
@@ -612,12 +888,15 @@ moveon:
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(job)));
 
             PMIX_LOAD_NSPACE(name.nspace, job);
-            /* get the job object */
+            /* get the job object - the job may already have completed, so
+             * this is not necessarily an error, but we cannot process the
+             * report without it */
             jdata = prte_get_job_data_object(job);
             debugging = false;
-            if (prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL) ||
-                prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_INIT, NULL, PMIX_BOOL) ||
-                prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP, NULL, PMIX_BOOL)) {
+            if (NULL != jdata &&
+                (prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL) ||
+                 prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_INIT, NULL, PMIX_BOOL) ||
+                 prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP, NULL, PMIX_BOOL))) {
                 debugging = true;
             }
             count = 1;
@@ -640,19 +919,24 @@ moveon:
                      "%s plm:base:receive got ready for debug for vpid %u",
                      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), vpid));
 
-                /* get the proc data object */
-                proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, vpid);
-                if (NULL == proc) {
-                    PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-                    PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_FORCED_EXIT);
-                    goto CLEANUP;
-                }
-                /* NEVER update the proc state before activating the state machine - let
-                 * the state cbfunc update it as it may need to compare this
-                 * state against the prior proc state */
-                proc->pid = pid;
-                if (debugging) {
-                    jdata->num_ready_for_debug++;
+                /* get the proc data object - if the job itself is gone (it
+                 * may have completed before this report arrived), there is
+                 * nothing to record, but we must keep unpacking so the rest
+                 * of the buffer stays parseable */
+                if (NULL != jdata) {
+                    proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, vpid);
+                    if (NULL == proc) {
+                        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_FORCED_EXIT);
+                        goto CLEANUP;
+                    }
+                    /* NEVER update the proc state before activating the state machine - let
+                     * the state cbfunc update it as it may need to compare this
+                     * state against the prior proc state */
+                    proc->pid = pid;
+                    if (debugging) {
+                        jdata->num_ready_for_debug++;
+                    }
                 }
                 /* get entry from next rank */
                 rc = PMIx_Data_unpack(NULL, buffer, &vpid, &count, PMIX_PROC_RANK);
@@ -709,6 +993,32 @@ moveon:
         }
         if (jdata->num_reported == jdata->num_procs) {
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_REGISTERED);
+        }
+        break;
+
+    case PRTE_PLM_TOOL_DEPARTED_CMD:
+        /* The partner of TOOL_ATTACHED above. A daemon other than the master
+         * holds no job object for a tool that connected to it, so it cannot
+         * retire one - it tells us instead, and we drive the tool's proc into
+         * TERMINATED here. Vet the namespace before doing so: the daemon is
+         * reporting a peer it could not identify beyond "not a client of
+         * mine", and acting on one that turns out to be an application job
+         * would terminate that job. Nothing is wrong with a namespace we no
+         * longer know - the DVM may already have discarded it - so that is
+         * not an error either. */
+        count = 1;
+        rc = PMIx_Data_unpack(NULL, buffer, &name, &count, PMIX_PROC);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            goto CLEANUP;
+        }
+        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                             "%s plm:base:receive tool %s departed (reported by %s)",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&name),
+                             PRTE_NAME_PRINT(sender)));
+        jdata = prte_get_job_data_object(name.nspace);
+        if (NULL != jdata && PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+            PRTE_ACTIVATE_PROC_STATE(&name, PRTE_PROC_STATE_TERMINATED);
         }
         break;
 
@@ -818,9 +1128,3 @@ CLEANUP:
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 }
 
-/* where HNP messages come */
-void prte_plm_base_receive_process_msg(int fd, short event, void *data)
-{
-    PRTE_HIDE_UNUSED_PARAMS(fd, event, data);
-    assert(0);
-}

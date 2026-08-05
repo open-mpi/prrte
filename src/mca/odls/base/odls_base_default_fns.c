@@ -45,6 +45,9 @@
 #include <pmix_server.h>
 #include <signal.h>
 #include <time.h>
+#ifdef HAVE_SYS_PTRACE_H
+#    include <sys/ptrace.h>
+#endif
 
 #include "prte_stdint.h"
 #include "src/hwloc/hwloc-internal.h"
@@ -87,28 +90,69 @@
 #include "src/mca/odls/base/base.h"
 
 typedef struct {
+    pmix_object_t super;
+    pmix_event_t ev;
     prte_job_t *jdata;
     pmix_info_t *info;
     size_t ninfo;
-    prte_pmix_lock_t lock;
+    pmix_byte_object_t pbo;
+    prte_odls_base_fork_local_proc_fn_t fork_local;
+    int pending;
+    pmix_status_t rstatus;
 } prte_odls_jcaddy_t;
+static void jccon(prte_odls_jcaddy_t *p)
+{
+    p->jdata = NULL;
+    p->info = NULL;
+    p->ninfo = 0;
+    PMIX_BYTE_OBJECT_CONSTRUCT(&p->pbo);
+    p->fork_local = NULL;
+    p->pending = 0;
+    p->rstatus = PMIX_SUCCESS;
+}
+static void jcdes(prte_odls_jcaddy_t *p)
+{
+    if (NULL != p->info) {
+        PMIX_INFO_FREE(p->info, p->ninfo);
+    }
+    PMIX_BYTE_OBJECT_DESTRUCT(&p->pbo);
+}
+static PMIX_CLASS_INSTANCE(prte_odls_jcaddy_t, pmix_object_t, jccon, jcdes);
+
+static void _setup_complete(int sd, short args, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+    int rc;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* add the results to the launch msg */
+    rc = PMIx_Data_pack(NULL, &cd->jdata->launch_msg, &cd->pbo, 1, PMIX_BYTE_OBJECT);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+    }
+
+    /* move to next stage */
+    PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_SEND_LAUNCH_MSG);
+
+    /* releasing the caddy also releases the app-setup info
+     * we passed to the PMIx server */
+    PMIX_RELEASE(cd);
+}
 
 static void setup_cbfunc(pmix_status_t status, pmix_info_t info[], size_t ninfo,
                          void *provided_cbdata, pmix_op_cbfunc_t cbfunc, void *cbdata)
 {
     prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) provided_cbdata;
-    prte_job_t *jdata = cd->jdata;
     pmix_data_buffer_t pbuf;
-    pmix_byte_object_t pbo;
     int rc = PRTE_SUCCESS;
     PRTE_HIDE_UNUSED_PARAMS(status);
 
-    /* release any info */
-    if (NULL != cd->info) {
-        PMIX_INFO_FREE(cd->info, cd->ninfo);
-    }
-
-    PMIX_BYTE_OBJECT_CONSTRUCT(&pbo);
+    /* this callback executes on the PMIx progress thread, so we
+     * cannot touch the job object here - capture the returned
+     * info by serializing it into a byte object, then shift to
+     * our progress thread */
     if (NULL != info) {
         PMIX_DATA_BUFFER_CONSTRUCT(&pbuf);
         /* pack the provided info */
@@ -123,29 +167,21 @@ static void setup_cbfunc(pmix_status_t status, pmix_info_t info[], size_t ninfo,
             goto done;
         }
         /* unload it */
-        rc = PMIx_Data_unload(&pbuf, &pbo);
+        rc = PMIx_Data_unload(&pbuf, &cd->pbo);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
         }
     }
-    /* add the results */
-    rc = PMIx_Data_pack(NULL, &jdata->launch_msg, &pbo, 1, PMIX_BYTE_OBJECT);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-    }
 
 done:
-    PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
-    /* release our caller */
+    /* release our caller - we are done with the provided info */
     if (NULL != cbfunc) {
         cbfunc(rc, cbdata);
     }
 
-    /* move to next stage */
-    PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_SEND_LAUNCH_MSG);
-
-    /* release the original thread */
-    PRTE_PMIX_WAKEUP_THREAD(&cd->lock);
+    prte_event_set(prte_event_base, &cd->ev, -1, PRTE_EV_WRITE, _setup_complete, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&cd->ev, PRTE_EV_WRITE, 1);
 }
 
 /* IT IS CRITICAL THAT ANY CHANGE IN THE ORDER OF THE INFO PACKED IN
@@ -163,7 +199,7 @@ int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *buffer, pmix_n
     prte_node_t *node;
     int i, k;
     char **list, **procs, **micro, *tmp, *regex;
-    prte_odls_jcaddy_t cd = {0};
+    prte_odls_jcaddy_t *cd;
     prte_proc_t *pptr;
     uint32_t uid;
     uint32_t gid;
@@ -308,7 +344,10 @@ int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *buffer, pmix_n
         if (PMIX_SUCCESS != (ret = PMIx_generate_regex(tmp, &regex))) {
             PMIX_ERROR_LOG(ret);
             free(tmp);
-            PMIX_INFO_FREE(cd.info, cd.ninfo);
+            if (NULL != procs) {
+                PMIx_Argv_free(procs);
+            }
+            PMIX_INFO_LIST_RELEASE(ilist);
             return prte_pmix_convert_status(ret);
         }
         free(tmp);
@@ -324,7 +363,8 @@ int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *buffer, pmix_n
         if (PMIX_SUCCESS != (ret = PMIx_generate_ppn(tmp, &regex))) {
             PMIX_ERROR_LOG(ret);
             free(tmp);
-            PMIX_INFO_FREE(cd.info, cd.ninfo);
+            /* list and procs were already freed above */
+            PMIX_INFO_LIST_RELEASE(ilist);
             return prte_pmix_convert_status(ret);
         }
         free(tmp);
@@ -365,36 +405,130 @@ int prte_odls_base_default_get_add_procs_data(pmix_data_buffer_t *buffer, pmix_n
     }
     /* convert the job info into an array */
     PMIX_INFO_LIST_CONVERT(ret, ilist, &darray);
-    cd.info = (pmix_info_t *) darray.array;
-    cd.ninfo = darray.size;
     PMIX_INFO_LIST_RELEASE(ilist);
 
-    /* we don't want to block here because it could
-     * take some indeterminate time to get the info */
-    rc = PRTE_SUCCESS;
-    cd.jdata = jdata;
-    PRTE_PMIX_CONSTRUCT_LOCK(&cd.lock);
-    ret = PMIx_server_setup_application(jdata->nspace, cd.info, cd.ninfo,
-                                        setup_cbfunc, &cd);
+    /* do not block waiting for the answer as it could take some
+     * indeterminate time to get the info - the callback will
+     * thread-shift, complete the launch message, and activate
+     * the next state */
+    cd = PMIX_NEW(prte_odls_jcaddy_t);
+    cd->jdata = jdata;
+    cd->info = (pmix_info_t *) darray.array;
+    cd->ninfo = darray.size;
+    ret = PMIx_server_setup_application(jdata->nspace, cd->info, cd->ninfo,
+                                        setup_cbfunc, cd);
     if (PMIX_SUCCESS != ret) {
         pmix_output(0, "[%s:%d] PMIx_server_setup_application failed: %s", __FILE__, __LINE__,
                     PMIx_Error_string(ret));
-        rc = PRTE_ERROR;
-    } else {
-        PRTE_PMIX_WAIT_THREAD(&cd.lock);
+        /* the callback will never fire - releasing the caddy
+         * also releases the info array */
+        PMIX_RELEASE(cd);
+        return PRTE_ERROR;
     }
-    PRTE_PMIX_DESTRUCT_LOCK(&cd.lock);
-    return rc;
+    return PRTE_SUCCESS;
+}
+
+static void _local_support_complete(int sd, short args, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    PMIX_ACQUIRE_OBJECT(cd);
+
+    /* the local support is in place - we can now launch the
+     * local procs */
+    PRTE_ACTIVATE_LOCAL_LAUNCH(cd->jdata->nspace, cd->fork_local);
+
+    /* releasing the caddy also releases the setup info */
+    PMIX_RELEASE(cd);
 }
 
 static void ls_cbunc(pmix_status_t status, void *cbdata)
 {
-    prte_pmix_lock_t *lock = (prte_pmix_lock_t *) cbdata;
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(status);
-    PRTE_PMIX_WAKEUP_THREAD(lock);
+
+    /* this callback executes on the PMIx progress thread - shift
+     * to our progress thread before proceeding with the launch */
+    prte_event_set(prte_event_base, &cd->ev, -1, PRTE_EV_WRITE, _local_support_complete, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&cd->ev, PRTE_EV_WRITE, 1);
 }
 
-int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix_nspace_t *job)
+/* join point for the nspace registrations - once they have all
+ * reported, proceed with the local support setup and launch.
+ * Executes on the PRRTE progress thread */
+static void job_reg_join(prte_odls_jcaddy_t *cd)
+{
+    pmix_status_t ret;
+
+    cd->pending--;
+    if (0 < cd->pending) {
+        return;
+    }
+
+    /* all registrations have reported */
+    if (PMIX_SUCCESS != cd->rstatus) {
+        /* report an error back to the HNP so we don't just hang
+         * while it waits to hear that our local procs launched */
+        PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
+        PMIX_RELEASE(cd);
+        return;
+    }
+
+    /* if we have local support setup info, then execute it here - we
+     * have to do so AFTER we register the nspace so the PMIx server
+     * has the nspace info it needs */
+    if (0 < cd->ninfo) {
+        /* do not block waiting for the answer - the callback will
+         * thread-shift and activate the local launch once the
+         * support is in place */
+        ret = PMIx_server_setup_local_support(cd->jdata->nspace, cd->info, cd->ninfo,
+                                              ls_cbunc, cd);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            PRTE_ACTIVATE_JOB_STATE(cd->jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
+            PMIX_RELEASE(cd);
+            return;
+        }
+        /* spin up the spawn threads */
+        prte_odls_base_start_threads(cd->jdata);
+        return;
+    }
+
+    /* spin up the spawn threads */
+    prte_odls_base_start_threads(cd->jdata);
+
+    /* no local support setup is required, so we can proceed
+     * directly to launching the local procs */
+    PRTE_ACTIVATE_LOCAL_LAUNCH(cd->jdata->nspace, cd->fork_local);
+    PMIX_RELEASE(cd);
+}
+
+static void _prior_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        /* not fatal - the job is already running elsewhere */
+        PMIX_ERROR_LOG(status);
+    }
+    job_reg_join(cd);
+}
+
+static void _job_reg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_odls_jcaddy_t *cd = (prte_odls_jcaddy_t *) cbdata;
+
+    if (PMIX_SUCCESS != status) {
+        PMIX_ERROR_LOG(status);
+        cd->rstatus = status;
+    }
+    job_reg_join(cd);
+}
+
+int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix_nspace_t *job,
+                                                prte_odls_base_fork_local_proc_fn_t fork_local)
 {
     int rc;
     int32_t cnt;
@@ -406,7 +540,9 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
     prte_proc_t *pptr, *dmn;
     prte_app_context_t *app;
     int8_t flag;
-    prte_pmix_lock_t lock;
+    prte_odls_jcaddy_t *cd;
+    pmix_pointer_array_t priorjobs;
+    prte_job_t *jptr;
     pmix_info_t *info = NULL;
     size_t ninfo = 0;
     pmix_status_t ret;
@@ -422,9 +558,13 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
     /* set a default response */
     PMIX_LOAD_NSPACE(*job, NULL);
 
+    /* setup to track any prior jobs that must be registered
+     * with the PMIx server */
+    PMIX_CONSTRUCT(&priorjobs, pmix_pointer_array_t);
+    pmix_pointer_array_init(&priorjobs, 1, INT_MAX, 8);
+
     /* get the daemon job object */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    PRTE_PMIX_CONSTRUCT_LOCK(&lock);
 
     /* unpack the flag to see if new daemons were launched */
     cnt = 1;
@@ -464,6 +604,8 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
                 rc = prte_pmix_convert_status(rc);
+                PMIX_DATA_BUFFER_DESTRUCT(&jdbuf);
+                PMIX_DATA_BUFFER_DESTRUCT(&dbuf);
                 goto REPORT_ERROR;
             }
             /* unpack each job and add it to the local prte_job_data array */
@@ -508,8 +650,7 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
                         PMIX_DATA_BUFFER_DESTRUCT(&jdbuf);
                         goto REPORT_ERROR;
                     }
-                    /* connect the two */
-                    PMIX_RETAIN(dmn->node);
+                    /* connect the two - the node backpointer is borrowed */
                     pptr->node = dmn->node;
 
                     /* add the node to the job map, if needed */
@@ -532,11 +673,9 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
                     }
 
                 }
-                // now register this job
-                rc = prte_pmix_server_register_nspace(jdata);
-                if (PRTE_SUCCESS != rc) {
-                    PRTE_ERROR_LOG(rc);
-                }
+                // stash this job for registration with the PMIx
+                // server once we reach the registration point below
+                pmix_pointer_array_add(&priorjobs, jdata);
             }
             /* release the buffer */
             PMIX_DATA_BUFFER_DESTRUCT(&jdbuf);
@@ -590,7 +729,8 @@ next:
         if (NULL == jdata->schizo) {
             pmix_show_help("help-schizo-base.txt", "no-proxy", true,
                            prte_tool_basename, "NULL");
-            return 1;
+            rc = PRTE_ERR_NOT_FOUND;
+            goto REPORT_ERROR;
         }
     } else {
         prte_set_job_data_object(jdata);
@@ -612,7 +752,8 @@ next:
             if (NULL != tmp) {
                 free(tmp);
             }
-            return 1;
+            rc = PRTE_ERR_NOT_FOUND;
+            goto REPORT_ERROR;
         }
         if (NULL != tmp) {
             free(tmp);
@@ -652,33 +793,43 @@ next:
             goto REPORT_ERROR;
         }
         PMIX_DATA_BUFFER_DESTRUCT(&pbuf);
-        /* add any cache'd values to the front of the job attributes  */
-        for (m = 0; m < ninfo; m++) {
-            if (0 == strcmp(info[m].key, PMIX_SET_ENVAR)) {
-                envt.envar = info[m].value.data.envar.envar;
-                envt.value = info[m].value.data.envar.value;
-                envt.separator = info[m].value.data.envar.separator;
+        /* Add any cache'd values to the FRONT of the job attributes: these
+         * come from PMIx_server_setup_application, and the user's own
+         * directives - which arrive on the job already - have to be applied
+         * after them so the user's wins.
+         *
+         * Walk the array in REVERSE to do it. Prepending a block one entry
+         * at a time reverses that block, and these are envar directives:
+         * PREPEND/APPEND edit an existing value, so the order they are
+         * applied in is the value the process ends up with. */
+        for (m = ninfo; m > 0; m--) {
+            size_t idx = m - 1;
+            pmix_info_t *iptr = &info[idx];
+            if (0 == strcmp(iptr->key, PMIX_SET_ENVAR)) {
+                envt.envar = iptr->value.data.envar.envar;
+                envt.value = iptr->value.data.envar.value;
+                envt.separator = iptr->value.data.envar.separator;
                 prte_prepend_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR, PRTE_ATTR_GLOBAL,
                                        &envt, PMIX_ENVAR);
-            } else if (0 == strcmp(info[m].key, PMIX_ADD_ENVAR)) {
-                envt.envar = info[m].value.data.envar.envar;
-                envt.value = info[m].value.data.envar.value;
-                envt.separator = info[m].value.data.envar.separator;
+            } else if (0 == strcmp(iptr->key, PMIX_ADD_ENVAR)) {
+                envt.envar = iptr->value.data.envar.envar;
+                envt.value = iptr->value.data.envar.value;
+                envt.separator = iptr->value.data.envar.separator;
                 prte_prepend_attribute(&jdata->attributes, PRTE_JOB_ADD_ENVAR, PRTE_ATTR_GLOBAL,
                                        &envt, PMIX_ENVAR);
-            } else if (0 == strcmp(info[m].key, PMIX_UNSET_ENVAR)) {
+            } else if (0 == strcmp(iptr->key, PMIX_UNSET_ENVAR)) {
                 prte_prepend_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR, PRTE_ATTR_GLOBAL,
-                                       info[m].value.data.string, PMIX_STRING);
-            } else if (0 == strcmp(info[m].key, PMIX_PREPEND_ENVAR)) {
-                envt.envar = info[m].value.data.envar.envar;
-                envt.value = info[m].value.data.envar.value;
-                envt.separator = info[m].value.data.envar.separator;
+                                       iptr->value.data.string, PMIX_STRING);
+            } else if (0 == strcmp(iptr->key, PMIX_PREPEND_ENVAR)) {
+                envt.envar = iptr->value.data.envar.envar;
+                envt.value = iptr->value.data.envar.value;
+                envt.separator = iptr->value.data.envar.separator;
                 prte_prepend_attribute(&jdata->attributes, PRTE_JOB_PREPEND_ENVAR, PRTE_ATTR_GLOBAL,
                                        &envt, PMIX_ENVAR);
-            } else if (0 == strcmp(info[m].key, PMIX_APPEND_ENVAR)) {
-                envt.envar = info[m].value.data.envar.envar;
-                envt.value = info[m].value.data.envar.value;
-                envt.separator = info[m].value.data.envar.separator;
+            } else if (0 == strcmp(iptr->key, PMIX_APPEND_ENVAR)) {
+                envt.envar = iptr->value.data.envar.envar;
+                envt.value = iptr->value.data.envar.value;
+                envt.separator = iptr->value.data.envar.separator;
                 prte_prepend_attribute(&jdata->attributes, PRTE_JOB_APPEND_ENVAR, PRTE_ATTR_GLOBAL,
                                        &envt, PMIX_ENVAR);
             }
@@ -714,7 +865,7 @@ next:
                 rc = PRTE_ERR_NOT_FOUND;
                 goto REPORT_ERROR;
             }
-            PMIX_RETAIN(dmn->node);
+            /* the node backpointer is borrowed, not retained */
             pptr->node = dmn->node;
             /* add the node to the job map, if needed */
             if (!PRTE_FLAG_TEST(pptr->node, PRTE_NODE_FLAG_MAPPED)) {
@@ -769,46 +920,51 @@ next:
         }
     }
 
-    /* register this job with the PMIx server - need to wait until after we
-     * have computed the #local_procs before calling the function */
-    if (PRTE_SUCCESS != (rc = prte_pmix_server_register_nspace(jdata))) {
-        PRTE_ERROR_LOG(rc);
-        goto REPORT_ERROR;
-    }
+    /* create the caddy that carries the launch through the
+     * asynchronous registrations and local support setup */
+    cd = PMIX_NEW(prte_odls_jcaddy_t);
+    cd->jdata = jdata;
+    cd->info = info;
+    cd->ninfo = ninfo;
+    cd->fork_local = fork_local;
+    info = NULL; // the caddy now owns the info array
 
-    /* if we have local support setup info, then execute it here - we
-     * have to do so AFTER we register the nspace so the PMIx server
-     * has the nspace info it needs */
-    if (0 < ninfo) {
-        ret = PMIx_server_setup_local_support(jdata->nspace, info, ninfo,
-                                              ls_cbunc, &lock);
-        if (PMIX_SUCCESS != ret) {
-            PMIX_ERROR_LOG(ret);
-            rc = PRTE_ERROR;
-            goto REPORT_ERROR;
+    /* register this job - and any prior jobs a newly-launched
+     * daemon needs to know about - with the PMIx server. We have
+     * to wait until after we computed the #local_procs before
+     * registering this job. The registrations complete
+     * asynchronously, and the launch proceeds once all have
+     * reported. Hold a sentinel on the join so it cannot fire
+     * before we finish initiating the registrations */
+    cd->pending = 1;
+    for (n = 0; n < priorjobs.size; n++) {
+        jptr = (prte_job_t *) pmix_pointer_array_get_item(&priorjobs, n);
+        if (NULL == jptr) {
+            continue;
         }
+        rc = prte_pmix_server_register_nspace(jptr, _prior_reg_complete, cd);
+        if (PRTE_SUCCESS == rc) {
+            cd->pending++;
+        } else {
+            /* not fatal - just note it */
+            PRTE_ERROR_LOG(rc);
+        }
+    }
+    PMIX_DESTRUCT(&priorjobs);
+    rc = prte_pmix_server_register_nspace(jdata, _job_reg_complete, cd);
+    if (PRTE_SUCCESS == rc) {
+        cd->pending++;
     } else {
-        lock.active = false; // we won't get a callback
+        PRTE_ERROR_LOG(rc);
+        cd->rstatus = PMIX_ERROR;
     }
-
-    /* spin up the spawn threads */
-    prte_odls_base_start_threads(jdata);
-
-    /* to save memory, purge the job map of all procs other than
-     * our own - for daemons, this will completely release the
-     * proc structures. For the HNP, the proc structs will
-     * remain in the prte_job_t array */
-
-    /* wait here until the local support has been setup */
-    PRTE_PMIX_WAIT_THREAD(&lock);
-    PRTE_PMIX_DESTRUCT_LOCK(&lock);
-    if (NULL != info) {
-        PMIX_INFO_FREE(info, ninfo);
-    }
+    /* release our sentinel - if everything already reported,
+     * this progresses the launch */
+    job_reg_join(cd);
     return PRTE_SUCCESS;
 
 REPORT_ERROR:
-    PRTE_PMIX_DESTRUCT_LOCK(&lock);
+    PMIX_DESTRUCT(&priorjobs);
     if (NULL != info) {
         PMIX_INFO_FREE(info, ninfo);
     }
@@ -822,17 +978,22 @@ REPORT_ERROR:
     return rc;
 }
 
-static int setup_path(prte_app_context_t *app, char **wdir)
+static int setup_path(prte_job_t *job, prte_app_context_t *app, char **wdir)
 {
     int rc = PRTE_SUCCESS;
     char dir[PRTE_PATH_MAX];
     char *session_dir;
     bool usercwd = false;
-    prte_job_t *job;
 
     if (prte_get_attribute(&app->attributes, PRTE_APP_SSNDIR_CWD, NULL, PMIX_BOOL)) {
-        /* move us to that location */
-        job = (prte_job_t*)app->job;
+        /* move us to that location. Use the job handed in by our caller: the
+         * app->job back-pointer is a raw pointer that is never serialized into
+         * the launch message, so it is NULL on any daemon that unpacked this
+         * job - dereferencing it segfaults (it is only set on the HNP).
+         */
+        if (NULL == job) {
+            return PRTE_ERROR;
+        }
         session_dir = job->session_dir;
         if (NULL == session_dir) {
             // cannot do it
@@ -847,6 +1008,11 @@ static int setup_path(prte_app_context_t *app, char **wdir)
          */
         if (NULL == getcwd(dir, sizeof(dir))) {
             return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+        /* free any prior value before overwriting - our caller may pass
+         * &app->cwd, which already holds an owned string */
+        if (NULL != *wdir) {
+            free(*wdir);
         }
         *wdir = strdup(dir);
         PMIx_Setenv("PWD", dir, true, &app->env);
@@ -879,6 +1045,10 @@ static int setup_path(prte_app_context_t *app, char **wdir)
          */
         if (NULL == getcwd(dir, sizeof(dir))) {
             return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+        /* free any prior value before overwriting (see note above) */
+        if (NULL != *wdir) {
+            free(*wdir);
         }
         *wdir = strdup(dir);
         PMIx_Setenv("PWD", dir, true, &app->env);
@@ -957,6 +1127,7 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
         // if we aren't spawning the apps, then just mark them as
         // terminated and return
         PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_TERMINATED);
+        PMIX_RELEASE(cd);
         return;
     }
 
@@ -1082,6 +1253,10 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
         free(output);
     }
 
+    /* compute this child's binding in the parent, before the fork, so the
+       async-signal-safe child only has to issue the bind syscalls */
+    prte_odls_base_prepare_binding(cd);
+
     if (PRTE_SUCCESS != (rc = cd->fork_local(cd))) {
         /* error message already output */
         state = PRTE_PROC_STATE_FAILED_TO_START;
@@ -1108,17 +1283,81 @@ errorout:
     PMIX_RELEASE(cd);
 }
 
+/*
+ * If this "NAME=value" environment entry is for exactly this variable,
+ * return its value; otherwise NULL.
+ *
+ * The name has to be matched up to - and including - the '='.  A bare
+ * strncmp() of the name's length matches any variable that merely STARTS
+ * with it, so "--prepend-env PATH[:] /foo" would edit PATHEXT (or
+ * PATH_SEPARATOR, or the user's own PATHOLOGY) instead of, or as well as,
+ * PATH - whichever the environment happened to list first.
+ */
+static char *envar_value(char *entry, const char *name)
+{
+    size_t len = strlen(name);
+
+    if (0 != strncmp(entry, name, len) || '=' != entry[len]) {
+        return NULL;
+    }
+    return entry + len + 1;
+}
+
+/*
+ * Remove a variable from the app's environment.  A trailing '*' makes the
+ * name a prefix: every variable that starts with it goes.
+ */
+static void unset_envar(const char *name, prte_app_context_t *app)
+{
+    char *ptr, *tmp, *p2;
+    size_t n;
+
+    if (NULL == name) {
+        return;
+    }
+    if (NULL == strchr(name, '*')) {
+        pmix_unsetenv((char *) name, &app->env);
+        return;
+    }
+    ptr = strdup(name);
+    ptr[strlen(ptr) - 1] = '\0'; // trim off the '*'
+    for (n = 0; NULL != app->env[n]; n++) {
+        if (0 == strncmp(app->env[n], ptr, strlen(ptr))) {
+            // find the '=' sign
+            tmp = strdup(app->env[n]);
+            p2 = strchr(tmp, '=');
+            if (NULL != p2) {
+                *p2 = '\0';
+                pmix_unsetenv(tmp, &app->env);
+            }
+            free(tmp);
+            /* the entry we just removed shifted the array down, so re-check
+             * this index rather than stepping past the new occupant */
+            --n;
+        }
+    }
+    free(ptr);
+}
+
 static void process_envars(prte_job_t *jdata,
                            prte_app_context_t *app)
 {
     prte_attribute_t *attr;
     pmix_value_t *val;
     pmix_envar_t *envar;
-    char *ptr, *tmp, *p2;
+    char *ptr, *tmp;
     size_t n;
     bool found;
 
     PMIX_LIST_FOREACH(attr, &jdata->attributes, prte_attribute_t) {
+        /* UNSET names a variable, so it is carried as a STRING, not as a
+         * pmix_envar_t - it has to be handled BEFORE the PMIX_ENVAR type
+         * filter below, and read out of data.string.  Filtered out first
+         * (and read as an envar), --unset-env quietly did nothing. */
+        if (attr->key == PRTE_JOB_UNSET_ENVAR) {
+            unset_envar(attr->data.data.string, app);
+            continue;
+        }
         if (PMIX_ENVAR != attr->data.type) {
             continue;
         }
@@ -1130,35 +1369,14 @@ static void process_envars(prte_job_t *jdata,
         } else if (attr->key == PRTE_JOB_ADD_ENVAR) {
             PMIx_Setenv(envar->envar, envar->value, true, &app->env);
 
-        } else if (attr->key == PRTE_JOB_UNSET_ENVAR) {
-            // need to support the wildcard here
-            if (NULL != strchr(envar->envar, '*')) {
-                ptr = strdup(envar->envar);
-                ptr[strlen(ptr)-1] = '\0';  // trim off the '*'
-                for (n=0; NULL != app->env[n]; n++) {
-                    if (0 == strncmp(app->env[n], ptr, strlen(ptr))) {
-                        // find the '=' sign
-                        tmp = strdup(app->env[n]);
-                        p2 = strchr(tmp, '=');
-                        *p2 = '\0';
-                        pmix_unsetenv(tmp, &app->env);
-                        free(tmp);
-                    }
-                }
-                free(ptr);
-            } else {
-                pmix_unsetenv(envar->envar, &app->env);
-            }
-
         } else if (attr->key == PRTE_JOB_PREPEND_ENVAR) {
             // see if this envar exists
             ptr = NULL;
             found = false;
             for (n=0; NULL != app->env[n]; n++) {
-                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
-                    // find the value - this is a copied env, so we can modify
-                    ptr = strchr(app->env[n], '=');
-                    ++ptr; // step over the '='
+                ptr = envar_value(app->env[n], envar->envar);
+                if (NULL != ptr) {
+                    // this is a copied env, so we can modify it
                     pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, envar->value, envar->separator, ptr);
                     free(app->env[n]);
                     app->env[n] = tmp;
@@ -1176,10 +1394,9 @@ static void process_envars(prte_job_t *jdata,
             ptr = NULL;
             found = false;
             for (n=0; NULL != app->env[n]; n++) {
-                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
-                    // find the value - this is a copied env, so we can modify
-                    ptr = strchr(app->env[n], '=');
-                    ++ptr; // step over the '='
+                ptr = envar_value(app->env[n], envar->envar);
+                if (NULL != ptr) {
+                    // this is a copied env, so we can modify it
                     pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, ptr, envar->separator, envar->value);
                     free(app->env[n]);
                     app->env[n] = tmp;
@@ -1196,6 +1413,11 @@ static void process_envars(prte_job_t *jdata,
 
     // app trumps job, so do it after the job
     PMIX_LIST_FOREACH(attr, &app->attributes, prte_attribute_t) {
+        /* see the note on UNSET in the job loop above */
+        if (attr->key == PRTE_APP_UNSET_ENVAR) {
+            unset_envar(attr->data.data.string, app);
+            continue;
+        }
         if (PMIX_ENVAR != attr->data.type) {
             continue;
         }
@@ -1207,18 +1429,14 @@ static void process_envars(prte_job_t *jdata,
         } else if (attr->key == PRTE_APP_ADD_ENVAR) {
             PMIx_Setenv(envar->envar, envar->value, true, &app->env);
 
-        } else if (attr->key == PRTE_APP_UNSET_ENVAR) {
-            pmix_unsetenv(envar->envar, &app->env);
-
         } else if (attr->key == PRTE_APP_PREPEND_ENVAR) {
             // see if this envar exists
             ptr = NULL;
             found = false;
             for (n=0; NULL != app->env[n]; n++) {
-                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
-                    // find the value - this is a copied env, so we can modify
-                    ptr = strchr(app->env[n], '=');
-                    ++ptr; // step over the '='
+                ptr = envar_value(app->env[n], envar->envar);
+                if (NULL != ptr) {
+                    // this is a copied env, so we can modify it
                     pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, envar->value, envar->separator, ptr);
                     free(app->env[n]);
                     app->env[n] = tmp;
@@ -1236,10 +1454,9 @@ static void process_envars(prte_job_t *jdata,
             ptr = NULL;
             found = false;
             for (n=0; NULL != app->env[n]; n++) {
-                if (0 == strncmp(app->env[n], envar->envar, strlen(envar->envar))) {
-                    // find the value - this is a copied env, so we can modify
-                    ptr = strchr(app->env[n], '=');
-                    ++ptr; // step over the '='
+                ptr = envar_value(app->env[n], envar->envar);
+                if (NULL != ptr) {
+                    // this is a copied env, so we can modify it
                     pmix_asprintf(&tmp, "%s=%s%c%s", envar->envar, ptr, envar->separator, envar->value);
                     free(app->env[n]);
                     app->env[n] = tmp;
@@ -1254,7 +1471,6 @@ static void process_envars(prte_job_t *jdata,
         }
     }
 }
-
 
 void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
 {
@@ -1288,8 +1504,15 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
      * to this place as our default directory
      */
     if (NULL == getcwd(basedir, sizeof(basedir))) {
-        PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
-        goto ERROR_OUT;
+        /* basedir is unusable, so do NOT fall through to ERROR_OUT (which
+         * would chdir() to an uninitialized buffer). Fail the job we were
+         * asked to launch and release the caddy directly. */
+        PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+        if (NULL != (jobdat = prte_get_job_data_object(job))) {
+            PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
+        }
+        PMIX_RELEASE(caddy);
+        return;
     }
     /* find the jobdat for this job */
     if (NULL == (jobdat = prte_get_job_data_object(job))) {
@@ -1382,7 +1605,7 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
         /* setup the working directory for this app - will jump us
          * to that directory
          */
-        if (PRTE_SUCCESS != (rc = setup_path(app, &app->cwd))) {
+        if (PRTE_SUCCESS != (rc = setup_path(jobdat, app, &app->cwd))) {
             PMIX_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
                                  "%s odls:launch:setup_path failed with error %s(%d)",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_ERROR_NAME(rc), rc));
@@ -1393,7 +1616,7 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
              * to flag all the other procs from the app_context as having "not failed"
              * so we can report things out correctly
              */
-            PRTE_ODLS_SET_ERROR(job, PMIX_ERR_SYS_LIMITS_FILES, j);
+            PRTE_ODLS_SET_ERROR(job, rc, j);
             PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
             goto GETOUT;
         }
@@ -1417,57 +1640,33 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
                                  "%s odls:launch:setup_fork failed with error %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_ERROR_NAME(rc)));
 
-            /* do not ERROR_LOG this failure - it will be reported
-             * elsewhere. The launch is going to fail. Since we could have
-             * multiple app_contexts, we need to ensure that we flag only
-             * the correct one that caused this operation to fail. We then have
-             * to flag all the other procs from the app_context as having "not failed"
-             * so we can report things out correctly
-             */
-            /* cycle through children to find those for this jobid */
-            for (idx = 0; idx < prte_local_children->size; idx++) {
-                child = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, idx);
-                if (NULL == child) {
-                    continue;
-                }
-                if (PMIX_CHECK_NSPACE(job, child->name.nspace) && j == (int) child->app_idx) {
-                    child->exit_code = PRTE_PROC_STATE_FAILED_TO_LAUNCH;
-                    PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
-                }
-            }
+            /* do not ERROR_LOG this failure - it will be reported elsewhere.
+             * Flag this app's procs as failed (with the correct error code),
+             * then drive the whole job down. Aborting the job as a whole -
+             * rather than just failing this app's procs - is what keeps a
+             * multi-app launch from hanging: any procs belonging to apps we
+             * have not reached yet would otherwise be left in INIT forever,
+             * and on a real daemon the errmgr only reports FAILED_TO_LAUNCH
+             * once every local proc has been accounted for. */
+            PRTE_ODLS_SET_ERROR(job, rc, j);
+            PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
             goto GETOUT;
         }
 
         /* setup any local files that were prepositioned for us */
         if (PRTE_SUCCESS != (rc = prte_filem.link_local_files(jobdat, app))) {
-            /* cycle through children to find those for this jobid */
-            for (idx = 0; idx < prte_local_children->size; idx++) {
-                child = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, idx);
-                if (NULL == child) {
-                    continue;
-                }
-                if (PMIX_CHECK_NSPACE(job, child->name.nspace) && j == (int) child->app_idx) {
-                    child->exit_code = rc;
-                    PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
-                }
-            }
+            /* flag this app's procs and abort the whole job (see setup_fork) */
+            PRTE_ODLS_SET_ERROR(job, rc, j);
+            PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
             goto GETOUT;
         }
 
         rc = pmix_util_check_context_app(&app->app, app->cwd, app->env);
         /* do not ERROR_LOG - it will be reported elsewhere */
         if (PMIX_SUCCESS != rc) {
-            /* cycle through children to find those for this jobid */
-            for (idx = 0; idx < prte_local_children->size; idx++) {
-                child = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, idx);
-                if (NULL == child) {
-                    continue;
-                }
-                if (PMIX_CHECK_NSPACE(job, child->name.nspace) && j == (int) child->app_idx) {
-                    child->exit_code = rc;
-                    PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
-                }
-            }
+            /* flag this app's procs and abort the whole job (see setup_fork) */
+            PRTE_ODLS_SET_ERROR(job, rc, j);
+            PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
             goto GETOUT;
         }
 
@@ -1475,17 +1674,9 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
         if (PRTE_SUCCESS != (rc = prte_util_init_sys_limits(&msg))) {
             pmix_show_help("help-prte-odls-default.txt", "set limit", true,
                            prte_process_info.nodename, app, __FILE__, __LINE__, msg);
-            /* cycle through children to find those for this jobid */
-            for (idx = 0; idx < prte_local_children->size; idx++) {
-                child = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, idx);
-                if (NULL == child) {
-                    continue;
-                }
-                if (PMIX_CHECK_NSPACE(job, child->name.nspace) && j == (int) child->app_idx) {
-                    child->exit_code = rc;
-                    PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
-                }
-            }
+            /* flag this app's procs and abort the whole job (see setup_fork) */
+            PRTE_ODLS_SET_ERROR(job, rc, j);
+            PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
             goto GETOUT;
         }
 
@@ -1497,7 +1688,12 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
          * to their current location
          */
         if (0 != chdir(basedir)) {
-            PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
+            /* NOTE: we are still in the per-app loop, before the per-child
+             * loop that assigns "child", so "child" may be NULL (first app)
+             * or a stale proc from a prior app - do not dereference it. Fail
+             * the job as a whole. */
+            PRTE_ODLS_SET_ERROR(job, PRTE_ERR_NOT_FOUND, j);
+            PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
             goto GETOUT;
         }
 
@@ -1552,12 +1748,28 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  PRTE_NAME_PRINT(&child->name)));
 
-            /* determine the thread that will handle this child */
-            ++prte_odls_globals.next_base;
-            if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
-                prte_odls_globals.next_base = 0;
+            /* determine the thread that will handle this child.
+             *
+             * STOP_ON_EXEC requires that the SAME thread which calls fork()
+             * (and thereby becomes the ptrace(2) tracer of the child) also
+             * performs the later ptrace(PTRACE_DETACH) call - ptrace control
+             * operations are only permitted from the exact tracer thread,
+             * even though waitpid() for the same status is visible to any
+             * thread in the process.  Our STOP_ON_EXEC detach happens in
+             * wait_local_proc(), which always runs on prte_event_base, so
+             * force the fork onto that same base instead of handing it to
+             * one of the odls worker threads - otherwise the PTRACE_DETACH
+             * call fails (ESRCH) once the local proc count reaches the
+             * worker-thread-pool cutoff. */
+            if (prte_get_attribute(&jobdat->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL)) {
+                evb = prte_event_base;
+            } else {
+                ++prte_odls_globals.next_base;
+                if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
+                    prte_odls_globals.next_base = 0;
+                }
+                evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
             }
-            evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
 
             /* set the waitpid callback here for thread protection and
              * to ensure we can capture the callback on shortlived apps */
@@ -1587,6 +1799,10 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
                 child->exit_code = rc;
                 PMIX_RELEASE(cd);
                 PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
+                /* abort the whole job (see setup_fork): other children of
+                 * this app - and later apps - that we will now never launch
+                 * must not be left to strand it */
+                PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
                 goto GETOUT;
             }
             if (PRTE_FLAG_TEST(jobdat, PRTE_JOB_FLAG_FORWARD_OUTPUT)) {
@@ -1594,8 +1810,11 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
                 rc = prte_iof_base_setup_parent(&child->name, &cd->opts);
                 if (PRTE_SUCCESS != rc) {
                     PRTE_ERROR_LOG(rc);
+                    child->exit_code = rc;
                     PMIX_RELEASE(cd);
                     PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
+                    /* abort the whole job (see setup_fork) */
+                    PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
                     goto GETOUT;
                 }
             }
@@ -1753,6 +1972,46 @@ void prte_odls_base_default_wait_local_proc(int fd, short sd, void *cbdata)
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name)));
         goto MOVEON;
     }
+
+#if PRTE_HAVE_STOP_ON_EXEC
+    /* If the child stopped due to the ptrace TRACEME+exec SIGTRAP, this is the
+     * stop-on-exec debug-attach point.  The wait_signal_callback consumed the
+     * ptrace-stop notification before do_parent could see it; handle it here
+     * instead.  Detach with SIGSTOP injected so the child stays stopped for
+     * the debugger, re-register for its eventual exit, and fire READY_FOR_DEBUG.
+     * Do NOT fall through to the exit-handling logic below. */
+    if (WIFSTOPPED(proc->exit_code) && WSTOPSIG(proc->exit_code) == SIGTRAP) {
+        if (NULL != jobdat &&
+            prte_get_attribute(&jobdat->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL)) {
+            PMIX_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
+                                 "%s odls:waitpid_fired ptrace-stop for %s, detaching with SIGSTOP",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_NAME_PRINT(&proc->name)));
+            errno = 0;
+#    if PRTE_HAVE_LINUX_PTRACE
+            ptrace(PRTE_DETACH, proc->pid, 0, (void *) SIGSTOP);
+#    else
+            ptrace(PRTE_DETACH, proc->pid, 0, SIGSTOP);
+#    endif
+            if (0 != errno) {
+                PMIX_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
+                                     "%s odls:waitpid_fired ptrace detach failed for %s: %s",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                     PRTE_NAME_PRINT(&proc->name), strerror(errno)));
+                state = PRTE_PROC_STATE_FAILED_TO_START;
+                PRTE_FLAG_UNSET(proc, PRTE_PROC_FLAG_ALIVE);
+                goto MOVEON;
+            }
+            proc->state = PRTE_PROC_STATE_RUNNING;
+            PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_ALIVE);
+            /* re-register to catch the child's eventual exit after the debugger releases it */
+            prte_wait_cb(proc, prte_odls_base_default_wait_local_proc, NULL);
+            PRTE_ACTIVATE_PROC_STATE(&proc->name, PRTE_PROC_STATE_READY_FOR_DEBUG);
+            PMIX_RELEASE(t2);
+            return;
+        }
+    }
+#endif
 
     /* determine the state of this process */
     if (WIFEXITED(proc->exit_code)) {
@@ -2171,7 +2430,7 @@ int prte_odls_base_default_restart_proc(prte_proc_t *child,
     }
 
     /* setup the path */
-    if (PRTE_SUCCESS != (rc = setup_path(app, &wdir))) {
+    if (PRTE_SUCCESS != (rc = setup_path(jobdat, app, &wdir))) {
         PRTE_ERROR_LOG(rc);
         if (NULL != wdir) {
             free(wdir);
@@ -2217,11 +2476,17 @@ int prte_odls_base_default_restart_proc(prte_proc_t *child,
             goto CLEANUP;
         }
     }
-    ++prte_odls_globals.next_base;
-    if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
-        prte_odls_globals.next_base = 0;
+    /* see comment in launch_local_procs() regarding STOP_ON_EXEC + ptrace
+     * tracer-thread affinity */
+    if (prte_get_attribute(&jobdat->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL)) {
+        evb = prte_event_base;
+    } else {
+        ++prte_odls_globals.next_base;
+        if (prte_odls_globals.num_threads <= prte_odls_globals.next_base) {
+            prte_odls_globals.next_base = 0;
+        }
+        evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
     }
-    evb = prte_odls_globals.ev_bases[prte_odls_globals.next_base];
     prte_wait_cb(child, prte_odls_base_default_wait_local_proc, NULL);
 
     PMIX_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output, "%s restarting app %s",

@@ -67,8 +67,31 @@ typedef uint8_t prte_app_context_flags_t;
 #define PRTE_APP_PSET_NAME          23 // string - user-assigned name for the process
                                        //          set containing the given process
 #define PRTE_APP_PES_PER_PROC       24 // uint16_t - number of cpus to be assigned to each process
-#define PRTE_APP_PPR                25 // uint16_t - number of procs to place on the resource specified
-                                       //           in the job ppr string
+#define PRTE_APP_PPR                25 // string - this app's ppr pattern, "N:object", in the same
+                                       //          spelling as the job-level PRTE_JOB_PPR. The object
+                                       //          is part of the pattern: an app that asks for
+                                       //          "2:package" is not asking for the job's object
+                                       //          twice per node
+#define PRTE_APP_MAPBY              26 /* uint16_t mapping policy enum */
+#define PRTE_APP_RANKBY             27 /* uint16_t ranking policy enum */
+#define PRTE_APP_BINDTO             28 /* uint16_t binding policy enum */
+#define PRTE_APP_MAP_FILE           29 /* char* path to seq or rankfile */
+#define PRTE_APP_DIST_DEVICE        30 /* char* dist device name */
+#define PRTE_APP_HWT_CPUS           31 /* bool: use hwthreads as CPUs */
+#define PRTE_APP_CORE_CPUS          32 /* bool: use cores as CPUs */
+#define PRTE_APP_CPUSET             33 /* char* comma-delimited CPU ranges */
+#define PRTE_APP_BINDING_LIMIT      34 /* uint16_t max procs per binding target */
+/* effective map/rank/bind policies resolved for this app during per-app
+ * dispatch, recorded so the map display can show per-app policy lines. Local
+ * to the HNP - never packed/sent. */
+#define PRTE_APP_RESOLVED_MAPBY     35 /* uint16_t resolved mapping policy */
+#define PRTE_APP_RESOLVED_RANKBY    36 /* uint16_t resolved ranking policy */
+#define PRTE_APP_RESOLVED_BINDTO    37 /* uint16_t resolved binding policy */
+/* the mapping component that placed this app, recorded by the rmaps base once
+ * a mapper accepts it. There is no matching "which mapper to use" key: the
+ * mapping policy is the choice of mapper. Local to the HNP - never
+ * packed/sent. */
+#define PRTE_APP_LAST_MAPPER        38 /* char* mapping component that placed this app */
 
 #define PRTE_APP_MAX_KEY 100
 
@@ -105,6 +128,8 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_FLAG_FORWARD_OUTPUT    0x0020 // forward output from the apps
 #define PRTE_JOB_FLAG_DO_NOT_MONITOR    0x0040 // do not monitor apps for termination
 #define PRTE_JOB_FLAG_FORWARD_COMM      0x0080 //
+#define PRTE_JOB_FLAG_SUSPENDED         0x0100 // job's procs have been stopped by a session
+                                               // pause/preempt directive and await a resume/restore
 #define PRTE_JOB_FLAG_RESTART           0x0200 //
 #define PRTE_JOB_FLAG_PROCS_MIGRATING   0x0400 // some procs in job are migrating from one node to another
 #define PRTE_JOB_FLAG_OVERSUBSCRIBED    0x0800 // at least one node in the job is oversubscribed
@@ -247,6 +272,13 @@ typedef uint16_t prte_job_flags_t;
 #define PRTE_JOB_REPORT_PHYSICAL_CPUS       (PRTE_JOB_START_KEY + 121) // bool - report using physical (vs logical) cpu IDs
 #define PRTE_JOB_ALLOC_DISPLAYED            (PRTE_JOB_START_KEY + 122) // bool - allocation has been displayed
 #define PRTE_JOB_DO_NOT_SPAWN               (PRTE_JOB_START_KEY + 123) // bool - do not spawn app procs
+#define PRTE_JOB_SPAWN_TARGET               (PRTE_JOB_START_KEY + 124) // char* - comma-delimited list of PMIX_ALLOC_ID strings naming the
+                                                                       // allocations (sessions) this job may map onto; empty token = default session
+#define PRTE_JOB_OUTPUT_FILE_PATTERN        (PRTE_JOB_START_KEY + 125) // bool - treat PRTE_JOB_OUTPUT_TO_FILE as a name pattern the user
+                                                                       // controls instead of annotating it with nspace and rank
+#define PRTE_JOB_REPORT_CHILD_SEP           (PRTE_JOB_START_KEY + 126) // bool - report the exit status of child jobs separately: return the
+                                                                       // primary job's status only, rather than the first non-zero status
+                                                                       // returned by the primary job or any job it spawned
 
 #define PRTE_JOB_MAX_KEY (PRTE_JOB_START_KEY + 200)
 
@@ -304,6 +336,26 @@ typedef uint16_t prte_proc_flags_t;
 
 #define PRTE_ATTR_KEY_MAX PRTE_RML_MAX_KEY
 
+/*** SESSION FLAGS ***/
+typedef uint16_t prte_session_flags_t;
+#define PRTE_SESSION_FLAG_DYNAMIC       0x0001 // session was dynamically allocated
+#define PRTE_SESSION_FLAG_RESERVED      0x0002 // nodes withheld from default pool
+#define PRTE_SESSION_FLAG_DETACHED      0x0004 // session lifetime is independent of its owning
+                                               // namespace (PMIX_SESSION_SEP) - the inheritance
+                                               // disposition is not fired when that namespace ends
+#define PRTE_SESSION_FLAG_PAUSED        0x0008 // every job in the session has been stopped by a
+                                               // PMIX_SESSION_PAUSE directive
+#define PRTE_SESSION_FLAG_SCHEDULER     0x0010 // session was instantiated by the scheduler via
+                                               // PMIx_Session_control, so its completion must be
+                                               // reported back to the scheduler
+#define PRTE_SESSION_FLAG_TERMINATING   0x0020 // a PMIX_SESSION_TERMINATE is in flight - the
+                                               // session is reclaimed once its jobs have retired
+#define PRTE_SESSION_FLAG_AUTO_COMPLETE 0x0040 // the session exists to run the jobs it was
+                                               // instantiated with, so it is reclaimed when the
+                                               // last of them retires rather than persisting
+                                               // until an explicit terminate
+
+
 /*** FLAG OPS ***/
 #define PRTE_FLAG_SET(p, f)   ((p)->flags |= (f))
 #define PRTE_FLAG_UNSET(p, f) ((p)->flags &= ~(f))
@@ -325,8 +377,20 @@ PRTE_EXPORT void prte_remove_attribute(pmix_list_t *attributes, prte_attribute_k
 PRTE_EXPORT prte_attribute_t *prte_fetch_attribute(pmix_list_t *attributes, prte_attribute_t *prev,
                                                    prte_attribute_key_t key);
 
+/* Add an attribute to the front of a list, keeping any prior entry with the
+ * same key - use for the multi-valued attributes (the envar directives) when
+ * the new entry must be applied BEFORE the ones already there.  Note that
+ * prepending a block of entries one at a time reverses that block: walk the
+ * source in reverse if its internal order matters. */
 PRTE_EXPORT int prte_prepend_attribute(pmix_list_t *attributes, prte_attribute_key_t key,
                                        bool local, void *data, pmix_data_type_t type);
+
+/* Add an attribute to the end of a list, keeping any prior entry with the
+ * same key.  This is what preserves the order a set of multi-valued
+ * attributes was generated in - which, for the envar directives, is the
+ * order the user gave them on the command line. */
+PRTE_EXPORT int prte_append_attribute(pmix_list_t *attributes, prte_attribute_key_t key,
+                                      bool local, void *data, pmix_data_type_t type);
 
 PRTE_EXPORT int prte_attr_load(prte_attribute_t *kv, void *data, pmix_data_type_t type);
 
@@ -358,8 +422,10 @@ struct prte_proc_t;
 struct prte_node_t;
 struct prte_app_context_t;
 struct prte_job_t;
+struct prte_session_t;
 
 PRTE_EXPORT char* prte_print_proc_flags(struct prte_proc_t *p);
 PRTE_EXPORT char* prte_print_node_flags(struct prte_node_t *p);
 PRTE_EXPORT char* prte_print_app_flags(struct prte_app_context_t *p);
 PRTE_EXPORT char* prte_print_job_flags(struct prte_job_t *p);
+PRTE_EXPORT char* prte_print_session_flags(struct prte_session_t *ptr);

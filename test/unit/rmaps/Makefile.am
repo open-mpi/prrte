@@ -1,0 +1,40 @@
+# $COPYRIGHT$
+# Additional copyrights may follow
+# $HEADER$
+
+AM_CPPFLAGS = \
+    -I$(top_srcdir)/src \
+    -I$(top_srcdir)/include \
+    -I$(top_srcdir)
+
+check_PROGRAMS = test_rmaps
+
+test_rmaps_SOURCES = \
+    test_rmaps_main.c      \
+    test_policy_parse.c    \
+    test_job_policy.c      \
+    test_job_qualifiers.c  \
+    test_resolve_options.c \
+    test_ranking.c         \
+    test_binding.c         \
+    test_check_avail.c     \
+    test_dispatch.c        \
+    test_round_robin.c     \
+    test_ppr.c             \
+    test_seq.c             \
+    test_rank_file.c
+
+test_rmaps_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
+
+# The synthetic hwloc topologies used to exercise map/rank/bind patterns
+# without a live DVM now live in the shared test/topologies directory
+# (see the "Testing" section, "Offline mapper harness", in AGENTS.md).
+
+TESTS = test_rmaps
+
+# Run against the components in this build tree, not just an installed
+# one: without this a --enable-mca-dso build has no components to find
+# and every component-dependent case skips.
+AM_TESTS_ENVIRONMENT = \
+    PRTE_MCA_mca_base_component_path=@PRTE_COMPONENT_BUILD_PATH@; \
+    export PRTE_MCA_mca_base_component_path;

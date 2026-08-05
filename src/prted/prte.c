@@ -135,25 +135,27 @@ static void epipe_signal_callback(int fd, short args, void *cbdata);
 static int prep_singleton(const char *name);
 static bool keepalive = false;
 
+/* NOTE: these callbacks execute on the PMIx progress thread. They
+ * therefore capture their arguments and shift the wakeup onto our
+ * event base - the waiters below drive prte_event_base while
+ * polling the lock, so a wakeup signaled directly from the PMIx
+ * thread could be missed while the loop is parked in the backend */
 static void opcbfunc(pmix_status_t status, void *cbdata)
 {
     prte_pmix_lock_t *lock = (prte_pmix_lock_t *) cbdata;
-    PRTE_HIDE_UNUSED_PARAMS(status);
 
-    PMIX_ACQUIRE_OBJECT(lock);
-    PRTE_PMIX_WAKEUP_THREAD(lock);
+    prte_pmix_shifted_wakeup(lock, status, NULL);
 }
 
 static void spcbfunc(pmix_status_t status, char nspace[], void *cbdata)
 {
     prte_pmix_lock_t *lock = (prte_pmix_lock_t *) cbdata;
+    char *msg = NULL;
 
-    PMIX_ACQUIRE_OBJECT(lock);
-    lock->status = status;
     if (PMIX_SUCCESS == status) {
-        lock->msg = strdup(nspace);
+        msg = strdup(nspace);
     }
-    PRTE_PMIX_WAKEUP_THREAD(lock);
+    prte_pmix_shifted_wakeup(lock, status, msg);
 }
 
 static void parent_died_fn(size_t evhdlr_registration_id, pmix_status_t status,
@@ -178,8 +180,9 @@ static void evhandler_reg_callbk(pmix_status_t status, size_t evhandler_ref, voi
     mylock_t *lock = (mylock_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(evhandler_ref);
 
-    lock->status = status;
-    PRTE_PMIX_WAKEUP_THREAD(&lock->lock);
+    /* executes on the PMIx progress thread - record the status in
+     * the embedded lock and shift the wakeup onto our event base */
+    prte_pmix_shifted_wakeup(&lock->lock, status, NULL);
 }
 
 
@@ -241,7 +244,83 @@ static void shutdown_callback(int fd, short flags, void *arg)
     exit(PRTE_ERROR_DEFAULT_EXIT_CODE);
 }
 
-int prte(int argc, char *argv[])
+
+/* Strip any trailing path separators from an in-place prefix string.  A value
+ * consisting solely of separators normalizes to a single separator.
+ *
+ * NOTE: this must not be done with strncpy(param, PRTE_PATH_SEP,
+ * sizeof(param) - 1) at the call site, as the code here once did four times
+ * over: `param` is a char*, so sizeof yields the size of the *pointer*, and
+ * strncpy then NUL-pads out to that many bytes - overrunning the heap for any
+ * prefix shorter than a pointer.  "--prefix /" (a two-byte allocation) was
+ * enough to corrupt the heap.  The loop below also has to guard len before
+ * indexing param[len - 1]; an empty prefix string used to read off the front
+ * of the allocation.
+ */
+void prte_strip_trailing_pathsep(char *param)
+{
+    size_t len;
+
+    if (NULL == param) {
+        return;
+    }
+    len = strlen(param);
+    if (0 == len) {
+        /* nothing to strip - and no room to write a separator into */
+        return;
+    }
+    while (0 < len && 0 == strcmp(PRTE_PATH_SEP, &param[len - 1])) {
+        param[len - 1] = '\0';
+        --len;
+    }
+    if (0 == len) {
+        /* it was nothing but separators, so the prefix is a single
+         * separator.  The original string held at least one character,
+         * so the buffer has room for this. */
+        param[0] = PRTE_PATH_SEP[0];
+        param[1] = '\0';
+    }
+}
+
+/* Split a singleton identifier of the form "<nspace>.<rank>" into its parts.
+ * Returns PRTE_SUCCESS and fills nspace/rank on success.  The value arrives
+ * straight off the command line, so a missing "." must be reported rather
+ * than dereferenced - strrchr returns NULL and "prte --singleton foo" used
+ * to segfault on the spot.
+ */
+int prte_parse_singleton_id(const char *name, pmix_nspace_t nspace, pmix_rank_t *rank)
+{
+    char *ptr, *p1, *end;
+    unsigned long rk;
+
+    if (NULL == name || NULL == rank) {
+        return PRTE_ERR_BAD_PARAM;
+    }
+    ptr = strdup(name);
+    if (NULL == ptr) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    p1 = strrchr(ptr, '.');
+    if (NULL == p1 || p1 == ptr || '\0' == p1[1]) {
+        /* no rank suffix, or an empty nspace/rank */
+        free(ptr);
+        return PRTE_ERR_BAD_PARAM;
+    }
+    *p1 = '\0';
+    ++p1;
+    errno = 0;
+    rk = strtoul(p1, &end, 10);
+    if (0 != errno || NULL == end || '\0' != *end) {
+        free(ptr);
+        return PRTE_ERR_BAD_PARAM;
+    }
+    PMIX_LOAD_NSPACE(nspace, ptr);
+    free(ptr);
+    *rank = (pmix_rank_t) rk;
+    return PRTE_SUCCESS;
+}
+
+PRTE_EXPORT int prte(int argc, char *argv[])
 {
     int rc = 1, i;
     char *param, *tpath, *cptr;
@@ -250,7 +329,7 @@ int prte(int argc, char *argv[])
     prte_pmix_app_t *app;
     pmix_info_t *iptr, *iptr2, info;
     pmix_status_t ret;
-    size_t n, ninfo, param_len;
+    size_t n, ninfo;
     pmix_app_t *papps;
     size_t napps;
     mylock_t mylock;
@@ -271,6 +350,8 @@ int prte(int argc, char *argv[])
     char *personality;
     pmix_cli_result_t results;
     pmix_cli_item_t *opt;
+    pmix_cli_item_t dispopt;
+    bool dispdefault = false;
     FILE *fp;
     prte_info_item_t *iprteinfo;
 
@@ -375,52 +456,9 @@ int prte(int argc, char *argv[])
         return rc;
     }
 
-    /* look for any personality specification and do a quick sanity check */
-    personality = NULL;
-    bool rankby_found = false;
-    bool bindto_found = false;
-    for (i = 0; NULL != pargv[i]; i++) {
-        if (0 == strcmp(pargv[i], "--personality")) {
-            personality = pargv[i + 1];
-            continue;
-        }
-        if (0 == strcmp(pargv[i], "--map-by")) {
-            free(pargv[i]);
-            pargv[i] = strdup("--mapby");
-            continue;
-        }
-        if (0 == strcmp(pargv[i], "--rank-by") ||
-            0 == strcmp(pargv[i], "--rankby")) {
-            if (rankby_found) {
-                pmix_show_help("help-schizo-base.txt", "multi-instances", true, pargv[i]);
-                return PRTE_ERR_BAD_PARAM;
-            }
-            rankby_found = true;
-            if (0 == strcmp(pargv[i], "--rank-by")) {
-                free(pargv[i]);
-                pargv[i] = strdup("--rankby");
-            }
-            continue;
-        }
-        if (0 == strcmp(pargv[i], "--bind-to") ||
-            0 == strcmp(pargv[i], "--bindto")) {
-            if (bindto_found) {
-                pmix_show_help("help-schizo-base.txt", "multi-instances", true, "bind-to");
-                return PRTE_ERR_BAD_PARAM;
-            }
-            bindto_found = true;
-            if (0 == strcmp(pargv[i], "--bind-to")) {
-                free(pargv[i]);
-                pargv[i] = strdup("--bindto");
-            }
-            continue;
-        }
-        if (0 == strcmp(pargv[i], "--runtime-options")) {
-            free(pargv[i]);
-            pargv[i] = strdup("--rtos");
-            continue;
-        }
-    }
+    /* normalize deprecated option spellings and look for any personality
+     * specification */
+    personality = prte_schizo_base_normalize_argv(pargv);
 
     /* detect if we are running as a proxy and select the active
      * schizo module for this tool */
@@ -452,7 +490,7 @@ int prte(int argc, char *argv[])
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (rc = prte_register_params())) {
         if (PRTE_ERR_SILENT != rc) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
+            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte register params",
                            PRTE_ERROR_NAME(rc), rc);
         }
@@ -477,19 +515,6 @@ int prte(int argc, char *argv[])
             return rc;
         }
     }
-    // check if they asked for XML output from us
-    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_OUTPUT);
-    if (NULL != opt) {
-        split = PMIx_Argv_split(opt->values[0], ',');
-        for (n = 0; NULL != split[n]; n++) {
-            if (PMIX_CHECK_CLI_OPTION(split[n], PRTE_CLI_XML)) {
-                prte_xml_output = true;
-                break;
-            }
-        }
-        PMIx_Argv_free(split);
-    }
-
    /* Did the user specify a default hostfile? */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_DEFAULT_HOSTFILE);
     if (NULL != opt) {
@@ -523,12 +548,6 @@ int prte(int argc, char *argv[])
      */
     if (0 == geteuid()) {
         schizo->allow_run_as_root(&results); // will exit us if not allowed
-    }
-
-    /* check for bootstrap operation */
-    if (pmix_cmd_line_is_taken(&results, PRTE_CLI_BOOTSTRAP)) {
-        /* flag that allocation is read from config file */
-        prte_bootstrap_setup = true;
     }
 
     // check for an appfile
@@ -667,6 +686,14 @@ int prte(int argc, char *argv[])
         prte_state_base.parent_fd = wait_pipe[1];
         prte_daemon_init_callback(NULL, wait_dvm);
         close(wait_pipe[0]);
+        /* the event base was opened before we forked, and some
+         * backends (e.g., kqueue on macOS) do not survive a fork.
+         * Reinitialize the base so the child gets a functional
+         * backend - otherwise the event loop spins on a dead
+         * kernel queue and the DVM never reports ready */
+        if (0 != prte_event_reinit(prte_event_base)) {
+            return PRTE_ERROR;
+        }
     } else {
 #if defined(HAVE_SETSID)
         /* see if we were directed to separate from current session */
@@ -700,10 +727,21 @@ int prte(int argc, char *argv[])
         setenv("PRTE_MCA_prte_launch_agent", opt->values[0], true); // cmd line overrides all
     }
 
-    /* if we are supporting a singleton, cache its ID
-     * so it can get picked up and registered by server init */
+    /* If we are supporting a singleton, cache its ID so it can get picked
+     * up and registered by server init.  Validate it here, before prte_init:
+     * the value is handed straight down to PMIx_server_init as
+     * PMIX_SINGLETON, and a value that is not "<nspace>.<rank>" faults
+     * inside the PMIx library long before PRRTE's own prep_singleton would
+     * ever see it. */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_SINGLETON);
     if (NULL != opt) {
+        pmix_nspace_t sgltn;
+        pmix_rank_t sgrank;
+        if (PRTE_SUCCESS != prte_parse_singleton_id(opt->values[0], sgltn, &sgrank)) {
+            pmix_show_help("help-prte.txt", "bad-singleton", true,
+                           prte_tool_basename, opt->values[0]);
+            return 1;
+        }
         prte_pmix_server_globals.singleton = strdup(opt->values[0]);
     }
 
@@ -714,7 +752,7 @@ int prte(int argc, char *argv[])
     if (!pmix_cmd_line_is_taken(&results, PRTE_CLI_DAEMONIZE)) {
         /* see if they want to run an application - let's parse
          * the cmd line to get it */
-        rc = prte_parse_locals(schizo, &apps, pargv, &hostfiles, &hosts, &jobdata);
+        rc = prte_parse_locals(schizo, &apps, pargv, &hostfiles, &hosts, &jobdata, &results);
         // not-found => no app given
         if (PRTE_SUCCESS != rc && PRTE_ERR_NOT_FOUND != rc) {
             PRTE_UPDATE_EXIT_STATUS(rc);
@@ -740,6 +778,30 @@ int prte(int argc, char *argv[])
             }
             /* mark that we are not a persistent DVM */
             prte_persistent = false;
+        }
+    }
+
+    /* check if they asked for XML output from us.  This has to come AFTER
+     * prte_parse_locals(), which is what puts a "--output" written in a
+     * later app segment of an MPMD line back into the parse result - and
+     * it can: the only readers of prte_xml_output run inside prte_init()
+     * below and later still. */
+    opt = pmix_cmd_line_get_param(&results, PRTE_CLI_OUTPUT);
+    if (NULL != opt) {
+        for (i = 0; NULL != opt->values[i]; i++) {
+            split = PMIx_Argv_split(opt->values[i], ',');
+            for (n = 0; NULL != split[n]; n++) {
+                if (PMIX_CHECK_CLI_OPTION(split[n], PRTE_CLI_XML)) {
+                    if (PRTE_SUCCESS != prte_cli_bool_value(PMIX_CLI_QUALIFIER_VALUE(split[n]),
+                                                            &prte_xml_output)) {
+                        /* the value is reported where the directive is
+                         * parsed - all this needs is to not act on it */
+                        prte_xml_output = false;
+                    }
+                    break;
+                }
+            }
+            PMIx_Argv_free(split);
         }
     }
 
@@ -804,7 +866,14 @@ int prte(int argc, char *argv[])
     PMIX_INFO_LOAD(&info, PMIX_EVENT_AFFECTED_PROC, &pname, PMIX_PROC);
     PMIx_Register_event_handler(&code, 1, &info, 1, parent_died_fn, evhandler_reg_callbk,
                                 (void *) &mylock);
-    PRTE_PMIX_WAIT_THREAD(&mylock.lock);
+    /* the registration callback shifts its wakeup onto our event
+     * base, so we must cycle the event library while we wait. Do
+     * not add an escape from this loop - the callback references
+     * the stack-based lock, so we cannot leave until it has fired */
+    while (mylock.lock.active) {
+        prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
+    }
+    PMIX_ACQUIRE_OBJECT(&mylock.lock);
     PMIX_INFO_DESTRUCT(&info);
     PRTE_PMIX_DESTRUCT_LOCK(&mylock.lock);
 
@@ -872,36 +941,14 @@ int prte(int argc, char *argv[])
             param = strdup(prte_install_dirs.prefix);
         }
         /* "Parse" the param, aka remove superfluous path_sep. */
-        param_len = strlen(param);
-        while (0 == strcmp(PRTE_PATH_SEP, &(param[param_len - 1]))) {
-            param[param_len - 1] = '\0';
-            param_len--;
-            if (0 == param_len) {
-                /* We get here if we removed all PATH_SEP's and end up
-                   with an empty string.  In this case, the prefix is
-                   just a single PATH_SEP. */
-                strncpy(param, PRTE_PATH_SEP, sizeof(param) - 1);
-                break;
-            }
-        }
+        prte_strip_trailing_pathsep(param);
     } else if (NULL != (cptr = getenv("PRTE_PREFIX"))) {
         /* need to cover the case where "want prefix by default" is not
          * given, but PRTE_PREFIX was added to the environment prior
          * to actually invoking prte */
         param = strdup(cptr);
         /* "Parse" the param, aka remove superfluous path_sep. */
-        param_len = strlen(param);
-        while (0 == strcmp(PRTE_PATH_SEP, &(param[param_len - 1]))) {
-            param[param_len - 1] = '\0';
-            param_len--;
-            if (0 == param_len) {
-                /* We get here if we removed all PATH_SEP's and end up
-                   with an empty string.  In this case, the prefix is
-                   just a single PATH_SEP. */
-                strncpy(param, PRTE_PATH_SEP, sizeof(param) - 1);
-                break;
-            }
-        }
+        prte_strip_trailing_pathsep(param);
     } else {
         /* Check if called with fully-qualified path to prte.
            (Note: Put this second so can override with --prefix (above). */
@@ -977,33 +1024,11 @@ int prte(int argc, char *argv[])
      * cmd line above, so we can just use that result */
     if (NULL != param) {
         /* "Parse" the param, aka remove superfluous path_sep. */
-        param_len = strlen(param);
-        while (0 == strcmp(PRTE_PATH_SEP, &(param[param_len - 1]))) {
-            param[param_len - 1] = '\0';
-            param_len--;
-            if (0 == param_len) {
-                /* We get here if we removed all PATH_SEP's and end up
-                   with an empty string.  In this case, the prefix is
-                   just a single PATH_SEP. */
-                strncpy(param, PRTE_PATH_SEP, sizeof(param) - 1);
-                break;
-            }
-        }
+        prte_strip_trailing_pathsep(param);
     } else if (NULL != (cptr = getenv("PMIX_PREFIX"))) {
         param = strdup(cptr);
         /* "Parse" the param, aka remove superfluous path_sep. */
-        param_len = strlen(param);
-        while (0 == strcmp(PRTE_PATH_SEP, &(param[param_len - 1]))) {
-            param[param_len - 1] = '\0';
-            param_len--;
-            if (0 == param_len) {
-                /* We get here if we removed all PATH_SEP's and end up
-                   with an empty string.  In this case, the prefix is
-                   just a single PATH_SEP. */
-                strncpy(param, PRTE_PATH_SEP, sizeof(param) - 1);
-                break;
-            }
-        }
+        prte_strip_trailing_pathsep(param);
     }
     if (NULL != param) {
         // add the directive to the daemon job object
@@ -1037,75 +1062,51 @@ int prte(int argc, char *argv[])
         goto DONE;
     }
 
-    /* check a couple of display options for the DVM itself */
+    /* Check a couple of display options for the DVM itself.  Ask the same
+     * parser the job's copy of these directives goes through rather than
+     * re-reading the directive list here: this used to be two more hand
+     * -written scans of it (one for the cmd line, one for the MCA default),
+     * and a directive spelling either of them failed to recognize was
+     * silently honored for the job and ignored by the DVM. */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_DISPLAY);
+    if (NULL == opt && NULL != prte_schizo_base.default_display_options) {
+        PMIX_CONSTRUCT(&dispopt, pmix_cli_item_t);
+        dispopt.key = strdup(PRTE_CLI_DISPLAY);
+        PMIx_Argv_append_nosize(&dispopt.values, prte_schizo_base.default_display_options);
+        opt = &dispopt;
+        dispdefault = true;
+    }
     if (NULL != opt) {
-        char **targv;
-        char *tptr;
-        int m;
-        for (n=0; NULL != opt->values[n]; n++) {
-            targv = PMIx_Argv_split(opt->values[n], ',');
-            for (i=0; NULL != targv[i]; i++) {
-                if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_ALLOC)) {
-                    prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC,
-                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
-                    break;
-                } else if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSEABLE) ||
-                           PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSABLE)) {
-                    prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
-                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
-                }
-            }
-            PMIx_Argv_free(targv);
-            /* check for qualifiers */
-            tptr = strchr(opt->values[n], ':');
-            if (NULL != tptr) {
-                ++tptr;
-                targv = PMIx_Argv_split(tptr, ':');
-                /* check qualifiers */
-                for (m=0; NULL != targv[m]; m++) {
-                    if (PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSEABLE) ||
-                        PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSABLE)) {
+        void *dinfo;
+        pmix_data_array_t darray2;
+
+        PMIX_INFO_LIST_START(dinfo);
+        rc = prte_schizo_base_parse_display(opt, dinfo);
+        if (PRTE_SUCCESS == rc) {
+            PMIX_INFO_LIST_CONVERT(ret, dinfo, &darray2);
+            if (PMIX_SUCCESS == ret) {
+                pmix_info_t *dptr = (pmix_info_t *) darray2.array;
+                size_t dn;
+                for (dn = 0; dn < darray2.size; dn++) {
+                    if (PMIX_CHECK_KEY(&dptr[dn], PMIX_DISPLAY_ALLOCATION)) {
+                        prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC,
+                                           PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                    } else if (PMIX_CHECK_KEY(&dptr[dn], PMIX_DISPLAY_PARSEABLE_OUTPUT)) {
                         prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
                                            PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
-                        break;
                     }
                 }
-                PMIx_Argv_free(targv);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray2);
             }
         }
-
-    } else if (NULL != prte_schizo_base.default_display_options) {
-        char **targv;
-        char *tptr;
-        int m;
-        targv = PMIx_Argv_split(prte_schizo_base.default_display_options, ',');
-        for (i=0; NULL != targv[i]; i++) {
-            if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_ALLOC)) {
-                prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC,
-                                   PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
-            } else if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSEABLE) ||
-                       PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSABLE)) {
-                prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
-                                   PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
-            }
+        PMIX_INFO_LIST_RELEASE(dinfo);
+        if (dispdefault) {
+            PMIX_DESTRUCT(&dispopt);
         }
-        PMIx_Argv_free(targv);
-        /* check for qualifiers */
-        tptr = strchr(prte_schizo_base.default_display_options, ':');
-        if (NULL != tptr) {
-            ++tptr;
-            targv = PMIx_Argv_split(tptr, ':');
-            /* check qualifiers */
-            for (m=0; NULL != targv[m]; m++) {
-                if (PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSEABLE) ||
-                    PMIX_CHECK_CLI_OPTION(targv[m], PRTE_CLI_PARSABLE)) {
-                    prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
-                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
-                    break;
-                }
-            }
-            PMIx_Argv_free(targv);
+        if (PRTE_SUCCESS != rc) {
+            /* the parser reported what was wrong with it */
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            goto DONE;
         }
     }
 
@@ -1119,6 +1120,18 @@ int prte(int argc, char *argv[])
 
     /* setup to capture job-level info */
     PMIX_INFO_LIST_START(jinfo);
+
+    /* Carry over the mapping/ranking/binding directives the app parser
+     * determined belong to the job rather than to any one app - a directive
+     * given once applies to the whole job, however many apps were given.
+     * The rest of the jobdata list (prefixes) is examined separately above. */
+    PMIX_LIST_FOREACH(iprteinfo, &jobdata, prte_info_item_t) {
+        if (PMIx_Check_key(iprteinfo->info.key, PMIX_MAPBY) ||
+            PMIx_Check_key(iprteinfo->info.key, PMIX_RANKBY) ||
+            PMIx_Check_key(iprteinfo->info.key, PMIX_BINDTO)) {
+            PMIX_INFO_LIST_XFER(ret, jinfo, &iprteinfo->info);
+        }
+    }
 
     /* see if we ourselves were spawned by someone */
     PMIX_LOAD_PROCID(&pname, myproc.nspace, PMIX_RANK_WILDCARD);
@@ -1302,7 +1315,11 @@ int prte(int argc, char *argv[])
         papps[n].cmd = strdup(app->app.cmd);
         papps[n].argv = PMIx_Argv_copy(app->app.argv);
         papps[n].env = PMIx_Argv_copy(app->app.env);
-        papps[n].cwd = strdup(app->app.cwd);
+        /* cwd is deliberately left NULL when --set-cwd-to-session-dir was
+         * given (the session dir becomes the cwd on the backend via the
+         * PMIX_SET_SESSION_CWD directive), so guard against strdup(NULL)
+         */
+        papps[n].cwd = (NULL == app->app.cwd) ? NULL : strdup(app->app.cwd);
         papps[n].maxprocs = app->app.maxprocs;
         PMIX_INFO_LIST_CONVERT(ret, app->info, &darray);
         if (PMIX_SUCCESS != ret) {
@@ -1328,7 +1345,7 @@ int prte(int argc, char *argv[])
      * get properly recorded - e.g., forwarding IOF */
     PRTE_PMIX_CONSTRUCT_LOCK(&lock);
     ret = PMIx_Spawn_nb(iptr, ninfo, papps, napps, spcbfunc, &lock);
-    if (PRTE_SUCCESS != ret) {
+    if (PMIX_SUCCESS != ret) {
         pmix_output(0, "PMIx_Spawn failed (%d): %s", ret, PMIx_Error_string(ret));
         rc = ret;
         PRTE_UPDATE_EXIT_STATUS(rc);
@@ -1341,7 +1358,17 @@ int prte(int argc, char *argv[])
     }
     PMIX_ACQUIRE_OBJECT(&lock.lock);
     if (PMIX_SUCCESS != lock.status) {
-        PRTE_UPDATE_EXIT_STATUS(lock.status);
+        /* The request was accepted but the spawn itself failed - e.g., the
+         * job named an allocation the DVM does not have, or it could not be
+         * mapped. Nothing else reports this: we are the tool, and the only
+         * trace of the failure is the status handed back through the
+         * callback. Say the same thing the synchronous failure above says,
+         * so which side of the call detected it is not something the user
+         * has to care about. */
+        pmix_output(0, "PMIx_Spawn failed (%d): %s", lock.status,
+                    PMIx_Error_string(lock.status));
+        rc = lock.status;
+        PRTE_UPDATE_EXIT_STATUS(rc);
         goto DONE;
     }
     PMIX_LOAD_NSPACE(spawnednspace, lock.msg);
@@ -1373,7 +1400,15 @@ int prte(int argc, char *argv[])
         if (PMIX_SUCCESS != ret && PMIX_OPERATION_SUCCEEDED != ret) {
             pmix_output(0, "IOF push of stdin failed: %s", PMIx_Error_string(ret));
         } else if (PMIX_SUCCESS == ret) {
-            PRTE_PMIX_WAIT_THREAD(&lock);
+            /* the callback shifts its wakeup onto our event base,
+             * so we must cycle the event library while we wait. Do
+             * not add an escape from this loop - the callback
+             * references the stack-based lock, so we cannot leave
+             * until it has fired */
+            while (lock.active) {
+                prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
+            }
+            PMIX_ACQUIRE_OBJECT(&lock);
         }
         PRTE_PMIX_DESTRUCT_LOCK(&lock);
         PMIX_INFO_FREE(iptr2, 1);
@@ -1394,7 +1429,15 @@ proceed:
     if (PMIX_SUCCESS != ret && PMIX_OPERATION_SUCCEEDED != ret) {
         pmix_output(0, "IOF close of stdin failed: %s", PMIx_Error_string(ret));
     } else if (PMIX_SUCCESS == ret) {
-        PRTE_PMIX_WAIT_THREAD(&lock);
+        /* the callback shifts its wakeup onto our event base. The
+         * main event loop above has already exited, so we must
+         * cycle the event library ourselves until the wakeup
+         * arrives - the callback references the stack-based lock,
+         * so we cannot leave until it has fired */
+        while (lock.active) {
+            prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
+        }
+        PMIX_ACQUIRE_OBJECT(&lock);
     }
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
     PMIX_INFO_DESTRUCT(&info);
@@ -1527,7 +1570,7 @@ static void abort_signal_callback(int fd)
 
 static int prep_singleton(const char *name)
 {
-    char *ptr, *p1;
+    pmix_nspace_t nspace;
     prte_job_t *jdata;
     prte_node_t *node;
     prte_proc_t *proc;
@@ -1535,15 +1578,15 @@ static int prep_singleton(const char *name)
     pmix_rank_t rank;
     prte_app_context_t *app;
     char cwd[PRTE_PATH_MAX];
+    prte_pmix_lock_t lock;
 
-    ptr = strdup(name);
-    p1 = strrchr(ptr, '.');
-    *p1 = '\0';
-    ++p1;
-    rank = strtoul(p1, NULL, 10);
+    rc = prte_parse_singleton_id(name, nspace, &rank);
+    if (PRTE_SUCCESS != rc) {
+        pmix_show_help("help-prte.txt", "bad-singleton", true, prte_tool_basename, name);
+        return rc;
+    }
     jdata = PMIX_NEW(prte_job_t);
-    PMIX_LOAD_NSPACE(jdata->nspace, ptr);
-    free(ptr);
+    PMIX_LOAD_NSPACE(jdata->nspace, nspace);
     jdata->session = prte_default_session;
     rc = prte_set_job_data_object(jdata);
     if (PRTE_SUCCESS != rc) {
@@ -1556,8 +1599,6 @@ static int prep_singleton(const char *name)
     app->app = strdup(jdata->nspace);
     app->num_procs = 1;
     PMIx_Argv_append_nosize(&app->argv, app->app);
-    pmix_getcwd(cwd, sizeof(cwd));
-    app->cwd = strdup(cwd);
     pmix_pointer_array_set_item(jdata->apps, 0, app);
     jdata->num_apps = 1;
 
@@ -1571,6 +1612,11 @@ static int prep_singleton(const char *name)
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
         return PRTE_ERR_NOT_FOUND;
     }
+    if (PRTE_SUCCESS != pmix_getcwd(cwd, sizeof(cwd))) {
+        cwd[0] = '\0';
+    }
+    free(app->cwd);
+    app->cwd = strdup(cwd);
     PMIX_RETAIN(node);
     pmix_pointer_array_add(jdata->map->nodes, node);
     ++(jdata->map->num_nodes);
@@ -1588,8 +1634,7 @@ static int prep_singleton(const char *name)
     PMIX_RETAIN(proc);
     pmix_pointer_array_set_item(&app->procs, rank, proc);
     app->first_rank = rank;
-    /* link it to the node */
-    PMIX_RETAIN(node);
+    /* link it to the node - the backpointer is borrowed, not retained */
     proc->node = node;
     /* add it to the job */
     pmix_pointer_array_set_item(jdata->procs, rank, proc);
@@ -1601,8 +1646,22 @@ static int prep_singleton(const char *name)
     node->num_procs = 1;
     node->slots_inuse = 1;
 
-    // register the info with our PMIx server
-    rc = prte_pmix_server_register_nspace(jdata);
+    // register the info with our PMIx server - the registration
+    // completes asynchronously, with the callback firing on our
+    // own progress thread, so we must cycle the event library
+    // while we wait for it
+    PRTE_PMIX_CONSTRUCT_LOCK(&lock);
+    rc = prte_pmix_server_register_nspace(jdata, opcbfunc, &lock);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_PMIX_DESTRUCT_LOCK(&lock);
+        return rc;
+    }
+    while (lock.active) {
+        prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
+    }
+    PMIX_ACQUIRE_OBJECT(&lock);
+    rc = prte_pmix_convert_status(lock.status);
+    PRTE_PMIX_DESTRUCT_LOCK(&lock);
 
     return rc;
 }

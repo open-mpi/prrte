@@ -8,6 +8,14 @@
 .gdb*
 cov-int
 
+# Out-of-tree (VPATH) build dirs.  vpath-linux/vpath-macos are the ones
+# contrib/dockerswarm/build.sh creates; build/ is the conventional name
+# for your own, which AGENTS.md tells you to use rather than configuring
+# in the source tree.
+/vpath-linux/
+/vpath-macos/
+/build/
+
 .hgrc
 .hgignore
 .hg
@@ -44,6 +52,47 @@ cov-int
 
 Makefile
 Makefile.in
+test/Makefile
+test/unit/Makefile
+test/unit/rmaps/Makefile
+test/unit/rmaps/test_rmaps
+test/unit/runtime/Makefile
+test/unit/runtime/test_runtime
+test/unit/errmgr/Makefile
+test/unit/errmgr/test_errmgr
+test/unit/ess/Makefile
+test/unit/ess/test_ess
+test/unit/event/Makefile
+test/unit/event/test_event
+test/unit/filem/Makefile
+test/unit/filem/test_filem
+test/unit/grpcomm/Makefile
+test/unit/grpcomm/test_grpcomm
+test/unit/hwloc/Makefile
+test/unit/include/Makefile
+test/unit/include/test_include
+test/unit/odls/Makefile
+test/unit/odls/test_odls
+test/unit/iof/Makefile
+test/unit/iof/test_iof
+test/unit/pmix/Makefile
+test/unit/plm/Makefile
+test/unit/plm/test_plm
+test/unit/rml/Makefile
+test/unit/rml/test_rml
+test/unit/rml/test_rml_routing
+test/unit/ras/Makefile
+test/unit/ras/test_ras
+test/unit/schizo/Makefile
+test/unit/schizo/test_schizo
+test/unit/state/Makefile
+test/unit/state/test_state
+test/unit/tools/Makefile
+test/unit/tools/test_tools
+test/unit/prted/Makefile
+test/unit/prted/test_prted
+test/unit/util/Makefile
+test/unit/util/test_util
 static-components.h
 static-components.h.new.extern
 static-components.h.new.struct
@@ -139,6 +188,8 @@ examples/nodeid
 examples/client-threaded
 examples/dynamic-dep
 examples/abort
+examples/elastic
+examples/sessionctrl
 
 src/sys/powerpc/atomic-32.s
 src/sys/powerpc/atomic-64.s
@@ -211,6 +262,9 @@ docs/_build
 docs/_static
 docs/_static/css/custom.css
 docs/_templates
+
+# Generated RST files
+docs/code-of-conduct.rst
 src/docs/_build
 src/docs/mca/mca.rst
 src/docs/mca/help*rst

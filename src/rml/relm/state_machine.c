@@ -104,7 +104,9 @@ prte_relm_msg_t* prte_relm_get_msg(prte_relm_signature_t* sig){
     );
     if(PMIX_SUCCESS != ret){
         PMIX_ERROR_LOG(ret);
-        PMIX_RELEASE(rank);
+        /* the message never made it into the table, so it is the object that
+         * has to go - the rank is still live and still holds its other msgs */
+        PMIX_RELEASE(msg);
         return NULL;
     }
     return msg;
@@ -191,7 +193,7 @@ int prte_relm_start_msg(
     if(NULL == buf){
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
-    } else if(dst > prte_rml_base.n_dmns){
+    } else if(dst >= prte_rml_base.n_dmns){
         PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
         return PRTE_ERR_BAD_PARAM;
     } else if(!prte_rml_is_node_up(dst)){
@@ -229,9 +231,19 @@ int prte_relm_start_msg(
     PMIx_Byte_object_destruct(&bo);
     if(PMIX_SUCCESS != ret){
         PMIx_Data_buffer_release(data);
+        /* "buf" is the caller's on every error return, exactly as it is for
+         * prte_rml_send_buffer_nb() - so leave it alone here even though the
+         * unload above may already have emptied it. Releasing an emptied
+         * buffer is what the caller then does, and it is harmless. */
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
         return ret;
     }
+    /* We took ownership of "buf" by succeeding, and the unload above moved
+     * its payload out into "data" - but that leaves the container itself,
+     * and nothing was releasing it. Every reliable send between daemons
+     * came through here, so this was not a one-off 40 bytes: it was 40
+     * bytes per inter-daemon message, for the life of the DVM. */
+    PMIx_Data_buffer_release(buf);
 
     start_msg_caddy_t* msg_cd = PMIX_NEW(start_msg_caddy_t);
     msg_cd->dst = dst;
@@ -405,7 +417,14 @@ void prte_relm_message_handler(pmix_rank_t src, pmix_data_buffer_t* buf){
         PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
         return;
     } else if(msg->prev_uid <= PRTE_RELM_UID_MAX){
-        prte_relm_get_prev_msg(msg)->next_uid = msg->uid;
+        prte_relm_msg_t* prev = prte_relm_get_prev_msg(msg);
+        if(NULL == prev){
+            /* get_msg returns NULL on a bad signature or a table failure */
+            PMIX_ERROR_LOG(PMIX_ERR_BAD_PARAM);
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+            return;
+        }
+        prev->next_uid = msg->uid;
     }
 
     prte_relm_state_t state = prte_relm_unpack_state(buf);
@@ -461,8 +480,10 @@ static void sm_cons(prte_relm_state_machine_t* sm){
 static void sm_dest(prte_relm_state_machine_t* sm){
     pmix_rank_t key;
     prte_relm_rank_t* val;
+    /* the ranks were allocated with PMIX_NEW, so they have to be released -
+     * destructing them runs the destructor but leaves the object itself */
     PMIX_HASH_TABLE_FOREACH(key, uint32, val, &sm->ranks){
-        PMIX_DESTRUCT(val);
+        PMIX_RELEASE(val);
     }
     PMIX_DESTRUCT(&sm->ranks);
     PMIX_DESTRUCT(&sm->cached_messages);

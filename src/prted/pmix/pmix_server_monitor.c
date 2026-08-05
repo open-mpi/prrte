@@ -66,13 +66,6 @@
  * down to the requestor.
  */
 
-static void rlfn(void *cbdata)
-{
-    prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
-
-    pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
-    PMIX_RELEASE(req);
-}
 
 static void mfn(int sd, short args, void *cbdata)
 {
@@ -81,6 +74,10 @@ static void mfn(int sd, short args, void *cbdata)
     pmix_status_t rc;
     int ret;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
+
+    // record the number of daemons that must respond - the DVM can
+    // grow or shrink, so this must be read on the progress thread
+    req->ndaemons = prte_process_info.num_daemons - 1;
 
     // cache the request
     req->local_index = pmix_pointer_array_add(&prte_pmix_server_globals.local_reqs, req);
@@ -158,7 +155,7 @@ static void mfn(int sd, short args, void *cbdata)
 errorout:
     // need to alert the PMIx server so nothing hangs
     if (NULL != req->infocbfunc) {
-        req->infocbfunc(rc, NULL, 0, req->cbdata, rlfn, req);
+        req->infocbfunc(rc, NULL, 0, req->cbdata, prte_pmix_server_req_release, req);
     } else {
         pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);
         PMIX_RELEASE(req);
@@ -187,7 +184,6 @@ pmix_status_t pmix_server_monitor_fn(const pmix_proc_t *requestor,
     req->ndirs = ndirs;
     req->infocbfunc = cbfunc;
     req->cbdata = cbdata;
-    req->ndaemons = prte_process_info.num_daemons - 1;
 
     // need to threadshift this to our event base
     prte_event_set(prte_event_base, &(req->ev), -1, PRTE_EV_WRITE, mfn, req);
@@ -482,13 +478,19 @@ void pmix_server_monitor_resp(int status, pmix_proc_t *sender,
     // record that another daemon reported
     ++req->nreported;
 
+    /* Note that every failure below records the error on the request and
+     * then falls through to the completion check.  Returning early would
+     * leave nreported already incremented for this daemon, so a malformed
+     * response from the LAST daemon to report would mean the request never
+     * completes and the requestor hangs forever. */
+
     // unpack the returned status
     cnt = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &rstatus, &cnt, PMIX_STATUS);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         req->pstatus = rc;
-        return;
+        goto complete;
     }
     req->pstatus = rstatus;
 
@@ -499,7 +501,7 @@ void pmix_server_monitor_resp(int status, pmix_proc_t *sender,
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
             req->pstatus = rc;
-            return;
+            goto complete;
         }
         if (0 < ninfo) {
             PMIX_INFO_CREATE(info, ninfo);
@@ -507,9 +509,9 @@ void pmix_server_monitor_resp(int status, pmix_proc_t *sender,
             rc = PMIx_Data_unpack(NULL, buffer, info, &cnt, PMIX_INFO);
             if (PMIX_SUCCESS != rc) {
                 PMIX_ERROR_LOG(rc);
-                PMIx_Info_free(info, ninfo);
+                PMIX_INFO_FREE(info, ninfo);
                 req->pstatus = rc;
-                return;
+                goto complete;
             }
         }
         // add these to the collected results
@@ -530,17 +532,21 @@ void pmix_server_monitor_resp(int status, pmix_proc_t *sender,
                 ++m;
             }
             PMIX_INFO_FREE(req->info, req->ninfo);
+            /* PMIX_INFO_XFER deep-copies, so the array we just unpacked
+             * still owns its entries - release them */
+            PMIX_INFO_FREE(info, ninfo);
             req->info = results;
             req->ninfo = sz;
         }
         req->copy = true;
     }
 
+complete:
     // if all daemons have reported, then we are complete
     if (req->ndaemons == req->nreported) {
         if (NULL != req->infocbfunc) {
             req->infocbfunc(req->pstatus, req->info, req->ninfo, req->cbdata,
-                            rlfn, req);
+                            prte_pmix_server_req_release, req);
         } else {
             // nothing we can do!
             pmix_pointer_array_set_item(&prte_pmix_server_globals.local_reqs, req->local_index, NULL);

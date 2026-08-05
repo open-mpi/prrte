@@ -92,6 +92,7 @@
 #include "src/mca/state/base/base.h"
 #include "src/prted/prted.h"
 #include "src/runtime/prte_globals.h"
+#include "src/runtime/prte_quit.h"
 #include "src/runtime/runtime.h"
 
 #include "src/prted/prted.h"
@@ -103,6 +104,14 @@ typedef struct {
 } mylock_t;
 
 static pmix_nspace_t spawnednspace;
+
+/* The application exit status the DVM reported for our job, or -1 if it
+ * reported none.  This is what we exit with when we have it, so that
+ * "prun ... false" answers 1 the way "prterun ... false" does.  The
+ * job-termination status cannot serve: it is a pmix_status_t naming the
+ * *reason* the job ended, and passing that to exit() is how every failed
+ * job used to come back as 71 - the low byte of PRTE_ERROR. */
+static int job_exit_code = -1;
 
 static size_t evid = INT_MAX;
 static pmix_proc_t myproc;
@@ -130,6 +139,11 @@ static void opcbfunc(pmix_status_t status, void *cbdata)
     PRTE_PMIX_WAKEUP_THREAD(lock);
 }
 
+/* the release lock the main thread parks on while the job runs -
+ * the default handler must be able to wake it even if an event
+ * fails to carry the registered return object */
+static prte_pmix_lock_t *release_lock = NULL;
+
 static void defhandler(size_t evhdlr_registration_id, pmix_status_t status,
                        const pmix_proc_t *source, pmix_info_t info[], size_t ninfo,
                        pmix_info_t *results, size_t nresults,
@@ -144,6 +158,19 @@ static void defhandler(size_t evhdlr_registration_id, pmix_status_t status,
         pmix_output(0, "PRUN: DEFHANDLER WITH STATUS %s(%d)", PMIx_Error_string(status), status);
     }
 
+    /* find the lock we are to release - if the event did not carry
+     * it, fall back to the release lock we registered */
+    if (NULL != info) {
+        for (n = 0; n < ninfo; n++) {
+            if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_RETURN_OBJECT)) {
+                lock = (prte_pmix_lock_t *) info[n].value.data.ptr;
+            }
+        }
+    }
+    if (NULL == lock) {
+        lock = release_lock;
+    }
+
     if (PMIX_ERR_IOF_FAILURE == status) {
         pmix_proc_t target;
         pmix_info_t directive;
@@ -153,31 +180,28 @@ static void defhandler(size_t evhdlr_registration_id, pmix_status_t status,
         PMIX_INFO_LOAD(&directive, PMIX_JOB_CTRL_KILL, NULL, PMIX_BOOL);
         rc = PMIx_Job_control_nb(&target, 1, &directive, 1, NULL, NULL);
         if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
-            PMIx_tool_finalize();
-            /* exit with a non-zero status */
-            exit(1);
+            /* we cannot terminate the job. This handler executes on
+             * the PMIx progress thread, so we must not finalize the
+             * library or exit from here - record the error and wake
+             * the main thread, which owns the shutdown path */
+            if (NULL != lock) {
+                lock->status = rc;
+                if (NULL == lock->msg) {
+                    lock->msg = strdup("failed to terminate job after IOF failure");
+                }
+                PRTE_PMIX_WAKEUP_THREAD(lock);
+            }
         }
         goto progress;
     }
 
     if (PMIX_ERR_UNREACH == status || PMIX_ERR_LOST_CONNECTION == status) {
-        /* we should always have info returned to us - if not, there is
-         * nothing we can do */
-        if (NULL != info) {
-            for (n = 0; n < ninfo; n++) {
-                if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_RETURN_OBJECT)) {
-                    lock = (prte_pmix_lock_t *) info[n].value.data.ptr;
-                }
-            }
+        if (NULL != lock) {
+            /* save the status */
+            lock->status = status;
+            /* release the lock */
+            PRTE_PMIX_WAKEUP_THREAD(lock);
         }
-
-        if (NULL == lock) {
-            exit(1);
-        }
-        /* save the status */
-        lock->status = status;
-        /* release the lock */
-        PRTE_PMIX_WAKEUP_THREAD(lock);
     }
 progress:
     /* we _always_ have to execute the evhandler callback or
@@ -209,6 +233,10 @@ static void evhandler(size_t evhdlr_registration_id, pmix_status_t status,
         for (n = 0; n < ninfo; n++) {
             if (0 == strncmp(info[n].key, PMIX_JOB_TERM_STATUS, PMIX_MAX_KEYLEN)) {
                 jobstatus = prte_pmix_convert_status(info[n].value.data.status);
+            } else if (0 == strncmp(info[n].key, PMIX_EXIT_CODE, PMIX_MAX_KEYLEN)) {
+                /* the application's own status - preferred over the
+                 * termination reason when we come to exit */
+                job_exit_code = info[n].value.data.integer;
             } else if (0 == strncmp(info[n].key, PMIX_EVENT_AFFECTED_PROC, PMIX_MAX_KEYLEN)) {
                 PMIX_LOAD_NSPACE(jobid, info[n].value.data.proc->nspace);
             } else if (0 == strncmp(info[n].key, PMIX_EVENT_RETURN_OBJECT, PMIX_MAX_KEYLEN)) {
@@ -229,6 +257,55 @@ static void evhandler(size_t evhdlr_registration_id, pmix_status_t status,
         }
         /* release the lock */
         PRTE_PMIX_WAKEUP_THREAD(lock);
+    }
+
+    /* we _always_ have to execute the evhandler callback or
+     * else the event progress engine will hang */
+    if (NULL != cbfunc) {
+        cbfunc(PMIX_EVENT_ACTION_COMPLETE, NULL, 0, NULL, NULL, cbdata);
+    }
+}
+
+/* A launch that fails before we have an nspace is reported here and nowhere
+ * else.  The spawn call is about to return an error and we will leave without
+ * ever registering the job-termination handler that carries this news for a
+ * job that at least started, so the DVM sends it ahead of the spawn response
+ * precisely so that we are still here to receive it.
+ *
+ * The DVM sends the facts, not the sentence, and we compose the sentence -
+ * because the message names the tool that could not launch the application,
+ * and that is us.  Rendered on the HNP it would tell a prun user that "prte"
+ * had failed them. */
+static void launch_failed_cbfunc(size_t evhdlr_registration_id, pmix_status_t status,
+                                 const pmix_proc_t *source, pmix_info_t info[], size_t ninfo,
+                                 pmix_info_t *results, size_t nresults,
+                                 pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
+{
+    const char *app = NULL, *wdir = NULL, *nodename = NULL;
+    pmix_rank_t rank = PMIX_RANK_WILDCARD;
+    int code = 0;
+    char *msg;
+    size_t n;
+    PRTE_HIDE_UNUSED_PARAMS(evhdlr_registration_id, status, source, results, nresults);
+
+    for (n = 0; n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_AFFECTED_PROC)) {
+            rank = info[n].value.data.proc->rank;
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_HOSTNAME)) {
+            nodename = info[n].value.data.string;
+        } else if (PMIX_CHECK_KEY(&info[n], "prte.launch.failed.app")) {
+            app = info[n].value.data.string;
+        } else if (PMIX_CHECK_KEY(&info[n], "prte.launch.failed.wdir")) {
+            wdir = info[n].value.data.string;
+        } else if (PMIX_CHECK_KEY(&info[n], "prte.launch.failed.code")) {
+            code = info[n].value.data.int32;
+        }
+    }
+
+    msg = prte_render_launch_failure(code, app, wdir, nodename, rank);
+    if (NULL != msg) {
+        fprintf(stderr, "%s\n", msg);
+        free(msg);
     }
 
     /* we _always_ have to execute the evhandler callback or
@@ -310,7 +387,8 @@ int prun_common(pmix_cli_result_t *results,
     int rc = 1;
     char *param, *ptr;
     prte_pmix_lock_t lock, rellock;
-    pmix_list_t apps;
+    pmix_list_t apps, jobdata;
+    prte_info_item_t *iprteinfo;
     prte_pmix_app_t *app;
     void *tinfo, *jinfo;
     pmix_info_t info, *iptr;
@@ -319,7 +397,7 @@ int prun_common(pmix_cli_result_t *results,
     bool flag;
     size_t n, ninfo;
     pmix_app_t *papps = NULL;
-    size_t napps;
+    size_t napps = 0;
     mylock_t mylock;
     uint32_t ui32;
     pid_t pid;
@@ -425,46 +503,28 @@ int prun_common(pmix_cli_result_t *results,
 
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_PID);
     if (NULL != opt) {
-        /* see if it is an integer value */
-        char *leftover;
-        leftover = NULL;
-        pid = strtol(opt->values[0], &leftover, 10);
-        if (NULL == leftover || 0 == strlen(leftover)) {
-            /* it is an integer */
+        rc = prte_parse_pid_option(opt->values[0], &pid, (const char **) &param);
+        switch (rc) {
+        case PRTE_SUCCESS:
             PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_SERVER_PIDINFO, &pid, PMIX_PID);
-        } else if (0 == strncasecmp(opt->values[0], "file", 4)) {
-            FILE *fp;
-            /* step over the file: prefix */
-            param = strchr(opt->values[0], ':');
-            if (NULL == param) {
-                /* malformed input */
-                pmix_show_help("help-prun.txt", "bad-option-input", true, prte_tool_basename,
-                               "--pid", opt->values[0], "file:path");
-                return PRTE_ERR_BAD_PARAM;
-            }
-            ++param;
-            fp = fopen(param, "r");
-            if (NULL == fp) {
-                pmix_show_help("help-prun.txt", "file-open-error", true, prte_tool_basename,
-                               "--pid", opt->values[0], param);
-                return PRTE_ERR_BAD_PARAM;
-            }
-            rc = fscanf(fp, "%lu", (unsigned long *) &pid);
-            if (1 != rc) {
-                /* if we were unable to obtain the single conversion we
-                 * require, then error out */
-                pmix_show_help("help-prun.txt", "bad-file", true, prte_tool_basename,
-                               "--pid", opt->values[0], param);
-                fclose(fp);
-                return PRTE_ERR_BAD_PARAM;
-            }
-            fclose(fp);
-            PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_SERVER_PIDINFO, &pid, PMIX_PID);
-        } else { /* a string that's neither an integer nor starts with 'file:' */
-                pmix_show_help("help-prun.txt", "bad-option-input", true,
-                               prte_tool_basename, "--pid",
-                               opt->values[0], "file:path");
-                return PRTE_ERR_BAD_PARAM;
+            break;
+        case PRTE_ERR_FILE_OPEN_FAILURE:
+            pmix_show_help("help-prun.txt", "file-open-error", true, prte_tool_basename,
+                           "--" PRTE_CLI_PID, opt->values[0], param);
+            PMIX_INFO_LIST_RELEASE(tinfo);
+            return PRTE_ERR_BAD_PARAM;
+        case PRTE_ERR_FILE_READ_FAILURE:
+            /* we could not obtain the single conversion we require */
+            pmix_show_help("help-prun.txt", "bad-file", true, prte_tool_basename,
+                           "--" PRTE_CLI_PID, opt->values[0], param);
+            PMIX_INFO_LIST_RELEASE(tinfo);
+            return PRTE_ERR_BAD_PARAM;
+        default: /* neither an integer nor a usable 'file:' spec */
+            pmix_show_help("help-prun.txt", "bad-option-input", true,
+                           prte_tool_basename, "--" PRTE_CLI_PID,
+                           opt->values[0], "file:path");
+            PMIX_INFO_LIST_RELEASE(tinfo);
+            return PRTE_ERR_BAD_PARAM;
         }
     }
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_NAMESPACE);
@@ -513,6 +573,7 @@ int prun_common(pmix_cli_result_t *results,
     /* register a default event handler and pass it our release lock
      * so we can cleanly exit if the server goes away */
     PRTE_PMIX_CONSTRUCT_LOCK(&rellock);
+    release_lock = &rellock;
     PMIX_INFO_CREATE(iptr, 2);
     PMIX_INFO_LOAD(&iptr[1], PMIX_EVENT_RETURN_OBJECT, &rellock, PMIX_POINTER);
     PMIX_INFO_LOAD(&iptr[0], PMIX_EVENT_HDLR_NAME, "DEFAULT", PMIX_STRING);
@@ -521,6 +582,27 @@ int prun_common(pmix_cli_result_t *results,
     PRTE_PMIX_WAIT_THREAD(&lock);
     PRTE_PMIX_DESTRUCT_LOCK(&lock);
     PMIX_INFO_FREE(iptr, 2);
+
+    /* Register for the launch-failure event BEFORE we spawn - the whole point
+     * of it is to describe a job that never got an nspace, so there is no
+     * later moment at which we could ask for it.  The DVM aims it at us
+     * alone, so no affected-proc filter is needed.
+     *
+     * Name the concrete code rather than leaning on the default handler just
+     * above.  A PMIx server records a default registration only by appending
+     * it to a default entry it already holds, and creates no entry when it
+     * holds none - so the first tool to attach to a server is dropped from
+     * its dispatch list and silently receives no default-routed event again.
+     * That is fixed upstream, but PRRTE builds against any PMIx from 6.1.0
+     * on, and this has to work on all of them. */
+    PMIX_INFO_CREATE(iptr, 1);
+    PMIX_INFO_LOAD(&iptr[0], PMIX_EVENT_HDLR_NAME, "LAUNCH-FAILED", PMIX_STRING);
+    code = PMIX_ERR_JOB_FAILED_TO_LAUNCH;
+    PRTE_PMIX_CONSTRUCT_LOCK(&lock);
+    PMIx_Register_event_handler(&code, 1, iptr, 1, launch_failed_cbfunc, regcbfunc, &lock);
+    PRTE_PMIX_WAIT_THREAD(&lock);
+    PRTE_PMIX_DESTRUCT_LOCK(&lock);
+    PMIX_INFO_FREE(iptr, 1);
 
     /***** CONSTRUCT THE APP'S JOB-INFO ****/
     PMIX_INFO_LIST_START(jinfo);
@@ -541,6 +623,7 @@ int prun_common(pmix_cli_result_t *results,
     }
 
     /* we want to be notified upon job completion */
+    flag = true;
     PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_NOTIFY_COMPLETION, &flag, PMIX_BOOL);
 
     /* pickup any relevant envars */
@@ -586,12 +669,19 @@ int prun_common(pmix_cli_result_t *results,
     /* they want to run an application, so let's parse
      * the cmd line to get it */
 
-    rc = prte_parse_locals(schizo, &apps, pargv, NULL, NULL, NULL);
+    PMIX_CONSTRUCT(&jobdata, pmix_list_t);
+    rc = prte_parse_locals(schizo, &apps, pargv, NULL, NULL, &jobdata, results);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
+        PMIX_LIST_DESTRUCT(&jobdata);
         PMIX_LIST_DESTRUCT(&apps);
         goto DONE;
     }
+    /* anything the parser determined to be job-level goes into the job spec */
+    PMIX_LIST_FOREACH(iprteinfo, &jobdata, prte_info_item_t) {
+        PMIX_INFO_LIST_XFER(ret, jinfo, &iprteinfo->info);
+    }
+    PMIX_LIST_DESTRUCT(&jobdata);
 
     /* bozo check */
     if (0 == pmix_list_get_size(&apps)) {
@@ -633,7 +723,7 @@ int prun_common(pmix_cli_result_t *results,
     }
 
     ret = PMIx_Spawn(iptr, ninfo, papps, napps, spawnednspace);
-    if (PRTE_SUCCESS != ret) {
+    if (PMIX_SUCCESS != ret) {
         pmix_output(0, "PMIx_Spawn failed (%d): %s", ret, PMIx_Error_string(ret));
         rc = ret;
         goto DONE;
@@ -739,6 +829,8 @@ int prun_common(pmix_cli_result_t *results,
     PMIX_INFO_DESTRUCT(&info);
 
 DONE:
+    /* the release lock is about to leave scope */
+    release_lock = NULL;
     PMIX_LIST_FOREACH(evitm, &forwarded_signals, prte_event_list_item_t)
     {
         prte_event_signal_del(&evitm->ev);
@@ -755,15 +847,35 @@ DONE:
         // a warning here, if prte logging is on.
         pmix_output(0, "PMIx_tool_finalize() failed. Status = %d", ret);
     }
+
+    /* Our caller makes this our exit status.  If the DVM told us what the
+     * application exited with, that is the answer - a launcher reports the
+     * status of what it launched, which is what prterun does and what any
+     * script driving prun expects.  Otherwise all we have is why the job
+     * ended, which is a status code, not an exit status: keep returning it
+     * (a caller only ever gets its low byte, but non-zero is non-zero) so
+     * that failures with no application status behind them still fail. */
+    if (0 < job_exit_code) {
+        return job_exit_code;
+    }
     return rc;
 }
+
+/* the mutually-exclusive ways of naming the allocation a job is to be
+ * mapped onto - see the resolution order in prte_plm_base_recv() */
+static const char *alloc_target_opts[] = {
+    PRTE_CLI_SESSION_ID,
+    PRTE_CLI_TARGET_ALLOC,
+    PRTE_CLI_ALLOC_REFID,
+    NULL
+};
 
 int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
                                prte_schizo_base_module_t *schizo,
                                pmix_list_t *apps)
 {
     pmix_cli_item_t *opt, opt2;
-    int ret, i;
+    int ret, i, ntargets;
     uint32_t ui32;
     bool flag;
     prte_pmix_app_t *app;
@@ -771,6 +883,16 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
 
     /* pass the personality */
     PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_PERSONALITY, schizo->name, PMIX_STRING);
+
+    /* Display directives are job-level only: there is no way to scope a map,
+     * binding, or allocation display to an individual app context.  A second
+     * instance therefore almost always means the user attached one to an app
+     * in an MPMD line, which we cannot honor - reject it rather than silently
+     * applying just one. */
+    if (1 < pmix_cmd_line_get_ninsts(results, PRTE_CLI_DISPLAY)) {
+        pmix_show_help("help-schizo-base.txt", "multi-instances", true, PRTE_CLI_DISPLAY);
+        return PRTE_ERR_BAD_PARAM;
+    }
 
     /* get display options */
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_DISPLAY);
@@ -819,22 +941,12 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_STDIN_TGT, opt->values[0], PMIX_STRING);
     }
 
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_MAPBY);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_MAPBY, opt->values[0], PMIX_STRING);
-    }
-
-    /* if the user specified a ranking policy, then set it */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_RANKBY);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_RANKBY, opt->values[0], PMIX_STRING);
-    }
-
-    /* if the user specified a binding policy, then set it */
-    opt = pmix_cmd_line_get_param(results, PRTE_CLI_BINDTO);
-    if (NULL != opt) {
-        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_BINDTO, opt->values[0], PMIX_STRING);
-    }
+    /* The mapping, ranking and binding directives are NOT taken from the
+     * global parse: it stops at the first app, so it cannot see a directive
+     * the user attached to a later one, and it cannot tell how many were
+     * given. prte_parse_locals() sees every segment and decides - a lone
+     * directive is the job's, several are the apps' - handing the job's back
+     * on the jobdata list, which is transferred into jinfo above. */
 
     /* check for an exec agent */
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_EXEC_AGENT);
@@ -912,6 +1024,65 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
         info.value.data.string = opt->values[0];
         flag = PMIX_INFO_TRUE(&info);
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_GPU_SUPPORT, &flag, PMIX_BOOL);
+    }
+
+    /* Determine the allocation upon which this job is to be mapped. The
+     * three options are alternative spellings of the same thing - the
+     * numeric ID of the session that holds the allocation, the identifier
+     * the host environment assigned to the allocation, or the reference ID
+     * the user attached to it when the allocation was requested. The DVM
+     * master resolves them in a fixed order, so naming more than one is
+     * ambiguous: refuse it here rather than silently honoring just one.
+     * Each is a job-level directive - there is no way to map different
+     * app contexts of a single job onto different allocations - so a
+     * second instance means the user attached one to an app in an MPMD
+     * line, which we likewise cannot honor. */
+    ntargets = 0;
+    for (i = 0; NULL != alloc_target_opts[i]; i++) {
+        if (1 < pmix_cmd_line_get_ninsts(results, alloc_target_opts[i])) {
+            pmix_show_help("help-schizo-base.txt", "multi-instances", true,
+                           alloc_target_opts[i]);
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        if (pmix_cmd_line_is_taken(results, alloc_target_opts[i])) {
+            ++ntargets;
+        }
+    }
+    if (1 < ntargets) {
+        pmix_show_help("help-schizo-base.txt", "alloc-target-conflict", true,
+                       PRTE_CLI_SESSION_ID, PRTE_CLI_TARGET_ALLOC, PRTE_CLI_ALLOC_REFID);
+        PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+        return PRTE_ERR_BAD_PARAM;
+    }
+
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_SESSION_ID);
+    if (NULL != opt) {
+        char *endptr = NULL;
+        unsigned long sid;
+
+        /* require a bare run of digits: strtoul would otherwise accept a
+         * leading sign or whitespace, and silently wrap "-1" into a valid
+         * (and quite possibly meaningful) session ID */
+        errno = 0;
+        sid = strtoul(opt->values[0], &endptr, 10);
+        if (!isdigit((unsigned char) opt->values[0][0]) || '\0' != *endptr ||
+            0 != errno || sid != (unsigned long) (uint32_t) sid) {
+            pmix_show_help("help-schizo-base.txt", "bad-session-id", true,
+                           PRTE_CLI_SESSION_ID, opt->values[0]);
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        ui32 = (uint32_t) sid;
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_SESSION_ID, &ui32, PMIX_UINT32);
+    }
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_TARGET_ALLOC);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_ALLOC_ID, opt->values[0], PMIX_STRING);
+    }
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_ALLOC_REFID);
+    if (NULL != opt) {
+        PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_ALLOC_REQ_ID, opt->values[0], PMIX_STRING);
     }
 
     /* give the schizo components a chance to add to the job info */

@@ -45,7 +45,6 @@
 #include "src/util/error.h"
 #include "src/util/error_strings.h"
 #include "src/util/pmix_keyval_parse.h"
-#include "src/util/malloc.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_if.h"
 #include "src/util/pmix_net.h"
@@ -166,6 +165,7 @@ int prte_init_minimum(void)
 {
     int ret, n;
     char *path = NULL;
+    char *extra;
     char *evar, **prefixes;
     const char *rvers;
     char token[100];
@@ -184,12 +184,27 @@ int prte_init_minimum(void)
      * cross version operations from inside of PRRTE.
      */
     rvers = PMIx_Get_version();
-    ret = sscanf(rvers, "%s %u.%u.%u",
-                 token, &major, &minor, &release);
-    ret = sscanf(PRTE_PMIX_MIN_VERSION_STRING, "%u.%u.%u",
-                 &reqmajor, &reqminor, &reqrelease);
-    ret = sscanf(PRTE_PMIX_MAX_VERSION_STRING, "%u.%u.%u",
-                 &maxmajor, &maxminor, &maxrelease);
+    /* Check what sscanf actually converted. These returns used to be
+     * assigned and thrown away, so a version string we could not parse left
+     * major/minor/release uninitialized and the range checks below then ran
+     * on whatever was on the stack - which can as easily pass as fail. */
+    if (4 != sscanf(rvers, "%s %u.%u.%u",
+                    token, &major, &minor, &release) ||
+        3 != sscanf(PRTE_PMIX_MIN_VERSION_STRING, "%u.%u.%u",
+                    &reqmajor, &reqminor, &reqrelease) ||
+        3 != sscanf(PRTE_PMIX_MAX_VERSION_STRING, "%u.%u.%u",
+                    &maxmajor, &maxminor, &maxrelease)) {
+        fprintf(stderr, "************************************************\n");
+        fprintf(stderr, "We were unable to parse the version of the PMIx\n");
+        fprintf(stderr, "library we were given:\n\n");
+        fprintf(stderr, "    Runtime:  %s\n", (NULL == rvers) ? "NULL" : rvers);
+        fprintf(stderr, "    Minimum:  %s\n", PRTE_PMIX_MIN_VERSION_STRING);
+        fprintf(stderr, "    Maximum:  %s\n\n", PRTE_PMIX_MAX_VERSION_STRING);
+        fprintf(stderr, "Please update your LD_LIBRARY_PATH to point\n");
+        fprintf(stderr, "us to the same PMIx version used to build PRRTE.\n");
+        fprintf(stderr, "************************************************\n");
+        return PRTE_ERR_SILENT;
+    }
 
     /* check the version triplet agains the min values
      * specified in VERSION
@@ -258,9 +273,22 @@ int prte_init_minimum(void)
         return ret;
     }
 
-    /* initialize the MCA infrastructure */
+    /* initialize the MCA infrastructure.  PRTE_MCA_mca_base_component_path
+     * names additional directories to search, mirroring what PMIx offers
+     * for its own components: the installed location is the only one we
+     * would otherwise look in, which leaves no way to run against
+     * components that have been built but not installed - a build tree,
+     * for one, which is where "make check" runs. */
+    extra = getenv("PRTE_MCA_mca_base_component_path");
     if (check_exist(prte_install_dirs.pmixlibdir)) {
-        pmix_asprintf(&path, "prte@%s", prte_install_dirs.pmixlibdir);
+        if (NULL == extra) {
+            pmix_asprintf(&path, "prte@%s", prte_install_dirs.pmixlibdir);
+        } else {
+            pmix_asprintf(&path, "prte@%s%c%s", extra, PMIX_ENV_SEP,
+                          prte_install_dirs.pmixlibdir);
+        }
+    } else if (NULL != extra) {
+        pmix_asprintf(&path, "prte@%s", extra);
     }
     ret = pmix_init_util(NULL, 0, path);
     if (NULL != path) {
@@ -277,18 +305,45 @@ int prte_init_minimum(void)
         return ret;
     }
 
+    /* A bootstrapping daemon must publish the DVM-wide MCA parameters it reads
+     * from prte.conf before those parameters are first registered below (an
+     * MCA variable evaluates its environment only on first registration).  The
+     * install directories - and thus the config-file path - are known by now,
+     * so this is the earliest correct point.  prte_bootstrap_setup is set from
+     * the argument vector in prted before prte_init_util was called. */
+    if (prte_bootstrap_setup) {
+        if (PRTE_SUCCESS != (ret = prte_ess_base_bootstrap_params())) {
+            if (PRTE_ERR_SILENT != ret) {
+                pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                               "prte bootstrap params", PRTE_ERROR_NAME(ret), ret);
+            }
+            return 1;
+        }
+    }
+
     /* Register all global MCA Params */
     if (PRTE_SUCCESS != (ret = prte_register_params())) {
         if (PRTE_ERR_SILENT != ret) {
-            pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true,
+            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
                            "prte register params",
                            PRTE_ERROR_NAME(ret), ret);
         }
         return 1;
     }
 
-    /* pre-load any default mca param files */
-    prte_preload_default_mca_params();
+    /* pre-load any default mca param files. A malformed file has to be
+     * fatal: the values in it steer component selection and launch, so
+     * silently carrying on with a partial set - which is what discarding
+     * this return did - starts a DVM configured differently from what the
+     * files say. */
+    ret = prte_preload_default_mca_params();
+    if (PRTE_SUCCESS != ret) {
+        if (PRTE_ERR_SILENT != ret) {
+            pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true,
+                           "prte preload mca params", PRTE_ERROR_NAME(ret), ret);
+        }
+        return ret;
+    }
 
     return PRTE_SUCCESS;
 }
@@ -310,9 +365,6 @@ int prte_init_util(prte_proc_type_t flags)
 
     /* ensure we know the type of proc for when we finalize */
     prte_process_info.proc_type = flags;
-
-    /* initialize the memory allocator */
-    prte_malloc_init();
 
     /* initialize the output system */
     pmix_output_init();
@@ -346,7 +398,7 @@ int prte_init_util(prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true, error,
+        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 
@@ -398,8 +450,12 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
     /* let the pmix server register params */
     pmix_server_register_params();
 
-    /* open hwloc */
-    prte_hwloc_base_open();
+    /* open hwloc - this is where the DVM-wide "bindto" value is validated,
+     * so a bad one has to stop us here rather than be diagnosed and ignored */
+    if (PRTE_SUCCESS != (ret = prte_hwloc_base_open())) {
+        error = "prte_hwloc_base_open";
+        goto error;
+    }
 
     /* setup the global job and node arrays */
     prte_job_data = PMIX_NEW(pmix_pointer_array_t);
@@ -491,6 +547,14 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
     prte_cache = PMIX_NEW(pmix_pointer_array_t);
     pmix_pointer_array_init(prte_cache, 1, INT_MAX, 1);
 
+    /* initialize launch-fence held-job arrays */
+    prte_held_jobs = PMIX_NEW(pmix_pointer_array_t);
+    pmix_pointer_array_init(prte_held_jobs, 1, INT_MAX, 1);
+    prte_prelaunch_held_jobs = PMIX_NEW(pmix_pointer_array_t);
+    pmix_pointer_array_init(prte_prelaunch_held_jobs, 1, INT_MAX, 1);
+    PMIX_CONSTRUCT(&prte_shrink_campaigns, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_grow_campaigns, pmix_list_t);
+
     /* All done */
     PMIX_ACQUIRE_THREAD(&prte_init_lock);
     prte_initialized = true;
@@ -499,7 +563,7 @@ int prte_init(int *pargc, char ***pargv, prte_proc_type_t flags)
 
 error:
     if (PRTE_ERR_SILENT != ret) {
-        pmix_show_help("help-prte-runtime", "prte_init:startup:internal-failure", true, error,
+        pmix_show_help("help-prte-runtime.txt", "prte_init:startup:internal-failure", true, error,
                        PRTE_ERROR_NAME(ret), ret);
     }
 
@@ -561,7 +625,7 @@ int prte_preload_default_mca_params(void)
         free(file);
         if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
             // it is okay if the file isn't found
-            return rc;
+            goto failed;
         }
         /* now get the user-level defaults */
         file = pmix_os_path(false, home, ".prte", "mca-params.conf", NULL);
@@ -569,7 +633,7 @@ int prte_preload_default_mca_params(void)
         free(file);
         if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
             // it is okay if the file isn't found
-            return rc;
+            goto failed;
         }
     } else {
         // split the string on commas
@@ -580,7 +644,7 @@ int prte_preload_default_mca_params(void)
             if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
                 // it is okay if the file isn't found
                 PMIx_Argv_free(paths);
-                return rc;
+                goto failed;
             }
         }
         PMIx_Argv_free(paths);
@@ -617,16 +681,17 @@ int prte_preload_default_mca_params(void)
     PMIX_LIST_DESTRUCT(&params);
     PMIX_LIST_DESTRUCT(&params2);
 
-    // process any override params
+    // process any override params. Both lists are re-constructed (params2
+    // stays empty) so that the shared error exit below can destruct all
+    // three unconditionally.
     PMIX_CONSTRUCT(&params, pmix_list_t);
+    PMIX_CONSTRUCT(&params2, pmix_list_t);
     if (NULL != prte_override_param_file) {
         // process the file
         rc = pmix_mca_base_parse_paramfile(prte_override_param_file, &params);
         if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
             // it is okay if the file isn't found
-            PMIX_LIST_DESTRUCT(&params);
-            PMIX_LIST_DESTRUCT(&pfinal);
-            return rc;
+            goto failed;
         }
         if (0 < pmix_list_get_size(&params)) {
             // check the params against any given
@@ -675,7 +740,10 @@ int prte_preload_default_mca_params(void)
             }
         }
         PMIX_LIST_DESTRUCT(&params);
+        PMIX_CONSTRUCT(&params, pmix_list_t);
     }
+    PMIX_LIST_DESTRUCT(&params);
+    PMIX_LIST_DESTRUCT(&params2);
 
     /* now process the final list - but do not overwrite if the
      * user already has the param in our environment as their
@@ -702,4 +770,12 @@ int prte_preload_default_mca_params(void)
 
     PMIX_LIST_DESTRUCT(&pfinal);
     return PRTE_SUCCESS;
+
+failed:
+    /* every one of these bail-outs used to return with the three lists still
+     * holding their parsed entries */
+    PMIX_LIST_DESTRUCT(&params);
+    PMIX_LIST_DESTRUCT(&params2);
+    PMIX_LIST_DESTRUCT(&pfinal);
+    return rc;
 }

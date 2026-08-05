@@ -73,7 +73,6 @@ static int set_default_ranking(prte_job_t *jdata,
                                prte_rmaps_options_t *options);
 static void job_info(pmix_cli_result_t *results,
                      void *jobinfo);
-static int setup_app(prte_pmix_app_t *app);
 static int set_default_rto(prte_job_t *jdata,
                            prte_rmaps_options_t *options);
 
@@ -82,7 +81,7 @@ prte_schizo_base_module_t prte_schizo_ompi_module = {
     .parse_cli = parse_cli,
     .parse_env = parse_env,
     .setup_fork = prte_schizo_base_setup_fork,
-    .setup_app = setup_app,
+    .setup_app = NULL,
     .detect_proxy = detect_proxy,
     .allow_run_as_root = allow_run_as_root,
     .set_default_ranking = set_default_ranking,
@@ -120,7 +119,6 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_NOPREFIX, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_SIGNALS, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
-    PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_CHILD_SEP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_HOMO_NODES, PMIX_ARG_NONE),
 
     /* debug options */
@@ -162,7 +160,6 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_WDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("wd", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PATH, PMIX_ARG_REQD),
-    PMIX_OPTION_DEFINE(PRTE_CLI_SHOW_PROGRESS, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_PSET, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_HOSTFILE, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("machinefile", PMIX_ARG_REQD),
@@ -221,6 +218,8 @@ static struct option ompioptions[] = {
     // deprecated options
     PMIX_OPTION_DEFINE("mca", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("gmca", PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_SHOW_PROGRESS, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_CHILD_SEP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("xml", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("tag-output", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("timestamp-output", PMIX_ARG_NONE),
@@ -228,6 +227,7 @@ static struct option ompioptions[] = {
     PMIX_OPTION_DEFINE("output-filename", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("merge-stderr-to-stdout", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("display-devel-map", PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE("display-devel-allocation", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("display-topo", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("report-bindings", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("display-map", PMIX_ARG_NONE),
@@ -259,161 +259,9 @@ static struct option ompioptions[] = {
     PMIX_OPTION_END
 };
 static char *ompishorts = "h::vVpn:c:N:sH:x:";
-static char *ompi_install_dirs_libdir = NULL;
 
 static int convert_deprecated_cli(pmix_cli_result_t *results,
                                   bool silent);
-
-static void set_classpath_jar_file(prte_pmix_app_t *app, int index, char *jarfile)
-{
-    if (NULL == strstr(app->app.argv[index], jarfile)) {
-        /* nope - need to add it */
-        char *fmt = ':' == app->app.argv[index][strlen(app->app.argv[index]-1)]
-                    ? "%s%s/%s" : "%s:%s/%s";
-        char *str;
-        pmix_asprintf(&str, fmt, app->app.argv[index], ompi_install_dirs_libdir, jarfile);
-        free(app->app.argv[index]);
-        app->app.argv[index] = str;
-    }
-}
-
-/*
- * OMPI schizo setup_app is the place we prep for Java apps
- */
-
-static int setup_app(prte_pmix_app_t *app)
-{
-    bool found;
-    int i,rc;
-    char *value;
-
-    /* if this is a Java application, we have a bit more work to do. Such
-     * applications actually need to be run under the Java virtual machine
-     * and the "java" command will start the "executable". So we need to ensure
-     * that all the proper java-specific paths are provided
-     */
-
-    if (0 != strcmp(app->app.argv[0], "java")) {
-        return PRTE_SUCCESS;
-    }
-
-    ompi_install_dirs_libdir = getenv("OMPI_LIBDIR_LOC");
-    if (NULL == ompi_install_dirs_libdir) {
-        pmix_show_help("help-schizo-ompi.txt", "openmpi-install-path-not-found",1);
-        return PRTE_ERR_NOT_AVAILABLE;
-    }
-
-    /* see if we were given a library path */
-    found = false;
-    for (i=1; NULL != app->app.argv[i]; i++) {
-        if (NULL != strstr(app->app.argv[i], "java.library.path")) {
-            char *dptr;
-            /* find the '=' that delineates the option from the path */
-            if (NULL == (dptr = strchr(app->app.argv[i], '='))) {
-                /* that's just wrong */
-                rc = PRTE_ERR_BAD_PARAM;
-                goto cleanup;
-            }
-            /* step over the '=' */
-            ++dptr;
-            /* yep - but does it include the path to the mpi libs? */
-            found = true;
-            if (NULL == strstr(app->app.argv[i], ompi_install_dirs_libdir)) {
-                /* doesn't appear to - add it to be safe */
-                if (':' == app->app.argv[i][strlen(app->app.argv[i]-1)]) {
-                    pmix_asprintf(&value, "-Djava.library.path=%s%s", dptr, ompi_install_dirs_libdir);
-                } else {
-                    pmix_asprintf(&value, "-Djava.library.path=%s:%s", dptr, ompi_install_dirs_libdir);
-                }
-                free(app->app.argv[i]);
-                app->app.argv[i] = value;
-            }
-            break;
-        }
-    }
-
-    if (!found) {
-        /* need to add it right after the java command */
-        pmix_asprintf(&value, "-Djava.library.path=%s", ompi_install_dirs_libdir);
-        pmix_argv_insert_element(&app->app.argv, 1, value);
-        free(value);
-    }
-
-    /* see if we were given a class path
-     * See https://docs.oracle.com/javase/8/docs/technotes/tools/findingclasses.html
-     * for more info about rules for the ways to set the class path
-     */
-    found = false;
-    for (i=1; NULL != app->app.argv[i]; i++) {
-        if (NULL != strstr(app->app.argv[i], "cp") ||
-            NULL != strstr(app->app.argv[i], "classpath")) {
-            /* yep - but does it include the path to the mpi libs? */
-            found = true;
-            /* check if mpi.jar exists - if so, add it */
-            value = pmix_os_path(false, ompi_install_dirs_libdir, "mpi.jar", NULL);
-            if (access(value, F_OK ) != -1) {
-                set_classpath_jar_file(app, i+1, "mpi.jar");
-            }
-            free(value);
-            /* always add the local directory */
-            pmix_asprintf(&value, "%s:%s", app->app.cwd, app->app.argv[i+1]);
-            free(app->app.argv[i+1]);
-            app->app.argv[i+1] = value;
-            break;
-        }
-    }
-
-    if (!found) {
-        /* check to see if CLASSPATH is in the environment */
-        found = false;  // just to be pedantic
-        for (i=0; NULL != environ[i]; i++) {
-            if (0 == strncmp(environ[i], "CLASSPATH", strlen("CLASSPATH"))) {
-                value = strchr(environ[i], '=');
-                ++value; /* step over the = */
-                pmix_argv_insert_element(&app->app.argv, 1, value);
-                /* check for mpi.jar */
-                value = pmix_os_path(false, ompi_install_dirs_libdir, "mpi.jar", NULL);
-                if (access(value, F_OK ) != -1) {
-                    set_classpath_jar_file(app, 1, "mpi.jar");
-                }
-                free(value);
-                /* always add the local directory */
-                pmix_asprintf(&value, "%s:%s", app->app.cwd, app->app.argv[1]);
-                free(app->app.argv[1]);
-                app->app.argv[1] = value;
-                pmix_argv_insert_element(&app->app.argv, 1, "-cp");
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            /* need to add it right after the java command - have
-             * to include the working directory and trust that
-             * the user set cwd if necessary
-             */
-            char *str, *str2;
-            /* always start with the working directory */
-            str = strdup(app->app.cwd);
-            /* check for mpi.jar */
-            value = pmix_os_path(false, ompi_install_dirs_libdir, "mpi.jar", NULL);
-            if (access(value, F_OK ) != -1) {
-                pmix_asprintf(&str2, "%s:%s", str, value);
-                free(str);
-                str = str2;
-            }
-            free(value);
-            pmix_argv_insert_element(&app->app.argv, 1, str);
-            free(str);
-            pmix_argv_insert_element(&app->app.argv, 1, "-cp");
-        }
-    }
-
-    return PRTE_SUCCESS;
-
-cleanup:
-    return rc;
-}
 
 static bool mcaoption(char *s)
 {
@@ -545,11 +393,15 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
         char *corrected_args = NULL;
         int tail_pos = 0;
 
-        // Find the position of the tail.
-        for(n = 0; NULL != pargv[n]; n++) {
-            if(0 == strcmp(results->tail[0], pargv[n])) break;
+        /* The tail is the trailing run of pargv, so its position is fixed by
+         * the counts.  Searching for the first token equal to tail[0] finds
+         * an OPTION'S VALUE instead whenever the executable's name was also
+         * given as one (--wdir /tmp/app ... /tmp/app), which would count
+         * corrected options as being "after" the executable. */
+        tail_pos = PMIx_Argv_count(pargv) - PMIx_Argv_count(results->tail);
+        if (0 > tail_pos) {
+            tail_pos = 0;
         }
-        tail_pos = n;
 
         for(n = 0; n < cur_caught_pos; n++) {
             // Add all offending arguments before the user executable (tail).
@@ -622,15 +474,20 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
     // check for the --stream-buffering option
 
     if (NULL != results->tail) {
-        /* search for the leader of the tail */
-        for (n=0; NULL != argv[n]; n++) {
-            if (0 == strcmp(results->tail[0], argv[n])) {
-                /* this starts the tail - replace the rest of the
-                 * tail with the original argv */
-                PMIx_Argv_free(results->tail);
-                results->tail = PMIx_Argv_copy(&argv[n]);
-                break;
-            }
+        /* Restore the tail from the ORIGINAL argv, so the app's own
+         * arguments are handed on exactly as the user wrote them rather
+         * than as the single-dash correction rewrote them.
+         *
+         * The tail is the trailing run of the command line and argv has the
+         * same length as the pargv it was parsed from, so its start is
+         * argc - tailc.  Searching for the first token equal to tail[0]
+         * instead lands on an option's VALUE whenever that value happens to
+         * equal the executable name ("--wdir /tmp/app ... /tmp/app"), which
+         * would splice the options back into the app's argv. */
+        n = PMIx_Argv_count(argv) - PMIx_Argv_count(results->tail);
+        if (0 < n && NULL != argv[n] && 0 == strcmp(results->tail[0], argv[n])) {
+            PMIx_Argv_free(results->tail);
+            results->tail = PMIx_Argv_copy(&argv[n]);
         }
     }
 
@@ -641,6 +498,7 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                                   bool silent)
 {
     char *option, *p1, *p2, *tmp, *tmp2, *output;
+    char **ppr;
     int rc = PRTE_SUCCESS;
     pmix_cli_item_t *opt, *nxt, *opt2;
     bool warn;
@@ -702,10 +560,20 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
-        /* --show-progress -> --runtime-options show-progress */
+        /* --show-progress -> --runtime-options show-progress, and
+         * --report-child-jobs-separately -> the runtime option of the same
+         * name.  The prte personality performs the same two conversions;
+         * without the second one here, the standalone flag reached nothing
+         * at all. */
         else if(0 == strcmp(option, PRTE_CLI_SHOW_PROGRESS)) {
             rc = prte_schizo_base_add_directive(results, option,
                                                 PRTE_CLI_RTOS, PRTE_CLI_SHOW_PROGRESS,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+        else if(0 == strcmp(option, PRTE_CLI_REPORT_CHILD_SEP)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_REPORT_CHILD_SEP,
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
@@ -815,7 +683,11 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
         /* --rankfile X -> map-by rankfile:file=X */
         else if (0 == strcmp(option, "rankfile")) {
             pmix_asprintf(&p2, "%s:%s%s", PRTE_CLI_RANKFILE, PRTE_CLI_QFILE, opt->values[0]);
-            rc = prte_schizo_base_add_directive(results, option, PRTE_CLI_MAPBY, p2, true);
+            /* pass "warn", not an unconditional "true" - this personality
+             * defaults warn_deprecations to false, and hard-coding the report
+             * made --rankfile the one legacy option that scolded Open MPI
+             * users no matter how they had configured the warning */
+            rc = prte_schizo_base_add_directive(results, option, PRTE_CLI_MAPBY, p2, warn);
             free(p2);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
@@ -865,10 +737,19 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
-        /* --display-devel-map  -> --display allocation-devel */
+        /* --display-devel-map  -> --display map-devel */
         else if (0 == strcmp(option, "display-devel-map")) {
             rc = prte_schizo_base_add_directive(results, option,
                                                 PRTE_CLI_DISPLAY, PRTE_CLI_MAPDEV,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+        /* --display-devel-allocation  ->  --display allocation.  There is no
+         * separate developer allocation display any more, so it folds onto
+         * the one allocation directive parse_display knows. */
+        else if (0 == strcmp(option, "display-devel-allocation")) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_DISPLAY, PRTE_CLI_ALLOC,
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
@@ -983,15 +864,21 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                 free(p1);
                 free(opt->values[0]);
                 opt->values[0] = tmp;
-            } else if (0 == strncasecmp(opt->values[0], "ppr", strlen("ppr"))) {
+            } else if (0 == strncasecmp(opt->values[0], PRTE_CLI_PPR, strlen(PRTE_CLI_PPR))) {
                 // see if they specified "socket" as the resource
-                p1 = strdup(opt->values[0]);
-                p2 = strrchr(p1, ':');
-                ++p2;
-                if (0 == strncasecmp(p2, "socket", strlen("socket")) ||
-                    0 == strncasecmp(p2, "skt", strlen("skt"))) {
-                    *p2 = '\0';
-                    pmix_asprintf(&p2, "%spackage", p1);
+                /* the pattern is "ppr:N:resource[:qualifier...]", so the
+                 * resource is the THIRD field.  Reaching for it with strrchr()
+                 * finds the last ':' instead, which is the resource only when
+                 * no qualifiers follow it - and returns NULL for a bare
+                 * "--map-by ppr", where advancing past it dereferenced address
+                 * 0x1 and killed the tool outright */
+                ppr = PMIx_Argv_split(opt->values[0], ':');
+                if (3 <= PMIx_Argv_count(ppr) &&
+                    (0 == strncasecmp(ppr[2], "socket", strlen("socket")) ||
+                     0 == strncasecmp(ppr[2], "skt", strlen("skt")))) {
+                    free(ppr[2]);
+                    ppr[2] = strdup(PRTE_CLI_PACKAGE);
+                    p2 = PMIx_Argv_join(ppr, ':');
                     if (warn) {
                         pmix_asprintf(&tmp, "%s %s", option, opt->values[0]);
                         pmix_asprintf(&tmp2, "%s %s", option, p2);
@@ -1007,7 +894,7 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                     free(opt->values[0]);
                     opt->values[0] = p2;
                 }
-                free(p1);
+                PMIx_Argv_free(ppr);
             }
         }
         /* --rank-by socket ->  --rank-by package */
@@ -1912,14 +1799,7 @@ static bool check_prte_overlap(char *var, char *value)
 {
     char *tmp;
 
-    if (0 == strncmp(var, "dl_", 3)) {
-        pmix_asprintf(&tmp, "PRTE_MCA_prtedl_%s", &var[3]);
-        // set it, but don't overwrite if they already
-        // have a value in our environment
-        setenv(tmp, value, false);
-        free(tmp);
-        return true;
-    } else if (0 == strncmp(var, "oob_", 4)) {
+    if (0 == strncmp(var, "oob_", 4)) {
         pmix_asprintf(&tmp, "PRTE_MCA_%s", var);
         // set it, but don't overwrite if they already
         // have a value in our environment
@@ -2015,6 +1895,20 @@ static int translate_params(void)
     pmix_mca_base_var_file_value_t *fv;
     uid_t uid;
     int n, len;
+    static bool translated = false;
+
+    /* we only need to harvest the OMPI params once per process -
+     * nothing below overwrites a value already in our environment,
+     * so repeating the scan can never change the result. It can,
+     * however, crash us: detect_proxy is invoked on the PRRTE
+     * progress thread for every incoming spawn request, while the
+     * PMIx library's pmdl/ompi component parses these same files on
+     * the PMIx progress thread, and pmix_mca_base_parse_paramfile
+     * passes its target list through unprotected static storage */
+    if (translated) {
+        return 100;
+    }
+    translated = true;
 
     /* since we are the proxy, we need to check the OMPI default
      * MCA params to see if there is something relating to PRRTE
@@ -2040,7 +1934,17 @@ static int translate_params(void)
     for (n=0; NULL != environ[n]; n++) {
         if (0 == strncmp(environ[n], "OMPI_MCA_", len)) {
             e2 = strdup(environ[n]);
-            evar = strrchr(e2, '=');
+            /* split at the FIRST '=' - that is the one separating the
+             * variable's name from its value.  strrchr() splits at the last
+             * one instead, so any OMPI_MCA_ value that itself contains an
+             * '=' (mca_base_env_list="FOO=1;BAR=2" is the common one) is
+             * translated under a mangled name with a truncated value */
+            evar = strchr(e2, '=');
+            if (NULL == evar) {
+                /* environ entries always carry one, but do not trust it */
+                free(e2);
+                continue;
+            }
             *evar = '\0';
             ++evar;
             if (check_prte_overlap(&e2[len], evar)) {

@@ -40,6 +40,32 @@
 
 #include "src/mca/ras/base/base.h"
 
+/* Normalize a node name to the short form, storing the FQDN as rawname
+ * and as an alias so both forms resolve via prte_quickmatch / prte_nptr_match.
+ * No-op when keep_fqdn_hostnames is set or the name is an IP address. */
+static void normalize_node(prte_node_t *node)
+{
+    char *ptr, *fqdn;
+
+    if (prte_keep_fqdn_hostnames || pmix_net_isaddr(node->name)) {
+        return;
+    }
+    ptr = strchr(node->name, '.');
+    if (NULL == ptr) {
+        return;
+    }
+    /* copy the full FQDN, then truncate node->name in place to the short name */
+    fqdn = strdup(node->name);
+    *ptr = '\0';
+    if (NULL == node->rawname) {
+        node->rawname = fqdn;
+    } else {
+        PMIx_Argv_append_unique_nosize(&node->aliases, fqdn);
+        free(fqdn);
+    }
+    PMIx_Argv_append_unique_nosize(&node->aliases, node->rawname);
+}
+
 /*
  * Add the specified node definitions to the global data store
  * NOTE: this removes all items from the list!
@@ -50,10 +76,11 @@ int prte_ras_base_node_insert(pmix_list_t *nodes, prte_job_t *jdata)
     int32_t num_nodes;
     int rc, i;
     prte_node_t *node, *hnp_node, *nptr;
-    bool skiphnp = false;
-    prte_attribute_t *kv;
+    bool skiphnp = false, found;
+    prte_attribute_t *kv, *kv2;
     prte_proc_t *daemon;
     prte_job_t *djob;
+    pmix_status_t prc;
 
     /* get the number of nodes */
     num_nodes = (int32_t) pmix_list_get_size(nodes);
@@ -128,19 +155,39 @@ int prte_ras_base_node_insert(pmix_list_t *nodes, prte_job_t *jdata)
             /* update the total slots in the job */
             prte_ras_base.total_slots_alloc += node->slots;
             /* copy the allocation data to that node's info */
-            hnp_node->slots = node->slots;
             hnp_node->slots_max = node->slots_max;
-            /* copy across any attributes */
+            if (prte_get_attribute(&node->attributes, PRTE_NODE_ADD_SLOTS, NULL, PMIX_BOOL)) {
+                hnp_node->slots += node->slots;
+                if (0 > hnp_node->slots) {
+                    hnp_node->slots = 0;
+                } else if (hnp_node->slots > hnp_node->slots_max && hnp_node->slots_max > 0) {
+                    hnp_node->slots = hnp_node->slots_max;
+                }
+            } else {
+                hnp_node->slots = node->slots;
+            }
+            /* copy across any attributes. Note that prte_set_attribute()
+             * expects a raw C value pointer, NOT a pmix_value_t, so the
+             * attribute is duplicated and spliced in directly rather than
+             * being round-tripped through set_attribute. */
             PMIX_LIST_FOREACH(kv, &node->attributes, prte_attribute_t)
             {
-                prte_set_attribute(&node->attributes, kv->key,
-                                   PRTE_ATTR_LOCAL,
-                                   &kv->data, kv->data.type);
+                prte_remove_attribute(&hnp_node->attributes, kv->key);
+                kv2 = PMIX_NEW(prte_attribute_t);
+                kv2->key = kv->key;
+                kv2->local = kv->local;
+                prc = PMIx_Value_xfer(&kv2->data, &kv->data);
+                if (PMIX_SUCCESS != prc) {
+                    PMIX_RELEASE(kv2);
+                    continue;
+                }
+                pmix_list_append(&hnp_node->attributes, &kv2->super);
             }
-            if (prte_managed_allocation || PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN)) {
-                /* the slots are always treated as sacred
-                 * in managed allocations
-                 */
+            /* the incoming node carries the authority for its own slot count:
+             * whoever supplied it says whether the number is a given (an RM
+             * allocation, an explicit "slots=" in a hostfile) or a placeholder
+             * to be computed from the node's topology later */
+            if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_SLOTS_GIVEN)) {
                 PRTE_FLAG_SET(hnp_node, PRTE_NODE_FLAG_SLOTS_GIVEN);
             } else {
                 PRTE_FLAG_UNSET(hnp_node, PRTE_NODE_FLAG_SLOTS_GIVEN);
@@ -173,31 +220,98 @@ int prte_ras_base_node_insert(pmix_list_t *nodes, prte_job_t *jdata)
                 node->index = pmix_pointer_array_add(prte_node_pool, node);
             }
         } else {
-            /* insert the object onto the prte_nodes global array */
+            /* insert the object into the prte_nodes global array */
             PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
                                  "%s ras:base:node_insert node %s slots %d",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  (NULL == node->name) ? "NULL" : node->name, node->slots));
-            if (prte_managed_allocation) {
-                /* the slots are always treated as sacred
-                 * in managed allocations
-                 */
-                PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
+            // see if we already have this node
+            found = false;
+            for (i=0; i < prte_node_pool->size; i++) {
+                nptr = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, i);
+                if (NULL == nptr) {
+                    continue;
+                }
+                if (prte_nptr_match(nptr, node)) {
+                    found = true;
+                    /* The incoming entry is discarded in favor of the one
+                     * already in the pool, so anything the caller marked on
+                     * it has to be carried across. A dynamic addition marks
+                     * its nodes PRTE_NODE_STATE_ADDED precisely so the DVM
+                     * extension will launch a daemon on them; dropping that
+                     * for a node the pool already knows about makes the grow
+                     * a no-op. That is the normal case when re-growing a node
+                     * that was previously shrunk out of the DVM: the shrink
+                     * removes its daemon, but the pool entry survives. */
+                    if (PRTE_NODE_STATE_ADDED == node->state) {
+                        nptr->state = PRTE_NODE_STATE_ADDED;
+                    }
+                    if (prte_get_attribute(&node->attributes, PRTE_NODE_ADD_SLOTS, NULL, PMIX_BOOL)) {
+                        nptr->slots += node->slots;
+                        if (0 > nptr->slots) {
+                            nptr->slots = 0;
+                        } else if (nptr->slots > nptr->slots_max && nptr->slots_max > 0) {
+                            nptr->slots = nptr->slots_max;
+                        }
+                    }
+                    break;
+                }
             }
-            /* insert it into the array */
-            node->index = pmix_pointer_array_add(prte_node_pool, (void *) node);
-            if (PRTE_SUCCESS > (rc = node->index)) {
-                PRTE_ERROR_LOG(rc);
-                return rc;
+            if (found) {
+                /* the pool entry is authoritative - drop the duplicate the
+                 * caller handed us. Its slots must NOT be added to the
+                 * running total: that node is already counted, and adding
+                 * it again inflates total_slots_alloc on every re-grow of a
+                 * node the pool already knows about. The multiplier copies
+                 * likewise belong to the original insertion, not to this
+                 * rediscovery of it. */
+                PMIX_RELEASE(node);
+                continue;
             }
-            if (prte_get_attribute(&djob->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+            /* PRTE_NODE_FLAG_SLOTS_GIVEN arrives already set by whoever
+             * supplied the node and is carried into the pool untouched */
+            /* detect FQDN before normalizing, then normalize to short name */
+            if (!pmix_net_isaddr(node->name) && NULL != strchr(node->name, '.')) {
+                prte_have_fqdn_allocation = true;
+            }
+            normalize_node(node);
+            /* Insert it into the array.
+             *
+             * A component may pre-assign the pool slot by setting node->index
+             * before handing us the node; ras/bootstrap does exactly that, so
+             * a node lands at the slot matching its canonical DVM rank (read
+             * from the same config file the daemons read to compute their own
+             * rank). Appending to the lowest free slot would reproduce that
+             * only by accident of the order the config happens to list nodes
+             * in - and would silently overwrite the pre-assignment, making the
+             * correspondence unenforced. A slot that is already taken means a
+             * malformed config; fall back to an append rather than clobber
+             * another node. */
+            if (0 <= node->index &&
+                NULL == pmix_pointer_array_get_item(prte_node_pool, node->index)) {
+                rc = pmix_pointer_array_set_item(prte_node_pool, node->index,
+                                                 (void *) node);
+                if (PRTE_SUCCESS != rc) {
+                    PRTE_ERROR_LOG(rc);
+                    return rc;
+                }
+            } else {
+                node->index = pmix_pointer_array_add(prte_node_pool, (void *) node);
+                if (PRTE_SUCCESS > (rc = node->index)) {
+                    PRTE_ERROR_LOG(rc);
+                    return rc;
+                }
+            }
+            if (NULL != djob &&
+                prte_get_attribute(&djob->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL) &&
+                NULL == node->daemon) {
                 /* create a daemon for this node since we won't be launching
                  * and the mapper needs to see a daemon - this is used solely
                  * for testing the mappers */
                 daemon = PMIX_NEW(prte_proc_t);
                 PMIX_LOAD_PROCID(&daemon->name, PRTE_PROC_MY_NAME->nspace, node->index);
                 daemon->state = PRTE_PROC_STATE_RUNNING;
-                PMIX_RETAIN(node);
+                /* the node backpointer is borrowed, not retained */
                 daemon->node = node;
                 pmix_pointer_array_set_item(djob->procs, daemon->name.rank, daemon);
                 djob->num_procs++;
@@ -206,10 +320,6 @@ int prte_ras_base_node_insert(pmix_list_t *nodes, prte_job_t *jdata)
             }
             /* update the total slots in the job */
             prte_ras_base.total_slots_alloc += node->slots;
-            /* check if we have fqdn names in the allocation */
-            if (!pmix_net_isaddr(node->name) && NULL != strchr(node->name, '.')) {
-                prte_have_fqdn_allocation = true;
-            }
             /* duplicate the node if requested */
             for (i = 1; i < prte_ras_base.multiplier; i++) {
                 rc = prte_node_copy(&nptr, node);

@@ -31,7 +31,9 @@ sources = \
         ras_flux_component.c \
         ras_flux_module.c
 
-EXTRA_DIST = help-ras-flux.txt
+# testbuild_flux.h is only #included when --enable-testbuild-launchers
+# is given, so it appears in no _SOURCES list and has to be listed here
+EXTRA_DIST = help-ras-flux.txt testbuild_flux.h
 
 # Make the output library in this directory, and name it either
 # mca_<type>_<name>.la (for DSO builds) or libmca_<type>_<name>.la
@@ -50,8 +52,8 @@ mcacomponent_LTLIBRARIES = $(component_install)
 prte_mca_ras_flux_la_SOURCES = $(sources)
 prte_mca_ras_flux_la_CPPFLAGS = $(ras_flux_CPPFLAGS) $(ras_flux_jansson_CPPFLAGS)
 prte_mca_ras_flux_la_LDFLAGS = -module -avoid-version $(ras_flux_LDFLAGS) $(ras_flux_jansson_LDFLAGS)
-prte_mca_ras_flux_la_LIBADD = $(ras_flux_LIBS) $(ras_flux_jansson_LIBS)\
-    $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
+prte_mca_ras_flux_la_LIBADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la \
+    $(ras_flux_LIBS) $(ras_flux_jansson_LIBS)
 
 noinst_LTLIBRARIES = $(component_noinst)
 libprtemca_ras_flux_la_SOURCES =$(sources)

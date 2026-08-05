@@ -312,6 +312,17 @@ darwin[[45678]]*)
     AC_MSG_ERROR([Cannot continue])
 esac
 
+# Some test programs use Linux-only APIs and can only be built there
+case $host_os in
+linux*)
+    prte_on_linux=1
+    ;;
+*)
+    prte_on_linux=0
+    ;;
+esac
+AM_CONDITIONAL([PRTE_OS_LINUX], [test "$prte_on_linux" = "1"])
+
 ############################################################################
 # Check for compilers and preprocessors
 ############################################################################
@@ -384,13 +395,14 @@ AS_IF([test "$prte_cv_compiler_FAMILYNAME" = "GNU" && \
        AC_MSG_ERROR([Cannot continue])
       ])
 
-##################################
-# Assembler Configuration
-##################################
-
-prte_show_subtitle "Atomics"
-
-PRTE_CONFIG_ASM
+dnl There is no atomics configuration.  PRRTE requires C11 atomics, which
+dnl PRTE_SETUP_CC above verifies and errors out on; src/include/prte_stdatomic.h
+dnl then uses the _Atomic keyword unconditionally, as PMIx's
+dnl pmix_stdatomic.h does.  The PRTE_CONFIG_ASM macro that used to sit here
+dnl offered --enable-c11-atomics/--enable-builtin-atomics and a GCC
+dnl __atomic built-in fallback that selected a `volatile` alternative --
+dnl not an atomic type at all -- and the PRTE_ATOMIC_GCC_BUILTIN and
+dnl PRTE_ATOMIC_X86_64 symbols it emitted had no readers in the tree.
 
 ##################################
 # Header files
@@ -414,7 +426,7 @@ AC_CHECK_HEADERS([arpa/inet.h dirent.h \
                   sys/types.h sys/uio.h sys/un.h net/uio.h sys/utsname.h sys/wait.h syslog.h \
                   termios.h unistd.h util.h malloc.h \
                   paths.h \
-                  ioLib.h sockLib.h hostLib.h stdatomic.h])
+                  stdatomic.h])
 
 # Needed to work around Darwin requiring sys/socket.h for
 # net/if.h
@@ -584,8 +596,6 @@ AS_IF([test "$prte_cv_htonl_define" = "yes" || test "$prte_have_htonl" = "yes"],
     [AC_DEFINE_UNQUOTED([HAVE_UNIX_BYTESWAP], [1],
         [whether unix byteswap routines -- htonl, htons, nothl, ntohs -- are available])])
 
-AC_CHECK_DECLS(__func__)
-
 # checkpoint results
 AC_CACHE_SAVE
 
@@ -748,53 +758,22 @@ AC_CACHE_SAVE
 ##################################
 # Libevent
 ##################################
-prte_show_title "Event libraries"
+prte_show_title "Event library"
 
-dnl Only one of Libev or Libevent can be used by PRTE.  The
-dnl selection logic for the two is:
+dnl PRRTE requires Libevent.  There is no alternative and no configure
+dnl option to select one: PRRTE and PMIx share an event base and PMIx is
+dnl Libevent-only, so a PRRTE built against anything else could not talk to
+dnl the PMIx it is compiled against.
 dnl
-dnl   * libev is used if explicitly requested
-dnl   * libevent is used if explicitly requested
-dnl   * if both are explicitly requested, then we report the error
-dnl     and abort
-dnl   * if neither is explicitly requested, then we default to
-dnl     using libevent if it is available. If libevent isn't
-dnl     available, then we see if libev is available.
-dnl
-dnl poking at $with_libevent and $with_libev is a bit of an
-dnl abstraction break, but makes implementing this logic
-dnl significantly easier.
-prte_libev_support=0
-prte_libevent_support=0
-
-AS_IF([test ! -z "$with_libevent" -a "$with_libevent" != "no"],
-      [want_libevent=1])
-AS_IF([test ! -z "$with_libev" -a "$with_libev" != "no"],
-      [want_libev=1])
-
-AS_IF([test "$want_libevent" = "1" -a "$want_libev" = "1"],
-      [AC_MSG_WARN([Both libevent and libev support have been specified.])
-       AC_MSG_WARN([Only one can be configured against at a time. Please])
-       AC_MSG_WARN([remove one from the configure command line.])
-       AC_MSG_ERROR([Cannot continue])])
-
-prte_found_event_lib=0
-dnl If libevent succeeds, then we don't need libev, but we skip
-dnl libevent if libev was explicitly requested.
-AS_IF([test "$want_libev" != "1"],
-      [PRTE_LIBEVENT_CONFIG([prte_found_event_lib=1])])
-AS_IF([test $prte_found_event_lib -eq 0],
-      [PRTE_LIBEV_CONFIG([prte_found_event_lib=1])])
-
-dnl The following must _always_ be defined, regardless of which
-dnl event library was selected/requested
-AC_DEFINE_UNQUOTED([PRTE_HAVE_LIBEV], [$prte_libev_support], [Whether we are building against libev])
-AC_DEFINE_UNQUOTED([PRTE_HAVE_LIBEVENT], [$prte_libevent_support], [Whether we are building against libevent])
-
-AS_IF([test $prte_found_event_lib -eq 0],
-      [AC_MSG_WARN([Either libevent or libev support is required, but neither])
-       AC_MSG_WARN([was found. Please use the configure options to point us])
-       AC_MSG_WARN([to where we can find one or the other library])
+dnl PRRTE used to also accept libev here, chosen by --with-libev and
+dnl reported through a PRTE_HAVE_LIBEV symbol that gated a second arm in
+dnl src/event/event-internal.h and src/runtime/prte_progress_threads.c.
+dnl That arm is gone.  Two of its declarations had been unbuildable for
+dnl years without anyone noticing, which is what an alternative nothing
+dnl compiles is worth.
+PRTE_LIBEVENT_CONFIG([],
+      [AC_MSG_WARN([PRRTE requires Libevent, which was not found.])
+       AC_MSG_WARN([Use --with-libevent=DIR to point us at an installation.])
        AC_MSG_ERROR([Cannot continue])])
 
 ##################################
@@ -855,6 +834,12 @@ PRTE_CHECK_VISIBILITY
 prte_show_title "Ptrace stop-on-exec support"
 
 PRTE_CHECK_PTRACE
+
+# Check for async-signal-safe CPU affinity support (sched_setaffinity)
+
+prte_show_title "CPU affinity (sched_setaffinity) support"
+
+PRTE_CHECK_SETAFFINITY
 
 ############################################################################
 # Final top-level PRTE configuration
@@ -928,13 +913,25 @@ prte_show_subtitle "Compiler flags"
 # will install it for us. If we VPATH building, we do need to include the
 # source directories, however.
 #
+# ORDER MATTERS, and the build directory has to come FIRST.  Every generated
+# header - prte_config.h above all - lives in the build tree, and a source
+# tree that has ever been configured in-tree still holds its own copy of
+# them.  With the source directory searched first, a VPATH build silently
+# compiles against THAT stale copy instead of its own: the give-away is a
+# redefinition error for one of the OAC_HAVE_* platform macros when the two
+# trees were configured for different platforms, but the quiet case is
+# worse - same platform, different --with-pmix, and the build succeeds and
+# then fails at run time.  Searching the build directory first makes a
+# VPATH build independent of whatever the source tree happens to contain,
+# which is the entire point of building out of tree.
+#
 
 if test "$PRTE_TOP_BUILDDIR" != "$PRTE_TOP_SRCDIR"; then
     # Note the embedded m4 directives here -- we must embed them
     # rather than have successive assignments to these shell
     # variables, lest the $(foo) names try to get evaluated here.
     # Yuck!
-    cpp_includes="$PRTE_TOP_SRCDIR $PRTE_TOP_BUILDDIR $PRTE_TOP_SRCDIR/src/include $PRTE_TOP_BUILDDIR/src/include $PRTE_TOP_BUILDDIR/include"
+    cpp_includes="$PRTE_TOP_BUILDDIR $PRTE_TOP_SRCDIR $PRTE_TOP_BUILDDIR/src/include $PRTE_TOP_SRCDIR/src/include $PRTE_TOP_BUILDDIR/include"
 else
     cpp_includes="$PRTE_TOP_SRCDIR $PRTE_TOP_SRCDIR/src/include"
 fi
@@ -1002,12 +999,33 @@ esac
 
 prtedatadir='${datadir}/prte'
 prtelibdir='${libdir}/prte'
-prteincludedir='${includedir}/prte'
 AC_SUBST(prtedatadir)
 AC_SUBST(prtelibdir)
-AC_SUBST(prteincludedir)
+dnl There was a prteincludedir here, the install root for the headers that
+dnl --with-devel-headers used to install.  Both are gone -- PRRTE ships no
+dnl linkable library, so an installed header set has nothing to be compiled
+dnl against.  See config/prte_configure_options.m4.
 
 prte_want_prd=0
+
+# Where "make check" can find components that have been built but not
+# installed.  Unit tests run from the build tree, and the only component
+# directory PRRTE knows about is the installed one, so a --enable-mca-dso
+# build otherwise finds no components at all and the tests can only skip.
+# config/mca_library_paths.txt is written by autogen.pl and lists every
+# component directory relative to the top of the tree.
+prte_comp_build_path=
+if test -f "$srcdir/config/mca_library_paths.txt"; then
+    for prte_cpath in `tr ':' ' ' < "$srcdir/config/mca_library_paths.txt"`; do
+        if test -z "$prte_comp_build_path"; then
+            prte_comp_build_path="$ac_pwd/$prte_cpath/.libs"
+        else
+            prte_comp_build_path="$prte_comp_build_path:$ac_pwd/$prte_cpath/.libs"
+        fi
+    done
+fi
+PRTE_COMPONENT_BUILD_PATH=$prte_comp_build_path
+AC_SUBST(PRTE_COMPONENT_BUILD_PATH)
 
 prte_show_subtitle "Final output"
 

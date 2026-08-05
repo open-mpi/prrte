@@ -410,7 +410,7 @@ int prte_rmaps_rr_bycpu(prte_job_t *jdata, prte_app_context_t *app,
     }
 
     nprocs_mapped = 0;
-    savecpuset = strdup(options->cpuset);
+    savecpuset = (NULL != options->cpuset) ? strdup(options->cpuset) : NULL;
 
 pass:
     PMIX_LIST_FOREACH_SAFE(node, nd, node_list, prte_node_t)
@@ -509,10 +509,13 @@ pass:
                 hwloc_bitmap_free(options->job_cpuset);
                 options->job_cpuset = NULL;
             }
-            options->cpuset = strdup(savecpuset);
-            if (NULL != savecpuset) {
-                free(savecpuset);
+            /* restore the list the caller handed us - what is in options
+             * now is the remainder this pass did not consume, and it is
+             * ours to release, exactly as on the per-node path below */
+            if (NULL != options->cpuset) {
+                free(options->cpuset);
             }
+            options->cpuset = savecpuset;
             return PRTE_SUCCESS;
         }
         if (NULL != options->target) {
@@ -526,7 +529,7 @@ pass:
         if (NULL != options->cpuset) {
             free(options->cpuset);
         }
-        options->cpuset = strdup(savecpuset);
+        options->cpuset = (NULL != savecpuset) ? strdup(savecpuset) : NULL;
     } // next node
 
     /* second pass: if we haven't mapped everyone yet, it is
@@ -553,7 +556,7 @@ pass:
         if (NULL != options->cpuset) {
             free(options->cpuset);
         }
-        options->cpuset = strdup(savecpuset);
+        options->cpuset = (NULL != savecpuset) ? strdup(savecpuset) : NULL;
         // Rescan the nodes
         second_pass = true;
         goto pass;
@@ -652,11 +655,16 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
             nobjs = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
                                              options->maptype);
             if (0 == nobjs) {
-                /* this node doesn't have any objects of this type, so
-                 * we might as well drop it from consideration */
-                pmix_list_remove_item(node_list, &node->super);
-                PMIX_RELEASE(node);
-                continue;
+                /* We only ever map by an object because the user asked us
+                 * to, so a node that has no such object is a request we
+                 * cannot answer - say so. Quietly dropping the node instead
+                 * shrank the allocation the user gave us without telling
+                 * them, and quietly falling back to by-slot (which the
+                 * caller used to do) placed the job by a rule they never
+                 * asked for. */
+                pmix_show_help("help-prte-rmaps-base.txt", "rmaps:mapping-target-not-found",
+                               true, hwloc_obj_type_string(options->maptype), node->name);
+                return PRTE_ERR_SILENT;
             }
             pmix_output_verbose(2, prte_rmaps_base_framework.framework_output,
                                 "mca:rmaps:rr: found %u %s objects on node %s",
@@ -676,9 +684,19 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
                     break;
                 }
                 /* does this object have enough available cpus to
-                 * support the requested cpus_per_rank? */
+                 * support the requested cpus_per_rank? This only matters
+                 * when we are actually going to bind. If binding has been
+                 * turned off - e.g., because the node is oversubscribed and
+                 * the top-of-function check reset an unset binding policy to
+                 * BIND_TO_NONE - then a shortage of free cpus on the object
+                 * must not block placement. Otherwise a genuinely
+                 * oversubscribed node (whose cpus were already consumed by an
+                 * earlier job, such as the parent of a PMIx_Spawn) would be
+                 * wrongly rejected as overloaded and the unbound proc would
+                 * fail to map. */
                 ncpus = prte_rmaps_base_get_ncpus(node, obj, options);
-                if (ncpus < options->cpus_per_rank && !options->overload) {
+                if (PRTE_BIND_TO_NONE != options->bind &&
+                    ncpus < options->cpus_per_rank && !options->overload) {
                     outofcpus = true;
                     continue;
                 }
@@ -686,8 +704,17 @@ int prte_rmaps_rr_byobj(prte_job_t *jdata, prte_app_context_t *app,
 
                 if (!prte_rmaps_base_check_avail(jdata, app, node, node_list, obj, options)) {
                     rc = PRTE_ERR_OUT_OF_RESOURCE;
-                    PRTE_ERROR_LOG(rc);
-                    // out of resources on this node
+                    /* This node can take no more. Mark it done rather than
+                     * merely breaking out of the object loop: without this the
+                     * "redo" retry below re-enters the loop on the same node,
+                     * and if check_avail declined because the node reached its
+                     * max_slots bound it has already removed the node from
+                     * node_list and released it - so the retry asks it to
+                     * remove and release the very same node a second time,
+                     * corrupting the list and dropping the node's last
+                     * reference. That crashed the HNP for a --map-by <object>
+                     * job on a hostfile carrying max_slots. */
+                    nodefull = true;
                     break;
                 }
 

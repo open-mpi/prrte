@@ -68,6 +68,8 @@ static void job_info(pmix_cli_result_t *results,
 static int set_default_rto(prte_job_t *jdata,
                            prte_rmaps_options_t *options);
 
+char *prte_schizo_prte_version = NULL;
+
 prte_schizo_base_module_t prte_schizo_prte_module = {
     .name = "prte",
     .parse_cli = parse_cli,
@@ -107,7 +109,6 @@ static struct option prteoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_DEBUG_DAEMONS, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DEBUG_DAEMONS_FILE, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_LEAVE_SESSION_ATTACHED, PMIX_ARG_NONE),
-    PMIX_OPTION_DEFINE(PRTE_CLI_TMPDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PMIX_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_NOPREFIX, PMIX_ARG_NONE),
@@ -115,7 +116,6 @@ static struct option prteoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DO_NOT_AGG_HELP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_HOMO_NODES, PMIX_ARG_NONE),
-    PMIX_OPTION_DEFINE(PRTE_CLI_BOOTSTRAP, PMIX_ARG_NONE),
 
     // Launch options
     PMIX_OPTION_DEFINE(PRTE_CLI_TIMEOUT, PMIX_ARG_REQD),
@@ -135,6 +135,7 @@ static struct option prteoptions[] = {
     // deprecated options
     PMIX_OPTION_DEFINE("machinefile", PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE("hetero-nodes", PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_SHOW_PROGRESS, PMIX_ARG_NONE),
 
     PMIX_OPTION_END
 };
@@ -164,14 +165,12 @@ static struct option prterunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_DEBUG_DAEMONS, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DEBUG_DAEMONS_FILE, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_LEAVE_SESSION_ATTACHED, PMIX_ARG_NONE),
-    PMIX_OPTION_DEFINE(PRTE_CLI_TMPDIR, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PMIX_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_NOPREFIX, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_FWD_SIGNALS, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_PERSONALITY, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
-    PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_CHILD_SEP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DVM, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_HOMO_NODES, PMIX_ARG_NONE),
 
@@ -211,6 +210,9 @@ static struct option prterunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_GPU_SUPPORT, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_APP_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_NO_APP_PREFIX, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_TARGET_ALLOC, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_ALLOC_REFID, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_SESSION_ID, PMIX_ARG_REQD),
 
     // output options
     PMIX_OPTION_DEFINE(PRTE_CLI_OUTPUT, PMIX_ARG_REQD),
@@ -235,6 +237,9 @@ static struct option prterunoptions[] = {
 
     // deprecated options
     PMIX_OPTION_DEFINE("mca", PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE("n", PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_SHOW_PROGRESS, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_CHILD_SEP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("xml", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("tag-output", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("timestamp-output", PMIX_ARG_NONE),
@@ -298,6 +303,7 @@ static struct option prunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_PID, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_URI, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_FWD_SIGNALS, PMIX_ARG_REQD),
 
     // Launch options
     PMIX_OPTION_DEFINE(PRTE_CLI_TIMEOUT, PMIX_ARG_REQD),
@@ -335,6 +341,9 @@ static struct option prunoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_GPU_SUPPORT, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_APP_PREFIX, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PRTE_CLI_NO_APP_PREFIX, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_TARGET_ALLOC, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_ALLOC_REFID, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_SESSION_ID, PMIX_ARG_REQD),
 
     // output options
     PMIX_OPTION_DEFINE(PRTE_CLI_OUTPUT, PMIX_ARG_REQD),
@@ -364,6 +373,9 @@ static struct option prunoptions[] = {
 
     // deprecated options
     PMIX_OPTION_DEFINE("mca", PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE("n", PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PRTE_CLI_SHOW_PROGRESS, PMIX_ARG_NONE),
+    PMIX_OPTION_DEFINE(PRTE_CLI_REPORT_CHILD_SEP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("xml", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("tag-output", PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE("timestamp-output", PMIX_ARG_NONE),
@@ -422,7 +434,6 @@ static struct option prtedoptions[] = {
     PMIX_OPTION_DEFINE(PRTE_CLI_DEBUG, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DEBUG_DAEMONS, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_DEBUG_DAEMONS_FILE, PMIX_ARG_NONE),
-    PMIX_OPTION_DEFINE(PRTE_CLI_TEST_SUICIDE, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_LEAVE_SESSION_ATTACHED, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_BOOTSTRAP, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
@@ -440,6 +451,9 @@ static struct option ptermoptions[] = {
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_HELP, PMIX_ARG_OPTIONAL, 'h'),
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_VERSION, PMIX_ARG_NONE, 'V'),
     PMIX_OPTION_SHORT_DEFINE(PRTE_CLI_VERBOSE, PMIX_ARG_NONE, 'v'),
+    /* accepted for symmetry with the other tools - pterm launches
+     * nothing, so there is no root-execution hazard to guard */
+    PMIX_OPTION_DEFINE(PRTE_CLI_RUN_AS_ROOT, PMIX_ARG_NONE),
 
     // MCA parameters
     PMIX_OPTION_DEFINE(PRTE_CLI_PMIXMCA, PMIX_ARG_REQD),
@@ -533,11 +547,27 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
         shorts = pinfoshorts;
         helpfile = "help-prte-info.txt";
         sdprefix = "prte";
+    } else {
+        /* every PRRTE tool sets prte_tool_actual to one of the six names
+         * above, so this is unreachable today - but handing
+         * pmix_cmd_line_parse a NULL option table is a crash, not a
+         * diagnosable error, so refuse rather than continue */
+        pmix_show_help("help-schizo-base.txt", "no-proxy", true,
+                       prte_tool_basename, prte_tool_actual);
+        return PRTE_ERR_NOT_FOUND;
     }
     pmix_tool_msg = "Report bugs to: https://github.com/openpmix/prrte";
     pmix_tool_org = "PRRTE";
-    pmix_tool_version = prte_util_make_version_string("all", PRTE_MAJOR_VERSION, PRTE_MINOR_VERSION,
-                                                      PRTE_RELEASE_VERSION, PRTE_GREEK_VERSION, NULL);
+    /* PMIx only borrows this string, and a tool can parse more than one
+     * command line (prte parses its own, then each app's), so build it
+     * once and hand out the same copy - the component close releases it */
+    if (NULL == prte_schizo_prte_version) {
+        prte_schizo_prte_version = prte_util_make_version_string("all", PRTE_MAJOR_VERSION,
+                                                                 PRTE_MINOR_VERSION,
+                                                                 PRTE_RELEASE_VERSION,
+                                                                 PRTE_GREEK_VERSION, NULL);
+    }
+    pmix_tool_version = prte_schizo_prte_version;
     if (NULL == prte_process_info.sessdir_prefix) {
         prte_process_info.sessdir_prefix = strdup(sdprefix);
     }
@@ -580,6 +610,7 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                                   bool silent)
 {
     char *option, *p1, *p2, *tmp, *tmp2, *output;
+    char **ppr;
     int rc = PRTE_SUCCESS;
     pmix_cli_item_t *opt, *nxt;
     bool warn;
@@ -810,10 +841,37 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
 
-        /* --display-devel-map  -> --display allocation-devel */
+        /* --display-devel-map  -> --display map-devel */
         else if (0 == strcmp(option, "display-devel-map")) {
             rc = prte_schizo_base_add_directive(results, option,
                                                 PRTE_CLI_DISPLAY, PRTE_CLI_MAPDEV,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
+        /* --display-devel-allocation  ->  --display allocation
+         *
+         * There is no separate "developer" allocation display any more -
+         * PRTE_CLI_ALLOC is the only allocation directive parse_display
+         * knows - so the deprecated option folds onto it.  Without this
+         * branch the option is accepted by the tables and then silently
+         * discarded, which asks for a display and gets none. */
+        else if (0 == strcmp(option, "display-devel-allocation")) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_DISPLAY, PRTE_CLI_ALLOC,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
+        /* --merge-stderr-to-stdout  ->  --output merge-stderr-to-stdout
+         *
+         * The option is in the prterun/prun tables; with no conversion here
+         * it parsed cleanly and then did nothing at all, so stderr stayed
+         * separate no matter what the user asked for.  The ompi personality
+         * has always converted it - this is the missing mirror. */
+        else if (0 == strcmp(option, "merge-stderr-to-stdout")) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_OUTPUT, PRTE_CLI_MERGE_ERROUT,
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
@@ -914,6 +972,24 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
 
+        /* --show-progress  ->  --runtime-options show-progress, and
+         * --report-child-jobs-separately  ->  the runtime option of the
+         * same name.  Both are deprecated standalone spellings of a
+         * runtime option, and only the runtime option has a consumer -
+         * the standalone flags were accepted and then dropped on the
+         * floor. */
+        else if (0 == strcmp(option, PRTE_CLI_SHOW_PROGRESS)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_SHOW_PROGRESS,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        } else if (0 == strcmp(option, PRTE_CLI_REPORT_CHILD_SEP)) {
+            rc = prte_schizo_base_add_directive(results, option,
+                                                PRTE_CLI_RTOS, PRTE_CLI_REPORT_CHILD_SEP,
+                                                warn);
+            PMIX_CLI_REMOVE_DEPRECATED(results, opt);
+        }
+
         /* --map-by socket ->  --map-by package */
         else if (0 == strcmp(option, PRTE_CLI_MAPBY)) {
             /* check the value of the option for "socket" */
@@ -943,15 +1019,20 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                 free(p1);
                 free(opt->values[0]);
                 opt->values[0] = tmp;
-            } else if (0 == strncasecmp(opt->values[0], "ppr", strlen("ppr"))) {
+            } else if (0 == strncasecmp(opt->values[0], PRTE_CLI_PPR, strlen(PRTE_CLI_PPR))) {
                 // see if they specified "socket" as the resource
-                p1 = strdup(opt->values[0]);
-                p2 = strrchr(p1, ':');
-                ++p2;
-                if (0 == strncasecmp(p2, "socket", strlen("socket")) ||
-                    0 == strncasecmp(p2, "skt", strlen("skt"))) {
-                    *p2 = '\0';
-                    pmix_asprintf(&p2, "%spackage", p1);
+                /* the pattern is "ppr:N:resource[:qualifier...]", so the
+                 * resource is the THIRD field.  Reaching for it with strrchr()
+                 * finds the last ':' instead, which is the resource only when
+                 * no qualifiers follow it - and returns NULL for a bare "ppr",
+                 * where advancing past it dereferences address 0x1 */
+                ppr = PMIx_Argv_split(opt->values[0], ':');
+                if (3 <= PMIx_Argv_count(ppr) &&
+                    (0 == strncasecmp(ppr[2], "socket", strlen("socket")) ||
+                     0 == strncasecmp(ppr[2], "skt", strlen("skt")))) {
+                    free(ppr[2]);
+                    ppr[2] = strdup(PRTE_CLI_PACKAGE);
+                    p2 = PMIx_Argv_join(ppr, ':');
                     if (warn) {
                         pmix_asprintf(&tmp, "%s %s", option, opt->values[0]);
                         pmix_asprintf(&tmp2, "%s %s", option, p2);
@@ -967,21 +1048,23 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                     free(opt->values[0]);
                     opt->values[0] = p2;
                 }
-                free(p1);
+                PMIx_Argv_free(ppr);
             }
         }
 
-        /* --rank-by */
+        /* --rank-by socket  ->  --rank-by package
+         *
+         * ONLY "socket" is renamed here.  This used to rewrite every
+         * object-level spelling (numa, core, l1/l2/l3cache, hwthread) to
+         * "package" as well, which is not a rename - those are distinct
+         * objects, and none of them is a ranking directive PRRTE supports
+         * (the rankers are slot, node, fill and span).  The rewrite did not
+         * make them work; it only made the error message name "package", an
+         * option the user never typed.  Leaving them alone lets the sanity
+         * checker report what was actually given. */
         else if (0 == strcmp(option, PRTE_CLI_RANKBY)) {
-            /* check the value of the option for object-level directives - show help
-             * for ranking if given */
-            if (0 == strncasecmp(opt->values[0], "socket", strlen("socket")) ||
-                0 == strncasecmp(opt->values[0], "l1cache", strlen("l1cache"))  ||
-                0 == strncasecmp(opt->values[0], "l2cache", strlen("l2cache")) ||
-                0 == strncasecmp(opt->values[0], "l3cache", strlen("l3cache")) ||
-                0 == strncasecmp(opt->values[0], "numa", strlen("numa")) ||
-                0 == strncasecmp(opt->values[0], "hwthread", strlen("hwthread")) ||
-                0 == strncasecmp(opt->values[0], "core", strlen("core"))) {
+            /* check the value of the option for "socket" */
+            if (0 == strncasecmp(opt->values[0], "socket", strlen("socket"))) {
                 p1 = strdup(opt->values[0]); // save the original option
                 /* replace "socket" with "package" */
                 if (NULL == (p2 = strchr(opt->values[0], ':'))) {

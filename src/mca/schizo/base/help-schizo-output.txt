@@ -60,8 +60,74 @@ Supported qualifiers include:
 * "RAW" - do not buffer the output into complete lines, but instead output
   it as it is received.
 
+* "PATTERN" - when combined with the "FILE" option, the given name is a
+  pattern you compose yourself instead of being annotated with the namespace
+  and rank. These conversions are expanded in it:
+
+    %%n  the job's namespace
+    %%r  the process's rank
+    %%R  the rank, zero-padded to the width of the job's largest rank
+    %%h  the hostname of the node the process ran on
+    %%%%  a literal "%%" character
+
+  The stream suffix (".out" or ".err") is still appended, so stdout and
+  stderr can never land on the same file. A pattern containing no "%%" at all
+  is therefore simply a fixed name shared by every process in the job.
+
 Note that directives and qualifiers are case-insensitive.
+
+Every directive and qualifier above that asks a yes-or-no question -
+everything except "DIR" and "FILE", which name a place to write - may also
+be given an explicit truth value:
+
+  --output tag        the directive is requested
+  --output tag=1      the same, said explicitly
+  --output tag=0      the directive is NOT requested
+
+True may also be written "T", "Y", "TRUE", "YES" or "ENABLE", and false
+"F", "N", "FALSE", "NO" or "DISABLE" - case-insensitively, and as whole
+words ("TR" is not an abbreviation of "TRUE").
+
+A value that is neither true nor false is refused rather than guessed at:
+the truth test underneath reads anything it does not recognize as "false",
+so "tag=maybe" would otherwise quietly turn tagging off.
+
+"--output" describes the job, so on an MPMD command line it may be written
+in any app context and applies to all of them. Two app contexts that ask
+for opposite things are refused - there is no way to honor both.
 #
 [copy-nocopy]
 Both the "copy" and "nocopy" qualifiers were given. This is a contradictory
 set of directives. Please correct the input and try again.
+#
+[bad-pattern]
+The output filename pattern contains an unrecognized conversion:
+
+  Pattern:     %s
+  Conversion:  %s
+
+Supported conversions are:
+
+  %%n  the job's namespace
+  %%r  the process's rank
+  %%R  the rank, zero-padded to the width of the job's largest rank
+  %%h  the hostname of the node the process ran on
+  %%%%  a literal "%%" character
+
+Please correct the pattern and try again.
+#
+[pattern-needs-file]
+The "pattern" qualifier was given to the "output" directive, but no
+"file=<name>" directive was given for it to qualify. "pattern" says how to
+name the output FILES, so it has no meaning on its own.
+
+Please add a "file=<name>" directive, or drop the "pattern" qualifier.
+#
+[pattern-unsupported]
+The "pattern" qualifier was given to the "output" directive, but the PMIx
+library this PRRTE was built against cannot expand an output filename
+pattern - PMIx opens the output files, so it is what has to do the
+expansion.
+
+Please rebuild PRRTE against a PMIx that provides the
+PMIX_CAP_IOF_FILE_PATTERN capability, or drop the "pattern" qualifier.

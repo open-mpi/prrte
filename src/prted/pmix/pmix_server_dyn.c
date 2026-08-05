@@ -195,6 +195,21 @@ callback:
     PMIX_RELEASE(req);
 }
 
+/* Submit a fully-constructed job for launch.  This is the same path a
+ * PMIx_Spawn takes once interim() has finished translating it, exposed so
+ * that a caller which builds its own job object - notably a session
+ * instantiation carrying PMIX_SESSION_APP definitions - can hand it to the
+ * PLM without duplicating the request-tracking and packing in spawn().
+ *
+ * MUST be called on the PRRTE progress thread. cbfunc is invoked with the
+ * launched job's namespace once the HNP answers, or with a NULL namespace
+ * and a PMIx error if the request could not be sent. */
+void prte_pmix_server_launch_job(prte_job_t *jdata,
+                                 pmix_spawn_cbfunc_t cbfunc, void *cbdata)
+{
+    PRTE_SPN_REQ(jdata, spawn, cbfunc, cbdata);
+}
+
 int prte_pmix_xfer_job_info(prte_job_t *jdata,
                             pmix_info_t *iptr,
                             size_t ninfo)
@@ -229,9 +244,20 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
                 }
             }
 
-            /***   REQUESTED MAPPER   ***/
+            /***   REQUESTED MAPPER - no longer supported   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_MAPPER)) {
-            jdata->map->req_mapper = strdup(info->value.data.string);
+            /* Naming a mapping component is not a directive PRRTE can act
+             * on. The choice of mapper IS the mapping policy - each
+             * component claims the policies it implements - so a request
+             * that names a component says nothing PMIX_MAPBY has not
+             * already said, and when the two disagreed there was no answer
+             * that could be right. Refuse it rather than silently ignore
+             * it: a caller asking for a specific mapper is asking for
+             * something we cannot promise. */
+            pmix_show_help("help-prte-rmaps-base.txt", "mapper-not-supported", true,
+                           (NULL == info->value.data.string) ? "NULL"
+                                                             : info->value.data.string);
+            return PRTE_ERR_NOT_SUPPORTED;
 
             /***   DISPLAY ALLOCATION   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_DISPLAY_ALLOCATION)) {
@@ -253,6 +279,42 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
         } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_REQ_ID)) {
             prte_set_attribute(&jdata->attributes, PRTE_JOB_REF_ID,
                                PRTE_ATTR_GLOBAL, info->value.data.string, PMIX_STRING);
+
+#if defined(PMIX_SPAWN_TARGET)
+            /***   SPAWN TARGET ALLOCATION(S)   ***/
+        } else if (PMIX_CHECK_KEY(info, PMIX_SPAWN_TARGET)) {
+            /* the value is either a single PMIX_ALLOC_ID string or a
+             * pmix_data_array_t of PMIX_ALLOC_ID strings. Flatten it into a
+             * comma-delimited list (preserving empty tokens, which denote the
+             * default session) and stash it as PRTE_JOB_SPAWN_TARGET. Stored
+             * GLOBAL so the generic job-attribute pack loop forwards it to the
+             * HNP, where the multi-session resolution happens. */
+            char *tstr = NULL, *tmp2, *tok;
+            if (PMIX_STRING == info->value.type) {
+                tok = info->value.data.string;
+                tstr = strdup((NULL == tok) ? "" : tok);
+            } else if (PMIX_DATA_ARRAY == info->value.type &&
+                       NULL != info->value.data.darray &&
+                       PMIX_STRING == info->value.data.darray->type) {
+                char **strs = (char **) info->value.data.darray->array;
+                size_t k;
+                for (k = 0; k < info->value.data.darray->size; k++) {
+                    tok = (NULL == strs || NULL == strs[k]) ? "" : strs[k];
+                    if (NULL == tstr) {
+                        tstr = strdup(tok);
+                    } else {
+                        pmix_asprintf(&tmp2, "%s,%s", tstr, tok);
+                        free(tstr);
+                        tstr = tmp2;
+                    }
+                }
+            }
+            if (NULL != tstr) {
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_SPAWN_TARGET,
+                                   PRTE_ATTR_GLOBAL, tstr, PMIX_STRING);
+                free(tstr);
+            }
+#endif
 
             /***   DISPLAY MAP   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_DISPLAY_MAP)) {
@@ -560,6 +622,14 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
             prte_set_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_NOCOPY, PRTE_ATTR_GLOBAL,
                                &flag, PMIX_BOOL);
 
+        } else if (PMIX_CHECK_KEY(info, PMIX_IOF_FILE_PATTERN)) {
+            /* the output filename is the requestor's to compose - carry the
+             * flag through to the nspace registration, which is what puts it
+             * in front of the PMIx IOF that opens the file */
+            flag = PMIX_INFO_TRUE(info);
+            prte_set_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_FILE_PATTERN, PRTE_ATTR_GLOBAL,
+                               &flag, PMIX_BOOL);
+
             /***   MERGE STDERR TO STDOUT   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_IOF_MERGE_STDERR_STDOUT) ||
                    PMIX_CHECK_KEY(info, PMIX_MERGE_STDERR_STDOUT)) {
@@ -658,10 +728,6 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
             }
             prte_set_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT,
                                PRTE_ATTR_GLOBAL, &rc, PMIX_INT);
-
-        } else if (PMIX_CHECK_KEY(info, PMIX_TIMEOUT)) {
-            prte_set_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT, PRTE_ATTR_GLOBAL,
-                               &info->value.data.integer, PMIX_INT);
 
         } else if (PMIX_CHECK_KEY(info, PMIX_JOB_TIMEOUT)) {
             if (PMIX_STRING == info->value.type) {
@@ -779,7 +845,10 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                     /* get the cwd */
                     if (PRTE_SUCCESS != (rc = pmix_getcwd(cwd, sizeof(cwd)))) {
                         pmix_show_help("help-prted.txt", "cwd", true, "spawn", rc);
-                        PMIX_RELEASE(jdata);
+                        /* jdata belongs to our caller - it constructed it and
+                         * will dispose of it on our error return.  Releasing
+                         * it here would leave the caller with a dangling
+                         * pointer it goes on to use and release again */
                         return rc;
                     }
                     /* construct the absolute path */
@@ -806,18 +875,42 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
 
             /***   PPR (PROCS-PER-RESOURCE)   ***/
             } else if (PMIX_CHECK_KEY(info, PMIX_PPR)) {
-                char **ck, *p;
-                uint16_t ppn, pes;
+                char **ck, *p, *pattern;
+                uint16_t pes, appmap = 0, *u16ptr = &appmap;
                 int n;
+                /* a pattern IS a mapping policy, so it conflicts with a
+                 * PMIX_MAPBY on the same app exactly as it does at job
+                 * level - and the info array has no order to break the tie */
+                if (prte_get_attribute(&app->attributes, PRTE_APP_MAPBY,
+                                       (void **) &u16ptr, PMIX_UINT16) &&
+                    PRTE_MAPPING_POLICY_IS_SET(appmap)) {
+                    pmix_show_help("help-prte-rmaps-base.txt", "redefining-policy", true,
+                                   "mapping", info->value.data.string,
+                                   prte_rmaps_base_print_mapping(appmap));
+                    return PRTE_ERR_BAD_PARAM;
+                }
                 ck = PMIx_Argv_split(info->value.data.string, ':');
                 if (3 > PMIx_Argv_count(ck)) {
                     PMIx_Argv_free(ck);
-                    return PMIX_ERR_BAD_PARAM;
+                    return PRTE_ERR_BAD_PARAM;
                 }
                 if (0 == strcasecmp(ck[0], "ppr")) {
-                    ppn =  strtoul(ck[1], NULL, 10);
+                    /* ck[1] is the count and ck[2] the object - keep both, in
+                     * the spelling the job-level attribute uses. Keeping only
+                     * the count placed the app N-per-whatever-object the job
+                     * had resolved */
+                    pmix_asprintf(&pattern, "%s:%s", ck[1], ck[2]);
                     prte_set_attribute(&app->attributes, PRTE_APP_PPR,
-                                       PRTE_ATTR_GLOBAL, &ppn, PMIX_UINT16);
+                                       PRTE_ATTR_GLOBAL, pattern, PMIX_STRING);
+                    free(pattern);
+                    /* a pattern is a mapping directive: without the policy to
+                     * go with it, the pattern reached no mapper at all. Set it
+                     * on whatever this app's mapping word already holds, so
+                     * qualifiers given alongside are kept */
+                    PRTE_SET_MAPPING_POLICY(appmap, PRTE_MAPPING_PPR);
+                    PRTE_SET_MAPPING_DIRECTIVE(appmap, PRTE_MAPPING_GIVEN);
+                    prte_set_attribute(&app->attributes, PRTE_APP_MAPBY,
+                                       PRTE_ATTR_GLOBAL, &appmap, PMIX_UINT16);
                     // ck[2] has the object type
                     pes = 0;
                     for (n=2; NULL != ck[n]; n++) {
@@ -835,43 +928,47 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                 } 
                 PMIx_Argv_free(ck);
  
-                /***   MAP-BY   ***/
+                /***   REQUESTED MAPPER (per-app) - no longer supported   ***/
+            } else if (PMIX_CHECK_KEY(info, PMIX_MAPPER)) {
+                /* see prte_pmix_xfer_job_info(): the mapping policy is the
+                 * choice of mapper, so naming a component is not something
+                 * PRRTE can act on - per app any more than per job */
+                pmix_show_help("help-prte-rmaps-base.txt", "mapper-not-supported", true,
+                               (NULL == info->value.data.string) ? "NULL"
+                                                                 : info->value.data.string);
+                return PRTE_ERR_NOT_SUPPORTED;
+
+                /***   MAP-BY (per-app)   ***/
             } else if (PMIX_CHECK_KEY(info, PMIX_MAPBY)) {
-                char **ck, *p;
-                uint16_t ppn, pes;
-                int n;
-                ck = PMIx_Argv_split(info->value.data.string, ':');
-                for (n=0; NULL != ck[n]; n++) {
-                    if (0 == strcasecmp(ck[n], "ppr")) {
-                        ppn =  strtoul(ck[1], NULL, 10);
-                        prte_set_attribute(&app->attributes, PRTE_APP_PPR,
-                                           PRTE_ATTR_GLOBAL, &ppn, PMIX_UINT16);
-                    } else if (0 == strncmp(ck[n], "pe", 2) &&
-                               0 != strncmp(ck[n], "pe-", 3)) {
-                        p = strchr(ck[n], '=');
-                        if (NULL == p) {
-                            /* missing the value or value is invalid */
-                            pmix_show_help("help-prte-rmaps-base.txt", "invalid-value", true, "mapping policy",
-                                           "PE", ck[n]);
-                            PMIx_Argv_free(ck);
-                            return PRTE_ERR_SILENT;
-                        }
-                        ++p;
-                        if (NULL == p || '\0' == *p) {
-                            /* missing the value or value is invalid */
-                            pmix_show_help("help-prte-rmaps-base.txt", "invalid-value", true, "mapping policy",
-                                           "PE", ck[n]);
-                            PMIx_Argv_free(ck);
-                            return PRTE_ERR_SILENT;
-                        }
-                        pes = strtol(p, NULL, 10);                
-                        if (0 < pes) {
-                            prte_set_attribute(&app->attributes, PRTE_APP_PES_PER_PROC,
-                                               PRTE_ATTR_GLOBAL, &pes, PMIX_UINT16);
-                        }
-                    }
+                uint16_t appmap = 0, *u16ptr = &appmap;
+                /* the same conflict from the other side: this app cannot be
+                 * given two mapping policies, whichever spelling they use */
+                if (prte_get_attribute(&app->attributes, PRTE_APP_MAPBY,
+                                       (void **) &u16ptr, PMIX_UINT16) &&
+                    PRTE_MAPPING_POLICY_IS_SET(appmap)) {
+                    pmix_show_help("help-prte-rmaps-base.txt", "redefining-policy", true,
+                                   "mapping", info->value.data.string,
+                                   prte_rmaps_base_print_mapping(appmap));
+                    return PRTE_ERR_BAD_PARAM;
                 }
-                PMIx_Argv_free(ck);
+                rc = prte_rmaps_base_set_app_mapping_policy(app, info->value.data.string);
+                if (PRTE_SUCCESS != rc) {
+                    return rc;
+                }
+
+                /***   RANK-BY (per-app)   ***/
+            } else if (PMIX_CHECK_KEY(info, PMIX_RANKBY)) {
+                rc = prte_rmaps_base_set_app_ranking_policy(app, info->value.data.string);
+                if (PRTE_SUCCESS != rc) {
+                    return rc;
+                }
+
+                /***   BIND-TO (per-app)   ***/
+            } else if (PMIX_CHECK_KEY(info, PMIX_BINDTO)) {
+                rc = prte_rmaps_base_set_app_binding_policy(app, info->value.data.string);
+                if (PRTE_SUCCESS != rc) {
+                    return rc;
+                }
 
                 /***   ENVIRONMENTAL VARIABLE DIRECTIVES   ***/
                 /* there can be multiple of these, so we add them to the attribute list */
@@ -880,62 +977,62 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_SET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_SET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_SET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_ADD_ENVAR)) {
                 envar.envar = info->value.data.envar.envar;
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_ADD_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_ADD_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_ADD_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_ADD_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_UNSET_ENVAR)) {
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           info->value.data.string, PMIX_STRING);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          info->value.data.string, PMIX_STRING);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_UNSET_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           info->value.data.string, PMIX_STRING);
+                    prte_append_attribute(&app->attributes, PRTE_APP_UNSET_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          info->value.data.string, PMIX_STRING);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_PREPEND_ENVAR)) {
                 envar.envar = info->value.data.envar.envar;
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_PREPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_PREPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_PREPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_PREPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
             } else if (PMIX_CHECK_KEY(info, PMIX_APPEND_ENVAR)) {
                 envar.envar = info->value.data.envar.envar;
                 envar.value = info->value.data.envar.value;
                 envar.separator = info->value.data.envar.separator;
                 if (0 == app->idx) {
-                    prte_prepend_attribute(&jdata->attributes, PRTE_JOB_APPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&jdata->attributes, PRTE_JOB_APPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 } else {
-                    prte_prepend_attribute(&app->attributes, PRTE_APP_APPEND_ENVAR,
-                                           PRTE_ATTR_GLOBAL,
-                                           &envar, PMIX_ENVAR);
+                    prte_append_attribute(&app->attributes, PRTE_APP_APPEND_ENVAR,
+                                          PRTE_ATTR_GLOBAL,
+                                          &envar, PMIX_ENVAR);
                 }
 
             } else if (PMIX_CHECK_KEY(info, PMIX_PSET_NAME)) {
@@ -988,6 +1085,21 @@ static void interim(int sd, short args, void *cbdata)
     if (NULL == jdata->personality) {
         /* use the default */
         jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(NULL);
+    }
+    if (NULL == jdata->schizo) {
+        /* the requestor named a personality no component claims. Every later
+         * use of jdata->schizo (starting with set_default_rto just below) is
+         * an unchecked dereference, so reject the request here - a bad
+         * personality string in a spawn request must not take down the DVM */
+        char *prsn = (NULL == jdata->personality)
+                     ? NULL : PMIx_Argv_join(jdata->personality, ',');
+        pmix_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename,
+                       (NULL == prsn) ? "NULL" : prsn);
+        if (NULL != prsn) {
+            free(prsn);
+        }
+        rc = PRTE_ERR_NOT_FOUND;
+        goto complete;
     }
 
     /* transfer the apps across */
@@ -1042,13 +1154,47 @@ static void interim(int sd, short args, void *cbdata)
     return;
 
 complete:
-    if (NULL != cd->spcbfunc) {
+    if (NULL == cd->spcbfunc) {
+        /* nobody to answer - discard the partially-built job rather than
+         * leaking it */
+        PMIX_RELEASE(jdata);
+        PMIX_RELEASE(cd);
+        return;
+    }
+    {
         pmix_status_t prc;
         pmix_nspace_t nspace;
         PMIX_LOAD_NSPACE(nspace, NULL);
         prc = prte_pmix_convert_rc(rc);
+        /* the requestor learns of the failure directly through this callback */
         cd->spcbfunc(prc, nspace, cd->cbdata);
-        /* this isn't going to launch, so indicate that */
+        /* record the failure on the job itself for any consumer of its state */
+        if (0 == jdata->exit_code) {
+            jdata->exit_code = rc;
+        }
+        if (prte_persistent) {
+            /* A persistent DVM must survive a failed spawn - a user's typo in,
+             * say, a map-by directive cannot be allowed to take down the DVM.
+             * The requestor has already been notified of the error through the
+             * callback above, and this job was never registered: it has no
+             * nspace, is absent from the job pool, and owns no procs or
+             * daemons. Pushing such a phantom job into the job-termination
+             * state machine (via NEVER_LAUNCHED) drives it through server,
+             * IOF, and session cleanup that assume a real registered job,
+             * tearing down live state and crashing the HNP. So simply discard
+             * the phantom job here and leave the DVM running. */
+            PMIX_RELEASE(jdata);
+            PMIX_RELEASE(cd);
+            return;
+        }
+        /* We are a one-shot launch (prterun is itself the requestor). The
+         * spawn-completion notification above races the DVM teardown triggered
+         * by NEVER_LAUNCHED below - if teardown wins, the status is lost and we
+         * would exit 0. So, exactly as check_complete() does on normal
+         * termination, record the failure directly in our exit status now to
+         * guarantee a non-zero exit regardless of the race. */
+        PRTE_UPDATE_EXIT_STATUS(rc);
+        /* this isn't going to launch, so tear down the one-shot DVM */
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
     }
     PMIX_RELEASE(cd);
@@ -1201,6 +1347,10 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
     rc = prte_grpcomm.fence(procs, nprocs, info, ninfo,
                             cd->msg.unpack_ptr, cd->msg.bytes_used,
                             connect_release, cd);
+    if (PMIX_SUCCESS != rc) {
+        /* the release callback will never fire */
+        PMIX_RELEASE(cd);
+    }
     return rc;
 }
 

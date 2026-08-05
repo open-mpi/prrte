@@ -107,7 +107,9 @@ static void compute_local_rank(prte_job_t *jdata)
 }
 
 int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
-                                  prte_rmaps_options_t *options)
+                                  prte_rmaps_options_t *options,
+                                  int app_idx,
+                                  uint32_t *next_vpid)
 {
     int m, n, j, cnt;
     unsigned k, nobjs;
@@ -125,6 +127,15 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
          * on-the-fly during mapping) */
         compute_local_rank(jdata);
         compute_app_rank(jdata);
+        if (0 <= app_idx && NULL != next_vpid) {
+            /* the mapper numbered this app's procs itself, starting from the
+             * cursor it was handed in options->start_vpid. Move the cursor
+             * past what it used, or the next app is numbered on top of it */
+            app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, app_idx);
+            if (NULL != app) {
+                *next_vpid += app->num_procs;
+            }
+        }
         return PRTE_SUCCESS;
     }
 
@@ -139,8 +150,11 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     4 5       6 7        12 13     14 15
      */
     if (PRTE_RANK_BY_SLOT == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
@@ -177,6 +191,9 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                 }
             }
         }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
+        }
         compute_local_rank(jdata);
         compute_app_rank(jdata);
         return PRTE_SUCCESS;
@@ -192,8 +209,11 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     8 10     12 14        9 11     13 15
      */
     if (PRTE_RANK_BY_NODE == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
@@ -238,6 +258,9 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                 }
             }
         }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
+        }
         compute_local_rank(jdata);
         compute_app_rank(jdata);
         return PRTE_SUCCESS;
@@ -252,8 +275,11 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     2 3       6 7        10 11     14 15
      */
     if (PRTE_RANK_BY_FILL == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
@@ -308,6 +334,9 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                 }
             }
         }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
+        }
         compute_local_rank(jdata);
         compute_app_rank(jdata);
         return PRTE_SUCCESS;
@@ -325,13 +354,23 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
      *     8 12      9 13       10 14     11 15
      */
     if (PRTE_RANK_BY_SPAN == options->rank) {
-        rank = 0;
+        rank = (app_idx >= 0 && NULL != next_vpid) ? (pmix_rank_t)*next_vpid : 0;
         for (j=0; j < jdata->apps->size; j++) {
+            if (app_idx >= 0 && j != app_idx) {
+                continue;
+            }
             if (NULL == (app = (prte_app_context_t*)pmix_pointer_array_get_item(jdata->apps, j))) {
                 continue;
             }
             cnt = 0;
-            while (cnt < app->num_procs) {
+            one_found = true;
+            /* the "one_found" guard matters as much here as it does in the
+             * by-node loop above: if a pass over every node and object ranks
+             * nothing - a proc whose locale is not an object of the mapping
+             * type, or an app whose num_procs outruns what was actually
+             * placed - then cnt never advances and this loop never ends */
+            while (cnt < app->num_procs && one_found) {
+                one_found = false;
                 // scan across the nodes
                 for (n=0; n < jdata->map->nodes->size; n++) {
                     node = (prte_node_t*)pmix_pointer_array_get_item(jdata->map->nodes, n);
@@ -383,11 +422,15 @@ int prte_rmaps_base_compute_vpids(prte_job_t *jdata,
                             }
                             ++rank;
                             ++cnt;
+                            one_found = true;
                             break;
                         }
                     }
                 }
             }
+        }
+        if (app_idx >= 0 && NULL != next_vpid) {
+            *next_vpid = (uint32_t)rank;
         }
         compute_local_rank(jdata);
         compute_app_rank(jdata);

@@ -41,7 +41,6 @@
 #include "src/mca/base/pmix_base.h"
 #include "src/mca/mca.h"
 #include "src/util/pmix_argv.h"
-#include "src/util/malloc.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_show_help.h"
 
@@ -51,7 +50,6 @@
 #include "src/mca/grpcomm/base/base.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/plm/base/base.h"
-#include "src/mca/ras/base/base.h"
 #include "src/rml/rml.h"
 
 #include "src/mca/filem/base/base.h"
@@ -91,7 +89,10 @@ static int rte_init(int argc, char **argv)
     }
 
     /* Start by getting a unique name from the enviro */
-    env_set_name();
+    if (PRTE_SUCCESS != (ret = env_set_name())) {
+        error = "env_set_name";
+        goto error;
+    }
 
     /* if I am a daemon, complete my setup using the
      * default procedure
@@ -124,26 +125,7 @@ static int rte_finalize(void)
 
 static int env_set_name(void)
 {
-    pmix_rank_t vpid;
-
-    if (NULL == prte_ess_base_nspace) {
-        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        return PRTE_ERR_NOT_FOUND;
-    }
-
-    PMIX_LOAD_NSPACE(PRTE_PROC_MY_NAME->nspace, prte_ess_base_nspace);
-
-    if (NULL == prte_ess_base_vpid) {
-        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        return PRTE_ERR_NOT_FOUND;
-    }
-    vpid = strtoul(prte_ess_base_vpid, NULL, 10);
-    PRTE_PROC_MY_NAME->rank = vpid;
-
-    PMIX_OUTPUT_VERBOSE((1, prte_ess_base_framework.framework_output, "ess:env set name to %s",
-                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-
-    prte_process_info.num_daemons = prte_ess_base_num_procs;
-
-    return PRTE_SUCCESS;
+    /* an ssh launch assigns each daemon its vpid directly, so there is no
+     * per-node index to add */
+    return prte_ess_base_set_identity(NULL, 0);
 }

@@ -25,6 +25,7 @@
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
+#include "src/mca/plm/base/base.h"
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/prted/pmix/pmix_server_internal.h"
@@ -63,7 +64,6 @@ prte_state_base_module_t prte_state_prted_module = {
 /* Local functions */
 static void track_jobs(int fd, short argc, void *cbdata);
 static void track_procs(int fd, short argc, void *cbdata);
-static int pack_state_update(pmix_data_buffer_t *buf, prte_job_t *jdata);
 
 /* defined default state machines */
 static prte_job_state_t job_states[] = {
@@ -303,30 +303,41 @@ cleanup:
     PMIX_RELEASE(caddy);
 }
 
-static void opcbfunc(pmix_status_t status, void *cbdata)
-{
-    prte_pmix_lock_t *lk = (prte_pmix_lock_t *) cbdata;
+static void job_teardown(int fd, short argc, void *cbdata);
 
-    PMIX_POST_OBJECT(lk);
-    lk->status = prte_pmix_convert_status(status);
-    PRTE_PMIX_WAKEUP_THREAD(lk);
+/* Completion of the nspace deregistration.
+ *
+ * This runs on the PMIx progress thread, so it does nothing but hand the
+ * caddy back to ours - the teardown it resumes touches prte_job_t,
+ * prte_node_t and the RML, none of which may be reached from here.
+ *
+ * It used to block instead: PMIx was handed a callback that woke a
+ * prte_pmix_lock_t directly and track_procs sat in PRTE_PMIX_WAIT_THREAD
+ * until it fired.  prte_event_base has no progress thread of its own
+ * (event.c: "PRTE tools block in their own loop over the event base"), so
+ * that parked the ONE thread driving it and the daemon went deaf - no RML,
+ * no IOF, no other state transition - for however long PMIx took to tear
+ * the nspace down, which includes its per-peer filesystem epilog.  It also
+ * only worked at all because the wakeup was direct: the thread-shifted
+ * wakeup the golden rule asks for could never have run on a parked thread. */
+static void dereg_complete(pmix_status_t status, void *cbdata)
+{
+    prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(status);
+
+    PRTE_PMIX_THREADSHIFT(caddy, prte_event_base, job_teardown);
 }
+
 static void track_procs(int fd, short argc, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     pmix_proc_t *proc;
     prte_proc_state_t state;
     prte_job_t *jdata;
-    prte_proc_t *pdata, *pptr;
+    prte_proc_t *pdata, *pptr, *proct;
     pmix_data_buffer_t *alert;
     int rc, i;
     prte_plm_cmd_flag_t cmd;
-    int32_t index;
-    prte_job_map_t *map;
-    prte_node_t *node;
-    pmix_proc_t target;
-    prte_pmix_lock_t lock;
-    prte_app_context_t *app;
     PRTE_HIDE_UNUSED_PARAMS(fd, argc);
 
     PMIX_ACQUIRE_OBJECT(caddy);
@@ -479,14 +490,20 @@ static void track_procs(int fd, short argc, void *cbdata)
          * remain (might be some from another job)
          */
         if (prte_prteds_term_ordered && 0 == prte_rml_base.n_children) {
+            /* NOTE: this scan gets its own variable.  "pdata" is the proc
+             * whose state we are handling, and every other statement in this
+             * arm reads it; using it as the loop variable here happens to be
+             * harmless only because both ways out of the loop leave the arm
+             * immediately.  The identical shortcut in errmgr/prted did not
+             * have that luxury and reported the wrong proc to the HNP. */
             for (i = 0; i < prte_local_children->size; i++) {
-                pdata = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
-                if (NULL != pdata && PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_ALIVE)) {
+                proct = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i);
+                if (NULL != proct && PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_ALIVE)) {
                     /* at least one is still alive */
                     PMIX_OUTPUT_VERBOSE((5, prte_state_base_framework.framework_output,
                                          "%s state:prted all routes gone but proc %s still alive",
                                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                         PRTE_NAME_PRINT(&pdata->name)));
+                                         PRTE_NAME_PRINT(&proct->name)));
                     goto cleanup;
                 }
             }
@@ -510,7 +527,7 @@ static void track_procs(int fd, short argc, void *cbdata)
                 goto cleanup;
             }
             /* pack the job info */
-            if (PRTE_SUCCESS != (rc = pack_state_update(alert, jdata))) {
+            if (PRTE_SUCCESS != (rc = prte_plm_base_pack_state_update(alert, jdata, true))) {
                 PRTE_ERROR_LOG(rc);
                 PMIX_DATA_BUFFER_RELEASE(alert);
                 goto cleanup;
@@ -546,73 +563,15 @@ static void track_procs(int fd, short argc, void *cbdata)
                 prte_iof.complete(jdata);
             }
 
-            /* tell the PMIx subsystem the job is complete */
-            PRTE_PMIX_CONSTRUCT_LOCK(&lock);
-            PMIx_server_deregister_nspace(jdata->nspace, opcbfunc, &lock);
-            PRTE_PMIX_WAIT_THREAD(&lock);
-            PRTE_PMIX_DESTRUCT_LOCK(&lock);
-
-            /* release the resources */
-            if (NULL != jdata->map) {
-                map = jdata->map;
-                for (index = 0; index < map->nodes->size; index++) {
-                    node = (prte_node_t *) pmix_pointer_array_get_item(map->nodes, index);
-                    if (NULL == node) {
-                        continue;
-                    }
-                    PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                                         "%s state:prted releasing procs from node %s",
-                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
-                    for (i = 0; i < node->procs->size; i++) {
-                        pptr = (prte_proc_t *) pmix_pointer_array_get_item(node->procs, i);
-                        if (NULL == pptr) {
-                            continue;
-                        }
-                        if (!PMIX_CHECK_NSPACE(pptr->name.nspace, jdata->nspace)) {
-                            /* skip procs from another job */
-                            continue;
-                        }
-                        app = (prte_app_context_t*) pmix_pointer_array_get_item(jdata->apps, pptr->app_idx);
-                        if (!PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL) &&
-                            !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
-                            node->slots_inuse--;
-                            node->num_procs--;
-                        }
-                        PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
-                                             "%s state:prted releasing proc %s from node %s",
-                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                             PRTE_NAME_PRINT(&pptr->name), node->name));
-                        /* set the entry in the node array to NULL */
-                        pmix_pointer_array_set_item(node->procs, i, NULL);
-                        /* release the proc once for the map entry */
-                        PMIX_RELEASE(pptr);
-                    }
-                    /* set the node location to NULL */
-                    pmix_pointer_array_set_item(map->nodes, index, NULL);
-                    /* maintain accounting */
-                    PMIX_RELEASE(node);
-                    /* flag that the node is no longer in a map */
-                    PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_MAPPED);
-                }
-                PMIX_RELEASE(map);
-                jdata->map = NULL;
-            }
-
-            /* if requested, check fd status for leaks */
-            if (prte_state_base.run_fdcheck) {
-                prte_state_base_check_fds(jdata);
-            }
-
-            /* if ompi-server is around, then notify it to purge
-             * any session-related info */
-            if (NULL != prte_data_server_uri) {
-                PMIX_LOAD_PROCID(&target, jdata->nspace, PMIX_RANK_WILDCARD);
-                prte_state_base_notify_data_server(&target);
-            }
-
-            /* cleanup the job info */
-            pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
-            PMIX_RELEASE(jdata);
+            /* Tell the PMIx subsystem the job is complete, and resume the
+             * teardown when it says so.  The caddy carries the job across
+             * the hop; a proc-state activation leaves caddy->jdata NULL, so
+             * take a reference of our own for it here. */
+            caddy->jdata = jdata;
+            PMIX_RETAIN(jdata);
+            PMIx_server_deregister_nspace(jdata->nspace, dereg_complete, caddy);
+            /* the continuation owns the caddy now */
+            return;
         }
     }
 
@@ -620,71 +579,89 @@ cleanup:
     PMIX_RELEASE(caddy);
 }
 
-static int pack_state_for_proc(pmix_data_buffer_t *alert, prte_proc_t *child)
+/* The tail of track_procs' TERMINATED handling, resumed once PMIx has
+ * finished deregistering the nspace.  Runs on the PRRTE progress thread. */
+static void job_teardown(int fd, short argc, void *cbdata)
 {
-    int rc;
+    prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
+    prte_job_t *jdata;
+    prte_proc_t *pptr;
+    prte_job_map_t *map;
+    prte_node_t *node;
+    prte_app_context_t *app;
+    pmix_proc_t target;
+    int32_t index;
+    int i;
+    PRTE_HIDE_UNUSED_PARAMS(fd, argc);
 
-    /* pack the child's vpid */
-    rc = PMIx_Data_pack(NULL, alert, &child->name.rank, 1, PMIX_PROC_RANK);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return rc;
-    }
-    /* pack the pid */
-    rc = PMIx_Data_pack(NULL, alert, &child->pid, 1, PMIX_PID);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return rc;
-    }
-    /* pack its state */
-    rc = PMIx_Data_pack(NULL, alert, &child->state, 1, PMIX_UINT32);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return rc;
-    }
-    /* pack its exit code */
-    rc = PMIx_Data_pack(NULL, alert, &child->exit_code, 1, PMIX_INT32);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return rc;
-    }
+    PMIX_ACQUIRE_OBJECT(caddy);
+    jdata = caddy->jdata;
 
-    return PRTE_SUCCESS;
-}
-
-static int pack_state_update(pmix_data_buffer_t *alert, prte_job_t *jdata)
-{
-    int i, rc;
-    prte_proc_t *child;
-    pmix_rank_t null = PMIX_RANK_INVALID;
-
-    /* pack the jobid */
-    rc = PMIx_Data_pack(NULL, alert, &jdata->nspace, 1, PMIX_PROC_NSPACE);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return rc;
-    }
-    for (i = 0; i < prte_local_children->size; i++) {
-        if (NULL == (child = (prte_proc_t *) pmix_pointer_array_get_item(prte_local_children, i))) {
-            continue;
-        }
-        /* if this child is part of the job and has not been
-         * previously reported... */
-        if (PMIX_CHECK_NSPACE(child->name.nspace, jdata->nspace) &&
-            !PRTE_FLAG_TEST(child, PRTE_PROC_FLAG_TERM_REPORTED)) {
-            if (PRTE_SUCCESS != (rc = pack_state_for_proc(alert, child))) {
-                PRTE_ERROR_LOG(rc);
-                return rc;
+    /* release the resources */
+    if (NULL != jdata->map) {
+        map = jdata->map;
+        for (index = 0; index < map->nodes->size; index++) {
+            node = (prte_node_t *) pmix_pointer_array_get_item(map->nodes, index);
+            if (NULL == node) {
+                continue;
             }
-            PRTE_FLAG_SET(child, PRTE_PROC_FLAG_TERM_REPORTED);
+            PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
+                                 "%s state:prted releasing procs from node %s",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), node->name));
+            for (i = 0; i < node->procs->size; i++) {
+                pptr = (prte_proc_t *) pmix_pointer_array_get_item(node->procs, i);
+                if (NULL == pptr) {
+                    continue;
+                }
+                if (!PMIX_CHECK_NSPACE(pptr->name.nspace, jdata->nspace)) {
+                    /* skip procs from another job */
+                    continue;
+                }
+                app = (prte_app_context_t*) pmix_pointer_array_get_item(jdata->apps, pptr->app_idx);
+                if (!PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL) &&
+                    !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
+                    node->slots_inuse--;
+                    node->num_procs--;
+                }
+                PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
+                                     "%s state:prted releasing proc %s from node %s",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                     PRTE_NAME_PRINT(&pptr->name), node->name));
+                /* set the entry in the node array to NULL */
+                pmix_pointer_array_set_item(node->procs, i, NULL);
+                /* release the proc once for the map entry */
+                PMIX_RELEASE(pptr);
+            }
+            /* set the node location to NULL */
+            pmix_pointer_array_set_item(map->nodes, index, NULL);
+            /* flag that the node is no longer in a map.  This has to
+             * precede the release: the map holds a reference, and
+             * dropping it may be the last one */
+            PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_MAPPED);
+            /* maintain accounting */
+            PMIX_RELEASE(node);
         }
-    }
-    /* flag that this job is complete so the receiver can know */
-    rc = PMIx_Data_pack(NULL, alert, &null, 1, PMIX_PROC_RANK);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        return rc;
+        PMIX_RELEASE(map);
+        jdata->map = NULL;
     }
 
-    return PRTE_SUCCESS;
+    /* if requested, check fd status for leaks */
+    if (prte_state_base.run_fdcheck) {
+        prte_state_base_check_fds(jdata);
+    }
+
+    /* if ompi-server is around, then notify it to purge
+     * any session-related info */
+    if (NULL != prte_data_server_uri) {
+        PMIX_LOAD_PROCID(&target, jdata->nspace, PMIX_RANK_WILDCARD);
+        prte_state_base_notify_data_server(&target);
+    }
+
+    /* cleanup the job info.  The caddy still holds a reference of its own,
+     * so the object survives until it is released below. */
+    pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+    PMIX_RELEASE(jdata);
+
+    PMIX_RELEASE(caddy);
 }
+

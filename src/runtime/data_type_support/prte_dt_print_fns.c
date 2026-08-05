@@ -46,28 +46,19 @@ static void display_cpus(prte_topology_t *t,
                          prte_job_t *jdata,
                          char *node, char**output)
 {
-    char tmp[2048];
+    char *tmp;
     unsigned pkg, npkgs;
-    bool bits_as_cores = false, use_hwthread_cpus = prte_hwloc_default_use_hwthread_cpus;
-    unsigned npus, ncores;
+    bool use_hwthread_cpus, physical;
     hwloc_obj_t obj;
     hwloc_cpuset_t avail = NULL;
     hwloc_cpuset_t allowed;
-    hwloc_cpuset_t coreset = NULL;
     PRTE_HIDE_UNUSED_PARAMS(node);
 
     char *tmp1, *tmp2;
 
-    npus = prte_hwloc_base_get_nbobjs_by_type(t->topo, HWLOC_OBJ_PU);
-    ncores = prte_hwloc_base_get_nbobjs_by_type(t->topo, HWLOC_OBJ_CORE);
-    if (npus == ncores && !use_hwthread_cpus) {
-        /* the bits in this bitmap represent cores */
-        bits_as_cores = true;
-    }
     use_hwthread_cpus = prte_get_attribute(&jdata->attributes, PRTE_JOB_HWT_CPUS, NULL, PMIX_BOOL);
-    if (!use_hwthread_cpus && !bits_as_cores) {
-        coreset = hwloc_bitmap_alloc();
-    }
+    physical = prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_PHYSICAL_CPUS, NULL,
+                                  PMIX_BOOL);
     avail = hwloc_bitmap_alloc();
     pmix_asprintf(&tmp1, "        <processors>\n");
     npkgs = prte_hwloc_base_get_nbobjs_by_type(t->topo, HWLOC_OBJ_PACKAGE);
@@ -77,30 +68,26 @@ static void display_cpus(prte_topology_t *t,
         hwloc_bitmap_and(avail, obj->cpuset, allowed);
         if (hwloc_bitmap_iszero(avail)) {
             pmix_asprintf(&tmp2, "%s            <package id=\"%d\" cpus=\"%s\"/>\n", tmp1, pkg, "NONE");
+            /* fall through to the accumulate step below rather than
+             * continuing: skipping it both dropped this package from the
+             * output and leaked the string just built for it */
+            free(tmp1);
+            tmp1 = tmp2;
+            tmp2 = NULL;
             continue;
         }
-        if (bits_as_cores) {
-            /* can just use the hwloc fn directly */
-            hwloc_bitmap_list_snprintf(tmp, 2048, avail);
-            pmix_asprintf(&tmp2, "%s            <package id=\"%d\" cpus=\"%s\"/>\n", tmp1, pkg, tmp);
-        } else if (use_hwthread_cpus) {
-            /* can just use the hwloc fn directly */
-            hwloc_bitmap_list_snprintf(tmp, 2048, avail);
-            pmix_asprintf(&tmp2, "%s            <package id=\"%d\" cpus=\"%s\"/>\n", tmp1, pkg, tmp);
-        } else {
-            prte_hwloc_build_map(t->topo, avail, use_hwthread_cpus | bits_as_cores, coreset);
-            /* now print out the string */
-            hwloc_bitmap_list_snprintf(tmp, 2048, coreset);
-            pmix_asprintf(&tmp2, "%s            <package id=\"%d\" cpus=\"%s\"/>\n", tmp1, pkg, tmp);
-        }
+        /* the bits are PU OS indices; what the user needs to read back out
+         * (and hand to --cpu-set) is the list of cores, or of hwthreads if
+         * that is what this job is using as cpus */
+        tmp = prte_hwloc_base_cpuset2ranges(t->topo, avail, use_hwthread_cpus, physical);
+        pmix_asprintf(&tmp2, "%s            <package id=\"%d\" cpus=\"%s\"/>\n", tmp1, pkg,
+                      (NULL == tmp) ? "NONE" : tmp);
+        free(tmp);
         free(tmp1);
         tmp1 = tmp2;
         tmp2 = NULL;
     }
     hwloc_bitmap_free(avail);
-    if (NULL != coreset) {
-        hwloc_bitmap_free(coreset);
-    }
 
     pmix_asprintf(output, "%s        </processors>\n", tmp1);
     free(tmp1);
@@ -186,7 +173,7 @@ void prte_job_print(char **output, prte_job_t *src)
  */
 void prte_node_print(char **output, prte_job_t *jdata, prte_node_t *src)
 {
-    char *tmp, *tmp1, *tmp2, *tmp3;
+    char *tmp, *tmp1 = NULL, *tmp2, *tmp3;
     int32_t i,j;
     prte_proc_t *proc;
     prte_topology_t *t;
@@ -330,8 +317,8 @@ void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src)
     hwloc_cpuset_t mycpus;
     char *str;
     bool use_hwthread_cpus;
-    int pkgnum;
     int npus;
+    int npkgs;
     char *cores = NULL;
     char xmlsp = ' ';
     bool physical;
@@ -349,29 +336,42 @@ void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src)
     physical = prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_PHYSICAL_CPUS, NULL, PMIX_BOOL);
 
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT, NULL, PMIX_BOOL)) {
-        if (NULL != src->cpuset && NULL != src->node->topology &&
-            NULL != src->node->topology->topo) {
+        if (NULL != src->cpuset && NULL != src->node &&
+            NULL != src->node->topology && NULL != src->node->topology->topo) {
             mycpus = hwloc_bitmap_alloc();
             hwloc_bitmap_list_sscanf(mycpus, src->cpuset);
 
             npus = prte_hwloc_base_get_nbobjs_by_type(src->node->topology->topo, HWLOC_OBJ_PU);
-            /* assuming each "core" xml element will take 20 characters. There could be at most npus such elements */
-            int sz = sizeof(char) * npus * 20;
+            npkgs = prte_hwloc_base_get_nbobjs_by_type(src->node->topology->topo,
+                                                       HWLOC_OBJ_PACKAGE);
+            /* There can be one element per PU, and each is 20 spaces of
+             * indent plus "<core>%d</core>\n" - 34 characters for a
+             * single-digit index and more as the index grows. The estimate
+             * used to be 20 per element, so a process bound to more than
+             * about half the cores of a non-SMT node had its site list
+             * silently truncated (and, before the writes were bounded,
+             * overran this buffer outright). Each package the process
+             * touches also costs an opening and a closing element, so budget
+             * for the whole topology's worth of them rather than one. */
+            int sz = sizeof(char) * (npus * 48 + npkgs * 64 + 64);
             cores = (char*)malloc(sz);
             if (NULL == cores) {
                 pmix_asprintf(&tmp, "\n%*c<MemoryError/>\n", 8, xmlsp);
                 *output = tmp;
                 return;
             }
-            prte_hwloc_get_binding_info(mycpus, use_hwthread_cpus,
-                                        src->node->topology->topo, &pkgnum, cores, sz);
+            /* the renderer emits the <package> elements itself: a process
+             * bound across two packages has two of them, and the shape this
+             * used to wrap around it could only ever name one */
+            prte_hwloc_get_binding_info(mycpus, use_hwthread_cpus, physical,
+                                        src->node->topology->topo, cores, sz);
 
             hwloc_bitmap_free(mycpus);
 
             pmix_asprintf(&tmp, "\n%*c<rank id=\"%s\" appid=\"%ld\">\n%*c<binding>\n"
-                          "%*c<package id=\"%d\">\n%s\n%*c</package>\n%*c</binding>\n%*c</rank>\n",
+                          "%s%*c</binding>\n%*c</rank>\n",
                           8, xmlsp, PRTE_VPID_PRINT(src->name.rank), (long) src->app_idx, 12, xmlsp,
-                          16, xmlsp, pkgnum, cores, 16, xmlsp, 12, xmlsp, 8, xmlsp);
+                          cores, 12, xmlsp, 8, xmlsp);
 
             free (cores);
         } else {
@@ -385,8 +385,8 @@ void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src)
     }
 
     if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, NULL, PMIX_BOOL)) {
-        if (NULL != src->cpuset && NULL != src->node->topology
-            && NULL != src->node->topology->topo) {
+        if (NULL != src->cpuset && NULL != src->node
+            && NULL != src->node->topology && NULL != src->node->topology->topo) {
             mycpus = hwloc_bitmap_alloc();
             hwloc_bitmap_list_sscanf(mycpus, src->cpuset);
             str = prte_hwloc_base_cset2str(mycpus, use_hwthread_cpus, physical,
@@ -419,12 +419,20 @@ void prte_proc_print(char **output, prte_job_t *jdata, prte_proc_t *src)
     free(tmp);
     tmp = tmp3;
 
-    if (NULL != src->cpuset) {
+    /* the topology has to be reachable to render a cpuset: a proc that was
+     * never mapped (or whose node has already been torn down - the node
+     * clears the backpointer on the procs it knows about) has no node, and
+     * this path had none of the guards its two siblings above carry */
+    if (NULL != src->cpuset && NULL != src->node &&
+        NULL != src->node->topology && NULL != src->node->topology->topo) {
         mycpus = hwloc_bitmap_alloc();
         hwloc_bitmap_list_sscanf(mycpus, src->cpuset);
         tmp2 = prte_hwloc_base_cset2str(mycpus, use_hwthread_cpus,
                                         physical, src->node->topology->topo);
         hwloc_bitmap_free(mycpus);
+        if (NULL == tmp2) {
+            tmp2 = strdup("UNBOUND");
+        }
     } else {
         tmp2 = strdup("UNBOUND");
     }
@@ -491,6 +499,142 @@ void prte_app_print(char **output, prte_job_t *jdata, prte_app_context_t *src)
 }
 
 
+/* Decide whether to print per-app policy lines instead of a single job-level
+ * line. We do so only when the per-app dispatch recorded resolved policies for
+ * two or more apps AND those policies are not all identical: that is the case
+ * where "per-app policies were given" produced genuinely different placement.
+ * A single app, or multiple apps that all resolved to the same map/rank/bind,
+ * is effectively a single job-level policy and uses the existing output. */
+static bool job_show_per_app_policy(prte_job_t *jdata)
+{
+    prte_app_context_t *app;
+    int i;
+    bool have_first = false;
+    uint16_t m0 = 0, r0 = 0, b0 = 0;
+    uint16_t u16, *u16ptr;
+
+    for (i = 0; i < jdata->apps->size; i++) {
+        uint16_t m, r, b;
+
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i);
+        if (NULL == app) {
+            continue;
+        }
+        u16ptr = &u16;
+        if (!prte_get_attribute(&app->attributes, PRTE_APP_RESOLVED_MAPBY,
+                                (void **) &u16ptr, PMIX_UINT16)) {
+            /* nothing recorded for this app (non-per-app dispatch records
+             * nothing) - cannot be a per-app job */
+            return false;
+        }
+        m = u16;
+        u16ptr = &u16;
+        r = prte_get_attribute(&app->attributes, PRTE_APP_RESOLVED_RANKBY,
+                               (void **) &u16ptr, PMIX_UINT16) ? u16 : 0;
+        u16ptr = &u16;
+        b = prte_get_attribute(&app->attributes, PRTE_APP_RESOLVED_BINDTO,
+                               (void **) &u16ptr, PMIX_UINT16) ? u16 : 0;
+        /* An app that was mapped by something other than the job's own
+         * policy has to be shown, even if all its siblings were mapped the
+         * same way: the job-level line would otherwise report the default
+         * the job never used. That is what every app saying "--map-by
+         * pe-list=..." looks like - the apps agree with each other and
+         * disagree with the job. */
+        if (m != jdata->map->mapping || r != jdata->map->ranking
+            || b != jdata->map->binding) {
+            return true;
+        }
+        if (!have_first) {
+            m0 = m;
+            r0 = r;
+            b0 = b;
+            have_first = true;
+        } else if (m != m0 || r != r0 || b != b0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The mapping component that placed this job, for the single-policy display.
+ * There is no such field on the map: which component ran is recorded on each
+ * app by the rmaps base, because with per-app policies two apps of one job
+ * can be placed by two different components and one job-level name could
+ * only ever be half the answer. Every app of a single-policy job carries the
+ * same name, so the first one that has it speaks for the job. */
+static char *job_mapper(prte_job_t *jdata)
+{
+    prte_app_context_t *app;
+    char *mapper;
+    int i;
+
+    for (i = 0; i < jdata->apps->size; i++) {
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i);
+        if (NULL == app) {
+            continue;
+        }
+        mapper = NULL;
+        if (prte_get_attribute(&app->attributes, PRTE_APP_LAST_MAPPER,
+                               (void **) &mapper, PMIX_STRING) && NULL != mapper) {
+            return mapper;
+        }
+    }
+    return strdup("N/A");
+}
+
+/* Build one "App N: Mapping/Ranking/Binding policy" line per app for a job
+ * that was mapped with per-app policies, joined by newlines and each prefixed
+ * with 'indent'. An app that did not record a resolved policy falls back to
+ * the job-level value. The mapping component that placed the app is named
+ * too: with each app's own policy deciding which mapper claims it, two apps
+ * of one job can be placed by two different components, and the job-level
+ * "Last mapper" line can only name one of them. Caller frees the returned
+ * string. */
+static char *per_app_policy_lines(prte_job_t *jdata, const char *indent)
+{
+    prte_job_map_t *src = jdata->map;
+    prte_app_context_t *app;
+    char *block, *tmp, *mapper;
+    int i;
+    uint16_t u16, *u16ptr;
+
+    block = strdup("");
+    for (i = 0; i < jdata->apps->size; i++) {
+        prte_mapping_policy_t m;
+        prte_ranking_policy_t r;
+        prte_binding_policy_t b;
+
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i);
+        if (NULL == app) {
+            continue;
+        }
+        u16ptr = &u16;
+        m = prte_get_attribute(&app->attributes, PRTE_APP_RESOLVED_MAPBY, (void **) &u16ptr, PMIX_UINT16)
+                ? (prte_mapping_policy_t) u16 : src->mapping;
+        u16ptr = &u16;
+        r = prte_get_attribute(&app->attributes, PRTE_APP_RESOLVED_RANKBY, (void **) &u16ptr, PMIX_UINT16)
+                ? (prte_ranking_policy_t) u16 : src->ranking;
+        u16ptr = &u16;
+        b = prte_get_attribute(&app->attributes, PRTE_APP_RESOLVED_BINDTO, (void **) &u16ptr, PMIX_UINT16)
+                ? (prte_binding_policy_t) u16 : src->binding;
+        mapper = NULL;
+        if (!prte_get_attribute(&app->attributes, PRTE_APP_LAST_MAPPER,
+                                (void **) &mapper, PMIX_STRING) || NULL == mapper) {
+            mapper = strdup("N/A");
+        }
+        pmix_asprintf(&tmp,
+                      "%s%s%sApp %d: Mapper: %s  Mapping policy: %s  Ranking policy: %s  Binding policy: %s",
+                      block, ('\0' == block[0]) ? "" : "\n", indent, (int) app->idx, mapper,
+                      prte_rmaps_base_print_mapping(m),
+                      prte_rmaps_base_print_ranking(r),
+                      prte_hwloc_base_print_binding(b));
+        free(mapper);
+        free(block);
+        block = tmp;
+    }
+    return block;
+}
+
 /*
  * JOB_MAP
  */
@@ -502,7 +646,7 @@ void prte_map_print(char **output, prte_job_t *jdata)
     prte_node_t *node;
     prte_job_map_t *src = jdata->map;
     uint16_t u16, *u16ptr = &u16;
-    char *ppr, *cpus_per_rank, *cpu_type, *cpuset = NULL;
+    char *ppr, *cpus_per_rank, *cpu_type, *cpuset = NULL, *mapper;
 
     /* set default result */
     *output = NULL;
@@ -579,19 +723,34 @@ void prte_map_print(char **output, prte_job_t *jdata)
     }
 
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, NULL, PMIX_BOOL)) {
-        pmix_asprintf(
-            &tmp,
-            "\n=================================   JOB MAP   =================================\n"
-            "Data for JOB %s offset %s Total slots allocated %lu\n"
-            "Mapper requested: %s  Last mapper: %s  Mapping policy: %s  Ranking policy: %s\n"
-            "Binding policy: %s  Cpu set: %s  PPR: %s  Cpus-per-rank: %s  Cpu Type: %s",
-            PRTE_JOBID_PRINT(jdata->nspace), PRTE_VPID_PRINT(jdata->offset),
-            (long unsigned) jdata->total_slots_alloc,
-            (NULL == src->req_mapper) ? "NULL" : src->req_mapper,
-            (NULL == src->last_mapper) ? "NULL" : src->last_mapper,
-            prte_rmaps_base_print_mapping(src->mapping),
-            prte_rmaps_base_print_ranking(src->ranking),
-            prte_hwloc_base_print_binding(src->binding), cpuset, ppr, cpus_per_rank, cpu_type);
+        if (job_show_per_app_policy(jdata)) {
+            char *plines = per_app_policy_lines(jdata, "");
+            pmix_asprintf(
+                &tmp,
+                "\n=================================   JOB MAP   =================================\n"
+                "Data for JOB %s offset %s Total slots allocated %lu\n"
+                "%s\n"
+                "Cpu set: %s  PPR: %s  Cpus-per-rank: %s  Cpu Type: %s",
+                PRTE_JOBID_PRINT(jdata->nspace), PRTE_VPID_PRINT(jdata->offset),
+                (long unsigned) jdata->total_slots_alloc,
+                plines, cpuset, ppr, cpus_per_rank, cpu_type);
+            free(plines);
+        } else {
+            mapper = job_mapper(jdata);
+            pmix_asprintf(
+                &tmp,
+                "\n=================================   JOB MAP   =================================\n"
+                "Data for JOB %s offset %s Total slots allocated %lu\n"
+                "Mapper: %s  Mapping policy: %s  Ranking policy: %s\n"
+                "Binding policy: %s  Cpu set: %s  PPR: %s  Cpus-per-rank: %s  Cpu Type: %s",
+                PRTE_JOBID_PRINT(jdata->nspace), PRTE_VPID_PRINT(jdata->offset),
+                (long unsigned) jdata->total_slots_alloc,
+                mapper,
+                prte_rmaps_base_print_mapping(src->mapping),
+                prte_rmaps_base_print_ranking(src->ranking),
+                prte_hwloc_base_print_binding(src->binding), cpuset, ppr, cpus_per_rank, cpu_type);
+            free(mapper);
+        }
 
         if (PMIX_RANK_INVALID == src->daemon_vpid_start) {
             pmix_asprintf(
@@ -605,6 +764,18 @@ void prte_map_print(char **output, prte_job_t *jdata)
         }
         free(tmp);
         tmp = tmp2;
+    } else if (job_show_per_app_policy(jdata)) {
+        /* per-app (MPMD) job: show a policy line for each app */
+        char *plines = per_app_policy_lines(jdata, "    ");
+        pmix_asprintf(&tmp,
+                      "\n========================   JOB MAP   ========================\n"
+                      "Data for JOB %s offset %s Total slots allocated %lu\n"
+                      "%s\n"
+                      "    Cpu set: %s  PPR: %s  Cpus-per-rank: %s  Cpu Type: %s\n",
+                      PRTE_JOBID_PRINT(jdata->nspace), PRTE_VPID_PRINT(jdata->offset),
+                      (long unsigned) jdata->total_slots_alloc, plines,
+                      cpuset, ppr, cpus_per_rank, cpu_type);
+        free(plines);
     } else {
         /* this is being printed for a user, so let's make it easier to see */
         pmix_asprintf(&tmp,
