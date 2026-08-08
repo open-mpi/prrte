@@ -102,6 +102,13 @@ PMIX_REF="${PMIX_REF:-master}"          # baked-image PMIx branch
 PMIX_REPO="${PMIX_REPO:-https://github.com/openpmix/openpmix.git}"
 PMIX_SRC="${PMIX_SRC:-}"                # optional openpmix checkout to build
 PMIX_HOME="${PMIX_HOME:-}"              # optional installed PMIx prefix (macOS)
+# Optional Open MPI checkout to build against the PMIx and PRRTE this script
+# just installed.  Off by default because it roughly triples the build time,
+# and only the collective-movement work needs it: an MPI job is the only thing
+# in this harness that drives a modex an application actually reads back.  The
+# checkout must be autogen'd and NOT configured in-tree (same rule as
+# PMIX_SRC -- configure runs VPATH over a read-only bind mount).
+OMPI_SRC="${OMPI_SRC:-}"
 
 mode=linux
 distclean=auto                          # auto | always | never
@@ -241,12 +248,18 @@ build_linux() {
         gen_lex "$(cd "$PMIX_SRC" && pwd)"
         pmix_mount=(-v "$(cd "$PMIX_SRC" && pwd)":/pmix-src:ro)
     fi
+    local ompi_mount=()
+    if [ -n "$OMPI_SRC" ]; then
+        gen_lex "$(cd "$OMPI_SRC" && pwd)"
+        ompi_mount=(-v "$(cd "$OMPI_SRC" && pwd)":/ompi-src:ro)
+    fi
 
     echo ">>> building PRRTE (and PMIx if PMIX_SRC set) into volume $VOLUME"
     docker run --rm \
         -v "$root":/prrte-src:ro \
         -v "$VOLUME":/opt/prte \
         ${pmix_mount[@]+"${pmix_mount[@]}"} \
+        ${ompi_mount[@]+"${ompi_mount[@]}"} \
         "$IMAGE" bash -euo pipefail -c '
             jobs=$(nproc)
 
@@ -259,7 +272,7 @@ build_linux() {
             #
             # $1 = build dir, $2 = argument string, $3 = srcdir
             #
-            # Three ways a persistent build dir can be stale:
+            # Four ways a persistent build dir can be stale:
             #   - never configured at all;
             #   - configured with different arguments (the PMIX_SRC trap
             #     above);
@@ -271,12 +284,45 @@ build_linux() {
             #     needs the exact aclocal/automake version the host used, and
             #     dies with "aclocal-N.NN: command not found", leaving the
             #     PREVIOUS install standing with no build stamp.
+            #   - configured against a source tree that has since LOST a
+            #     directory.  A framework that stops being a framework
+            #     (grpcomm) or a component that is deleted leaves its build
+            #     subdirectory here, and the parent Makefile -- also from that
+            #     old configure run -- still names it in SUBDIRS.  So make
+            #     recurses into a directory whose Makefile.am no longer exists
+            #     and stops with "No rule to make target
+            #     <srcdir>/src/mca/grpcomm/Makefile.am".  Neither the arguments
+            #     nor the configure timestamp changed, so nothing above sees
+            #     it, and the cost is a whole build cycle spent finding out.
+            orphan_dirs() {                     # $1 = build dir, $2 = srcdir
+                local d rel
+                find "$1" -mindepth 2 -name Makefile -printf "%h\n" |
+                    while IFS= read -r d; do
+                        rel=${d#"$1"/}
+                        [ -d "$2/$rel" ] || echo "$d"
+                    done
+            }
+
             reconfigure_needed() {
                 [ -f "$1/config.status" ] || return 0
                 [ -f "$1/.configure-args" ] || return 0
                 [ "$(cat "$1/.configure-args")" = "$2" ] || return 0
                 [ "$3/configure" -nt "$1/config.status" ] && return 0
+                [ -n "$(orphan_dirs "$1" "$3")" ] && return 0
                 return 1
+            }
+
+            # Reconfiguring regenerates the parent Makefile without the
+            # departed directory in SUBDIRS, so make would no longer enter it
+            # -- but leaving it behind means the NEXT run sees an orphan again
+            # and reconfigures forever.  Remove them as part of the same step.
+            drop_orphans() {                    # $1 = build dir, $2 = srcdir
+                local d
+                while IFS= read -r d; do
+                    [ -n "$d" ] || continue
+                    echo ">>>> dropping orphaned build dir $d (gone from $2)"
+                    rm -rf "$d"
+                done < <(orphan_dirs "$1" "$2")
             }
 
             if [ -d /pmix-src ]; then
@@ -286,6 +332,7 @@ build_linux() {
                 pmix_args="--prefix=$PMIX_PREFIX"
                 if reconfigure_needed . "$pmix_args" /pmix-src; then
                     echo ">>>> (re)configuring PMIx: $pmix_args"
+                    drop_orphans . /pmix-src
                     /pmix-src/configure $pmix_args
                     echo "$pmix_args" > .configure-args
                 fi
@@ -310,6 +357,7 @@ build_linux() {
             prte_args="--prefix=/opt/prte/prte --with-pmix=$PMIX_PREFIX --with-jansson --enable-debug"
             if reconfigure_needed . "$prte_args" /prrte-src; then
                 echo ">>>> (re)configuring PRRTE: $prte_args"
+                drop_orphans . /prrte-src
                 /prrte-src/configure $prte_args
                 echo "$prte_args" > .configure-args
             fi
@@ -392,6 +440,32 @@ build_linux() {
                 /prrte-src/contrib/dockerswarm/groupcon.c \
                 -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
 
+            # scaletest: a PMIx client that times a full-data fence and a
+            # bare barrier over the whole job, so the cost of the DVM
+            # collectives can be plotted against DVM size, process count,
+            # routing radix and payload size.  A collective is the one thing
+            # whose cost IS the shape of the daemon tree, so there is nothing
+            # for a single host to measure -- with one daemon the routing
+            # radix has no effect at all and the allgather never touches a
+            # wire.  Driven by scaletest.sh, not by run-tests.sh: it is a
+            # measurement, not a pass/fail case.
+            # (No apostrophes here: see the note further down.)
+            echo ">>>> scaletest (collective scaling measurement) client"
+            gcc -O2 -g -o /opt/prte/prte/bin/scaletest \
+                /prrte-src/contrib/dockerswarm/scaletest.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
+            # fencer: one fence, either a modex or a pure barrier.  The two
+            # differ only by PMIX_COLLECT_DATA, which is what the auto
+            # fence-movement selection reads -- and no other client here
+            # makes that distinction visible.
+            # NOTE: this whole block is inside bash -c ..., so an apostrophe
+            # anywhere in it (even in a comment) ends the script.
+            echo ">>>> fencer (modex vs barrier) test client"
+            gcc -O0 -g -o /opt/prte/prte/bin/fencer \
+                /prrte-src/contrib/dockerswarm/fencer.c \
+                -I"$PMIX_PREFIX/include" -L"$PMIX_PREFIX/lib" -Wl,-rpath,"$PMIX_PREFIX/lib" -lpmix
+
             # faulty: a PMIx client that fails on purpose, once per way the
             # errmgr has a policy branch for (abort, non-zero exit, signal,
             # exit without finalize).  Both errmgr components are involved in
@@ -464,13 +538,60 @@ build_linux() {
             mkdir -p /opt/prte/fakeslurm/bin
             install -m 0755 /prrte-src/contrib/dockerswarm/fake-slurm.py \
                 /opt/prte/fakeslurm/bin/fake-slurm
-            for t in sbatch scontrol scancel; do
+            for t in salloc scontrol scancel; do
                 ln -sf fake-slurm /opt/prte/fakeslurm/bin/$t
             done
+
+            # Open MPI, if a checkout was bind-mounted.  This is the only
+            # thing in the harness that produces a modex an application
+            # actually reads back: every other client here puts data because
+            # the test told it to.  An MPI job publishes what its transports
+            # need and then gets exactly the peers it talks to, which is the
+            # workload a fence movement has to be judged against.
+            #
+            # Built --with-prrte=external against the install above, so
+            # mpirun IS this PRRTE and an MPI job can be run under any
+            # grpcomm_fence_movement.  Fortran and OpenSHMEM are off (nothing
+            # here uses them and they dominate the build), and so is sphinx:
+            # the docs build needs python modules the image does not carry,
+            # and it is the only thing in an Open MPI build that fails for a
+            # reason having nothing to do with MPI.
+            if [ -d /ompi-src ]; then
+                echo ">>>> Open MPI VPATH build -> /opt/prte/ompi"
+                mkdir -p /opt/prte/vpath-linux-ompi && cd /opt/prte/vpath-linux-ompi
+                ompi_args="--prefix=/opt/prte/ompi --with-pmix=$PMIX_PREFIX \
+--with-prrte=/opt/prte/prte --disable-mpi-fortran --disable-oshmem --disable-sphinx"
+                if reconfigure_needed . "$ompi_args" /ompi-src; then
+                    echo ">>>> (re)configuring Open MPI: $ompi_args"
+                    drop_orphans . /ompi-src
+                    /ompi-src/configure $ompi_args
+                    echo "$ompi_args" > .configure-args
+                fi
+                make -j"$jobs"
+                make install
+
+                # mpinoop: MPI_Init and MPI_Finalize and nothing else, so the
+                # only thing timed is the modex fence and the barrier behind
+                # it.  ring_c is the tree own example: a real neighbour
+                # exchange, which is the pattern the ring share exists for.
+                echo ">>>> mpinoop + ring_c (MPI probes)"
+                /opt/prte/ompi/bin/mpicc -O0 -g -o /opt/prte/ompi/bin/mpinoop \
+                    /prrte-src/contrib/dockerswarm/mpinoop.c
+                /opt/prte/ompi/bin/mpicc -O0 -g -o /opt/prte/ompi/bin/ring_c \
+                    /ompi-src/examples/ring_c.c
+            fi
 
             # runtime env for login shells (node-entrypoint handles ld.so)
             printf "export PATH=/opt/prte/prte/bin:\$PATH\nexport LD_LIBRARY_PATH=/opt/prte/prte/lib:%s/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\n" \
                 "$PMIX_PREFIX" > /opt/prte/env.sh
+            if [ -d /ompi-src ]; then
+                # An app launched onto a non-head node inherits nothing, so
+                # the MPI libraries have to be findable from env.sh as well
+                # as from the wrapper rpath -- same trap as the PMIx one
+                # documented above the helper compiles.
+                printf "export PATH=/opt/prte/ompi/bin:\$PATH\nexport LD_LIBRARY_PATH=/opt/prte/ompi/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\n" \
+                    >> /opt/prte/env.sh
+            fi
 
             # Written LAST, and only on success.  The install lives in a
             # volume that outlives any one build, so a build that fails

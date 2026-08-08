@@ -34,20 +34,31 @@
 #include "src/util/name_fns.h"
 #include "src/util/nidmap.h"
 #include "src/util/proc_info.h"
+#include "src/util/prte_show_help.h"
 
-#include "grpcomm_direct.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "grpcomm_internal.h"
+#include "src/grpcomm/grpcomm.h"
 
 /* internal functions */
 static void fence(int sd, short args, void *cbdata);
-static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *sig, bool create);
-static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
+static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_fence_signature_t *sig, bool create);
+static int create_dmns(prte_grpcomm_fence_signature_t *sig,
                        pmix_rank_t **dmns, size_t *ndmns);
 static int fence_sig_pack(pmix_data_buffer_t *bkt,
-                          prte_grpcomm_direct_fence_signature_t *sig);
+                          prte_grpcomm_fence_signature_t *sig);
 static int fence_sig_unpack(pmix_data_buffer_t *buffer,
-                            prte_grpcomm_direct_fence_signature_t **sig);
+                            prte_grpcomm_fence_signature_t **sig);
 static void check_complete(prte_grpcomm_fence_t *coll);
+static void relcb(void *cbdata);
+static void abort_fence_op(prte_grpcomm_fence_t *coll, pmix_status_t st);
+static int pack_epoch_frame(pmix_data_buffer_t *framed, pmix_data_buffer_t *body);
+
+
+/* The rollup: gather to the controller, which broadcasts the answer back. */
+static bool tree_gather_converged(prte_grpcomm_fence_t *coll);
+static int  tree_gather_contribute(prte_grpcomm_fence_t *coll,
+                                   pmix_data_buffer_t *payload);
+static void tree_gather_answer(prte_grpcomm_fence_t *coll);
 
 /* Work out how many contributions this daemon has to collect for a fence:
  * one per child subtree holding a participant, plus our own if we are one.
@@ -84,14 +95,14 @@ static void set_nexpected(prte_grpcomm_fence_t *coll)
     }
 }
 
-int prte_grpcomm_direct_fence(const pmix_proc_t procs[], size_t nprocs,
+int prte_grpcomm_fence(const pmix_proc_t procs[], size_t nprocs,
                               const pmix_info_t info[], size_t ninfo, char *data,
                               size_t ndata, pmix_modex_cbfunc_t cbfunc, void *cbdata)
 {
     prte_pmix_fence_caddy_t *cd;
 
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct:fence",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm:fence",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
     // bozo check
@@ -124,7 +135,7 @@ static int pack_epoch_frame(pmix_data_buffer_t *framed, pmix_data_buffer_t *body
     pmix_status_t rc;
 
     rc = PMIx_Data_pack(NULL, framed,
-                        &prte_mca_grpcomm_direct_component.recovery_epoch, 1, PMIX_UINT32);
+                        &prte_grpcomm_globals.recovery_epoch, 1, PMIX_UINT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         return prte_pmix_convert_status(rc);
@@ -138,9 +149,13 @@ static int pack_epoch_frame(pmix_data_buffer_t *framed, pmix_data_buffer_t *body
 }
 
 /* End an in-flight fence that cannot complete correctly, without taking
- * anything else down with it. Only the controller calls this: it broadcasts a
- * release carrying the signature and a status but no gathered data, which the
- * normal release path hands to each daemon's local participants. */
+ * anything else down with it. It broadcasts a release carrying the signature
+ * and a status but no gathered data, which the normal release path hands to
+ * each daemon's local participants.
+ *
+ * The controller calls this - it is the daemon every rollup reaches, so it is
+ * the one that can tell a fence that will never converge from one that merely
+ * has not yet. */
 static void abort_fence_op(prte_grpcomm_fence_t *coll, pmix_status_t st)
 {
     pmix_data_buffer_t *reply;
@@ -160,7 +175,7 @@ static void abort_fence_op(prte_grpcomm_fence_t *coll, pmix_status_t st)
         return;
     }
     /* xcast copies the payload, so the buffer is still ours to free */
-    (void) prte_grpcomm.xcast(PRTE_RML_TAG_FENCE_RELEASE, reply);
+    (void) prte_grpcomm_release_bcast(PRTE_RML_TAG_FENCE_RELEASE, reply);
     PMIX_DATA_BUFFER_RELEASE(reply);
     /* the tracker goes when that release comes back around */
     coll->aborting = true;
@@ -185,20 +200,20 @@ static void fence_timeout(int sd, short args, void *cbdata)
     if (coll->converged || coll->aborting) {
         return;
     }
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct:fence timeout after %d seconds",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm:fence timeout after %d seconds",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), coll->timeout));
     coll->status = PMIX_ERR_TIMEOUT;
     abort_fence_op(coll, PMIX_ERR_TIMEOUT);
 }
 
-void prte_grpcomm_direct_fence_restart(void)
+void prte_grpcomm_fence_restart(void)
 {
     prte_grpcomm_fence_t *coll, *nxt;
     pmix_data_buffer_t *framed;
     int rc;
 
-    PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.fence_ops,
+    PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_grpcomm_globals.fence_ops,
                            prte_grpcomm_fence_t) {
         if (coll->aborting) {
             continue;
@@ -217,8 +232,8 @@ void prte_grpcomm_direct_fence_restart(void)
         if (PRTE_PROC_IS_MASTER && coll->converged) {
             continue;
         }
-
-        /* throw away everything gathered under the old tree */
+        /* A restart: the rollup's shape is the routing tree's, and the tree
+         * just changed, so throw away everything gathered under the old one. */
         pmix_bitmap_clear_all_bits(&coll->reported_slots);
         coll->self_reported = false;
         coll->nreported = 0;
@@ -231,11 +246,11 @@ void prte_grpcomm_direct_fence_restart(void)
          * now known to have failed */
         set_nexpected(coll);
 
-        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                             "%s grpcomm:direct:fence restarting at epoch %u, "
+        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                             "%s grpcomm:fence restarting at epoch %u, "
                              "nexpected now %d",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                             (unsigned) prte_mca_grpcomm_direct_component.recovery_epoch,
+                             (unsigned) prte_grpcomm_globals.recovery_epoch,
                              (int) coll->nexpected));
 
         if (NULL == coll->my_contribution) {
@@ -272,11 +287,11 @@ void prte_grpcomm_direct_fence_restart(void)
  * unrelated daemon failure fatal to bystanders - and because it had no scope
  * guard it also fired twice per failure and once on every revival, taking a
  * job down over a daemon that had just come back. */
-void prte_grpcomm_direct_fence_fault_handler(const prte_rml_recovery_status_t* status)
+void prte_grpcomm_fence_fault_handler(const prte_rml_recovery_status_t* status)
 {
     prte_grpcomm_fence_t *coll, *nxt;
 
-    if (0 == pmix_list_get_size(&prte_mca_grpcomm_direct_component.fence_ops)) {
+    if (0 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops)) {
         return;
     }
 
@@ -287,7 +302,7 @@ void prte_grpcomm_direct_fence_fault_handler(const prte_rml_recovery_status_t* s
          * broadcast, so it cannot give the parent-before-child ordering a
          * restart depends on - end the fences instead. */
         if (PRTE_PROC_IS_MASTER && 0 == status->failed_ranks.size) {
-            PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.fence_ops,
+            PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_grpcomm_globals.fence_ops,
                                    prte_grpcomm_fence_t) {
                 if (!coll->aborting && !coll->converged) {
                     abort_fence_op(coll, PMIX_ERR_LOST_CONNECTION);
@@ -297,22 +312,22 @@ void prte_grpcomm_direct_fence_fault_handler(const prte_rml_recovery_status_t* s
         return;
     }
 
-    if (!PRTE_PROC_IS_MASTER) {
+        if (!PRTE_PROC_IS_MASTER) {
         return;
     }
-    PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_mca_grpcomm_direct_component.fence_ops,
+    PMIX_LIST_FOREACH_SAFE(coll, nxt, &prte_grpcomm_globals.fence_ops,
                            prte_grpcomm_fence_t) {
         /* already answered, or already being torn down */
         if (coll->aborting || coll->converged) {
             continue;
         }
-        if (!prte_grpcomm_direct_procs_lost(coll->sig->signature, coll->sig->sz)) {
+        if (!prte_grpcomm_procs_lost(coll->sig->signature, coll->sig->sz)) {
             /* only the paths between us changed - the restart driven by the
              * component's epoch advance re-converges this one */
             continue;
         }
-        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                             "%s grpcomm:direct:fence ending a fence that lost a "
+        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                             "%s grpcomm:fence ending a fence that lost a "
                              "participant to a failed daemon",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         abort_fence_op(coll, PMIX_ERR_LOST_CONNECTION);
@@ -322,7 +337,7 @@ void prte_grpcomm_direct_fence_fault_handler(const prte_rml_recovery_status_t* s
 static void fence(int sd, short args, void *cbdata)
 {
     prte_pmix_fence_caddy_t *cd = (prte_pmix_fence_caddy_t *) cbdata;
-    prte_grpcomm_direct_fence_signature_t sig;
+    prte_grpcomm_fence_signature_t sig;
     prte_grpcomm_fence_t *coll = NULL;
     int rc;
     /* what our own participants are told if this contribution never makes
@@ -334,12 +349,12 @@ static void fence(int sd, short args, void *cbdata)
 
     PMIX_ACQUIRE_OBJECT(cd);
 
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct: fence",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm: fence",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
     /* compute the signature of this collective */
-    PMIX_CONSTRUCT(&sig, prte_grpcomm_direct_fence_signature_t);
+    PMIX_CONSTRUCT(&sig, prte_grpcomm_fence_signature_t);
     sig.sz = cd->nprocs;
     if (0 < sig.sz) {
         PMIX_PROC_CREATE(sig.signature, sig.sz);
@@ -357,8 +372,9 @@ static void fence(int sd, short args, void *cbdata)
     coll->cbfunc = cd->cbfunc;
     coll->cbdata = cd->cbdata;
 
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct: fence",
+
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm: fence",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
     // execute the fence operation
@@ -371,6 +387,13 @@ static void fence(int sd, short args, void *cbdata)
         st = prte_pmix_convert_rc(rc);
         goto done;
     }
+
+    /* Say how we intend to move this fence's contributions. Nobody downstream
+     * obeys it - every participant decides for itself, because there is no
+     * originator to decide for them - so this is not an instruction but an
+     * assertion, and the receiver's job is to notice if it disagrees. Packed
+     * unguarded: every daemon in a DVM runs the same build, so the bytes are
+     * never conditional even when the behaviour is. */
 
     // pack the info structs
     rc = PMIx_Data_pack(NULL, relay, &cd->ninfo, 1, PMIX_SIZE);
@@ -432,8 +455,8 @@ static void fence(int sd, short args, void *cbdata)
     }
 
     /* send this to ourselves for processing */
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct:fence sending to ourself",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm:fence sending to ourself",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
     PRTE_RML_SEND(rc, PRTE_PROC_MY_NAME->rank, framed,
@@ -469,7 +492,7 @@ done:
     PMIX_RELEASE(cd);
 }
 
-void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
+void prte_grpcomm_fence_recv(int status, pmix_proc_t *sender,
                                     pmix_data_buffer_t *buffer,
                                     prte_rml_tag_t tag, void *cbdata)
 {
@@ -480,12 +503,12 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
     size_t n, ninfo;
     pmix_status_t st;
     pmix_info_t *info = NULL;
-    prte_grpcomm_direct_fence_signature_t *sig = NULL;
+    prte_grpcomm_fence_signature_t *sig = NULL;
     prte_grpcomm_fence_t *coll;
     PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
 
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct fence recvd from %s",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm fence recvd from %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          PRTE_NAME_PRINT(sender)));
 
@@ -496,21 +519,21 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
         PMIX_ERROR_LOG(rc);
         return;
     }
-    if (stamp < prte_mca_grpcomm_direct_component.recovery_epoch) {
+    if (stamp < prte_grpcomm_globals.recovery_epoch) {
         /* sent before a failure this daemon has already recovered from, so it
          * belongs to a round that no longer exists */
-        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                             "%s grpcomm:direct fence stale epoch %u (at %u) - dropping",
+        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                             "%s grpcomm fence stale epoch %u (at %u) - dropping",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (unsigned) stamp,
-                             (unsigned) prte_mca_grpcomm_direct_component.recovery_epoch));
+                             (unsigned) prte_grpcomm_globals.recovery_epoch));
         return;
     }
-    if (stamp > prte_mca_grpcomm_direct_component.recovery_epoch) {
+    if (stamp > prte_grpcomm_globals.recovery_epoch) {
         /* should be unreachable - see the recovery_epoch commentary in
-         * grpcomm_direct.h - but adopting it is what our own fault notice
+         * grpcomm_internal.h - but adopting it is what our own fault notice
          * would do a moment later, so do that rather than lose the message */
         PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_ORDER_MSG);
-        prte_grpcomm_direct_advance_epoch(stamp);
+        prte_grpcomm_advance_epoch(stamp);
     }
 
     /* unpack the signature */
@@ -603,11 +626,11 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
         }
     }
 
-    /* Arm the deadline, if a participant asked for one. Only on the
-     * controller: it is the one daemon every rollup reaches, so it is the
-     * only one that can tell a fence that will never converge from one that
-     * simply has not yet. */
-    if (PRTE_PROC_IS_MASTER && !coll->tev_active && 0 < coll->timeout) {
+    /* Arm the deadline, if a participant asked for one.  Only the controller
+     * does: it is the one daemon every contribution reaches, so it is the only
+     * one that can tell a fence that will never converge from one that simply
+     * has not yet. */
+    if (!coll->tev_active && 0 < coll->timeout && PRTE_PROC_IS_MASTER) {
         prte_event_evtimer_set(prte_event_base, &coll->tev, fence_timeout, coll);
         tv.tv_sec = coll->timeout;
         tv.tv_usec = 0;
@@ -616,10 +639,11 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
         prte_event_evtimer_add(&coll->tev, &tv);
     }
 
-    /* transfer any data */
-    rc = PMIx_Data_copy_payload(&coll->bucket, buffer);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
+    /* Absorb the payload - the remainder of the message after the info
+     * structs - into the bucket. */
+    rc = tree_gather_contribute(coll, buffer);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
         PMIX_INFO_FREE(info, ninfo);
         return;
     }
@@ -633,8 +657,8 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
     }
     coll->nreported++;
 
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct fence recv nexpected %d nrep %d",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm fence recv nexpected %d nrep %d",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (int) coll->nexpected,
                          (int) coll->nreported));
 
@@ -655,27 +679,65 @@ void prte_grpcomm_direct_fence_recv(int status, pmix_proc_t *sender,
  * without depending on a message being present. */
 static void check_complete(prte_grpcomm_fence_t *coll)
 {
-    pmix_data_buffer_t *reply, *framed;
-    pmix_info_t *info = NULL;
-    size_t ninfo = 0;
-    int rc;
 
     if (coll->converged || coll->aborting) {
         return;
     }
-    if (coll->nreported < coll->nexpected) {
+
+    if (!tree_gather_converged(coll)) {
         return;
     }
+
     coll->converged = true;
     /* the fence resolved, so the guard timer has done its job */
     if (coll->tev_active) {
         prte_event_del(&coll->tev);
         coll->tev_active = false;
     }
+    tree_gather_answer(coll);
+}
+
+static bool tree_gather_converged(prte_grpcomm_fence_t *coll)
+{
+    return coll->nreported >= coll->nexpected;
+}
+
+/* The rollup's bucket is an append: order is whatever the merges happened to
+ * reach us in, which is why the result is not reproducible across daemons. */
+static int tree_gather_contribute(prte_grpcomm_fence_t *coll,
+                                  pmix_data_buffer_t *payload)
+{
+    int rc;
+
+    if (NULL == payload) {
+        return PRTE_SUCCESS;
+    }
+    rc = PMIx_Data_copy_payload(&coll->bucket, payload);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return prte_pmix_convert_status(rc);
+    }
+    return PRTE_SUCCESS;
+}
+
+/* MOVEMENT: roll the contributions up the routing tree to the controller,
+ * which broadcasts the gathered result back down.
+ *
+ * Right for a barrier, where there is nothing to gather and the cost is the
+ * depth of the tree in each direction. Its weakness is the release: the
+ * controller alone holds the answer, so it must fan the whole payload back out
+ * over the tree, and for a full modex that fanout is essentially the entire
+ * cost of the collective. */
+static void tree_gather_answer(prte_grpcomm_fence_t *coll)
+{
+    pmix_data_buffer_t *reply, *framed;
+    pmix_info_t *info = NULL;
+    size_t ninfo = 0;
+    int rc;
 
     if (PRTE_PROC_IS_MASTER) {
-        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                             "%s grpcomm:direct fence HNP reports complete",
+        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                             "%s grpcomm fence HNP reports complete",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         PMIX_DATA_BUFFER_CREATE(reply);
         rc = fence_sig_pack(reply, coll->sig);
@@ -697,13 +759,13 @@ static void check_complete(prte_grpcomm_fence_t *coll)
             return;
         }
         /* xcast copies the payload, so the buffer is still ours to free */
-        (void) prte_grpcomm.xcast(PRTE_RML_TAG_FENCE_RELEASE, reply);
+        (void) prte_grpcomm_release_bcast(PRTE_RML_TAG_FENCE_RELEASE, reply);
         PMIX_DATA_BUFFER_RELEASE(reply);
         return;
     }
 
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct fence rollup complete - sending to %s",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm fence rollup complete - sending to %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          PRTE_NAME_PRINT(PRTE_PROC_MY_PARENT)));
 
@@ -773,6 +835,7 @@ static void check_complete(prte_grpcomm_fence_t *coll)
     }
 }
 
+/* ---------------------------------------------------------------------- */
 static void relcb(void *cbdata)
 {
     uint8_t *data = (uint8_t *) cbdata;
@@ -782,19 +845,19 @@ static void relcb(void *cbdata)
     }
 }
 
-void prte_grpcomm_direct_fence_release(int status, pmix_proc_t *sender,
+void prte_grpcomm_fence_release(int status, pmix_proc_t *sender,
                                        pmix_data_buffer_t *buffer,
                                        prte_rml_tag_t tag, void *cbdata)
 {
     int32_t cnt;
     int rc, ret;
-    prte_grpcomm_direct_fence_signature_t *sig = NULL;
+    prte_grpcomm_fence_signature_t *sig = NULL;
     prte_grpcomm_fence_t *coll;
     pmix_byte_object_t bo;
     PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
 
-    PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct: fence release called with %d bytes",
+    PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_globals.output,
+                         "%s grpcomm: fence release called with %d bytes",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (int) buffer->bytes_used));
 
     /* unpack the signature */
@@ -841,22 +904,22 @@ void prte_grpcomm_direct_fence_release(int status, pmix_proc_t *sender,
          * callback above was handed it. */
         PMIX_BYTE_OBJECT_DESTRUCT(&bo);
     }
-    pmix_list_remove_item(&prte_mca_grpcomm_direct_component.fence_ops, &coll->super);
+    pmix_list_remove_item(&prte_grpcomm_globals.fence_ops, &coll->super);
     PMIX_RELEASE(coll);
     PMIX_RELEASE(sig);
 }
 
-static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *sig, bool create)
+static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_fence_signature_t *sig, bool create)
 {
     prte_grpcomm_fence_t *coll;
     int rc;
 
     /* search the existing tracker list to see if this already exists */
-    PMIX_LIST_FOREACH(coll, &prte_mca_grpcomm_direct_component.fence_ops, prte_grpcomm_fence_t) {
+    PMIX_LIST_FOREACH(coll, &prte_grpcomm_globals.fence_ops, prte_grpcomm_fence_t) {
         if (sig->sz == coll->sig->sz) {
             // must match proc signature
             if (0 == memcmp(sig->signature, coll->sig->signature, sig->sz * sizeof(pmix_proc_t))) {
-                PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
+                PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
                                      "%s grpcomm:base:returning existing collective",
                                      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
                 return coll;
@@ -866,7 +929,7 @@ static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *
     /* if we get here, then this is a new collective - so create
      * the tracker for it */
     if (!create) {
-        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
+        PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
                              "%s grpcomm:base: not creating new coll",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
@@ -874,13 +937,13 @@ static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *
     }
     coll = PMIX_NEW(prte_grpcomm_fence_t);
     // we have to know the participating procs
-    coll->sig = PMIX_NEW(prte_grpcomm_direct_fence_signature_t);
+    coll->sig = PMIX_NEW(prte_grpcomm_fence_signature_t);
     coll->sig->sz = sig->sz;
     if (0 < coll->sig->sz) {
         PMIX_PROC_CREATE(coll->sig->signature, coll->sig->sz);
         memcpy(coll->sig->signature, sig->signature, coll->sig->sz * sizeof(pmix_proc_t));
     }
-    pmix_list_append(&prte_mca_grpcomm_direct_component.fence_ops, &coll->super);
+    pmix_list_append(&prte_grpcomm_globals.fence_ops, &coll->super);
 
     /* now get the daemons involved */
     if (PRTE_SUCCESS != (rc = create_dmns(sig, &coll->dmns, &coll->ndmns))) {
@@ -889,7 +952,7 @@ static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *
          * on the list is worse than losing it: the next fence of the same
          * signature would find this one, see a rollup that expects nothing,
          * and answer with data it never gathered */
-        pmix_list_remove_item(&prte_mca_grpcomm_direct_component.fence_ops, &coll->super);
+        pmix_list_remove_item(&prte_grpcomm_globals.fence_ops, &coll->super);
         PMIX_RELEASE(coll);
         return NULL;
     }
@@ -903,13 +966,13 @@ static prte_grpcomm_fence_t* get_tracker(prte_grpcomm_direct_fence_signature_t *
 /* Same, for a caller outside this file. Exported only so the unit test can
  * build a tracker and inspect what the rollup was sized to expect, which is
  * where a fence goes wrong long before any message moves. */
-prte_grpcomm_fence_t *prte_grpcomm_direct_fence_get_tracker(prte_grpcomm_direct_fence_signature_t *sig,
+prte_grpcomm_fence_t *prte_grpcomm_fence_get_tracker(prte_grpcomm_fence_signature_t *sig,
                                                             bool create)
 {
     return get_tracker(sig, create);
 }
 
-static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
+static int create_dmns(prte_grpcomm_fence_signature_t *sig,
                        pmix_rank_t **dmns, size_t *ndmns)
 {
     size_t n;
@@ -933,8 +996,8 @@ static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
      * genuine error and still fatal. */
     bool tolerate = !pmix_bitmap_is_clear(&prte_rml_base.failed_dmns);
 
-    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                         "%s grpcomm:direct:fence:create_dmns called with %s signature size %" PRIsize_t "",
+    PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                         "%s grpcomm:fence:create_dmns called with %s signature size %" PRIsize_t "",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                          (NULL == sig->signature) ? "NULL" : "NON-NULL", sig->sz));
 
@@ -983,8 +1046,8 @@ static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
             break;
         }
         if (PMIX_RANK_WILDCARD == sig->signature[n].rank) {
-            PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_base_framework.framework_output,
-                                 "%s grpcomm:direct:fence::create_dmns called for all procs in job %s",
+            PMIX_OUTPUT_VERBOSE((1, prte_grpcomm_globals.output,
+                                 "%s grpcomm:fence::create_dmns called for all procs in job %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  PRTE_JOBID_PRINT(sig->signature[0].nspace)));
             /* all daemons hosting this jobid are participating */
@@ -1009,8 +1072,8 @@ static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
                     }
                 }
                 if (!found) {
-                    PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_base_framework.framework_output,
-                                         "%s grpcomm:direct:fence::create_dmns adding daemon %s to list",
+                    PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_globals.output,
+                                         "%s grpcomm:fence::create_dmns adding daemon %s to list",
                                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                          PRTE_NAME_PRINT(&node->daemon->name)));
                     nm = PMIX_NEW(prte_namelist_t);
@@ -1020,7 +1083,7 @@ static int create_dmns(prte_grpcomm_direct_fence_signature_t *sig,
             }
         } else {
             /* lookup the daemon for this proc and add it to the list */
-            PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_base_framework.framework_output,
+            PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_globals.output,
                                  "%s sign: GETTING PROC OBJECT FOR %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  PRTE_NAME_PRINT(&sig->signature[n])));
@@ -1064,8 +1127,8 @@ done:
         dns = (pmix_rank_t *) malloc(pmix_list_get_size(&ds) * sizeof(pmix_rank_t));
         nds = 0;
         while (NULL != (nm = (prte_namelist_t *) pmix_list_remove_first(&ds))) {
-            PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_base_framework.framework_output,
-                                 "%s grpcomm:direct:fence::create_dmns adding daemon %s to array",
+            PMIX_OUTPUT_VERBOSE((5, prte_grpcomm_globals.output,
+                                 "%s grpcomm:fence::create_dmns adding daemon %s to array",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&nm->name)));
             dns[nds++] = nm->name.rank;
             PMIX_RELEASE(nm);
@@ -1078,7 +1141,7 @@ done:
 }
 
 static int fence_sig_pack(pmix_data_buffer_t *bkt,
-                          prte_grpcomm_direct_fence_signature_t *sig)
+                          prte_grpcomm_fence_signature_t *sig)
 {
     pmix_status_t rc;
 
@@ -1100,13 +1163,13 @@ static int fence_sig_pack(pmix_data_buffer_t *bkt,
 }
 
 static int fence_sig_unpack(pmix_data_buffer_t *buffer,
-                            prte_grpcomm_direct_fence_signature_t **sig)
+                            prte_grpcomm_fence_signature_t **sig)
 {
     pmix_status_t rc;
     int32_t cnt;
-    prte_grpcomm_direct_fence_signature_t *s;
+    prte_grpcomm_fence_signature_t *s;
 
-    s = PMIX_NEW(prte_grpcomm_direct_fence_signature_t);
+    s = PMIX_NEW(prte_grpcomm_fence_signature_t);
 
     // unpack the participating procs
     cnt = 1;

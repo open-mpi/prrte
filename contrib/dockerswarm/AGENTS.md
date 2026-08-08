@@ -8,6 +8,16 @@ running node, stop: `build.sh` below already does the right thing
 (bind-mounts your live working tree into a builder and compiles it
 out-of-tree into the shared volume the nodes read).
 
+> **The one exception: a real scheduler.** The SLURM in this harness is
+> [`fake-slurm.py`](fake-slurm.py) (§12) — a stand-in control plane, which
+> can show that PRRTE issues the right commands and can never show that
+> SLURM accepts them. It also supplies no `srun`, so `plm/slurm` is not
+> exercised here at all. For that,
+> [`contrib/slurmswarm`](../slurmswarm/) is the same harness with an actual
+> SLURM installation in the ten containers. Keep the division: anything
+> without a `SLURM_` in it belongs *here*, because this harness is faster
+> and needs no scheduler.
+
 A small, self-contained harness for exercising PRRTE across several container
 "nodes" — a persistent DVM, one-shot `prterun`, and the **elastic DVM**
 (grow/shrink) plus multi-hop routing/relay — plus a native single-host build on
@@ -45,10 +55,13 @@ It is **not** a Docker Swarm in the orchestration sense — just ten plain
 | `dataserver.c` | A bare PMIx client for the publish/lookup service (`dataserver` in the install): publish/lookup/lookupwait/lookup2/unpublish. Drives `src/runtime/data_server`. See §13. |
 | `jobinfo.c` | A bare PMIx client for the **direct-modex** paths (`jobinfo` in the install): `publish`/`fetch`/`fetchkey`. Drives `src/prted/pmix/pmix_server_fence.c` from a daemon that hosts none of the target job's procs. |
 | `proctable.c` | A bare PMIx client for the **proc-table and server-URI queries** (`proctable` in the install): `procs`/`localprocs`/`serveruri`. Those are the only callers of `prte_pmix_convert_state()`, and the local-vs-global proc-table split has no meaning on one host. Drives `src/pmix`. |
-| `groupcon.c` | A bare PMIx client that drives a **group construct/destruct** (`groupcon` in the install): every rank contributes a local cid, asks for a context id, constructs, reads every peer's contribution back, destructs. Drives `grpcomm/direct`'s `grp_release` on daemons that merely *received* the broadcast. See §15. |
+| `groupcon.c` | A bare PMIx client that drives a **group construct/destruct** (`groupcon` in the install): every rank contributes a local cid, asks for a context id, constructs, reads every peer's contribution back, destructs. Drives grpcomm's `grp_release` on daemons that merely *received* the broadcast. See §15. |
 | `envspawn.c` | A PMIx client that spawns a child job carrying one of every **envar directive** (`envspawn` in the install): SET/ADD/UNSET/PREPEND/APPEND, pinned to a named host, with the child reporting the environment it actually got into a file on its own node. Those directives have no command-line surface — they arrive only on a spawn request — and `odls` applies them on whichever daemon forks the process, so the child has to land somewhere the parent is not. Drives `prte_odls_base_process_envars`. |
 | `slowcat.c` | A deliberately **slow** stdin reader (`slowcat` in the install, no PMIx dependency): copies stdin to a file in small reads with a pause between them, so the daemon feeding it keeps hitting *partial* writes. That is the only way to reach the iof short-write path. |
-| `fake-slurm.py` | A stand-in SLURM control plane (`sbatch`/`scontrol`/`scancel`) so `ras/slurm`'s elastic modify surface can be exercised. See §12. |
+| `fake-slurm.py` | A stand-in SLURM control plane (`salloc`/`scontrol`/`scancel`) so `ras/slurm`'s elastic modify surface can be exercised. See §12. |
+| `scaletest.c` | A PMIx client that **times** a full-data fence and a bare barrier over the whole job (`scaletest` in the install). Not a pass/fail case — a measurement. See §18. |
+| `mpinoop.c` | `MPI_Init` and `MPI_Finalize` and nothing else, so the only thing timed is the modex fence and the barrier behind it. Built only when `OMPI_SRC` is set — see §19. |
+| `scaletest.sh` | The measurement driver: stands up a swarm of arbitrary size (default 40), sweeps DVM size × procs-per-node × routing radix × payload, and writes a CSV. See §18. |
 
 ## 2. How it works
 
@@ -785,6 +798,26 @@ stamp is gone — which at least makes `run-tests.sh` refuse to run rather than
 test it. `reconfigure_needed` now also reconfigures when `configure` is newer
 than `config.status`, which is the condition that matters.
 
+**And a source tree can go stale by *losing* a directory.** When a framework
+stops being a framework (`src/mca/grpcomm` became `src/grpcomm`) or a component
+is deleted, the persistent build dir keeps that subdirectory — and the parent
+`Makefile`, also written by the old `configure` run, still names it in
+`SUBDIRS`. So `make` recurses into a directory whose `Makefile.am` no longer
+exists:
+
+```
+make[2]: *** No rule to make target '/prrte-src/src/mca/grpcomm/Makefile.am',
+         needed by '/prrte-src/src/mca/grpcomm/Makefile.in'.  Stop.
+```
+
+Neither the configure arguments nor the `configure` timestamp changed, so
+neither test above sees it, and pulling `master` into a tree the volume was
+built from before the restructure is enough to hit it. `build.sh` now compares
+every build-tree directory that holds a `Makefile` against the source tree,
+reconfigures when one of them is gone, and removes the orphan as part of the
+same step (`orphan_dirs`/`drop_orphans`) — dropping it matters, or the next run
+finds an orphan again and reconfigures forever.
+
 ### Writing a case that asserts on an error message
 
 **`show_help` emits a given message once per HNP.** A test that probes with
@@ -954,7 +987,7 @@ and would otherwise read as the child's.
 ## 12. Faking a SLURM environment (`ras/slurm`)
 
 `ras/slurm` is the only ras component with a full elastic **modify** surface,
-and everything past initial discovery is a shell-out: `sbatch` to grow,
+and everything past initial discovery is a shell-out: `salloc` to grow,
 `scontrol show job <id> --json` to learn what SLURM granted, `scontrol update
 job <id> ReqNodeList=…` to shrink one in place, `scancel` to give one back.
 None of that runs on a developer machine, so it had no automated coverage at
@@ -964,7 +997,7 @@ all — including the ~1000-line JSON parser, which this harness is also the
 
 [`fake-slurm.py`](fake-slurm.py) supplies the missing scheduler. `build.sh`
 installs it into the shared volume as
-`/opt/prte/fakeslurm/bin/{sbatch,scontrol,scancel}` (it dispatches on
+`/opt/prte/fakeslurm/bin/{salloc,scontrol,scancel}` (it dispatches on
 `argv[0]`), deliberately **not** into the install `bin/` that the node
 entrypoint puts on every node's default PATH — a test has to opt in by
 prepending that directory, so this cannot perturb anything else in the suite.
@@ -986,9 +1019,9 @@ $RUN 'export PATH=/opt/prte/fakeslurm/bin:$PATH
       nohup prte --prtemca prte_elastic_mode 1 --prtemca ras_base_verbose 5 \
             >/tmp/prte.out 2>&1 &
       sleep 8
-      elastic extend 2             # PMIX_ALLOC_EXTEND: sbatch, poll, absorb
+      elastic extend 2             # PMIX_ALLOC_EXTEND: salloc, absorb
       fake-slurm audit             # every command PRRTE issued
-      fake-slurm args 2001         # the sbatch argv it built
+      fake-slurm args 2001         # the salloc argv it built
       elastic shrink node3         # partial: scontrol update ReqNodeList=
       elastic release-id 2001'     # whole job: scancel
 ```
@@ -1013,7 +1046,7 @@ misbehaving (`fake-slurm set <key> <value>`):
 
 | key | effect |
 |-----|--------|
-| `pending_secs` | a new job sits in `PENDING` this long — lets a request be cancelled mid-poll |
+| `pending_secs` | a new job sits in `PENDING` this long — lets a request be cancelled while in flight, and is what keeps the stub's `salloc` alive long enough to exercise PRRTE's deferred reap (below) |
 | `scancel_fail` | `scancel` exits non-zero with far more output than the 256-byte capture buffer holds |
 | `bad_json` | `scontrol show job --json` returns unparsable output with exit status 0 |
 
@@ -1022,6 +1055,19 @@ The suite uses all three: a cancelled pending extend, a failing `scancel`
 take the HNP down), and malformed JSON. It also asserts a release naming a
 hostname with a shell metacharacter is refused before it can reach a command
 line.
+
+**The stub's `salloc` blocks, and that is deliberate.** The real one is the
+process holding a pending allocation — it announces the job on stderr as soon
+as slurmctld has it and only then waits for resources, exiting once they are
+granted. PRRTE reads the job ID out of that first line and leaves the child
+running, reaping it asynchronously later, so a stub that returned immediately
+the way `sbatch` did would never exercise that. `pending_secs` is therefore
+the knob that opens the window: while it is non-zero a live `salloc` sits
+under the HNP for the whole pending period, and a `scancel` during it makes
+the stub report the allocation revoked and exit non-zero, which is the reap
+callback's failure branch. That callback also completes the extend — PRRTE does
+not poll a queued job — so a stub `salloc` that exits early makes an extend land
+before its nodes exist.
 
 **Some slot counts are asserted from `ras_base_verbose` output, not from
 the pool.** The verbose line is what the component itself computed, so it
@@ -1340,3 +1386,327 @@ installs no handlers of its own for those signals; the block in
 always empty in a `prted`, and has been removed. Do not write a case that
 signals a `prted` directly and expects delivery — it will simply kill the
 daemon.
+
+## 18. Measuring collective scaling (`scaletest`, `scaletest.sh`)
+
+Everything above this section answers *is it correct*. This one answers
+*what does it cost*, and it is the only part of the harness that is not a
+pass/fail suite: `scaletest.sh` writes a CSV meant to be opened in a
+spreadsheet and plotted.
+
+The subject is the DVM's collectives. A collective's cost **is** the shape
+of the daemon tree, so there is nothing here a single host can measure — at
+one daemon the routing radix has no effect whatsoever and the allgather
+never touches a wire. That is why this lives in the swarm.
+
+### The two numbers
+
+`scaletest` is a bare PMIx client. Each iteration it puts `--nkeys`
+uniquely-named values whose sizes cycle through `--sizes`, calls
+`PMIx_Commit`, and then runs two fences over the whole job:
+
+- **COLLECT** — `PMIx_Fence` with `PMIX_COLLECT_DATA` **true**. The
+  allgather: every rank's committed data goes up the routing tree to the
+  HNP and back down to every daemon. This is the one that should grow with
+  the payload.
+- **BARRIER** — `PMIx_Fence` with `PMIX_COLLECT_DATA` **false**. The same
+  collective carrying nothing, so it is the latency floor the tree imposes,
+  and `collect − barrier` is what the data itself cost. The summary CSV
+  reports that difference as `data_cost_us`.
+
+`PUT` (the put loop plus the commit) is timed too, and is deliberately
+*not* part of either fence: a commit only hands data to the local server,
+so it measures staging, not movement.
+
+Every phase is preceded by an **unmeasured** barrier. Without it a
+straggler's late arrival is charged to the next collective and what you
+measure is the skew of the previous one.
+
+### Why the timestamps are absolute, and what that buys
+
+Every "node" here is a container on one host sharing one kernel clock, so
+`CLOCK_REALTIME` is directly comparable across ranks. Each rank prints the
+absolute start and end of every phase and the driver computes
+
+```
+wall = max(end) − min(start)          over every rank
+```
+
+which is the real answer to *"how long until all procs cleared the fence"*.
+A per-rank elapsed time cannot answer it — a rank that entered late has a
+*short* elapsed time precisely because everyone else was already blocked
+waiting for it. The driver reports the max of the per-rank elapsed times in
+a `*_max_local_us` column alongside, because that is the only thing a real
+cluster (with genuinely separate clocks) could measure, and it is useful to
+see how far the two diverge.
+
+**Nothing is printed until the very end.** Output from a rank travels back
+over the IOF wire through the same daemons the next collective needs, so a
+client that printed as it went would be measuring I/O forwarding. Results
+are buffered and flushed after a final barrier.
+
+### Running it
+
+The driver keeps its own swarm — `PRTE_SWARM=scale`, containers
+`scale-node1..N`, volume `scale-build` — so a sweep and the functional
+ten-node swarm cannot disturb each other. `docker compose` cannot loop, so
+the compose file is generated:
+
+```sh
+./scaletest.sh build                  # PMIX_SRC=<checkout> to build PMIx too
+./scaletest.sh up 40                  # generate docker-compose.scale.yml, start 40
+./scaletest.sh run --nodes 1,2,4,8,16,32,40 --ppn 1,2 --radix 2,4,64
+./scaletest.sh down
+```
+
+Four independent knobs, each a comma-separated sweep list:
+
+| flag | varies |
+|------|--------|
+| `--nodes` | how many containers are in the DVM |
+| `--ppn` | application procs per node (`--map-by ppr:N:node`) |
+| `--radix` | the routing radix — `--prtemca rml_base_radix` |
+| `--nkeys`, `--sizes` | how much data each rank contributes |
+
+A `--sizes` element may itself be a list of sizes the keys cycle through,
+joined with `+` (`--sizes 128,1024,'64+4096+65536'` is three configurations,
+the last one mixing three sizes). Plus, not comma, because the sweep list is
+already comma-separated *and* because a CSV column cannot hold a comma.
+
+**The radix is a property of the DVM**, fixed when the daemons start, so the
+sweep restarts the DVM for every `(nodes, radix)` pair and runs the cheap
+knobs inside that. Restarting is also what keeps one configuration's
+collected data out of the next one's daemons.
+
+### Two things the driver refuses to do
+
+- **Measure a DVM that came up short.** `dvm_start` waits for the URI and
+  then runs one proc per node and counts *distinct* hostnames. A 40-node
+  request that only brought up 31 daemons would otherwise be silently
+  recorded as a 40-node measurement.
+- **Map a job into slots the previous job has not released.** Every DVM is
+  given `max(--ppn) + 1` slots a node, and the readiness probe is followed
+  by a settle. Both exist for one failure: `prun` returning is not the same
+  as every proc having been reaped on every daemon, and a job whose ppn
+  exactly equals the slot count is then refused outright with *"All nodes
+  which are allocated for this job are already filled"*
+  (`PMIX_ERR_JOB_FAILED_TO_MAP`). The spare slot is never filled — mapping
+  is `ppr:N:node` — so it cannot change what is measured. Do not "tidy" it
+  away: `--ppn 1` over 40 nodes failed **every** run without it, while a
+  sweep that happened to include a larger ppn passed, which makes the
+  failure look like a property of the node count rather than of the slots.
+- **Run a configuration that will not fit.** After a collect fence *every*
+  daemon holds *every* rank's data, and the iterations use distinct keys —
+  so each daemon ends up carrying `bytes_per_rank × nprocs × iterations`.
+  At 160 ranks, 32 keys of 64 KB and 5 iterations that is nearly a gigabyte
+  **per daemon**, which on a laptop's Docker VM is not a measurement, it is
+  an OOM. The driver computes that figure, puts it in the CSV as
+  `collected_bytes`, and skips anything above `--max-bytes` (256 MB by
+  default) with a message saying so.
+
+  **And here the per-daemon figure is not the one that binds.** Every "node"
+  of this swarm is a container on *one* host, so what has to fit is
+  `collected_bytes × nodes` — 128 MB a daemon across 40 nodes is 5 GB. That
+  is a property of the harness, not of PRRTE; on a real cluster only the
+  per-daemon number would matter. `--max-total-bytes` (2 GB by default)
+  guards it, and a skip on that ground says so explicitly.
+
+### Reading the output
+
+Two files. `scale-results-raw.csv` is one row per configuration **per
+iteration** — pivot it however you like. `scale-results.csv` is one row per
+configuration with the median, min and max over the iterations, and is what
+you plot. The median is used rather than the mean because a single
+scheduling hiccup on an oversubscribed host skews a mean badly and the run
+count is small.
+
+**Interpreting numbers from a laptop.** These containers share one host
+kernel and a handful of cores. Once `nodes × ppn` passes the core count,
+every daemon and every rank is time-slicing, and the absolute microseconds
+say more about the CPU scheduler than about PRRTE. What survives that is the
+*shape*: how the cost grows with node count, how a radix-2 tree compares
+with a flat one at the same size, and how much of the total is payload
+(`data_cost_us`) versus tree latency (`barrier_med_us`). Treat absolute
+values as meaningful only against another run on the same host with the same
+load.
+
+### Checking a fence still *delivers*, not just that it is fast
+
+`scaletest --verify` reads one key back from two peers each iteration: a
+**NEAR** one (rank+1) and a **FAR** one (half the job away). Both, not one,
+and the reason is specific: the interesting way for a fence to be wrong is to
+deliver *some* of the modex rather than none. Under `--map-by ppr:1:node` the
+NEAR peer is the rank the local daemon is most likely to be holding anyway, so
+a verify that checked only it would pass with the on-demand direct-modex path
+completely broken. The FAR peer is the one that can only come back through
+that path.
+
+It stays **off by default**: a get perturbs the collective beside it, and a
+run that measures and verifies at once measures neither cleanly. It is also
+refused alongside `--neighbors` — see below for why.
+
+### What only the peers you need would cost (`--neighbors`)
+
+The COLLECT column is the price of handing every rank the whole job's data.
+`scaletest --neighbors` measures the other end of that trade: after the
+barrier — a fence that collected **nothing** — each rank fetches just its two
+ring neighbours, serially, and the driver reports it as a fourth phase and a
+`neighbors_med_us` column.
+
+Those two gets are answered by **direct modex**: the local daemon does not
+hold the peer's data, so it fetches it from the daemon that does. Both halves
+of the comparison therefore already exist in PRRTE, which is the point — the
+argument Slurm's `PMIX_Ring` makes (pay O(1) for the peers you actually need,
+not O(N) for everybody) becomes something measurable here rather than
+something to reason about. Nothing in the tree implements a ring; this is the
+number that would have to justify building one.
+
+**A `--neighbors` run collects nothing, and its COLLECT column is therefore a
+second barrier, not a collect.** That is deliberate and it is what makes the
+phase mean anything: with a collect fence left in the same iteration, every
+daemon already holds every rank's data, the two gets are local cache hits, and
+the phase reports microseconds of nothing. That was the original bug — a
+4-node run issued **zero** `DMODX REQ FOR` requests and reported ~6 µs.
+So read the NEIGHBORS column from this run and the COLLECT column from a
+separate plain run at the same size.
+
+`--verify` and `--neighbors` are **refused together**: verify fetches rank+1,
+which is one of the two peers NEIGHBORS times, so running both warms the very
+cache the next phase is trying to miss against.
+
+**Check the phase is live before believing a number**, because an inert one
+looks fast rather than broken:
+
+```sh
+prterun ... --prtemca pmix_server_verbose 2 --leave-session-attached \
+    scaletest --neighbors 2>&1 | grep -c "DMODX REQ FOR"
+```
+
+It must be `2 * nprocs` (4 ranks fetching two peers each is 8). Left and right
+are fetched in that order and never overlapped, so the figure is the
+pessimistic serial reading of the pattern.
+
+**What it measures, on 8 nodes at one proc per node** — NEIGHBORS against the
+COLLECT of a separate plain run:
+
+| Bytes per rank | COLLECT | NEIGHBORS | ratio |
+|---|---|---|---|
+| 64 (1 key) | 877 µs | 1000 µs | **1.14** |
+| 8 KB (8×1 KB) | 2433 µs | 1455 µs | 0.60 |
+| 64 KB (8×8 KB) | 5947 µs | 3660 µs | 0.62 |
+
+At 64 bytes a rank the on-demand path **loses** — two client round trips cost
+more than the extra half-kilobyte on the tree. The crossover is real, so any
+claim that fetching only what you need is cheaper has to say at what per-rank
+size.
+
+## 19. Running a real MPI job (`OMPI_SRC`, `mpinoop`, `ring_c`)
+
+Every other client in this harness puts data because a test told it to. An
+**MPI** job publishes what its transports actually need and then reads back
+exactly the peers it talks to, which is the only workload here that can judge
+whether a fence delivers *enough* rather than merely quickly. That is what
+this is for, and it is the check any future change to what the fence
+distributes has to survive.
+
+```sh
+OMPI_SRC=/path/to/ompi ./build.sh          # or: OMPI_SRC=... ./scaletest.sh build
+```
+
+The checkout must be **autogen'd and not configured in-tree** — the same rule
+as `PMIX_SRC`, and for the same reason: `configure` runs VPATH over a
+read-only bind mount. Open MPI is built `--with-prrte=external` against the
+install this script just made, so `mpirun` **is** this PRRTE — an MPI job runs
+against whatever you just built rather than against a packaged runtime.
+Fortran, OpenSHMEM and sphinx
+are disabled: the first two dominate the build time and nothing here uses
+them, and the docs build needs python modules the image does not carry — it is
+the one part of an Open MPI build that fails for a reason having nothing to do
+with MPI.
+
+It is **off by default** because it roughly triples the build. Only the
+collective work needs it.
+
+Two probes land in `/opt/prte/ompi/bin`:
+
+- **`mpinoop`** — `MPI_Init`, `MPI_Finalize`, and optionally one phase of
+  actual communication. It times `MPI_Init` with `clock_gettime`, **not**
+  `MPI_Wtime`, which may not be called before `MPI_Init` — the first version
+  of this file did, and reported a negative init time.
+
+  **With no flag it exercises no remote peer at all**, and knowing why is the
+  whole point of the file. Open MPI resolves a remote peer the *first time it
+  talks to it*: `mpi_add_procs_cutoff` defaults to 0 so the pre-add-everybody
+  branch never runs, and `ob1` demands the whole world only when a BTL sets
+  `MCA_BTL_FLAGS_SINGLE_ADD_PROCS` (TCP does that only with more than one
+  interface plus threads). So a program that calls `MPI_Init` and exits never
+  touches a peer, and it cannot tell two ways of distributing the modex apart.
+
+  `--ring` (exchange with the two neighbours) and `--all` (explicit
+  point-to-point with **every** other rank) are what actually separate them,
+  and they bracket the range: the cheap pattern a real application produces
+  and the adversarial one for on-demand retrieval.
+  `--all` is deliberately not `MPI_Alltoall`: a tuned alltoall on one int runs
+  Bruck and contacts about log2(N) partners, so it understates the case badly.
+  Each phase is timed twice — first touch, then a repeat with every peer
+  already resolved — so resolution cost is isolated rather than inferred.
+
+  **To count modex traffic you must turn Open MPI's collecting fence off
+  first**, or the probe cannot see anything:
+
+  ```sh
+  OMPI_MCA_pmix_base_collect_data=0 mpirun ... mpinoop --all
+  ```
+
+  With the default (`=1`), `MPI_Init`'s fence collects, every daemon already
+  holds every rank's data, and a get about any peer is a local hit. The
+  `DMODX REQ FOR` count is then flat at **7** across all three modes at 8
+  ranks over 8 nodes — and those seven are not first touch at all, they are
+  one request per non-master daemon for **rank 0**'s `pml.base.2.0` from PML
+  selection. A run that reports the same number under `--ring` and `--all` is
+  telling you the fence collected, not that first touch is free.
+
+  With `=0`, the on-demand path is live and the counts are exact:
+
+  | mode | DMODX | touch | repeat |
+  |---|---|---|---|
+  | baseline | 0 | 0.000 ms | 0.000 ms |
+  | `--ring` | 32 | 9.583 ms | 0.027 ms |
+  | `--all` | 56 | 6.343 ms | 0.019 ms |
+
+  The arithmetic is *distinct peers each rank touches × nprocs*, and it checks
+  out exactly. For `--all` that is 7 peers × 8 = 56. For `--ring` it is **4**,
+  not 2: rank 1 fetches `{0,2}` for the ring **union** `{0,3,5}` for the
+  barrier's recursive-doubling partners — 4 distinct peers × 8 = 32. That is
+  the barrier contribution the header comment warns about, visible in the
+  numbers. The key being fetched is `btl.tcp.6.1`, the BTL endpoint blob.
+- **`ring_c`** — Open MPI's own example, compiled from the mounted checkout. A
+  real neighbour exchange, and the honest version of what `--ring` simulates.
+
+The Open MPI knobs worth knowing when driving these:
+
+| MCA parameter | effect |
+|---------------|--------|
+| `pmix_base_async_modex` | skip the modex fence in `MPI_Init` entirely; peers are resolved on first use |
+| `pmix_base_collect_data` | whether the `MPI_Init` fence sets `PMIX_COLLECT_DATA`. **Set this to 0 for any measurement of on-demand retrieval** — at the default the fence hands every daemon everything and there is no on-demand path left to measure |
+| `mpi_add_procs_cutoff` | above this job size, do not add every peer at init |
+
+Those three are the application-side half of the same argument — what the
+*client* is willing to defer — and any daemon-side change to what the fence
+distributes should be checked against at least `ring_c` before it is believed.
+A design that only looks good against `scaletest` has been measured against a
+workload that reads exactly what a test told it to put.
+
+**Counting direct-modex requests needs `--leave-session-attached`.** The
+`DMODX REQ FOR` traces come out on each `prted`'s stderr, and without that
+flag only the master daemon's reach you — so the count is a fraction of the
+DVM's and looks reassuringly small. Measured on the same 8-node `--all` run:
+**7 without the flag, 56 with it.** Note the trap doubles up — 7 is also
+exactly what a *collecting* fence reports, so an under-counted run is
+indistinguishable from a correctly-counted one that forgot
+`OMPI_MCA_pmix_base_collect_data=0`. Rule out both before trusting a figure.
+
+```sh
+prterun ... --prtemca pmix_server_verbose 2 --leave-session-attached \
+    /opt/prte/ompi/bin/mpinoop --all 2>&1 | grep -c "DMODX REQ FOR"
+```

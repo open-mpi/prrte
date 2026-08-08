@@ -148,7 +148,7 @@ pmix_cap() {
 }
 
 # --- fake-SLURM helpers -----------------------------------------------------
-# ras/slurm reaches its scheduler by shelling out to sbatch/scontrol/scancel,
+# ras/slurm reaches its scheduler by shelling out to salloc/scontrol/scancel,
 # so the harness supplies them: build.sh installs fake-slurm.py into the shared
 # volume under its own prefix, and everything in that phase runs with that
 # prefix FIRST on PATH and the SLURM_* envars exported.  Nothing outside these
@@ -162,7 +162,7 @@ SL() { docker exec -e PRTE_ALLOW_RUN_AS_ROOT=1 -e PRTE_ALLOW_RUN_AS_ROOT_CONFIRM
 FS() { docker exec "${NODE}1" bash -lc "export PATH=$FS_BIN:\$PATH; fake-slurm $*"; }
 # "node2,node4" -> "2 4", for prted_count
 fs_idx() { echo "$1" | tr ',' '\n' | sed 's/^node//' | tr '\n' ' '; }
-# the sbatch argv that created a given fake job
+# the salloc argv that created a given fake job
 fs_args() { FS "args $1" 2>/dev/null; }
 
 # --- bootstrap-DVM helpers --------------------------------------------------
@@ -202,7 +202,7 @@ bootstrap_start() {
 ########################################################################
 #
 # Everything ras/slurm does beyond reading SLURM_NODELIST is a shell-out --
-# sbatch to grow, "scontrol show job --json" to learn what it got, "scontrol
+# salloc to grow, "scontrol show job --json" to learn what it got, "scontrol
 # update job ReqNodeList=" to shrink one, scancel to give one back -- so none
 # of it can run on a developer machine and none of it had any coverage.  The
 # unit test covers the half that only reads the environment (query, allocate);
@@ -360,7 +360,7 @@ test_slurm() {
         && ok "SLURM_TASKS_PER_NODE '2(x1)' expanded to node1 with 2 slots" \
         || bad "nodelist/tasks-per-node expansion wrong: $(SL 'grep -m3 "adding node" /tmp/prte.out' | tr '\n' ' ')"
 
-    banner "ras/slurm: PMIX_ALLOC_EXTEND runs sbatch and grows the DVM"
+    banner "ras/slurm: PMIX_ALLOC_EXTEND runs salloc and grows the DVM"
     # PMIX_ALLOC_EXTEND + PMIX_ALLOC_NUM_NODES is the only extend shape this
     # component accepts: which nodes it gets back is the scheduler's choice,
     # so the request names a count and the answer comes from the job JSON.
@@ -394,20 +394,28 @@ test_slurm() {
         && ok "slots derived from ALLOCATED cores, capped by cpus.count" \
         || bad "wrong slot count from the job JSON: $(SL 'grep -m3 discovered.node /tmp/prte.out' | tr '\n' ' ')"
 
-    banner "ras/slurm: the parent job's attributes are propagated onto sbatch"
+    banner "ras/slurm: the parent job's attributes are propagated onto salloc"
     sargs=$(fs_args "$jid")
-    for want in --parsable --exclusive --nodes=2 --account=prrte-test \
+    for want in --no-shell --exclusive --nodes=2 --account=prrte-test \
                 --partition=debug --qos=normal --chdir=/root --mem=1024 \
                 --time=60 --threads-per-core=1; do
         echo "$sargs" | grep -qx -- "$want" \
-            && ok "sbatch carried $want" \
-            || bad "sbatch missing $want (got: $(echo "$sargs" | tr '\n' ' '))"
+            && ok "salloc carried $want" \
+            || bad "salloc missing $want (got: $(echo "$sargs" | tr '\n' ' '))"
     done
     # memory_per_cpu is unset in the parent job, and an unset numeric object
     # must be omitted rather than sent as a sentinel
     echo "$sargs" | grep -q -- '--mem-per-cpu' \
-        && bad "sbatch sent --mem-per-cpu for an unset memory_per_cpu" \
-        || ok "an unset numeric field is omitted from the sbatch line"
+        && bad "salloc sent --mem-per-cpu for an unset memory_per_cpu" \
+        || ok "an unset numeric field is omitted from the salloc line"
+    # A batch script IS the job -- the job lives exactly as long as it runs,
+    # which is why the sbatch expander job ran "sleep infinity".  It runs on
+    # the job's first node, so releasing that node would have killed the
+    # script and taken the whole allocation with it.  --no-shell runs nothing
+    # at all, which is what makes an arbitrary shrink possible.
+    echo "$sargs" | grep -q -- '--wrap' \
+        && bad "the expander job is still anchored to a script (--wrap present)" \
+        || ok "the expander job runs nothing, so all of its nodes are releasable"
 
     banner "ras/slurm: releasing one node shrinks the SLURM job in place"
     # Removing SOME of a job's nodes keeps the job and resizes it with
@@ -476,6 +484,60 @@ test_slurm() {
     # the base allocation must survive: it holds the node PRRTE is running on
     FS jobs | grep -qx 1000 && ok "the DVM's own SLURM job was left alone" \
                             || bad "the release took out the base allocation"
+
+    banner "ras/slurm: a release issued while a grow is in flight does not wedge the DVM"
+    # Issue #2617.  Grow and shrink share one launch fence and one broadcast,
+    # and the shrink half had no notion of an in-flight grow: the shrink was
+    # xcast to every daemon INCLUDING ones still joining, which cannot be
+    # reached, so the campaign could neither complete nor abort.  It then sat
+    # on prte_shrink_campaigns forever and every later job parked at the
+    # LAUNCH_APPS hold -- a DVM wedged with no error reported to anyone.
+    #
+    # The interleaving is opportunistic, and deliberately so.  We start the
+    # extend in the background and issue the release without waiting for its
+    # daemons to join; if it happens to land outside the window the case still
+    # passes, correctly, having asserted a legal sequence.  When it lands
+    # inside -- which is the common outcome, since the fake scheduler answers
+    # in well under the time a daemon takes to report home -- an unfixed PRRTE
+    # wedges here and every assertion below fails.  Do not "stabilize" this by
+    # sleeping between the two requests: the sleep is the bug.
+    out=$(SL 'timeout 120 elastic extend 1' 2>&1)
+    settled=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    snode=$(FS "nodes $settled" | tr -d '\r')
+    sleep 10
+    # shellcheck disable=SC2086
+    [ -n "$snode" ] && [ "$(prted_count $(fs_idx "$snode"))" = 1 ] \
+        && ok "a settled node ($snode) is in place to be released" \
+        || bad "could not settle a node to release (job=$settled node=$snode)"
+    # now grow WITHOUT letting it settle, and release the settled node into
+    # that window.  The target is deliberately not one of the joining nodes --
+    # a per-target check would pass it, and the campaign would stall anyway on
+    # daemons the caller never selected.
+    SL 'nohup timeout 120 elastic extend 3 >/tmp/grow-race.out 2>&1 & sleep 1' \
+        >/dev/null 2>&1
+    out=$(SL "timeout 120 elastic shrink $snode" 2>&1)
+    sleep 20
+    echo "$out" | grep -q PMIX_DVM_IS_READY \
+        && ok "the release completed even though a grow was in flight" \
+        || bad "release never completed during a grow: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # shellcheck disable=SC2086
+    [ "$(prted_count $(fs_idx "$snode"))" = 0 ] \
+        && ok "the released node's daemon is gone" \
+        || bad "the daemon survived a release issued during a grow"
+    # the wedge's signature: every later job parks at LAUNCH_APPS and never
+    # launches, with no error reported anywhere
+    out=$(SL 'timeout 30 prun -n 1 hostname' 2>&1 | tail -1)
+    [ "$(echo "$out" | tr -d '\r')" = node1 ] \
+        && ok "a later job still launches (the DVM is not wedged)" \
+        || bad "DVM wedged after a release during a grow: $out"
+    # and the grow itself must still have been honored
+    SL 'grep -q "SUCCESS\|ALLOC_ID" /tmp/grow-race.out' \
+        && ok "the concurrent grow was answered too" \
+        || bad "the grow was lost: $(SL 'tr "\n" " " < /tmp/grow-race.out' | tail -c 200)"
+    for j in $(FS jobs | grep -v '^1000$' | tr -d '\r'); do
+        SL "timeout 120 elastic release-id $j" >/dev/null 2>&1
+    done
+    sleep 5
 
     banner "ras/slurm: a pending extend can be cancelled by request id"
     # PMIX_ALLOC_REQ_CANCEL is served while the extend's poll loop is still
@@ -558,7 +620,7 @@ test_slurm() {
     SL 'timeout -k 5 30 pterm' >/dev/null 2>&1
     cleanup_swarm
 
-    banner "ras/slurm: propagate_* MCA params gate what reaches sbatch"
+    banner "ras/slurm: propagate_* MCA params gate what reaches salloc"
     # Each propagated attribute has its own switch; turning two off must drop
     # exactly those two arguments and leave the rest of the line intact.
     FS 'init --jobid 1000 --base node1 --tasks 2 --pool node2,node3' >/dev/null
@@ -574,8 +636,8 @@ test_slurm() {
         sargs=$(fs_args "$jid")
         if [ -n "$jid" ]; then
             { ! echo "$sargs" | grep -q -- '--qos'; } && { ! echo "$sargs" | grep -q -- '--time'; } \
-                && ok "propagate_qos/propagate_time=0 dropped their sbatch args" \
-                || bad "a disabled attribute still reached sbatch: $(echo "$sargs" | tr '\n' ' ')"
+                && ok "propagate_qos/propagate_time=0 dropped their salloc args" \
+                || bad "a disabled attribute still reached salloc: $(echo "$sargs" | tr '\n' ' ')"
             echo "$sargs" | grep -qx -- '--account=prrte-test' \
                 && ok "the attributes still enabled were unaffected" \
                 || bad "disabling two attributes disturbed the rest of the line"
@@ -3228,6 +3290,7 @@ test_hwloc() {
 
 # Absolute path, deliberately -- see the note above DS.
 GC=/opt/prte/prte/bin/groupcon
+FENCER=/opt/prte/prte/bin/fencer
 
 test_grpcomm() {
     local out n g ranks hosts fails
@@ -3616,6 +3679,8 @@ test_grpcomm_ft() {
     cleanup_swarm
 }
 
+
+
 ########################################################################
 # src/mca/errmgr -- what happens when a process or a daemon fails.
 #
@@ -3976,7 +4041,7 @@ test_errmgr() {
 ES=/opt/prte/prte/bin/envspawn
 
 test_odls() {
-    local out rc n c
+    local out rc n c ns duri EL
 
     banner "odls: the envar directives reach the daemon that does the fork"
     # SET/ADD/UNSET/PREPEND/APPEND have no command-line surface at all: they
@@ -4211,6 +4276,67 @@ test_odls() {
                           || bad "the SIGTERM-proof child survived on node2"
     else
         bad "could not start a DVM for the kill-escalation test"
+    fi
+    cleanup_swarm
+
+    banner "odls/nidmap: a daemon grown into the DVM learns the jobs already running"
+    # What the launch message no longer carries, and where it went.
+    #
+    # A daemon joining a DVM has never seen the launch messages of the jobs
+    # already running in it, so it cannot resolve their namespaces.  That
+    # used to be patched by packing every other active job in FRONT of the
+    # launch message of whichever job brought the new daemons in -- which
+    # tied that message's size to the number of jobs resident in the DVM
+    # and, worse, did nothing at all for a daemon added by a bare elastic
+    # grow, because a grow launches no job and so sends no launch message.
+    # The jobs now travel with the nidmap at VM_READY, which is sent exactly
+    # when the daemon set changes.
+    #
+    # So the shape here is deliberate, and it is the case the old mechanism
+    # could not reach: grow a node with NO job launch of its own, then ask a
+    # proc on that node about a job that predates it.  The wireup is the
+    # only thing that can have told it.
+    cleanup_swarm
+    if ! RUN 'command -v jobinfo >/dev/null'; then
+        skp "jobinfo client not installed -- re-run ./build.sh"
+    else
+        RUN 'rm -f /tmp/dvm.uri; nohup prte --daemonize --report-uri /tmp/dvm.uri --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+        duri=$(RUN 'head -1 /tmp/dvm.uri' 2>/dev/null | tr -d '\r')
+        if [ -z "$duri" ]; then
+            bad "could not start an elastic DVM for the job-catchup test"
+        else
+            # every elastic call names the DVM: the long-running prun below
+            # leaves a rendezvous handle of its own, and bare discovery then
+            # finds two servers and refuses to choose
+            EL="PRTE_DVM_URI='$duri' timeout 90 elastic"
+            out=$(RUN "$EL grow node2:2" 2>&1)
+            if ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
+                bad "could not grow node2 -- cannot set up the catchup test"
+            else
+                ok "grew node2, which will host the job that predates node3"
+                RUN_BG /tmp/cu-pub.out "prun --dvm-uri file:/tmp/dvm.uri --host node2:2 -n 2 jobinfo publish 240"
+                sleep 10
+                ns=$(RUN 'grep -m1 "^NSPACE " /tmp/cu-pub.out' 2>/dev/null | awk '{print $2}' | tr -d '\r')
+                if [ -z "$ns" ]; then
+                    bad "the pre-existing job never reported its nspace: $(RUN 'cat /tmp/cu-pub.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+                else
+                    ok "a job is running on node2 (nspace $ns)"
+                    # node3 joins now, with no job launched onto it
+                    out=$(RUN "$EL grow node3:2" 2>&1)
+                    if ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
+                        bad "could not grow node3 -- cannot test the catchup: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+                    else
+                        ok "grew node3 into a DVM that already had a job running"
+                        out=$(RUN "timeout 60 prun --dvm-uri file:/tmp/dvm.uri --host node3:1 -n 1 jobinfo fetch $ns 20" 2>&1)
+                        n=$(echo "$out" | grep -m1 '^JOBSIZE ' | awk '{print $2}' | tr -d '\r')
+                        [ "$n" = 2 ] \
+                            && ok "a proc on the newly-grown node resolved the pre-existing job" \
+                            || bad "the grown node could not resolve a job that predates it (got '$n'): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+                    fi
+                fi
+            fi
+            RUN "timeout -k 5 30 pterm --dvm-uri file:/tmp/dvm.uri" >/dev/null 2>&1
+        fi
     fi
     cleanup_swarm
 }
@@ -4920,6 +5046,17 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     RUN 'nohup prte --daemonize --host node1:1,node2:1,node3:1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
     if RUN 'pgrep -x prte >/dev/null'; then
         RUN 'head -c 262144 /dev/urandom | base64 > /tmp/iof_stdin_in.txt' >/dev/null 2>&1
+        # A second, deliberately larger input for the flow-control cases below.
+        # Back-pressure is keyed on PRTE_IOF_MAX_INPUT_BUFFERS (50) *queued
+        # chunks*, and the HNP hands stdin over in 8 KB chunks -- so an input
+        # has to exceed 50 * 8192 = 400 KB before the backlog can cross the
+        # threshold AT ALL, no matter how slowly the reader drains it.  The
+        # 256 KB input above is 43 chunks, which is why the XOFF assertions
+        # here used to be unfalsifiable.  1 MB of random, base64'd to ~1.4 MB,
+        # is ~172 chunks.  Do not shrink this without redoing that arithmetic.
+        RUN 'head -c 1048576 /dev/urandom | base64 > /tmp/iof_bulk_in.txt' >/dev/null 2>&1
+        bulksum=$(RUN 'md5sum < /tmp/iof_bulk_in.txt' | awk '{print $1}')
+        bulksz=$(RUN 'wc -c < /tmp/iof_bulk_in.txt' | tr -d ' ')
         out=$(RUN 'cd /tmp && timeout 90 prun --host node2:1 -n 1 \
                      cat < iof_stdin_in.txt > iof_stdin_out.txt 2>iof_stdin_err.txt; echo "rc=$?"')
         rc=$(echo "$out" | sed -n 's/^rc=//p')
@@ -4992,14 +5129,14 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         # to drop anything.
         RUN 'cp /tmp/prte.out /tmp/prte.out.mark 2>/dev/null || : ' >/dev/null 2>&1
         out=$(RUN 'cd /tmp && timeout 300 prun --host node2:1 -n 1 \
-                     '"$SC"' /tmp/iof_xoff_out.txt 64 4000 < iof_stdin_in.txt \
+                     '"$SC"' /tmp/iof_xoff_out.txt 512 2000 < iof_bulk_in.txt \
                      2>iof_xoff_err.txt; echo "rc=$?"')
         rc=$(echo "$out" | sed -n 's/^rc=//p')
         got=$(echo "$out" | sed -n 's/^SLOWCAT-BYTES //p')
         outsum=$(ON 2 'md5sum < /tmp/iof_xoff_out.txt 2>/dev/null' | awk '{print $1}')
-        [ "$rc" = 0 ] && [ -n "$got" ] && [ "$got" = "$insz" ] && [ "$insum" = "$outsum" ] \
+        [ "$rc" = 0 ] && [ -n "$got" ] && [ "$got" = "$bulksz" ] && [ "$bulksum" = "$outsum" ] \
             && ok "stdin survived a reader slow enough to trigger XOFF" \
-            || bad "XOFF-triggering stdin corrupted (rc=$rc, sent=$insz received=$got, md5 $insum vs $outsum): $(RUN 'head -c 200 /tmp/iof_xoff_err.txt')"
+            || bad "XOFF-triggering stdin corrupted (rc=$rc, sent=$bulksz received=$got, md5 $bulksum vs $outsum): $(RUN 'head -c 200 /tmp/iof_xoff_err.txt')"
         # ...and the flow-control message did not come back at the user as a
         # corrupted one.  "prte --daemonize" detaches from stdio, so this is
         # what the HNP wrote before detaching plus anything pmix_output sent to
@@ -5027,26 +5164,42 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         # implementation that asserts XOFF once and releases once looks
         # identical to a correct one under a presence test, and so does one
         # that asserts fifty times and releases once.
-        RUN 'cp /tmp/prte.out /tmp/prte.out.mark2 2>/dev/null || : ' >/dev/null 2>&1
-        out=$(RUN 'cd /tmp && timeout 300 prun --prtemca iof_base_verbose 1 -n 1 \
-                     '"$SC"' /tmp/iof_pair_out.txt 2048 3000 < iof_stdin_in.txt \
-                     2>iof_pair_err.txt; echo "rc=$?"')
-        rc=$(echo "$out" | sed -n 's/^rc=//p')
-        got=$(echo "$out" | sed -n 's/^SLOWCAT-BYTES //p')
-        pairlog=$(RUN 'diff /tmp/prte.out.mark2 /tmp/prte.out 2>/dev/null | grep "^>" \
-                       || cat /tmp/prte.out 2>/dev/null')
-        nxoff=$(echo "$pairlog" | grep -c 'buffer backed up - holding')
-        nxon=$(echo "$pairlog" | grep -c 'releasing stdin flow control')
-        [ "$nxoff" -gt 0 ] \
-            && ok "stdin flow control engaged ($nxoff XOFF)" \
-            || bad "stdin flow control never engaged - the reader was not slow enough, or the backlog never crossed PRTE_IOF_MAX_INPUT_BUFFERS"
-        [ "$nxoff" = "$nxon" ] \
-            && ok "every XOFF was paired with an XON ($nxon)" \
-            || bad "unpaired stdin flow control: $nxoff XOFF vs $nxon XON - a producer is left suspended"
-        [ "$rc" = 0 ] && [ "$got" = "$insz" ] \
-            && ok "delivery stayed exact across $nxoff suspensions" \
-            || bad "flow-controlled stdin lost data (rc=$rc, sent=$insz received=$got)"
-        RUN 'rm -f /tmp/iof_pair_out.txt' >/dev/null 2>&1
+        # Two things this case has to get right before it can assert anything.
+        #
+        # It needs the flow-control API at all: without PMIX_CAP_IOF_FLOW_CONTROL
+        # both the XOFF assert and its matching release are compiled out, and the
+        # HNP simply queues (bounded by iof_base_output_limit).  There is then no
+        # XOFF to pair and nothing to test, so skip rather than fail.
+        #
+        # And it needs to be able to SEE the HNP's log.  The DVM this phase runs
+        # against is started with "prte --daemonize", which detaches stdio before
+        # any of this is emitted -- /tmp/prte.out is empty by construction, so
+        # grepping it can only ever fail.  So this one case drives its own
+        # foreground DVM with prterun and reads that process's stderr directly.
+        # prterun takes its own session-dir prefix (prtrn.<pid>), so it coexists
+        # with the daemonized DVM the rest of the phase is using.
+        if ! pmix_cap PMIX_CAP_IOF_FLOW_CONTROL; then
+            skp "PMIx predates PMIX_CAP_IOF_FLOW_CONTROL -- no XOFF to pair"
+        else
+            out=$(RUN 'cd /tmp && timeout 300 prterun --prtemca iof_base_verbose 1 -n 1 \
+                         '"$SC"' /tmp/iof_pair_out.txt 2048 3000 < iof_bulk_in.txt \
+                         2>iof_pair_err.txt; echo "rc=$?"')
+            rc=$(echo "$out" | sed -n 's/^rc=//p')
+            got=$(echo "$out" | sed -n 's/^SLOWCAT-BYTES //p')
+            pairlog=$(RUN 'cat /tmp/iof_pair_err.txt 2>/dev/null')
+            nxoff=$(echo "$pairlog" | grep -c 'buffer backed up - holding')
+            nxon=$(echo "$pairlog" | grep -c 'releasing stdin flow control')
+            [ "$nxoff" -gt 0 ] \
+                && ok "stdin flow control engaged ($nxoff XOFF)" \
+                || bad "stdin flow control never engaged - reader too fast, or the backlog never crossed PRTE_IOF_MAX_INPUT_BUFFERS (50 chunks of 8K; input is $bulksz bytes)"
+            [ "$nxoff" = "$nxon" ] \
+                && ok "every XOFF was paired with an XON ($nxon)" \
+                || bad "unpaired stdin flow control: $nxoff XOFF vs $nxon XON - a producer is left suspended"
+            [ "$rc" = 0 ] && [ "$got" = "$bulksz" ] \
+                && ok "delivery stayed exact across $nxoff suspensions" \
+                || bad "flow-controlled stdin lost data (rc=$rc, sent=$bulksz received=$got)"
+            RUN 'rm -f /tmp/iof_pair_out.txt' >/dev/null 2>&1
+        fi
 
         # And the same slow reader on the HNP node, where push_stdin writes
         # into the proc sink directly instead of going out over the RML: the
@@ -5531,6 +5684,54 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     fi
     cleanup_swarm
 
+    banner "elastic DVM: a job spanning a surviving daemon runs after grow/shrink/grow"
+    # The daemon that was already up when the DVM grew has to learn the new
+    # daemon's vpid, because odls walks EVERY proc of a job -- not just its own
+    # -- to wire each one to its node, and one unresolvable parent throws away
+    # the whole child list, including the process that daemon was about to fork.
+    # prte_util_decode_nidmap() used to record the node->daemon binding only
+    # when it created a new node-pool entry, so on every wireup after its first
+    # a surviving daemon skipped the binding entirely and never heard of the new
+    # daemon; it launched nothing and the HNP, which had no such gap, waited
+    # forever (openpmix/prrte#2616). It also keyed the pool by packing position
+    # while the sender skips daemon-less nodes, so a shrink slid every later
+    # node onto the wrong slot -- which is why the grow does NOT have to reuse
+    # the node that was shrunk out for this to break.
+    #
+    # Only a job that SPANS the survivor shows this: the tests above launch
+    # "prun -n 1", which lands on the HNP alone and passes with the DVM in
+    # exactly this state. Grow, shrink a node, grow a different node, then run
+    # one proc per node and require every node to report.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        RUN 'timeout 90 elastic grow node2:2,node3:2' >/dev/null 2>&1
+        RUN 'timeout 90 elastic shrink node3' >/dev/null 2>&1; sleep 3
+        out=$(RUN 'timeout 90 elastic grow node4:2' 2>&1); sleep 3
+        echo "$out" | grep -q PMIX_DVM_IS_READY && ok "grow after the shrink completed" \
+                                               || bad "grow after the shrink did not complete"
+        # node2 survived both DVM changes; node4 arrived in the second grow
+        out=$(RUN 'timeout 60 prun -n 3 --map-by ppr:1:node hostname' 2>&1)
+        for n in node1 node2 node4; do
+            echo "$out" | grep -qw "$n" && ok "$n ran its proc after grow/shrink/grow" \
+                                        || bad "$n launched nothing after grow/shrink/grow (nidmap rebind)"
+        done
+        # Now re-grow the node that was shrunk OUT. It keeps the pool slot it
+        # always had, so this is the case that a slot-keyed decode cannot fix
+        # by placement alone: the survivor has the node, and only the daemon on
+        # it has changed. Nothing is rebound unless every decode rebinds.
+        RUN 'timeout 90 elastic grow node3:2' >/dev/null 2>&1; sleep 3
+        out=$(RUN 'timeout 60 prun -n 4 --map-by ppr:1:node hostname' 2>&1)
+        for n in node1 node2 node3 node4; do
+            echo "$out" | grep -qw "$n" && ok "$n ran its proc after the shrunk node was re-grown" \
+                                        || bad "$n launched nothing after the re-grow (nidmap rebind)"
+        done
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start an elastic DVM for the spanning-launch test"
+    fi
+    cleanup_swarm
+
     banner "elastic DVM: a grow launches ONLY on the nodes it was given"
     # An allocation request naming node4 must start a daemon on node4 and
     # nowhere else. Shrink node2 first so the DVM holds a node that is in the
@@ -5716,6 +5917,8 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     test_odls
 
     test_grpcomm
+
+
 
     test_slurm_alloc
     test_slurm

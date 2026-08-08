@@ -47,7 +47,7 @@
 #include "src/mca/ess/ess.h"
 #include "src/mca/filem/base/base.h"
 #include "src/mca/filem/filem.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/iof/base/base.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/odls/odls_types.h"
@@ -612,7 +612,7 @@ static int get_traces(prte_job_t *jdata)
         return PRTE_ERROR;
     }
     /* goes to all daemons */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &buffer))) {
+    if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &buffer))) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_DESTRUCT(&buffer);
         return PRTE_ERROR;
@@ -961,6 +961,18 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
                          "%s plm:base:send launch msg for job %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace)));
 
+    /* Report how big the thing we are about to broadcast is.  This is the one
+     * large xcast PRRTE makes as a matter of course, so how its size scales
+     * with the job is worth being able to read off a run rather than reason
+     * about.  Reported ahead of the do-not-launch return below, so a
+     * mapping-only run can size a job without launching it. */
+    PMIX_OUTPUT_VERBOSE((2, prte_plm_base_framework.framework_output,
+                         "%s plm:base:launch_msg job %s size %lu bytes for %d nodes, %u procs",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(jdata->nspace),
+                         (unsigned long) jdata->launch_msg.bytes_used,
+                         (NULL == jdata->map) ? 0 : jdata->map->num_nodes,
+                         jdata->num_procs));
+
     /* if we don't want to launch the apps, now is the time to leave */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
         /* go ahead and register the job - the completion callback
@@ -976,8 +988,12 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
         return;
     }
 
-    /* goes to all daemons */
-    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &jdata->launch_msg))) {
+    /* Goes to all daemons, on the launch message's own tag rather than the
+     * general daemon-command tag. This is the one large broadcast PRRTE makes
+     * on a regular basis, and naming it is what lets grpcomm move it by what
+     * it is instead of inferring that from its size. */
+    if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON_LAUNCH,
+                                                 &jdata->launch_msg))) {
         PRTE_ERROR_LOG(rc);
         PRTE_ACTIVATE_JOB_STATE(caddy->jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
         PMIX_RELEASE(caddy);
@@ -3129,6 +3145,14 @@ void prte_plm_base_grow_drain(bool success)
         }
         PMIX_RELEASE(camp);
     }
+    /* The grow has resolved either way, so any release parked behind it can
+     * now run.  This is the resume point the deferral was written against:
+     * grow_drain is called from exactly the two safe places (vm_ready, after
+     * the WIREUP xcast, and the daemon-launch failure path) and is where
+     * prte_grow_campaigns is emptied - so a replayed release re-evaluates
+     * against a DVM that is no longer in flux. */
+    prte_ras_base_replay_deferred_releases();
+
     if (success) {
         /* admit the held jobs only once the *global* fence is clear — a
          * concurrent shrink may still hold it nonzero */
@@ -3278,7 +3302,7 @@ static void grow_rollback(prte_grow_campaign_t *camp, pmix_rank_t trigger)
             rc = PMIx_Data_pack(NULL, &msg, kill, nkill, PMIX_PROC_RANK);
         }
         if (PMIX_SUCCESS == rc) {
-            if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(PRTE_RML_TAG_DAEMON, &msg))) {
+            if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &msg))) {
                 PRTE_ERROR_LOG(rc);
             }
         } else {

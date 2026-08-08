@@ -89,8 +89,7 @@
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/ess/base/base.h"
-#include "src/mca/grpcomm/base/base.h"
-#include "src/mca/grpcomm/grpcomm.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/plm/plm.h"
 #include "src/mca/ras/ras.h"
@@ -479,6 +478,11 @@ int main(int argc, char *argv[])
 
     /* setup the primary daemon command receive function */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON,
+                  PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
+    /* The launch message rides its own tag so grpcomm can tell it apart from
+     * the commands, but it is the same command stream and the same handler -
+     * prte_daemon_recv ignores the tag it was delivered on. */
+    PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON_LAUNCH,
                   PRTE_RML_PERSISTENT, prte_daemon_recv, NULL);
 
     /* output a message indicating we are alive, our name, and our pid

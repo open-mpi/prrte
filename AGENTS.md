@@ -89,6 +89,7 @@ src/
   mca/            # All MCA frameworks and their components
   runtime/        # Global state, init/finalize, job/node/proc data structures
   rml/            # Runtime Messaging Layer (point-to-point communication between daemons)
+  grpcomm/        # DVM-wide collectives: broadcast (xcast), allgather/barrier (fence), PMIx groups
   util/           # Internal utilities (hostfile parsing, name formatting, attributes, ...)
   include/        # Internal header files (types.h, constants.h, ...)
   pmix/           # Thin shim connecting PRRTE to its PMIx dependency
@@ -139,7 +140,6 @@ utility stubs) and one or more component subdirectories.
 | `rmaps` | `src/mca/rmaps/` | Resource Mapping — assigns processes to nodes/slots. Components: `round_robin`, `ppr`, `rank_file`, `seq`. |
 | `odls` | `src/mca/odls/` | PRRTE Daemon Local Launch Subsystem — the per-node daemon (prted) forks/execs application processes. |
 | `iof` | `src/mca/iof/` | I/O Forwarding — routes stdout/stderr/stdin between daemons and the HNP. |
-| `grpcomm` | `src/mca/grpcomm/` | Group Communication — collective operations among daemons (broadcast, barrier). |
 | `errmgr` | `src/mca/errmgr/` | Error Manager — handles process faults, abnormal exits, and propagation of errors. |
 | `state` | `src/mca/state/` | State Machine — drives the DVM and job lifecycle through defined states/transitions. |
 | `schizo` | `src/mca/schizo/` | Personality layer — parses CLI options and environment for specific launcher personalities (prte, ompi). |
@@ -455,6 +455,7 @@ Common configure options:
 | `--with-lsf=<path>` | Enable LSF support |
 | `--with-pbs` | Enable PBS/Torque support |
 | `--with-flux=<dir>` | Enable Flux support |
+| `--enable-slurm-extensions` | Force `ras/slurm`'s elastic allocation extensions — the PMIx allocation extend/release/cancel surface and the `scontrol show job --json` parser — on or off. They need jansson and **SLURM 24.05 or later** (the release whose JSON schema the parser reads), and configure decides by asking the SLURM it can find. Where there is no SLURM to ask — a build node, a container — the default is *on*, so a build that has always had them keeps them; use `--disable-slurm-extensions` to gate them off when you know the target's SLURM is older. See [`src/mca/ras/slurm/AGENTS.md`](src/mca/ras/slurm/AGENTS.md). |
 | `--enable-debug` | Build with debug symbols and extra assertions |
 | `--enable-devel-check` | Enable strict compiler warnings (treat warnings as errors); on by default when `--enable-debug` is used in a git repo build |
 | `--enable-testbuild-launchers` | **Compile-only.** Build the `plm`/`ras`/`ess` components that an ordinary developer machine cannot, so they are compiled somewhere. Two shapes: the `plm`/`ras` launchers that need third-party headers (LSF, Flux, jansson) are built against declaration-only stubs, and must be run-time loadable plugins (the default `--enable-mca-dso` list) because a stub's unresolved symbols only fail to `dlopen`, whereas in `libprrte` they break the link of every tool. `ess/lsf` and `ess/pals` need no stubs and link nothing — their entire dependency on that RM is a `getenv` — so they build straight into `libprrte`; the gate is all that was keeping them from being compiled, which is exactly why they had drifted into not compiling at all. Such a tree builds and runs, but the stubbed components can do no actual work; don't install one over a good installation. See [`src/mca/ras/AGENTS.md`](src/mca/ras/AGENTS.md). |
@@ -620,8 +621,22 @@ changes; `run-tests.sh` drives the multi-node suite (launch, IOF,
 preload, mapping/ranking across nodes, elastic grow/shrink, relay).  Do
 not invent an ad-hoc container flow — use the harness.
 
-For resource-manager integration (SLURM, PBS, LSF), test within an actual
-allocation on the relevant system.
+**Testing under a real SLURM.**  [`contrib/slurmswarm/`](contrib/slurmswarm/)
+is the same harness with an actual SLURM installation in the ten
+containers — a real `slurmctld`, ten `slurmd`s, real `salloc`/`srun`/
+`sbatch`/`scancel` — so `ras/slurm` and `plm/slurm` can be exercised
+against a scheduler that can say no.  It is the only place `plm/slurm`
+runs at all (the sibling harness's fake scheduler supplies the control
+plane, not the launcher), and the only place PRRTE's `scontrol show job
+--json` parser meets SLURM's own output.  See its
+[`AGENTS.md`](contrib/slurmswarm/AGENTS.md); note in particular that
+`ras/slurm`'s JSON parser requires **SLURM 24.05 or newer**, which is why
+that image builds SLURM from source rather than taking the distribution
+package.  Everything that is not about the scheduler belongs in
+`contrib/dockerswarm`, which is faster and needs no SLURM.
+
+For PBS and LSF integration, test within an actual allocation on the
+relevant system.
 
 **Never bend a test to accommodate a bug.** Do not weaken, skip, or
 rewrite an existing test — and do not craft a new one — merely to make

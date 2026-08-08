@@ -110,8 +110,24 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 #define PRTE_RML_TAG_DAEMON_DIED    13
 #define PRTE_RML_TAG_DAEMON_ADOPTED 14
 
+/* The launch message, split off PRTE_RML_TAG_DAEMON so that what a broadcast
+ * IS can be read from its tag.
+ *
+ * It is delivered to the same handler as PRTE_RML_TAG_DAEMON and carries the
+ * same command byte - nothing about the receiving side changes. The tag exists
+ * to make the message's purpose declarable at the point it is sent, because
+ * that is what lets grpcomm choose a data movement by what the message is
+ * rather than by guessing from how big it happens to be. PRTE_RML_TAG_DAEMON
+ * was the only overloaded broadcast tag, and this was the only large thing
+ * on it. */
+#define PRTE_RML_TAG_DAEMON_LAUNCH 18
+
 #define PRTE_RML_TAG_XCAST         15
 #define PRTE_RML_TAG_XCAST_ACK     16
+/* The bulk broadcast's allgather phase, and the request to abandon it.  Kept
+ * off PRTE_RML_TAG_XCAST because these travel over lateral links between
+ * daemons that are not tree neighbours, while everything on the XCAST tag is
+ * from a parent and is discarded if it is not. */
 
 /* For FileM Base */
 #define PRTE_RML_TAG_FILEM_BASE      21
@@ -129,6 +145,10 @@ typedef void (*prte_rml_buffer_callback_fn_t)(int status, pmix_proc_t *peer,
 /* collectives */
 #define PRTE_RML_TAG_FENCE_RELEASE     31
 #define PRTE_RML_TAG_FENCE             33
+/* A fence's lateral allgather.  Separate from PRTE_RML_TAG_FENCE because
+ * these arrive from exchange partners rather than from a routing-tree child,
+ * and the rollup receiver rejects anything that is not in one of its
+ * subtrees. */
 
 /* debugger release */
 #define PRTE_RML_TAG_DEBUGGER_RELEASE 37
@@ -240,6 +260,13 @@ typedef struct {
      * original sender's epoch, copied from the received wire header. Lets a
      * hop drop traffic from a stale incarnation of a rebooted bootstrap rank. */
     uint64_t epoch;
+    /* Send straight to dst rather than to the next hop the routing tree would
+     * pick.  A bandwidth-efficient collective exchanges with partners that are
+     * not its tree neighbours, and routing those exchanges through the tree
+     * would funnel them via the root - which is exactly the bottleneck such a
+     * collective exists to avoid.  Only ever set for a peer whose contact info
+     * we can obtain; the send falls back to the routed path if we cannot. */
+    bool direct;
 } prte_rml_send_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_rml_send_t);
 

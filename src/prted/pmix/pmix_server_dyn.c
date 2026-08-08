@@ -43,7 +43,7 @@
 #include "src/util/pmix_getcwd.h"
 
 #include "src/mca/errmgr/errmgr.h"
-#include "src/mca/grpcomm/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/rml/rml.h"
 #include "src/mca/schizo/base/base.h"
@@ -1260,12 +1260,12 @@ static void connect_release(pmix_status_t status,
         // the payload consists of packed info containing
         // endpoint info for each involved process - we have to
         // convert each entry into an array of info, and then
-        // load that into a PMIX_PROC_DATA info
+        // load that into a PMIX_PROC_INFO_ARRAY info
         cnt = 1;
         rc = PMIx_Data_unpack(NULL, &pbkt, &infostat, &cnt, PMIX_INFO);
         while (PMIX_SUCCESS == rc) {
             // only interested in the endpt data
-            if (PMIX_CHECK_KEY(&infostat, PMIX_PROC_DATA)) {
+            if (PMIX_CHECK_KEY(&infostat, PMIX_PROC_INFO_ARRAY)) {
                 // contains an array of info
                 info = (pmix_info_t*)infostat.value.data.darray->array;
                 // procID is in first place
@@ -1333,7 +1333,7 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
 
     cd = PMIX_NEW(prte_pmix_server_req_t);
     for (n=0; n < ninfo; n++) {
-        if (PMIX_CHECK_KEY(&info[n], PMIX_PROC_DATA) ||
+        if (PMIX_CHECK_KEY(&info[n], PMIX_PROC_INFO_ARRAY) ||
             PMIX_CHECK_KEY(&info[n], PMIX_JOB_INFO_ARRAY)) {
             rc = PMIx_Data_pack(NULL, &cd->msg, (pmix_info_t*)&info[n], 1, PMIX_INFO);
             if (PMIX_SUCCESS != rc) {
@@ -1345,7 +1345,7 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
     cd->opcbfunc = cbfunc;
     cd->cbdata = cbdata;
 
-    rc = prte_grpcomm.fence(procs, nprocs, info, ninfo,
+    rc = prte_grpcomm_fence(procs, nprocs, info, ninfo,
                             cd->msg.unpack_ptr, cd->msg.bytes_used,
                             connect_release, cd);
     if (PRTE_SUCCESS != rc) {

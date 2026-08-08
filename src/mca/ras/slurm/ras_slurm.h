@@ -49,6 +49,10 @@ BEGIN_C_DECLS
 /* To check if Jansson is available in compilation */
 bool prte_ras_slurm_have_jansson(void);
 
+/* Whether this build can serve the elastic modify surface at all, reporting
+ * why not when it cannot.  Every entry point of that surface asks first. */
+bool prte_ras_slurm_have_extensions(void);
+
 /* Features requiring JSON parser */
 int prte_ras_slurm_extract_job_fields(pmix_hash_table_t *values_table);
 int prte_ras_slurm_add_modified_resources(const char *slurm_jobid, pmix_list_t *node_list);
@@ -58,14 +62,16 @@ int prte_ras_slurm_check_resources(const char *slurm_jobid);
 /* Features to serve cancel requests */
 int prte_ras_slurm_add_pending_req(const char *request_id, const char *slurm_job_id);
 int prte_ras_slurm_remove_pending_req(const char *request_id);
-bool prte_ras_slurm_pending_req_exists(const char *request_id);
 int prte_ras_slurm_cancel_pending_req(const char *request_id);
 int prte_ras_slurm_modify_cancel_init(void);
 int prte_ras_slurm_modify_cancel_finalize(void);
 int prte_ras_slurm_serve_cancel_req(prte_pmix_server_req_t *req);
 
 /* Features to serve extension requests */
+int prte_ras_slurm_modify_extend_init(void);
+int prte_ras_slurm_modify_extend_finalize(void);
 int prte_ras_slurm_serve_extend_req(prte_pmix_server_req_t *req);
+void prte_ras_slurm_extend_abort_request(const char *request_id);
 
 /* Features to serve release requests */
 int prte_ras_slurm_modify_release_init(void);
