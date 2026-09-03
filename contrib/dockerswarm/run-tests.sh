@@ -4599,6 +4599,354 @@ test_grpcomm() {
 
     test_grpcomm_invite
     test_grpcomm_ft
+    test_fence_straggler
+    test_fence_early_arrival
+    test_low_radix_release
+    test_low_radix_release_fault
+}
+
+test_fence_early_arrival() {
+    local out n
+
+    banner "grpcomm: a contribution for the next round does not join this one"
+    # The other side of the round number, and the one a straggler test cannot
+    # reach.  A fence release is an xcast, and PRTE_RML_TAG_FENCE_RELEASE is
+    # not in the process_first set, so a daemon FORWARDS a release to its
+    # children before it processes the release itself.  In that gap a child is
+    # released, its clients open the next round, and its contribution arrives
+    # at a parent that still has the previous round open.
+    #
+    # Keyed by signature alone that contribution joins the round it is not
+    # part of: it lands in a bucket that is about to be discarded by the
+    # release, and the round it actually belonged to then waits for a
+    # contribution that has already been consumed.  The symptom is not wrong
+    # data, it is the SECOND fence never completing.
+    #
+    # The gap is microseconds wide in normal running, so widen it:
+    # grpcomm_release_delay_ms holds one daemon's own processing of the
+    # release back while its children get theirs on time.  radix 1 makes the
+    # tree a chain, so daemon 1 is an interior daemon with a real subtree
+    # below it rather than a leaf hanging off the HNP.
+    cleanup_swarm
+    if ! RUN "test -x $FENCER"; then
+        skp "fencer client not installed -- re-run ./build.sh"
+        return
+    fi
+    if ! prted_dvm_start_mca 'node1:1,node2:1,node3:1,node4:1' \
+            '--prtemca rml_base_radix 1 --prtemca grpcomm_release_delay_ms 5000 --prtemca grpcomm_release_delay_vpid 1'; then
+        bad "could not start a DVM for the fence early-arrival test"
+        cleanup_swarm
+        return
+    fi
+
+    out=$(PRUN "--host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $FENCER collect --twice" 2>&1)
+
+    # The first fence has to have completed, or there was no release to run
+    # ahead of and nothing below tests anything.
+    n=$(echo "$out" | grep -c 'FENCER collect rank .* rc PMIX_SUCCESS')
+    [ "$n" = 4 ] \
+        && ok "the first fence completed despite the held-back release" \
+        || bad "$n of 4 ranks completed the first fence: $(echo "$out" | grep 'FENCER collect' | tr '\n' ' ' | tail -c 250)"
+
+    # ...and the assertion: the next round, whose contributions reached a
+    # daemon that had not caught up, still converges.
+    n=$(echo "$out" | grep -c 'FENCER second rank .* rc PMIX_SUCCESS')
+    [ "$n" = 4 ] \
+        && ok "...and the round that overtook it completed too" \
+        || bad "$n of 4 ranks completed the second fence: $(echo "$out" | grep 'FENCER second' | tr '\n' ' ' | tail -c 250)"
+
+    n=$(echo "$out" | grep -c 'peers-bad 0')
+    [ "$n" = 4 ] \
+        && ok "...with every peer's contribution intact" \
+        || bad "$n of 4 ranks got a complete modex: $(echo "$out" | grep 'peers-' | tr '\n' ' ' | tail -c 250)"
+
+    RUN 'pgrep -x prte' >/dev/null 2>&1 \
+        && ok "...and the DVM survived the overlap" \
+        || bad "the HNP died over the overlapping rounds"
+
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
+}
+
+test_low_radix_release() {
+    local out n hosts
+
+    banner "grpcomm: a fence release can travel a tree of its own"
+    # The rollup and the release want opposite radices.  A gathering daemon
+    # receives r messages and sends ONE aggregate, so fanout costs it nothing;
+    # a broadcasting daemon receives one copy and sends r, so fanout is the
+    # whole cost.  grpcomm_low_radix_release sends a fence's release down the
+    # tree rml_base_radix2 describes rather than the routing tree.
+    #
+    # The two radices are deliberately far apart here: routing radix 64 over
+    # eight daemons is one hop from the HNP to everybody, while release radix
+    # 2 is three levels deep.  That is what makes the case worth running - the
+    # release then arrives from a daemon that is NOT the receiver's routing
+    # parent, which the parent check screened on until it learned to ask which
+    # tree a message travelled, and daemons in the middle relay on a tree they
+    # relay on for nothing else.
+    #
+    # Run in the foreground rather than against a daemonized DVM, because the
+    # last assertion reads the HNP's verbose output and a --daemonize'd DVM
+    # detaches it.
+    #
+    # Note what this does NOT establish: anything about speed.  These
+    # containers share one host and have no per-node uplinks for a radix to
+    # contend on, so the entire point of the low radix is invisible here.
+    # What it establishes is that the release arrives, intact, over the other
+    # tree.
+    hosts=node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1,node8:1
+    cleanup_swarm
+    if ! RUN "test -x $FENCER"; then
+        skp "fencer client not installed -- re-run ./build.sh"
+        return
+    fi
+
+    out=$(RUN "timeout -k 5 180 prterun --prtemca grpcomm_low_radix_release 1 \
+                   --prtemca rml_base_radix2 2 --prtemca rml_base_radix 64 \
+                   --prtemca grpcomm_base_verbose 1 \
+                   --host $hosts -n 8 --map-by node $FENCER collect --twice" 2>&1)
+
+    n=$(echo "$out" | grep -c 'FENCER collect rank .* rc PMIX_SUCCESS')
+    [ "$n" = 8 ] \
+        && ok "all 8 ranks completed a modex fence released on the other tree" \
+        || bad "$n of 8 ranks completed the fence: $(echo "$out" | grep FENCER | tr '\n' ' ' | tail -c 250)"
+
+    n=$(echo "$out" | grep -c 'FENCER second rank .* rc PMIX_SUCCESS')
+    [ "$n" = 8 ] \
+        && ok "...and a second one over the same participants" \
+        || bad "$n of 8 ranks completed the second fence"
+
+    n=$(echo "$out" | grep -c 'peers-bad 0')
+    [ "$n" = 8 ] \
+        && ok "...with every peer's contribution delivered" \
+        || bad "$n of 8 ranks got a complete modex: $(echo "$out" | grep 'peers-' | tr '\n' ' ' | tail -c 250)"
+
+    # The assertion without which every one above passes vacuously: the
+    # release has to have gone down the other tree.  All of them succeed just
+    # as well when the knob is quietly ignored, which is exactly what happened
+    # the first time this was wired up - the selector was never installed, and
+    # three green runs said nothing at all.
+    n=$(echo "$out" | grep -c 'on tree 1')
+    [ "$n" -ge 1 ] \
+        && ok "...and the release travelled the release tree, not the routing one" \
+        || bad "no broadcast used the release tree - the knob was ignored"
+
+    # ...and it travelled it over DIRECT links, which is the assertion that
+    # decides whether any of the above means anything.  prte_rml_get_route()
+    # answers on the ROUTING tree, so a release edge sent routed is relayed by
+    # whichever daemon the routing tree puts in between - and at radix 64 that
+    # is the controller itself.  The release then crosses the very link the
+    # second tree exists to keep it off, the controller handles it twice, and
+    # the fanout is not reduced at all.  Every assertion above passes exactly
+    # as well in that state: the release does arrive, over the release tree,
+    # with the right data.  It was shipped that way, and the mistake was
+    # invisible until the routing was read directly.
+    #
+    # rml_base_verbose 2 names the macro each send used.  A forward from a
+    # NON-controller daemon is the one that matters - the controller's own
+    # children are routing children either way, so it is the only daemon whose
+    # sends cannot tell the two apart.
+    out=$(RUN "timeout -k 5 180 prterun --prtemca grpcomm_low_radix_release 1 \
+                   --prtemca rml_base_radix2 2 --prtemca rml_base_radix 64 \
+                   --prtemca rml_base_verbose 2 --leave-session-attached \
+                   --host $hosts -n 8 --map-by node $FENCER collect" 2>&1)
+    # tag 15 is PRTE_RML_TAG_XCAST; node1 hosts the controller, so exclude it
+    n=$(echo "$out" | grep -v '^\[node1:' \
+            | grep -cE 'RML-SEND-PAYLOAD-DIRECT-CB\([0-9]+:15\)')
+    [ "$n" -ge 1 ] \
+        && ok "...over direct links ($n relayed forwards bypassed the routing tree)" \
+        || bad "release forwards went out routed - every edge that is not also a routing edge is being relayed, so the second tree buys nothing"
+
+    # And now with NO parameters at all, because that is the contract as
+    # shipped: grpcomm_low_radix_release defaults on and rml_base_radix2
+    # defaults to 4.  Every assertion above sets both, so all of them would go
+    # on passing if a later change quietly turned the feature back off, and
+    # nobody would be measuring what the runtime actually does.  The routing
+    # radix is left alone too - at its default of 64 over eight daemons a
+    # radix-4 release tree is genuinely a different shape, so "on tree 1" here
+    # means the derived tree really was built and used.
+    cleanup_swarm
+    out=$(RUN "timeout -k 5 180 prterun --prtemca grpcomm_base_verbose 1 \
+                   --host $hosts -n 8 --map-by node $FENCER collect" 2>&1)
+    n=$(echo "$out" | grep -c 'FENCER collect rank .* rc PMIX_SUCCESS')
+    [ "$n" = 8 ] && ok "a fence with no parameters at all completes on 8 ranks" \
+                 || bad "$n of 8 ranks completed a default-configuration fence"
+    n=$(echo "$out" | grep -c 'on tree 1')
+    [ "$n" -ge 1 ] \
+        && ok "...and its release took the release tree BY DEFAULT" \
+        || bad "the default configuration put the release on the routing tree"
+    n=$(echo "$out" | grep -c 'peers-bad 0')
+    [ "$n" = 8 ] && ok "...delivering every peer's contribution" \
+                 || bad "$n of 8 ranks got a complete modex by default"
+
+    cleanup_swarm
+}
+
+test_low_radix_release_fault() {
+    local out n t0 t1 el
+
+    banner "grpcomm: a release tree repairs itself when a relay dies"
+    # Two trees in the DVM, each for one direction of a collective, and each
+    # therefore needing its own recovery.  The routing tree's is reported to
+    # us by the RML -- who was promoted, which children changed, what the
+    # previous set was -- and none of that describes the release tree, which
+    # is derived rather than repaired: after a death every daemon simply
+    # computes a different answer from a live set they all hold in step.
+    #
+    # Applying the routing tree's facts to a release-tree operation is not a
+    # near miss, it is the wrong tree in every particular.  Here the routing
+    # radix is 64, so a non-master daemon has NO routing children at all --
+    # and the old handler read that as "my subtree is empty, this operation is
+    # complete" and retired a release that had not been forwarded anywhere.
+    #
+    # The shape: release radix 2 over eight daemons is 0->{1,2}, 1->{3,4},
+    # 2->{5,6}, 3->{7}.  Daemon 1 is told to hold its forward, so daemons 3, 4
+    # and 7 do not have the release; then daemon 1 is killed, taking the held
+    # copy with it.  The only way those three are ever released is the repair.
+    # Daemon 1 hosts no process, so what dies is a relay and nothing else --
+    # the fence itself is not "affected" and must simply carry on.
+    cleanup_swarm
+    if ! RUN "test -x $FENCER"; then
+        skp "fencer client not installed -- re-run ./build.sh"
+        return
+    fi
+
+    if ! prted_dvm_start_mca \
+            'node1:1,node2:1,node3:1,node4:1,node5:1,node6:1,node7:1,node8:1' \
+            '--prtemca grpcomm_low_radix_release 1 --prtemca rml_base_radix2 2 --prtemca rml_base_radix 64 --prtemca grpcomm_xcast_delay_ms 12000 --prtemca grpcomm_xcast_delay_vpid 1'; then
+        bad "could not start the DVM for the release-tree fault test"
+        cleanup_swarm
+        return
+    fi
+
+    # The canary, and the assertion without which everything below passes
+    # vacuously: prove the hold is armed and aimed at daemon 1 before killing
+    # anything.  A parameter that never reached the daemons, or a delay that
+    # is not on the path a release takes, makes every later assertion pass
+    # while testing nothing at all -- which is exactly how the first version
+    # of the low-radix case spent three green runs.  With daemon 1 holding for
+    # 12s the fence cannot finish sooner, so the wall clock says whether it is
+    # really holding.
+    t0=$(date +%s)
+    out=$(RUN "timeout -k 5 120 prun --dvm-uri file:$PRTED_URI \
+                   --host node1:1,node3:1,node4:1,node5:1,node6:1,node7:1,node8:1 \
+                   -n 7 --map-by node $FENCER collect" 2>&1)
+    t1=$(date +%s)
+    el=$((t1 - t0))
+    n=$(echo "$out" | grep -c 'FENCER collect rank .* rc PMIX_SUCCESS')
+    [ "$n" = 7 ] && [ "$el" -ge 10 ] \
+        && ok "the forward hold is live: 7 ranks released, after ${el}s" \
+        || bad "hold not in effect ($n of 7 ranks, ${el}s) -- every assertion below would be vacuous"
+
+    # Now the fault.  Kill daemon 1 while it is sitting on the release.
+    PRUN_BG /tmp/lrr-fault.out \
+        "--host node1:1,node3:1,node4:1,node5:1,node6:1,node7:1,node8:1 \
+         -n 7 --map-by node --rtos recoverable $FENCER collect"
+    sleep 4
+    if ! ON 2 'pgrep -x prted' >/dev/null 2>&1; then
+        bad "node2 has no daemon to kill"
+    else
+        ON 2 'pkill -9 -x prted' >/dev/null 2>&1
+        n=0
+        while [ "$n" -lt 90 ]; do
+            RUN 'pgrep -x prun' >/dev/null 2>&1 || break
+            sleep 1; n=$((n+1))
+        done
+        out=$(RUN 'tr -d "\000" < /tmp/lrr-fault.out' 2>&1)
+
+        n=$(echo "$out" | grep -c 'FENCER collect rank .* rc PMIX_SUCCESS')
+        [ "$n" = 7 ] \
+            && ok "every rank was released after the relay holding it died" \
+            || bad "$n of 7 ranks were released: $(echo "$out" | grep FENCER | tr '\n' ' ' | tail -c 300)"
+
+        # ...and with the payload intact.  A repair that delivered *a*
+        # release rather than the one that was in flight would still let the
+        # fence return; what says it was the right one is the modex.
+        n=$(echo "$out" | grep -c 'peers-bad 0')
+        [ "$n" = 7 ] \
+            && ok "...with every peer's contribution still delivered" \
+            || bad "$n of 7 ranks got a complete modex after the repair"
+    fi
+
+    # The DVM has to have survived it: the repair runs on every daemon, and
+    # one that mis-repairs takes its own broadcast ordering with it, which
+    # shows up on the NEXT collective rather than this one.
+    out=$(RUN "timeout -k 5 60 prun --dvm-uri file:$PRTED_URI \
+                   --host node1:1,node3:1,node4:1 -n 3 --map-by node \
+                   $FENCER collect" 2>&1)
+    n=$(echo "$out" | grep -c 'FENCER collect rank .* rc PMIX_SUCCESS')
+    [ "$n" = 3 ] \
+        && ok "...and a later fence over the survivors still completes" \
+        || bad "the DVM could not run a fence after the repair: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
+}
+
+test_fence_straggler() {
+    local out n
+
+    banner "grpcomm: a straggler from an aborted fence is not the next round"
+    # A fence signature is only its participant list, so nothing about a
+    # contribution says which round it belongs to.  That costs nothing while a
+    # daemon converges only once everything it expects has arrived -- but
+    # abort_fence_op() ends a fence early, on a PMIX_TIMEOUT or a lost
+    # participant, and a contribution still climbing the tree then reaches a
+    # daemon whose tracker the release already retired.  Without a round
+    # number fence_recv() builds a fresh tracker for it, and the NEXT fence
+    # over those same participants finds that tracker, inherits its nreported
+    # and its bucket, and can converge early carrying the previous round's
+    # data.
+    #
+    # That window is a timing accident no test can arrange from outside, which
+    # is why grpcomm_fence_delay_ms exists and why it is compiled in rather
+    # than hidden behind a debug build.  Daemon vpid 2 holds its contribution
+    # for 8s; the fence carries a 3s deadline, so the controller ends it
+    # without that daemon; the held contribution then lands at ~8s, by which
+    # time the SECOND fence is in flight -- exactly on top of the tracker it
+    # must not join.
+    cleanup_swarm
+    if ! RUN "test -x $FENCER"; then
+        skp "fencer client not installed -- re-run ./build.sh"
+        return
+    fi
+    if ! prted_dvm_start_mca 'node1:1,node2:1,node3:1,node4:1' \
+            '--prtemca grpcomm_fence_delay_ms 8000 --prtemca grpcomm_fence_delay_vpid 2'; then
+        bad "could not start a DVM for the fence straggler test"
+        cleanup_swarm
+        return
+    fi
+
+    out=$(PRUN "--host node1:1,node2:1,node3:1,node4:1 -n 4 --map-by node $FENCER collect --timeout 3 --twice" 2>&1)
+
+    # First: the window has to have actually opened.  If the first fence
+    # SUCCEEDED then nothing was aborted, no contribution was left in flight,
+    # and everything below would pass without testing anything at all.
+    n=$(echo "$out" | grep -c 'FENCER collect rank .* rc PMIX_ERR_TIMEOUT')
+    [ "$n" = 4 ] \
+        && ok "the deadline ended the first fence without the held-back daemon" \
+        || bad "$n of 4 ranks saw the first fence time out -- the straggler window never opened: $(echo "$out" | grep 'FENCER collect' | tr '\n' ' ' | tail -c 250)"
+
+    # ...and now the assertion this exists for.
+    n=$(echo "$out" | grep -c 'FENCER second rank .* rc PMIX_SUCCESS')
+    [ "$n" = 4 ] \
+        && ok "...and the next fence over the same participants completed" \
+        || bad "$n of 4 ranks completed the second fence: $(echo "$out" | grep 'FENCER second' | tr '\n' ' ' | tail -c 250)"
+
+    # Converging is not enough: a fence that inherited the previous round's
+    # bucket converges too, and answers with data it never gathered.
+    n=$(echo "$out" | grep -c 'peers-bad 0')
+    [ "$n" = 4 ] \
+        && ok "...carrying every peer's contribution, not the aborted round's" \
+        || bad "$n of 4 ranks got a complete modex from the second fence: $(echo "$out" | grep 'peers-' | tr '\n' ' ' | tail -c 250)"
+
+    RUN 'pgrep -x prte' >/dev/null 2>&1 \
+        && ok "...and the DVM survived the aborted fence" \
+        || bad "the HNP died over the aborted fence"
+
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
 }
 
 # A group formed by INVITATION, asking for a context id.
@@ -5462,6 +5810,93 @@ test_errmgr() {
     c=$(prted_count 1 2 3 4 5 6 7 8 9 10)
     [ "$c" = 0 ] && ok "...and no daemon is left behind" \
                  || bad "$c stray prted after a failed start"
+    cleanup_swarm
+
+    banner "errmgr: a launch that fails on ONE node still accounts for the others"
+    # The case above fails every rank, and that is the easy one: nothing ever
+    # started, so nothing is left to account for.  The interesting shape is a
+    # launch that succeeds on some nodes and fails on one, which is what a
+    # path present on only part of a cluster produces -- the ordinary way to
+    # meet this, not an exotic one.
+    #
+    # job_errors used to declare such a job TERMINATED the instant the failure
+    # arrived, on the grounds that "the job never launched, so no proc state
+    # will be triggered".  That holds only when no daemon was given anything
+    # to run.  Here the other daemons launched their ranks and are still
+    # reporting it, so check_job_complete releases the job object underneath
+    # them: their "local launch complete" lands on an HNP that no longer has
+    # the job (plm_base_receive's PRTE_ERR_NOT_FOUND), and so does the death
+    # of every rank that did start (state/base's orphaned-proc path, which
+    # asks the user to file a bug for what is only a mistyped path).
+    #
+    # And the consequence is not confined to diagnostics: a PERSISTENT DVM
+    # does not survive it.  Releasing the job while its daemons are mid-report
+    # leaves the HNP with nothing it can account for, and it comes down -- so
+    # a mistyped path on one node of a long-lived DVM destroys the DVM, which
+    # is the one thing a persistent DVM exists not to do.  The last assertion
+    # below is the one that catches that.
+    #
+    # The first of them needs no log at all: a partial launch failure reported
+    # a DIFFERENT exit status from a total one, because the status was taken
+    # while the accounting was still incomplete.  On the unfixed runtime this
+    # block scores 4 of 7 -- 183 against 75, a PRTE_ERR_NOT_FOUND out of
+    # plm_base_receive, and a DVM that is gone by the next job.
+    cleanup_swarm
+    # A binary on node2 and node3 and NOT on node4.  /tmp is per-container
+    # here, which is what makes this expressible at all.
+    for n in 2 3; do
+        docker exec "$NODE$n" sh -c \
+            'printf "#!/bin/sh\nexit 0\n" > /tmp/partial-app && chmod +x /tmp/partial-app' \
+            >/dev/null 2>&1
+    done
+    docker exec "$NODE"4 rm -f /tmp/partial-app >/dev/null 2>&1
+
+    out=$(RUN 'timeout -k 5 90 prterun --host node2:1,node3:1,node4:1 -np 3 --map-by node \
+                  /tmp/partial-app' 2>&1); rc_partial=$?
+    RUN 'timeout -k 5 90 prterun --host node2:1,node3:1 -np 2 --map-by node \
+                  /no/such/executable' >/dev/null 2>&1; rc_total=$?
+    [ "$rc_partial" != 0 ] && ok "a launch that fails on one node fails the job (rc=$rc_partial)" \
+                           || bad "a missing executable on node4 was reported as success"
+    [ "$rc_partial" = "$rc_total" ] \
+        && ok "...reporting the same status as a launch that failed everywhere ($rc_total)" \
+        || bad "partial launch failure exited $rc_partial, total failure $rc_total"
+    echo "$out" | grep -q 'node4' \
+        && ok "...naming the node that could not run it" \
+        || bad "the diagnostic did not name node4: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    c=$(prted_settle 10 1 2 3 4)
+    [ "$c" = 0 ] && ok "...and every daemon came down afterwards" \
+                 || bad "$c stray prted after a partial launch failure"
+    cleanup_swarm
+
+    # The same launch against a PERSISTENT DVM, whose HNP has to survive it
+    # and go on working.  Run in the foreground so the HNP's own output is
+    # readable -- a --daemonize'd DVM discards it, and the whole point here is
+    # what the HNP says to itself.
+    HNPLOG=/tmp/partial-hnp.log
+    RUN "rm -f $PRTED_URI $HNPLOG" >/dev/null 2>&1
+    RUN_BG "$HNPLOG" "prte --report-uri $PRTED_URI --host node2:1,node3:1,node4:1"
+    for _ in $(seq 30); do RUN "grep -q 'DVM ready' $HNPLOG" 2>/dev/null && break; sleep 1; done
+    if RUN "test -s $PRTED_URI" 2>/dev/null; then
+        PRUN "--map-by node -np 3 /tmp/partial-app" >/dev/null 2>&1
+        sleep 2
+        hnp=$(RUN "cat $HNPLOG" 2>&1)
+        echo "$hnp" | grep -q 'PRTE ERROR' \
+            && bad "the HNP lost the job while its daemons were still reporting it: $(echo "$hnp" | grep 'PRTE ERROR' | head -1)" \
+            || ok "the HNP kept the job object until every daemon had reported"
+        echo "$hnp$out" | grep -qi 'holds no record of the job\|internal inconsistency' \
+            && bad "a mistyped path produced an internal-inconsistency report" \
+            || ok "...so no bug report is asked of the user for a mistyped path"
+        out=$(PRUN "--map-by node -np 3 hostname" 2>&1)
+        [ "$(echo "$out" | grep -c 'node[234]')" = 3 ] \
+            && ok "...and the DVM still runs the next job" \
+            || bad "the DVM did not survive a partial launch failure: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        RUN "timeout -k 5 30 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
+    else
+        skp "could not start a persistent DVM for the partial-launch test"
+    fi
+    for n in 2 3; do
+        docker exec "$NODE$n" rm -f /tmp/partial-app >/dev/null 2>&1
+    done
     cleanup_swarm
 }
 
@@ -6557,6 +6992,17 @@ test_linux() {
         # anything yourself.
         echo "     Recreate them: ${SWARM_ENV}docker compose up -d --force-recreate" >&2
         echo "     (from contrib/dockerswarm, so the pinned project name applies)" >&2
+        return
+    fi
+
+    # Run only the named phases, for iterating on one of them.  Everything
+    # above this line is preflight and still runs: the checks that say the
+    # install is the one you built, and the sweep that says the swarm is
+    # clean, are exactly the ones whose absence makes a subset run lie.
+    if [ -n "${TEST_ONLY:-}" ]; then
+        for only_fn in $TEST_ONLY; do
+            "$only_fn"
+        done
         return
     fi
 

@@ -112,7 +112,7 @@ Plain functions, all `PRTE_EXPORT`, declared in `grpcomm.h`:
 | `prte_grpcomm_finalize()` | Tear down trackers, cancel the RML receives. |
 | `prte_grpcomm_fault_handler(status)` | Invoked on **every** daemon by `src/rml/routed_radix.c` when the routing tree changes. Called twice per death (LOCAL scope then GLOBAL scope); which scope a collective keys on depends on what it needs, so read *Surviving a daemon failure* before adding a third. |
 | `prte_grpcomm_xcast(tag, msg)` | Broadcast to **every** daemon, delivered at `tag`. Non-destructive to `msg`. Returns `PRTE_SUCCESS` on *acceptance*, not completion. |
-| `prte_grpcomm_xcast_nb(tag, msg, cbfunc, cbdata)` | As above, but `cbfunc` fires on the **master** once the whole DVM has confirmed receipt. `cbfunc`/`cbdata` are ignored on non-master daemons. `xcast` is just `xcast_nb(tag, msg, NULL, NULL)`. |
+| `prte_grpcomm_xcast_nb(tag, msg, cbfunc, cbdata)` | As above, but `cbfunc` fires on the **master** once the whole DVM has confirmed receipt — or, if the broadcast is abandoned before it is ever emitted, as soon as that is known (`abandon_xcast`), because a caller waiting on it would otherwise wait forever. It carries no status, so it means only "stop waiting". `cbfunc`/`cbdata` are ignored on non-master daemons. `xcast` is just `xcast_nb(tag, msg, NULL, NULL)`. |
 | `prte_grpcomm_fence(procs, nprocs, info, ninfo, data, ndata, cbfunc, cbdata)` | Non-blocking allgather/barrier across the daemons hosting `procs`. A barrier supplies no data. Returns `PRTE_SUCCESS` once queued. |
 | `prte_grpcomm_group(op, grpid, procs, nprocs, directives, ndirs, cbfunc, cbdata)` | PMIx group construct/destruct/cancel. |
 
@@ -393,6 +393,46 @@ broadcast path. There is no separate size gate to sweep — the compressor's own
 --pmixmca pcompress zstd --pmixmca pcompress_zstd_level 1
 ```
 
+### How long a broadcast took: three stamps, and which pair to use
+
+`grpcomm_enable_timing` also stamps absolute microseconds at three points, so
+that the quantity a change to the fanout tree is actually about — how long the
+payload took to reach the whole DVM — can be measured. An end-to-end fence
+cannot resolve it: the rollup's noise is larger than the effect.
+
+```text
+grpcomm:xcast:timing started   op_id N tree K at <sec>.<usec>   originator only
+grpcomm:xcast:timing processed op_id N tag T tree K at ...      every daemon
+grpcomm:xcast:timing completed op_id N tag T tree K at ...      master only
+```
+
+Pair them on **(tree, op_id)**, never on the tag: the `started` line cannot
+name the payload tag, because at that point `tag` is the tag the message
+*arrived* on (`PRTE_RML_TAG_XCAST`) and the real one is still packed inside.
+Several broadcasts are in flight at once and they complete out of order, so
+the pairing key is load-bearing rather than a convenience.
+
+**Which span to measure depends on whose clock you have.**
+
+- `started` → last `processed` is the coverage itself, and it is only
+  meaningful where the clocks are common: a container swarm sharing one
+  kernel, yes; a real cluster, no. NTP holds a cluster to about a
+  millisecond and the whole broadcast is shorter than that, so the answer
+  there is clock skew with a broadcast buried in it.
+- `started` → `completed` is the same span measured **at one end**, on the
+  master, and is what to use anywhere else. It reads high by the ack tree's
+  return path, which is separable: a zero-byte broadcast is very nearly a
+  measurement of it on its own.
+
+Pair either with the census line's own `raw`/`wire` sizes, printed by
+`grpcomm_base_verbose 1` just before `started` on the same thread. Do not
+average a tag's spans without doing that — **a fence emits two releases per
+iteration on the same tag**, the allgather's (large) and the barrier's (tens
+of bytes), so a median over all of them is a median of the barrier.
+
+A `--daemonize`d DVM discards the HNP's output, so any of this needs a
+foreground `prte` or `prterun`.
+
 ### Timing runs want an optimized build — a debug build measures itself
 
 **Do not draw conclusions about sizes or times from a `--enable-debug` build.**
@@ -458,6 +498,137 @@ The in-file comments are the real spec — read them. The load-bearing ideas:
   assuming its *newly-acquired* subtree finished ops it completed before
   promotion.
 
+### Turning the release onto its own tree takes ONE parameter
+
+`grpcomm_low_radix_release` (bool, **default true**) is the switch: it alone
+decides whether a fence's release leaves the routing tree. Turned off, every
+release goes down the routing tree and none of the derived-tree code below
+runs — which makes it the one thing to reach for if a release misbehaves,
+since it restores the single-tree behaviour exactly.
+
+`rml_base_radix2` (int, **default 4**) only gives the release tree its shape,
+and is not consulted at all when the switch is off. Four is where the cost
+model puts the optimum for every payload past the point at which a copy's
+bandwidth overtakes its thread-divided software cost, which is the only kind
+of payload this tree ever carries — see
+[`two-radix-release.rst`](../../docs/plans/scalable_collectives/two-radix-release.rst),
+"Where does the release radix come from at scale".
+
+Setting the two to the SAME value does nothing useful, and it used to be the
+obvious mistake because that is what leaving the radix alone gave you: at
+equal radices the release tree *is* the routing tree, identical parent and
+children for every rank and every failure pattern
+(`test_release_tree_matches_routing` in `test/unit/rml`). The master emits the
+`release-radix-noop` help topic for that combination and carries on. It is
+still reachable — by setting `rml_base_radix` to 4, or `rml_base_radix2` to
+64 — which is why the diagnostic stays. Note
+which way round the two want to be: the rollup wants a **wide** tree (a
+gathering daemon receives r messages and sends one aggregate, so width is
+free) and the release wants a **narrow** one (a broadcasting daemon receives
+one and sends r, so width is the whole cost).
+
+### A derived tree's edges must be sent DIRECT
+
+`prte_rml_get_route()` answers on the **routing** tree, so an edge of any other
+tree that is not also a routing edge gets *relayed*. At a high routing radix
+the relay is the controller itself, which means the bytes cross the very link
+the second tree exists to keep them off, the controller handles them twice,
+and the fanout is not reduced at all. Measured on eight daemons at routing
+radix 64 with release radix 2: seven of nine release edges went back through
+rank 0, which is worse than not having a second tree.
+
+So `forward_payload_to()` and `send_ack_msg()` route their sends through
+`edge_is_direct()`: the routing tree keeps the routed send (there every edge
+*is* the route), and every other tree gets
+`prte_rml_send_payload_direct_cb_nb()` / `prte_rml_send_buffer_direct_cb_nb()`.
+Both fall back to a routed send on their own when contact information is
+missing, so no caller handles "no direct route".
+
+A peer reached that way and not also a tree neighbour is registered with
+`prte_rml_lateral_register()`. That is about faults, not delivery: losing a
+lateral link means the tree has **not** changed shape, and repairing on the
+strength of it would end every in-flight collective in the DVM.
+`prte_rml_route_lost()` consults `prte_rml_is_lateral_only()`, deregisters,
+and calls the lateral-lost callback instead of repairing.
+
+grpcomm installs that callback (`prte_grpcomm_xcast_lateral_lost`), and it
+closes a hole that only exists once edges are direct: an *undeliverable*
+forward is covered by `forward_lost`, but a link that drops **after** the
+forward landed produces no send completion at all, and the operation then
+waits on an ack that is never coming. The handler re-derives and re-forwards,
+and deliberately concludes nothing about the peer being dead — the RML reached
+it precisely because it decided the loss was not a tree fault.
+
+**Check this when measuring.** `--prtemca rml_base_verbose 2` names the macro
+each send used; a release-tree forward from a non-controller must appear as
+`RML-SEND-PAYLOAD-DIRECT-CB`.
+
+### A derived tree repairs by different rules, and they are not optional
+
+An op may travel a tree other than the routing one — today a fence release
+under `grpcomm_low_radix_release`, tomorrow anything else added to
+`prte_grpcomm_topology_t`. Such a tree is **derived**: every daemon computes
+it from the daemon count, the failed set and `rml_base_radix2`, all of which
+they hold in step, so there is no protocol and nothing to keep synchronized.
+That is what makes it cheap. It also means **none of the routing tree's
+recovery inputs describe it** — `status->promoted`, `->children_changed`,
+`->prev_children` and `prte_rml_base.n_children` are all facts about the
+routing tree, and applying them to an op travelling another one is not a near
+miss but the wrong tree in every particular. With `rml_base_radix 64` a
+non-master daemon has *no* routing children at all, and the handler read that
+as "my subtree is empty, this op is complete" and retired a release it had
+forwarded nowhere.
+
+`release_tree_fault()` is the separate path, and five rules hold it up. All
+five are properties of deriving a tree rather than being told one, so anything
+added here inherits them:
+
+- **Both halves of the derivation must agree.** `prte_rml_release_tree()`
+  computes a parent *and* children, and they have to describe the same tree
+  for every failure pattern. Walking up past dead ancestors to name a parent
+  while replacing a dead child in place is two different promotion rules and
+  orphans daemons outright. `test_release_tree` (`test/unit/rml`) brute-forces
+  every failure subset and requires one tree rooted at 0 covering exactly the
+  living daemons — run it before believing any change here.
+- **Do not screen a forward on "is the sender my parent".** That screen is
+  sound on the routing tree, whose repair notice travels the routing tree, so
+  a daemon has processed the notice that gave it a new parent before anything
+  that parent relays can arrive. A derived tree has no such ordering: a
+  repaired parent replays to a child that has not heard yet. Both the forward
+  and the ack-request screens are therefore asked only of
+  `PRTE_GRPCOMM_TOPO_ROUTING`.
+- **Ack whoever asked** (`send_ack_to`, `op->upstream`), not whoever this
+  daemon's own derivation currently calls its parent. Answering the wrong
+  daemon costs nothing; failing to answer the right one hangs the broadcast.
+- **Nobody defers.** `replay_pending_parent` is a routing-tree device; here a
+  daemon deferring to a parent that has already replayed waits for a second
+  replay that never comes, and strands its subtree. It is also unnecessary: an
+  op a child is missing is still in flight, hence held and replayed by someone
+  in the same pass, in op order.
+- **A forward must be read under the view it was computed in.** Every forward
+  carries `prte_rml_tree_version()` — a monotone count of the departures and
+  returns the sender has learned of. A receiver that is behind it **and** was
+  addressed by a daemon it does not call its parent parks the op
+  (`awaiting_news`): it takes the payload and delivers it locally, which does
+  not depend on the tree, but derives nothing until the notice lands. Without
+  this, a daemon promoted into a dead relay's slot still reads itself as a
+  leaf, retires the op as complete with zero children, and strands everything
+  beneath it. Both conditions are required — the version is a count of events
+  learned rather than an agreed number, and daemons legitimately hold
+  different ones for a while (a grown daemon is seeded from the departed set
+  it was launched with), so the "not my parent" test is what keeps ordinary
+  traffic from ever being parked.
+
+`grpcomm_xcast_delay_ms` / `_vpid` is the instrument: it holds one daemon's
+*forward* on a non-routing tree, so a broadcast that is otherwise over in
+microseconds can have a daemon killed underneath it on purpose. Its two
+siblings (`grpcomm_fence_delay_ms`, `grpcomm_release_delay_ms`) both act after
+the forward has gone and cannot reach this path at all. It ships compiled in,
+for the same reason they do. `contrib/dockerswarm`'s
+"a release tree repairs itself when a relay dies" is the case, and its first
+assertion is a canary on the hold being live — without it every assertion
+below passes vacuously.
+
 ### The forward is shared, and that changes what a send completion means
 
 `tree_whole_forward()` packs the forward **once** and hands the same
@@ -510,18 +681,24 @@ is the hook the elastic DVM-shrink path uses.
 thread-shifts to the static `fence()` handler.
 
 1. **`fence` handler.** Computes the signature, gets-or-creates the
-   tracker, packs signature + info + payload, and **sends it to itself** on
+   tracker, names the operation from the directives, packs signature +
+   operation + info + payload, and **sends it to itself** on
    `PRTE_RML_TAG_FENCE` — funnelling the local contribution through the
-   same receive path everything else uses.
+   same receive path everything else uses.  A barrier packs no payload.
 2. **`fence_recv`.** Checks the epoch, unpacks the signature, finds the
-   tracker, merges info (`PMIX_TIMEOUT` takes the max; a non-success
-   `PMIX_LOCAL_COLLECTIVE_STATUS` is sticky), copies the payload into
-   `coll->bucket`, bumps `nreported`. At `nreported == nexpected`:
+   tracker, merges the operation (see *Two operations* below), merges info
+   (`PMIX_TIMEOUT` takes the max; a non-success `PMIX_LOCAL_COLLECTIVE_STATUS`
+   is sticky), copies the payload into `coll->bucket` **if this is an
+   allgather**, bumps `nreported` either way. At `nreported == nexpected`:
    - **HNP:** broadcast the result via `prte_grpcomm_release_bcast`.
    - **non-HNP:** forward the bucket up to `PRTE_PROC_MY_PARENT`.
 3. **`fence_release`.** Finds the tracker (missing tracker == "I had no
    local participants", not an error) and fires `coll->cbfunc` to hand the
    gathered data back to the PMIx server. Removes and releases the tracker.
+   A barrier is handed a NULL payload rather than an empty one, which is what
+   tells PMIx to skip its store outright. The release message itself does not
+   carry the operation and does not need to: a daemon only reaches this path
+   by holding a tracker, and a tracker knows which collective it is.
 
 **`create_dmns()`'s answer is a pair, and NULL means two different
 things.** A signature naming the daemon job is "every daemon in the DVM",
@@ -560,33 +737,122 @@ gathers the *local* contributions, then deletes it the instant the request
 is handed to the host — deliberately, so a late host answer cannot reach a
 tracker it already released.
 
-**A contribution can outlive the release that ended its fence, and nothing
-here can tell that from the next round.**  A fence signature is only its
-participant list — no round, no sequence number, nothing on the wire that
-distinguishes one fence over a set of procs from the next.  In the normal
-flow that costs nothing, because a daemon converges only when everything it
-expects has arrived, so nothing *can* arrive afterwards.  But
-`abort_fence_op()` ends a fence early — on a `PMIX_TIMEOUT`, and on a
-participant lost to a failed daemon — and a contribution still climbing the
-tree then reaches a daemon whose tracker the release already retired.
-`fence_recv()` builds a new tracker for it, and the next fence over those
-same participants *finds* that tracker, inherits its `nreported` and its
-bucket, and can converge early carrying the previous round's data.
+**A contribution can outlive the release that ended its fence, and a
+generation on the wire is what tells that from the next round.**  A fence
+signature is only its participant list, so nothing about a contribution says
+which round it belongs to.  In the normal flow that costs nothing, because a
+daemon converges only when everything it expects has arrived, so nothing
+*can* arrive afterwards.  But `abort_fence_op()` ends a fence early — on a
+`PMIX_TIMEOUT`, and on a participant lost to a failed daemon — and a
+contribution still climbing the tree then reaches a daemon whose tracker the
+release already retired.  Without a round number `fence_recv()` builds a new
+tracker for it, and the next fence over those same participants *finds* that
+tracker, inherits its `nreported` and its bucket, and converges early
+carrying the previous round's data.
 
-**Do not fix this by copying `completed_group_ops`.**  The group memo works
-because a group is keyed by `groupID` + operation and `group()` drops the
-memo entry when a local client starts one.  A daemon relaying a fence for
-its subtree has no local client and would never drop the entry, so the next
-fence's legitimate contribution would be discarded — a hang, which is worse
-than the wrong answer it was meant to prevent.  On a pure relay a straggler
-and a new round are genuinely the same message, and a fence has no
-originator to stamp a round id: this is the same "every participant must
-reach the same answer independently" problem the withdrawn lateral fence
-ran into.  What would work is a per-signature *release count* — each daemon
-counts releases seen for a signature, stamps contributions with it, drops
-anything stamped lower — which is the recovery epoch's mechanism scoped to a
-signature.  That is a wire change and needs the dockerswarm harness; see
-[`docs/todo.rst`](../../docs/todo.rst).
+**It is a counter, not a memo, and that is why `completed_group_ops` could
+not be copied.**  The group memo works because a group is keyed by `groupID`
++ operation and `group()` drops the entry when a local client starts one.  A
+daemon relaying a fence for its subtree has no local client and would never
+drop it, so the next fence's legitimate contribution would be discarded — a
+hang, worse than the wrong answer it was meant to prevent.  What works is a
+per-signature *release count*: `prte_grpcomm_globals.fence_generations` holds
+one `prte_grpcomm_fence_memo_t` per signature giving the number of the **next**
+fence over it, one past the last released here.
+
+The rules, and each earns its place:
+
+- **The count is driven by releases**, and `prte_grpcomm_fence_gen_record()`
+  **adopts** the released generation rather than incrementing.
+- **Every contribution is stamped** with its tracker's generation, and the
+  **release carries one too** — up *and* down, so a daemon can learn a number
+  it never counted.
+- **`fence_recv()` screens before `get_tracker()`.**  A stamp below what we
+  expect is dropped there, deliberately ahead of building anything: creating
+  a tracker and then discarding the message would leave exactly the wreck the
+  mechanism exists to prevent.
+- **The counter has to bootstrap, and that means round 0 must be a real
+  round.**  A daemon present since the DVM started takes "no entry for this
+  signature" as round 0 and stamps 0.  Without that nothing ever establishes
+  a first round: every contribution is stamped "unknown", nothing is ever
+  recognized as stale, and the mechanism is **inert** — which is exactly what
+  the first version of this did, and it passed every unit test while doing
+  nothing, because the tests drove the counter directly instead of through
+  the path that has to start it.
+
+- **`PRTE_GRPCOMM_FENCE_GEN_UNKNOWN` is for a daemon a grow added, and only
+  for one.**  It has released none of the earlier rounds, so it cannot claim
+  0 — every daemon that has been present is past it and would drop a 0 as
+  ancient, hanging the fence.  It says it does not know instead, which a
+  receiver takes into whatever round is current.  Safe because a joiner has
+  no earlier round over that signature to have straggled from, so its first
+  contribution cannot be one: the window is **one contribution per signature
+  per joiner**, and after its first release it holds a real number.
+
+- **Which of the two a daemon is, it is told rather than derives**
+  (`prte_grpcomm_fence_note_join()`), on the first wireup it receives, and
+  never revised afterwards — a later wireup describes a DVM it is already
+  part of.  What travels is a **flag, not a count**, and that is the whole
+  reason it works: a count would be stale on arrival, because the master goes
+  on answering fences over other signatures while the grow completes and
+  there is no moment at which a number handed over is still true.  A flag is
+  true exactly as long as it is true.  Deriving the count locally is not
+  sufficient on its own either, which is why it is checked on arrival rather
+  than only counted; Slurm's `kvs_seq` carries it in both directions for the
+  same reason.
+- **The memo is bounded** (`PRTE_GRPCOMM_FENCE_MEMO_MAX`).  Eviction is a
+  graceful loss: that signature returns to the pre-generation behaviour, where
+  a straggler and a new round are indistinguishable.  It does not corrupt
+  anything, and an entry only has to outlive its own fence's in-flight
+  messages.
+
+The other half of this was already in place: `0d9dde1c8a` retires the tracker
+*before* delivering, at both sites, because a client may fence again over the
+same participants the moment the callback returns.
+
+**Reproducing the race.**  The window is a timing accident no test can
+arrange from outside, so `grpcomm_fence_delay_ms` (with
+`grpcomm_fence_delay_vpid`) holds one daemon's own contribution back.  Paired
+with a `PMIX_TIMEOUT` on the fence, the controller ends the round without
+that daemon and the held contribution lands afterwards — the straggler.  The
+knob is **compiled in always**, deliberately: a race hook that exists only
+under `PRTE_ENABLE_DEBUG` cannot reproduce a race on the build that shows it.
+`contrib/dockerswarm`'s *"a straggler from an aborted fence is not the next
+round"* case drives it, and it has been watched failing with the drop removed
+— a regression test for a race that has never been red proves nothing.
+
+**A test that asserts a collective *delivered* something must use
+`PMIX_OPTIONAL` on the readback.**  Without it a `PMIx_Get` for a key the
+fence did not carry falls through to a direct modex and fetches it from the
+owning daemon anyway; the value turns up and the assertion proves nothing.
+That cost two full build-and-run cycles of false green here.  (It is also a
+neat demonstration that the on-demand path works: the fence had genuinely
+lost the key and the application never noticed.)
+
+**The early contribution, and why it is not a corner case.**
+`PRTE_RML_TAG_FENCE_RELEASE` is not in `xcast`'s `process_first` set, so a
+daemon forwards a release to its children *before* processing it itself.  A
+child can therefore be released, start the next round, and have its
+contribution reach the parent while the parent is still in the previous one.
+That is what `(signature, generation)` keying is for: the early contribution
+gets a tracker of its own instead of landing in a bucket the release is about
+to discard.
+
+Adopting the higher number onto the live tracker instead — which is what the
+first attempt did — is worse than dropping, because it relabels a tracker
+holding the previous round's data.  The symptom is not wrong data but a
+**hang**: the early contribution is consumed by the wrong round, and the round
+it belonged to then waits for something that has already arrived.  Measured,
+with the generation removed from the key: the second fence completes on 0 of 4
+ranks while the first still succeeds and the DVM survives.
+
+`grpcomm_release_delay_ms` (with `grpcomm_release_delay_vpid`) is what makes
+that reachable — it holds one daemon's own *processing* of a release back
+while the forward to its children goes on time, widening a window that is
+otherwise microseconds.  Drive it at `rml_base_radix 1` so the tree is a chain
+and the delayed daemon is genuinely interior; hanging it off the HNP as a leaf
+tests nothing.  See the *"a contribution for the next round does not join this
+one"* case in `contrib/dockerswarm`.
 
 **A release with no local callback still has data to free.** A daemon
 holding a tracker only because it relayed for its subtree has no `cbfunc`
@@ -611,12 +877,62 @@ ends it with `PMIX_ERR_LOST_CONNECTION`. Note the difference from a group
 construct, which *can* complete on survivors when asked: a fence has no
 equivalent of `PMIX_GROUP_FT_COLLECTIVE`.
 
+### Two operations, one movement
+
+**`PMIX_COLLECT_DATA` names the operation, and nothing else may.** False or
+absent is a **barrier**; true is an **allgather**. `prte_grpcomm_fence_op_from_info()`
+reads it out of the info array PMIx hands to the upcall, `fence()` records it
+on the tracker, and every contribution carries it as a byte of its own ahead
+of the info array — `fence_op_pack()` / `fence_op_unpack()`.
+
+**Do not derive it from the payload.** The bytes vary from daemon to daemon
+while the operation must not: a participant with nothing to publish is fully a
+participant in an allgather, and since PMIx learned to contribute only what
+changed, a zero-byte contribution is the ordinary case for any fence after the
+first rather than a degenerate one. Deriving the operation from the payload
+would have daemons disagree about which collective they are in, and a fence
+has no originator to settle it — the same failure that withdrew the lateral
+movements. The directive is safe precisely because it is a property of the
+*call*: every participant passes the same value, and PMIx has already forced
+the local participants to agree before the upcall (disagreement there becomes
+`PMIX_COLLECT_INVALID` and the fence is refused locally).
+
+**What the operation gates is the payload, in three places** — the
+contribution `fence()` packs, the bucket `tree_gather_answer()` sends up or
+broadcasts, and the unload `fence_release()` performs. It gates *nothing*
+about participation: `nreported`, `reported_slots` and `self_reported` are
+counted, never weighed, so an empty contribution advances the rollup exactly
+as far as a large one. That is the invariant that lets an allgather stay an
+allgather when a participant has nothing to add, and any future exchange
+schedule will depend on it.
+
+**A barrier has no data path at all.** PMIx still builds a blob for one — a
+lone `PMIX_COLLECT_NO` flag byte, compressed and wrapped — but it never leaves
+the node: rolling one of those up from every daemon and broadcasting the
+concatenation back to all of them spends the whole round trip on bytes that
+say only "there is nothing here". The receiving side wants it no more than we
+do, because PMIx skips its store outright when the host returns no data, where
+a present-but-empty payload makes it walk the blobs to find that out.
+
+**A disagreement is reported, not resolved.** `prte_grpcomm_fence_op_merge()`
+adopts on the first answer and requires agreement after that; a mismatch emits
+`help-prte-grpcomm.txt`'s `fence-op-mismatch` and makes `coll->status` sticky
+at `PMIX_ERR_INVALID_ARG` — the status PMIx itself answers for the local form
+of the same user error — which the rollup carries to the controller and the
+release carries back out to every participant. The contribution is still
+counted: convergence is what delivers the failure, so refusing to count it
+would hang instead. **This check is load-bearing rather than belt-and-braces.**
+PMIx compares a collect-flag byte per contribution inside `store_modex` and
+raises `collection-mismatch`, but a barrier no longer puts anything on the wire
+for it to compare, so PRRTE is now the only thing that can see the two answers
+together.
+
 ### One movement: rollup and release
 
 A fence rolls its contributions **up the routing tree** to the controller,
-which broadcasts the gathered result back down. Barrier and modex travel the
-same way; nothing reads `PMIX_COLLECT_DATA` to decide, and no movement id is
-on the wire.
+which broadcasts the gathered result back down. Both operations travel that
+way — the operation decides what rides along, not where it goes — and no
+movement id is on the wire.
 
 The seam that a different movement would use is still visible in the shape of
 the code — `tree_gather_converged()` / `_contribute()` / `_answer()` are
