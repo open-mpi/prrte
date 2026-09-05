@@ -75,11 +75,11 @@ static bool registry_live(void)
  * NOT PMIX_CHECK_NSPACE, which answers "true" the moment either side is
  * empty - wildcard semantics that are right for matching a request and wrong
  * for deciding who is in an assemblage, where an empty nspace would put a
- * proc in every one of them. */
-static bool same_nspace(const pmix_nspace_t a, const pmix_nspace_t b)
-{
-    return (0 == strncmp(a, b, PMIX_MAX_NSLEN));
-}
+ * proc in every one of them.  PMIX_CHECK_NSPACE_STRICT is that question,
+ * and it also declines to call two *unset* namespaces the same one: an
+ * assemblage member with no namespace is malformed input, not a participant
+ * two requests can agree on. */
+#define same_nspace(a, b) PMIX_CHECK_NSPACE_STRICT((a), (b))
 
 /* Does this member entry cover this proc?  An entry naming a wildcard rank
  * stands for every proc of that namespace, which is how a connect between
@@ -96,16 +96,13 @@ static bool member_covers(const pmix_proc_t *member, const pmix_proc_t *proc)
  * order carries no meaning - the PMIx definition says so explicitly - so this
  * compares them as sets.
  *
- * The comparison of a single entry is literal, deliberately: PMIX_CHECK_PROCID
- * would call "nspace/0" and "nspace/WILDCARD" a match, and the two are
- * different participant lists.  PMIx itself will not match a connect
- * expressed one way with a connect expressed the other, so neither may we -
- * a disconnect naming a set we never recorded must fail to find it rather
- * than drop somebody else's. */
-static bool same_proc(const pmix_proc_t *a, const pmix_proc_t *b)
-{
-    return (a->rank == b->rank && same_nspace(a->nspace, b->nspace));
-}
+ * The comparison of a single entry wildcards on neither half, which is what
+ * PMIX_CHECK_PROCID_STRICT is for: PMIX_CHECK_PROCID would call "nspace/0"
+ * and "nspace/WILDCARD" a match, and the two are different participant
+ * lists.  PMIx itself will not match a connect expressed one way with a
+ * connect expressed the other, so neither may we - a disconnect naming a set
+ * we never recorded must fail to find it rather than drop somebody else's. */
+#define same_proc(a, b) PMIX_CHECK_PROCID_STRICT((a), (b))
 
 static bool same_membership(prte_pmix_server_connection_t *cptr,
                             const pmix_proc_t *members, size_t nmembers)

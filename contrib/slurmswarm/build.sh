@@ -89,6 +89,14 @@ VOLUME="${VOLUME:-$PRTE_SLURM_SWARM-build}"
 PMIX_REF="${PMIX_REF:-master}"          # baked-image PMIx branch
 PMIX_REPO="${PMIX_REPO:-https://github.com/openpmix/openpmix.git}"
 PMIX_SRC="${PMIX_SRC:-}"                # optional openpmix checkout to build
+SLURM_VERSION="${SLURM_VERSION:-}"      # override the image's baked SLURM release
+# Extra configure arguments for a PMIX_SRC build.  The reason this exists is
+# --enable-debug: PMIX_SRC is how an uncommitted PMIx change is tested here,
+# and the moment such a change needs debugging, valgrind and gdb have only
+# addresses to work with because the default build carries no symbols.  It is
+# part of the recorded configure arguments, so changing it forces the
+# reconfigure it needs.
+PMIX_CONFIG_ARGS="${PMIX_CONFIG_ARGS:-}"
 
 mode=linux
 distclean=auto                          # auto | always | never
@@ -205,8 +213,16 @@ prep_srcdir() {
 # --- (re)build the base image if needed -------------------------------------
 build_image() {
     if [ "${1:-}" = force ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-        echo ">>> docker build $IMAGE (SLURM from the distribution, baked PMIx $PMIX_REF)"
+        # Empty means "whatever the Dockerfile pins", so that the version
+        # lives in exactly one place.  The expansion has to survive `set -u`
+        # with an empty array on bash 3.2 (macOS), hence the [@]+ guard.
+        local slurm_arg=()
+        if [ -n "$SLURM_VERSION" ]; then
+            slurm_arg=(--build-arg "SLURM_VERSION=$SLURM_VERSION")
+        fi
+        echo ">>> docker build $IMAGE (SLURM ${SLURM_VERSION:-as pinned in the Dockerfile}, baked PMIx $PMIX_REF)"
         docker build -t "$IMAGE" \
+            ${slurm_arg[@]+"${slurm_arg[@]}"} \
             --build-arg PMIX_REPO="$PMIX_REPO" \
             --build-arg PMIX_REF="$PMIX_REF" \
             "$here"
@@ -231,6 +247,7 @@ build_linux() {
     docker run --rm \
         -v "$root":/prrte-src:ro \
         -v "$VOLUME":/opt/prte \
+        -e PMIX_CONFIG_ARGS="$PMIX_CONFIG_ARGS" \
         ${pmix_mount[@]+"${pmix_mount[@]}"} \
         "$IMAGE" bash -euo pipefail -c '
             jobs=$(nproc)
@@ -259,7 +276,7 @@ build_linux() {
                 PMIX_PREFIX=/opt/prte/pmix
                 echo ">>>> PMIx from bind-mounted /pmix-src -> $PMIX_PREFIX"
                 mkdir -p /opt/prte/vpath-linux-pmix && cd /opt/prte/vpath-linux-pmix
-                pmix_args="--prefix=$PMIX_PREFIX"
+                pmix_args="--prefix=$PMIX_PREFIX ${PMIX_CONFIG_ARGS:-}"
                 if reconfigure_needed . "$pmix_args" /pmix-src; then
                     echo ">>>> (re)configuring PMIx: $pmix_args"
                     /pmix-src/configure $pmix_args

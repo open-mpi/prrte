@@ -61,10 +61,7 @@ If no Slurm command can be run, or the version cannot be parsed
    - `srun`
    - `--external-launcher` (unless `early`)
    - `--ntasks-per-node=1` (one `prted` per node)
-   - `--kill-on-bad-exit` — **unless** the job is recoverable/continuous
-     or `prte_elastic_mode`, in which case `--no-kill
-     --kill-on-bad-exit=0` (a node/daemon dying must not tear down an
-     elastic DVM).
+   - `--no-kill --kill-on-bad-exit=0`, always — see the rule below.
    - `--mpi=none` (daemons aren't MPI tasks), `--cpu-bind=none` (don't
      let TaskAffinity pin the prted to one core).
    - any `plm_slurm_args`.
@@ -118,18 +115,18 @@ meaningless (it's srun's, not the failed proc's). The callback:
 - Refuses to proceed against an `ancient` SLURM (`ancient-version`).
 - On non-zero exit → `srun-failed` help + activate
   `DAEMONS_TERMINATED`.
-- On clean exit of the **primary** srun, whether that means the DVM is
-  gone depends on whether the `prted`s daemonized. By default a `prted`
-  forks and detaches (see `src/tools/prted/AGENTS.md`), and its parent —
-  the process srun actually tracks as the task — exits as soon as the
-  real daemon signals it is up, long before the daemon itself does. So a
-  clean exit here is normally just that hand-off, not termination: it is
-  ignored, and real daemon loss is instead caught when the daemon's RML
-  connection to the HNP drops. Only with `--debug-daemons` or
-  `--leave-session-attached` (no forking, `prted` stays attached) does
-  srun genuinely track the daemon's own lifetime, so only then does a
-  clean exit fire `DAEMONS_TERMINATED` (set `num_terminated = num_procs`
-  first to avoid a bogus error message) so `prun`/the HNP can exit.
+- On clean exit of the **primary** srun → `DAEMONS_TERMINATED` (set
+  `num_terminated = num_procs` first to avoid a bogus error message) so
+  `prun`/the HNP can exit. That is sound because **this component never
+  passes `--daemonize`**, so the process srun tracks *is* the daemon: a
+  `prted` forks only when told to, and a `prted` launched by a resource
+  manager must remain the task the RM is watching. See
+  [`src/tools/prted/AGENTS.md`](../../../tools/prted/AGENTS.md) —
+  detaching ends the step, and under `proctrack/cgroup` `slurmstepd` then
+  kills the daemon along with it. Do not "fix" a spurious termination here
+  by teaching this callback to ignore the exit; if srun is exiting while
+  the DVM is alive, the daemon has left its step and *that* is the bug
+  ([#2757](https://github.com/openpmix/prrte/issues/2757)).
 
 `plm_slurm_terminate_prteds` similarly special-cases the "we never
 launched additional daemons" case (`primary_pid_set == false`) by firing
@@ -162,9 +159,23 @@ not srun).
   [`common/slurm`](../../common/slurm/AGENTS.md) parsed out of
   `srun --version`. Change a threshold there, not here — and remember a
   third component reads the same struct.
-- **Elastic mode changes the kill flags.** `--no-kill
-  --kill-on-bad-exit=0` in elastic/recoverable/continuous mode is
-  deliberate — a node loss must not kill the whole srun.
+- **The kill flags are unconditional, and must stay that way.**
+  `--kill-on-bad-exit` tells `srun` to take down the *whole step* when any
+  one task exits non-zero, and `--no-kill` is what stops a single node's
+  failure doing the same — so between them they decide whether losing one
+  daemon costs us one daemon or all of the daemons that `srun` launched.
+  Which daemon losses are survivable is PRRTE's judgement to make: that is
+  what [`errmgr/dvm`](../../errmgr/dvm/AGENTS.md) and the `recoverable` and
+  `continuous` runtime options are for, and the scheduler must not pre-empt
+  it by killing the survivors.
+
+  This has been got wrong once already, and quietly. `8d67814366` made the
+  flags unconditional; `538e4ada35`, whose subject describes only *adding*
+  them for elastic mode, reinstated the `--kill-on-bad-exit` branch for
+  everything else and said nothing about it. It went unnoticed for as long
+  as it did because a `prted` daemonized out of its step, so the flags only
+  ever governed a fork's parent that had already exited. They reach live
+  daemons now.
 - **Environment purge in the child is mandatory** — SLURM forwards the
   full environment; leaving `PMIX_`/`PRTE_` vars in breaks tool
   connections and duplicates command-line settings.
@@ -178,7 +189,10 @@ not srun).
   containers running a real SLURM, where the daemons really do go out over
   `srun --jobid=<the allocation>`. It asserts the three things only a live
   scheduler shows — that the step joins the caller's job rather than
-  queueing a second one, that the srun exit after `prted` daemonizes is
-  read as a hand-off and not a launch failure (and leaves SLURM no dangling
-  step), and that `pterm` does not take the user's allocation down with the
-  DVM.
+  queueing a second one, that the daemons stay *inside* the step srun
+  launched them in (the srun is still running, the step is still
+  registered, and SLURM accounts the `prted`'s pid to it), and that `pterm`
+  does not take the user's allocation down with the DVM. Run it with
+  `PRTE_SLURM_PROCTRACK=cgroup PRTE_SLURM_PRIVILEGED=true` for the process
+  tracking a real cluster does; the unprivileged default lets a detached
+  daemon escape its step and survive, which hides that whole class.
