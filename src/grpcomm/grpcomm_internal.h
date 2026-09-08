@@ -24,6 +24,43 @@
 
 BEGIN_C_DECLS
 
+/* Which tree a broadcast travels.
+ *
+ * There is more than one: the routing tree, at a high radix, which everything
+ * has always used; and the release tree, at a low one, which a collective's
+ * fan-out will use because the two want opposite radices - fanout is free on
+ * the way up a rollup and is the entire cost on the way down a release. See
+ * docs/plans/scalable_collectives/two-radix-release.rst.
+ *
+ * The topology is part of a broadcast's identity, not a routing hint. Two
+ * trees cannot share reliability accounting: a completion count is a
+ * statement about one tree's shape, and acks rolled up tree A say nothing
+ * about coverage of a message that travelled tree B. So each topology gets
+ * its own op-id sequence, its own completion state, and its own idea of who
+ * its parent and children are - and a message names which it belongs to.
+ *
+ * Keep PRTE_GRPCOMM_TOPO_ROUTING at zero: it is the value a zeroed structure
+ * or an unstamped message lands on, and it is the one that has always been
+ * meant. */
+typedef enum {
+    PRTE_GRPCOMM_TOPO_ROUTING = 0,
+    PRTE_GRPCOMM_TOPO_RELEASE,
+    PRTE_GRPCOMM_TOPO_COUNT
+} prte_grpcomm_topology_t;
+
+/* The per-tree reliability state.  One of these per topology: the sequence is
+ * what orders ops within a tree, and two trees ordering against one counter
+ * would have each raising out-of-order on the other's traffic. */
+typedef struct {
+    // ID of the last known completed (in our subtree) operation
+    size_t op_id_completed;
+    // op_id_completed when we were last promoted
+    // (our subtree grew, so we can't assume completion in our new subtree)
+    size_t op_id_completed_at_promotion;
+    // ID of the last known initiated operation
+    size_t op_id_inited;
+} prte_grpcomm_tree_state_t;
+
 /* Tracks ongoing xcast operations to ensure all messages are delivered exactly
  * once to all daemons even in the presence of daemon failures */
 typedef struct {
@@ -33,13 +70,8 @@ typedef struct {
     // FIFO of completion callbacks for master-originated broadcasts awaiting
     // relay back to the master (see grpcomm_xcast.c)
     pmix_list_t pending_completions;
-    // ID of the last known completed (in our subtree) operation
-    size_t op_id_completed;
-    // op_id_completed when we were last promoted
-    // (our subtree grew, so we can't assume completion in our new subtree)
-    size_t op_id_completed_at_promotion;
-    // ID of the last known initiated operation
-    size_t op_id_inited;
+    // reliability state, one set per tree
+    prte_grpcomm_tree_state_t tree[PRTE_GRPCOMM_TOPO_COUNT];
 } prte_grpcomm_xcast_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_grpcomm_xcast_t);
 
@@ -69,6 +101,17 @@ typedef struct {
     // as the first contribution to a brand-new operation and build a tracker
     // that nothing will ever complete or delete.
     pmix_list_t completed_group_ops;
+    // How many fences over each signature this daemon has released - list of
+    // prte_grpcomm_fence_memo_t, capped at PRTE_GRPCOMM_FENCE_MEMO_MAX. This
+    // is what tells a straggler from the next round: a fence signature is
+    // only its participant list, so without a per-round number on the wire a
+    // contribution that outlived the release which ended its fence is
+    // indistinguishable from the first contribution to the next fence over
+    // the same procs. Unlike completed_group_ops this is a counter rather
+    // than a memo of "already done", because a fence has no local client
+    // whose arrival could forget the entry - see the commentary in
+    // grpcomm_fence.c.
+    pmix_list_t fence_generations;
     // The collective recovery epoch for this daemon. A daemon failure
     // invalidates every in-flight rollup, because how many contributions each
     // daemon expects is derived from the routing tree. Recovery is a
@@ -83,9 +126,97 @@ typedef struct {
     // and the clock reads it needs sit directly in the broadcast path.
     // Set with the grpcomm_enable_timing MCA parameter.
     bool enable_timing;
+    // Fault injection: hold this daemon's own fence contribution back by
+    // delay_ms before sending it, on the daemon whose vpid is delay_vpid.
+    //
+    // This exists to make a race reachable that no test can otherwise
+    // provoke: abort_fence_op() ends a fence while contributions are still
+    // climbing the tree, and what arrives afterwards must be recognized as
+    // belonging to a round that is over rather than absorbed into the next
+    // one. Without a way to hold a contribution back, the window is a timing
+    // accident nobody can arrange.
+    //
+    // It ships, and is deliberately not compiled out of an optimized build:
+    // a race hook that only exists under PRTE_ENABLE_DEBUG cannot be used to
+    // reproduce a race on the build that shows it. Off unless asked for -
+    // delay_ms 0 costs one compare per fence.
+    int fence_delay_ms;
+    int fence_delay_vpid;
+    // Fault injection, the other half: hold this daemon's own *processing* of
+    // a fence release back, without holding up the forward to its children.
+    //
+    // That is the shape of the one window the round number has to cover and
+    // grpcomm_fence_delay_ms cannot reach. xcast forwards a release before
+    // processing it, so a child is released while its parent still has the
+    // previous round open; the child's clients start the next round and their
+    // contribution arrives at a parent that has not caught up. Delaying the
+    // parent's processing widens that gap from microseconds to whatever is
+    // asked for, which is what makes it testable at all.
+    //
+    // Ships for the same reason its sibling does.
+    int release_delay_ms;
+    int release_delay_vpid;
+    // Fault injection, the third: hold this daemon's *forward* of a broadcast
+    // back, so the op stays in flight on the tree for as long as is asked
+    // for.
+    //
+    // Its two siblings both act on a release that has already been forwarded,
+    // which is the right shape for the round-number window and the wrong one
+    // for the fault path: repairing a tree only means anything while an op is
+    // still travelling it, and on eight daemons a release is over in
+    // microseconds. Widening that to seconds is what makes it possible to
+    // kill a daemon in the middle of a broadcast on purpose rather than by
+    // luck.
+    //
+    // Deliberately confined to the trees that are NOT the routing tree. The
+    // routing tree carries the daemon command channel - the halt, the wireup,
+    // the launch - and a knob that stalls those does not inject a fault, it
+    // wedges the DVM, which is a different experiment and a worse one.
+    //
+    // Ships for the same reason its siblings do.
+    int xcast_delay_ms;
+    int xcast_delay_vpid;
+    // Did this daemon join a DVM that had already been running collectives?
+    //
+    // It decides what "I have no round number for this signature" means, and
+    // the two readings are opposites. For a daemon present from the start it
+    // means round 0 has not happened yet, so it stamps 0 and the counter
+    // bootstraps. For one added by a grow it means the round is genuinely
+    // unknown - every daemon that has been present is at some k, and a 0 from
+    // this one would be read as ancient and dropped, hanging the fence.
+    //
+    // Told, not derived, because only the master can tell the two apart; and
+    // told as a *flag* rather than as a count, because a count would be stale
+    // by the time it arrived - the master goes on answering fences while the
+    // grow completes. A flag cannot go stale: it stays true exactly as long
+    // as it is true, and stops mattering the moment this daemon sees its
+    // first release for a signature and learns that signature's real number.
+    //
+    // Set from the first wireup this daemon receives and never revised: a
+    // later wireup describes a DVM this daemon is already part of.
+    bool joined_late;
+    bool joined_late_known;
+    // Send a fence's release down the low-radix tree rather than the routing
+    // tree. Off by default: the tree we have is the one we know works, and
+    // there is no measurement yet that says which is better on hardware where
+    // the cost model's constants mean what it assumes.
+    bool low_radix_release;
 } prte_grpcomm_globals_t;
 
 #define PRTE_GRPCOMM_GROUP_MEMO_MAX 64
+#define PRTE_GRPCOMM_FENCE_MEMO_MAX 64
+
+/* "No round number is known here." Distinct from generation 0, which is a
+ * real round: a daemon that has never taken part in a fence over a signature
+ * must be able to say so, because 0 would be read as a round already long
+ * released and its contribution dropped. */
+#define PRTE_GRPCOMM_FENCE_GEN_UNKNOWN UINT32_MAX
+
+/* The step a tree rollup runs at.  A rollup has exactly one - every
+ * participant contributes once and one release ends it - so this is the only
+ * value in use today.  A dissemination exchange numbers its steps from here
+ * and stamps them on the wire; see the tracker identity commentary below. */
+#define PRTE_GRPCOMM_FENCE_STEP_ROLLUP 0
 
 typedef struct {
     pmix_list_item_t super;
@@ -124,8 +255,28 @@ PRTE_EXPORT extern prte_grpcomm_globals_t prte_grpcomm_globals;
  * the result, with nothing to release - and because it is the only way the
  * unit test can see the release a controller would emit without standing up
  * an RML.  Production code sets this once, at startup, and never again. */
+/* Broadcast on a named tree. prte_grpcomm_xcast_nb is this with the routing
+ * tree, which is what almost every caller wants. */
+PRTE_EXPORT
+int prte_grpcomm_xcast_topo(prte_rml_tag_t tag, pmix_data_buffer_t *msg,
+                            prte_grpcomm_topology_t topology,
+                            prte_grpcomm_xcast_complete_fn_t cbfunc,
+                            void *cbdata);
+
+/* The one seam every collective's release goes through - two sites in the
+ * fence, two in the group. Putting the tree choice here rather than at each
+ * of them is what stops the two collectives drifting into different methods
+ * for the same job. */
 typedef int (*prte_grpcomm_release_bcast_fn_t)(prte_rml_tag_t tag, pmix_data_buffer_t *msg);
 PRTE_EXPORT extern prte_grpcomm_release_bcast_fn_t prte_grpcomm_release_bcast;
+/* Which tree a release for this tag travels - the decision alone, so it can
+ * be asserted without a DVM to send over. */
+/* Told by the RML that a lateral link died - see the definition for why a
+ * derived tree needs this and the routing tree does not. */
+PRTE_EXPORT void prte_grpcomm_xcast_lateral_lost(pmix_rank_t rank);
+PRTE_EXPORT prte_grpcomm_topology_t prte_grpcomm_release_topology(prte_rml_tag_t tag);
+PRTE_EXPORT int prte_grpcomm_release_bcast_select(prte_rml_tag_t tag,
+                                                  pmix_data_buffer_t *msg);
 
 
 /* Define collective signatures so we don't need to
@@ -139,6 +290,18 @@ typedef struct {
     size_t sz;
 } prte_grpcomm_fence_signature_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_grpcomm_fence_signature_t);
+
+/* What this daemon remembers about a signature once its fence is over: the
+ * number of the NEXT fence over those participants, which is one past the
+ * last generation released here. It has to outlive the tracker, because the
+ * whole point is to recognize something that arrives after the tracker is
+ * gone. */
+typedef struct {
+    pmix_list_item_t super;
+    prte_grpcomm_fence_signature_t *sig;
+    uint32_t next_generation;
+} prte_grpcomm_fence_memo_t;
+PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_grpcomm_fence_memo_t);
 
 typedef struct {
     pmix_object_t super;
@@ -164,6 +327,27 @@ typedef struct {
 } prte_grpcomm_group_signature_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_grpcomm_group_signature_t);
 
+/* Which of the two operations a fence is running.
+ *
+ * PMIX_COLLECT_DATA names it, and nothing else may: the directive is a
+ * property of the *call*, so every participant passes the same value, while
+ * the payload is a property of what the local procs happened to publish and
+ * differs from daemon to daemon.  Deriving the operation from the bytes would
+ * therefore have daemons disagree about which collective they are in, and a
+ * fence has no originator to settle it - which is the failure class that
+ * withdrew the lateral movements (see docs/plans/scalable_collectives/).
+ *
+ * That distinction stopped being academic when PMIx learned to contribute
+ * only what changed: a participant with nothing new to say contributes zero
+ * bytes to an allgather it is fully a member of.
+ *
+ * UNKNOWN is "no contribution has said yet", not a third operation. */
+typedef enum {
+    PRTE_GRPCOMM_FENCE_OP_UNKNOWN = 0,
+    PRTE_GRPCOMM_FENCE_OP_BARRIER,
+    PRTE_GRPCOMM_FENCE_OP_ALLGATHER
+} prte_grpcomm_fence_op_t;
+
 /* Internal component object for tracking ongoing
  * allgather operations */
 typedef struct {
@@ -171,6 +355,32 @@ typedef struct {
     /* collective's signature */
     prte_grpcomm_fence_signature_t *sig;
     pmix_status_t status;
+    // Which operation this is. Carried on the wire by every contribution
+    // rather than re-derived, so that a participant that disagrees can be
+    // caught saying so instead of quietly running the other collective.
+    prte_grpcomm_fence_op_t op;
+    // ---- the tracker's identity ----
+    //
+    // A tracker is identified by its signature AND its generation, not by the
+    // signature alone. Two rounds over the same participants can legitimately
+    // be live on one daemon at the same time: xcast forwards a release to a
+    // daemon's children before that daemon processes it, so a child can be
+    // released, start the next round, and have its contribution arrive while
+    // its parent is still in the previous one. Keyed by signature alone that
+    // contribution joins the wrong collective; keyed by both it gets a
+    // tracker of its own and each round accumulates separately.
+    //
+    // `step` is the third level, and is 0 everywhere today. A tree rollup has
+    // no steps - one contribution per participant, one release - so the pair
+    // is enough for it. A dissemination exchange (Bruck, recursive doubling,
+    // a ring) has log2(N) or N-1 *steps within one collective*, each carrying
+    // a different block, and a message from step i is not interchangeable
+    // with one from step j even at the same generation. Whoever adds such a
+    // movement stamps the step on the wire beside the generation and keys its
+    // trackers on all three; nothing else here has to change to accommodate
+    // it, which is the reason the field is here rather than added later.
+    uint32_t generation;
+    uint32_t step;
     /* collection bucket */
     pmix_data_buffer_t bucket;
     /* participating daemons */
@@ -337,7 +547,59 @@ void prte_grpcomm_fence_fault_handler(const prte_rml_recovery_status_t* status);
  * list - if that cannot be done. Exported so the unit test can drive it. */
 PRTE_EXPORT
 prte_grpcomm_fence_t *prte_grpcomm_fence_get_tracker(prte_grpcomm_fence_signature_t *sig,
+                                                            uint32_t generation,
+                                                            uint32_t step,
                                                             bool create);
+
+/* Which operation this fence's directives ask for.  Only PMIX_COLLECT_DATA is
+ * consulted: true is an allgather, false is a barrier, and so is its absence -
+ * a caller that said nothing asked for synchronization and nothing else.
+ * Never answers UNKNOWN.  Exported so the unit test can drive it. */
+PRTE_EXPORT
+prte_grpcomm_fence_op_t prte_grpcomm_fence_op_from_info(const pmix_info_t info[],
+                                                        size_t ninfo);
+
+/* Fold an arriving contribution's operation into the tracker's, adopting it if
+ * the tracker has not heard one yet.  Returns false if the two disagree, which
+ * means the participants asked for different collectives - a user error the
+ * fence cannot resolve, and one that has to be caught here because it is
+ * otherwise invisible: a barrier now puts nothing on the wire for PMIx's own
+ * per-blob collect-flag check to compare.  Exported so the unit test can drive
+ * it; the caller is what reports the disagreement. */
+PRTE_EXPORT
+bool prte_grpcomm_fence_op_merge(prte_grpcomm_fence_t *coll,
+                                 prte_grpcomm_fence_op_t incoming);
+
+/* The number of the next fence over this signature - one past the last
+ * generation released here - or PRTE_GRPCOMM_FENCE_GEN_UNKNOWN if this daemon
+ * has never released one. Exported so the unit test can drive it. */
+PRTE_EXPORT
+uint32_t prte_grpcomm_fence_gen_next(prte_grpcomm_fence_signature_t *sig);
+
+/* What this daemon stamps on a contribution for a signature it has no entry
+ * for: round 0 if it has been here since the start, UNKNOWN if it joined a
+ * DVM that was already running collectives. Exported so the unit test can
+ * drive both readings. */
+PRTE_EXPORT
+uint32_t prte_grpcomm_fence_gen_baseline(void);
+
+/* Record whether this daemon joined an already-running DVM. Called once, from
+ * the first wireup; later calls are ignored. Exported for the unit test. */
+PRTE_EXPORT
+void prte_grpcomm_fence_note_join(bool late);
+
+/* Record that generation `gen` over this signature has been released here, so
+ * the next one is gen+1. Adopts rather than increments, which is what puts a
+ * daemon that joined the DVM late - and so counted none of the earlier rounds
+ * - in step with everyone else after its first fence. Exported for the test. */
+PRTE_EXPORT
+void prte_grpcomm_fence_gen_record(prte_grpcomm_fence_signature_t *sig, uint32_t gen);
+
+/* Is a contribution stamped `gen` one this daemon has already released?  Only
+ * a stamp strictly below what we are expecting is stale; UNKNOWN never is,
+ * because it carries no claim about a round at all.  Exported for the test. */
+PRTE_EXPORT
+bool prte_grpcomm_fence_gen_is_stale(prte_grpcomm_fence_signature_t *sig, uint32_t gen);
 
 /* group functions */
 PRTE_EXPORT extern

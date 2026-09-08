@@ -635,6 +635,17 @@ prte_node_t* prte_node_match(pmix_list_t *nodes, const char *name)
     return NULL;
 }
 
+/* Does not ask prte_check_host_is_local() about either name, though
+ * prte_quickmatch() and prte_node_match() below both do, and this used to as
+ * well. Every caller has already resolved local names before it gets here:
+ * hostfile_parse_line() and the dash-host parser rewrite any name answering
+ * to this host into prte_process_info.nodename as they read it, and
+ * prte_ras_base_node_insert() folds a locally-named node into the HNP's pool
+ * entry in a branch that never reaches the dedup loop calling this. So the
+ * check would find nothing - at the price of putting pmix_ifislocal(), which
+ * resolves addresses and appends to a process-global alias list, inside a
+ * loop that runs once per pool entry for every node inserted. Do not put it
+ * back; fix the caller that failed to normalize instead. */
 bool prte_nptr_match(prte_node_t *n1, prte_node_t *n2)
 {
     size_t i, m;
@@ -644,19 +655,32 @@ bool prte_nptr_match(prte_node_t *n1, prte_node_t *n2)
         return true;
     }
 
+    /* each side's alias list has to be checked against the other's name
+     * independently of whether the far side has aliases at all. A node
+     * parsed out of a hostfile or a dash-host spec carries no aliases of
+     * its own, while the allocation's node has the name the user gave
+     * demoted to an alias the moment its daemon reports the hostname it
+     * found for itself - so nesting either test inside the other means a
+     * node named by an address, and reported by name, stops matching. */
     if (NULL != n1->aliases) {
         for (i = 0; NULL != n1->aliases[i]; i++) {
             if (0 == strcmp(n1->aliases[i], n2->name)) {
                 return true;
             }
-            if (NULL != n2->aliases) {
-                for (m = 0; NULL != n2->aliases[m]; m++) {
-                    if (0 == strcmp(n2->aliases[m], n1->name)) {
-                        return true;
-                    }
-                    if (0 == strcmp(n1->aliases[i], n2->aliases[m])) {
-                        return true;
-                    }
+        }
+    }
+    if (NULL != n2->aliases) {
+        for (m = 0; NULL != n2->aliases[m]; m++) {
+            if (0 == strcmp(n2->aliases[m], n1->name)) {
+                return true;
+            }
+        }
+    }
+    if (NULL != n1->aliases && NULL != n2->aliases) {
+        for (i = 0; NULL != n1->aliases[i]; i++) {
+            for (m = 0; NULL != n2->aliases[m]; m++) {
+                if (0 == strcmp(n1->aliases[i], n2->aliases[m])) {
+                    return true;
                 }
             }
         }
@@ -893,6 +917,28 @@ static void prte_job_destruct(prte_job_t *job)
     if (NULL != job->traces) {
         PMIx_Argv_free(job->traces);
     }
+    /* A session's job array holds BORROWED pointers - see prte_session_t -
+     * so a job that dies while still listed there leaves the session holding
+     * a dangling one, and every later walk of that array reads freed memory.
+     * The job pool above is kept honest the same way, by the object removing
+     * itself as it goes; do the same here rather than relying on whichever
+     * state-machine path happened to run first.  check_complete_resume()
+     * normally drops the entry, but it has exits that return before reaching
+     * that point, and a job can be released without completing at all.
+     *
+     * Matched by identity, not by namespace: PMIX_CHECK_NSPACE treats an
+     * empty namespace as a wildcard, and this array legitimately holds
+     * not-yet-named jobs - plm_base_receive adds a spawn request to it before
+     * prte_plm_base_setup_job mints the namespace - so a namespace compare
+     * here can match, and clear, somebody else's entry. */
+    if (NULL != job->session && NULL != job->session->jobs) {
+        for (n = 0; n < job->session->jobs->size; n++) {
+            if (job == (prte_job_t *) pmix_pointer_array_get_item(job->session->jobs, n)) {
+                pmix_pointer_array_set_item(job->session->jobs, n, NULL);
+            }
+        }
+    }
+
     /* Both the primary session and every target carry a counted reference -
      * see prte_job_t::session.  Dropping them here is what finally reclaims a
      * reservation that was torn down while this job was still running in it:
@@ -934,7 +980,6 @@ static void prte_node_construct(prte_node_t *node)
     node->procs = PMIX_NEW(pmix_pointer_array_t);
     pmix_pointer_array_init(node->procs, PRTE_GLOBAL_ARRAY_BLOCK_SIZE, PRTE_GLOBAL_ARRAY_MAX_SIZE,
                             PRTE_GLOBAL_ARRAY_BLOCK_SIZE);
-    node->next_node_rank = 0;
 
     node->state = PRTE_NODE_STATE_UNKNOWN;
     node->slots = 0;

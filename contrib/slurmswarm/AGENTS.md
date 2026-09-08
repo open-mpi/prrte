@@ -351,6 +351,41 @@ as "the grow did not happen", several cases further on. `slurm-alloc free
 --all` cancels *every* job in the queue, deliberately: this is a dedicated
 single-purpose cluster and there is nothing in it that is not the harness.
 
+### Never scancel an allocation the DVM is still using
+
+Between elastic groups the harness gives the scheduler back everything except
+the DVM's own allocation. It must do that **through the DVM**, not with
+`scancel`, and `drop_extra_jobs` is where that is enforced.
+
+Those extra jobs are not all leftovers. Some are expander allocations the
+*running* DVM has absorbed, whose daemons live inside those jobs' SLURM steps.
+Cancelling one behind PRRTE's back kills daemons it still believes in, and the
+HNP does the right thing with that — reports a communication failure on a
+daemon nobody released and takes a non-recoverable DVM down. Every group after
+that point is then testing a DVM that no longer exists. That is exactly what
+happened: four failures, all of them one death and its cascade, and the tell
+was in `slurmctld.log` rather than PRRTE's — `REQUEST_KILL_JOB`s for jobs PRRTE
+never logged killing, immediately followed by comm failures on those jobs'
+nodes.
+
+**Wait for the release to complete.** A release is asynchronous, and a
+`scancel` issued while one is in flight beats PRRTE to its own daemons and
+causes precisely the failure being avoided — the first attempt at this fix did
+exactly that. A completed release cancels the SLURM job with it, so nothing is
+left to cancel; the `scancel` survives only as the fallback for a job the DVM
+does not hold, such as a pending expander it never absorbed.
+
+Like almost everything else in this file, this was survivable for as long as a
+`prted` daemonized out of its step and so sat beyond `scancel`'s reach. It is
+not survivable now that a daemon stays inside the allocation it was launched
+in, and `elastic_external_cancel_group` is the case that states what the DVM
+owes a user whose allocation is revoked: notice it, say so, orphan nothing, and
+leave the user's own allocation alone. That case deliberately does **not**
+assert whether the DVM survives — it currently ends, which is defensible for a
+non-recoverable DVM, but an elastic DVM shrinking instead would be equally
+defensible, and freezing an answer to an open question in a test is the mistake
+this whole area started from.
+
 Two things about cgroups being off (§9): SLURM's process tracking is
 best-effort here, so a stray application process is SLURM's to lose — the
 per-node `pkill` sweep is what actually guarantees a clean slate — and
@@ -417,7 +452,53 @@ not ordinary cluster configuration:
 - **`ProctrackType=proctrack/linuxproc`, `TaskPlugin=task/none`.** The cgroup
   plugins want a cgroup hierarchy to own. `linuxproc` tracks a step by walking
   `/proc` parentage, which needs nothing a container lacks. See §7 for the
-  consequence.
+  cleanup consequence and §9a for the much larger one.
+
+### 9a. Process tracking, and why the default hides bugs
+
+`ProctrackType` is not a tuning knob here. It decides which PRRTE behaviors
+this harness is *able* to observe, so a run's coverage depends on it and
+preflight prints which mode is in force.
+
+Under **`proctrack/linuxproc`** a step is the set of processes reachable by
+walking `/proc` parentage from the task `slurmd` started. A task that forks,
+calls `setsid()` and lets its parent exit is reparented to PID 1 and is no
+longer reachable from anything the step knows about: it escapes, and outlives
+the step. That is the mode a container gets for free, and it is the default.
+
+Under **`proctrack/cgroup`** — what every production cluster runs — the same
+process cannot escape. `setsid()` leaves a process tree; it does not leave a
+cgroup. When the last task of a step exits, `slurmstepd` signals the step's
+cgroup, and anything still in it dies.
+
+A `prted` is exactly a process that forks and detaches. So the difference
+between the two modes is the difference between "the daemon survives its
+`srun` and the DVM works" and "the daemon is killed the instant `srun`
+returns and every node goes down right after reporting in" — and the harness
+running only the first of those is why
+[issue #2757](https://github.com/openpmix/prrte/issues/2757) was found on a
+user's cluster rather than here.
+
+To run the real-cluster mode, both variables are required — the mode, and the
+privilege the writable cgroup hierarchy needs:
+
+```sh
+export PRTE_SLURM_PROCTRACK=cgroup PRTE_SLURM_PRIVILEGED=true
+docker compose up -d --force-recreate
+./run-tests.sh
+```
+
+The entrypoint rewrites `ProctrackType`/`TaskPlugin` and replaces
+`CgroupPlugin=disabled` with `autodetect` + `IgnoreSystemd=yes` before
+`slurmd` starts, and **refuses to start** if the mode was asked for without
+the privilege — the alternative being a `slurmd` that dies with a message
+about D-Bus that names neither. Going back is the same two variables unset
+plus another `--force-recreate`.
+
+The default stays `linuxproc` and unprivileged: it is what a developer's
+machine can do without being asked for anything, and it covers everything in
+this suite that is not about a process outliving its step. It just must not
+be mistaken for the cluster.
 - **`InactiveLimit=0`.** Load-bearing. The harness holds its allocations with
   `salloc --no-shell`-style background jobs and runs steps into them minutes
   later; a non-zero `InactiveLimit` kills an allocation with no active step,

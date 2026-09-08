@@ -1315,6 +1315,25 @@ when the movements were written are true now:
   ``MCA_BTL_FLAGS_SINGLE_ADD_PROCS``, and remote procs materialise on first
   use.  Exactly one non-optional reserved key names an off-node proc, and
   PMIx derives it and its neighbours from the node and proc maps.
+* **The direct-modex path has now been seen repairing an incomplete fence,
+  accidentally and under controlled conditions.**  While building the fence
+  straggler regression test (2026-08-31), a deliberately broken second fence
+  failed to deliver one daemon's contribution to the other three.  With an
+  ordinary ``PMIx_Get`` every rank read every peer's key back and reported a
+  complete modex; with ``PMIX_OPTIONAL`` on the same Get, in the same build
+  and the same workload, three of four ranks reported the key missing.  The
+  fence had genuinely lost it, and the on-demand resolution fetched it
+  correctly without the application noticing.
+
+  That is a narrow demonstration - four ranks, one key, the owning daemon
+  alive and its data committed - and it says nothing about cost.  But it is
+  direct evidence for the thing Level 2 depends on: that a fence which does
+  not deliver everything is *recoverable* rather than fatal, which is exactly
+  the failure class ``answer_from_job()`` closed.  It also means any test
+  asserting that a collective delivered something must use ``PMIX_OPTIONAL``,
+  or it is testing the runtime's ability to find the data by any means rather
+  than the collective's.
+
 * The crossover has been measured, and it favours on-demand once the per-rank
   contribution is kilobytes rather than tens of bytes — and the win grows with
   ``N``, because collecting is ``O(N)`` a daemon while resolving is
@@ -1847,12 +1866,23 @@ What to do, and in what order
 Revised after the sweep, which moved two items and deleted one.
 
 #. **Make the commit a true delta, and give shmem3 delta segments with
-   search-back.**  One piece of work in openpmix, against openpmix#4087: the
-   delta commit is the trigger condition the ``shmem3`` comment already names
-   for needing search-back, and it is what flattens the transfer as well as
-   the storage.  It turns a run of repeated modex fences from ``O(K^2)`` into
-   ``O(K)`` — 2.1x at eight fences, 3.5x at twenty.  It does **not** reduce
-   the cost of a single collecting fence; see the caveat above.
+   search-back.**  **DONE**, and in openpmix rather than here, as this entry
+   predicted: ``c784d9b81`` contributes only what changed to a collecting
+   fence, ``bd52187a9`` screens the contribution's flag byte and names the
+   delta marker, and the shmem3 generation chain followed (``7790e0f08``,
+   ``c3c56a394``).  Key deletion arrived with it (``21bdfcdb1``,
+   ``0062e188c``), and the design is written up on that side (``111fac636``,
+   openpmix#4162).
+
+   It turns a run of repeated modex fences from ``O(K^2)`` into ``O(K)``
+   — 2.1x at eight fences, 3.5x at twenty.  It does **not** reduce the cost
+   of a single collecting fence; see the caveat above.
+
+   One consequence lands back on this side, and it is why the item below is
+   worded the way it is: **a zero-byte contribution to an allgather is now
+   ordinary**.  A participant with nothing new to say contributes nothing at
+   all, so any rule that read the operation off the payload would now misread
+   the common case rather than a corner one.
 #. **Make the first fence cheaper**, which is a separate lever and reaches the
    case a single-collective job actually pays.  ``shmem3`` builds its
    in-segment hash at ~35 ns a byte against ``hash``'s ~14 for the same data;
@@ -1863,15 +1893,38 @@ Revised after the sweep, which moved two items and deleted one.
    is a one-parameter change that cuts the fence cost 4.3x at 32 daemons.  It
    is not free — it gives up the cheap post-fence ``PMIx_Get`` that ``shmem3``
    is buying — so it is a knob to characterise, not a default to change.
-#. **Decide the COLLECT_DATA-as-commit-barrier question.**  The only item
-   that attacks the dominant term for jobs below roughly a thousand ranks, and
-   the only one with an order-of-magnitude story rather than a constant-factor
-   one.  It is a policy call, not a measurement.
+#. **Decide the COLLECT_DATA-as-commit-barrier question.**  **DECIDED, and in
+   the negative** — see "The directive names the operation" below.
+   ``COLLECT_DATA`` means collect: a fence that asked for the data delivers
+   it, and the certification reading is not taken.  What the decision produced
+   instead is that the two operations are now told apart in the code, which is
+   the enabling step for the two-radix release and for any exchange schedule
+   that comes later.
 #. **Land the fence sequence number standalone**, on tree-only code, and
-   settle its elastic-join rule (see below).  The retire-before-deliver half
-   is already merged as ``0d9dde1c8a``.  Cheap, reviewable in isolation, and it
-   takes the defect that killed the movements off the critical path of
-   anything that comes later.
+   settle its elastic-join rule (see below).  **DONE.**  Each daemon now keeps,
+   per signature, the number of the next fence over it — one past the last
+   generation released here — stamps every contribution with it, and drops a
+   contribution stamped below what it expects.  The screen runs *before*
+   ``get_tracker()``: building a tracker for a straggler and then discarding
+   the message would leave exactly the wreck the mechanism exists to prevent.
+   The retire-before-deliver half was already merged as ``0d9dde1c8a``.
+
+   **The elastic-join rule is settled, and deriving the count locally is not
+   enough.**  A daemon added by a grow has released none of the earlier rounds;
+   if it stamped 0, every daemon that had been present would drop its
+   contribution as ancient and the fence would hang — the very failure the
+   number exists to prevent.  So a daemon with no entry stamps a distinct
+   ``UNKNOWN`` rather than 0, which is silence rather than a claim about a
+   round and is accepted into whatever round is current; and the release
+   carries the generation it ends, which the recipient **adopts** rather than
+   increments.  That is what puts a joiner in step after its first fence
+   instead of leaving it permanently one behind, and it is why the number is
+   carried in both directions and checked on arrival — the robustness this
+   document already noted in Slurm's ``kvs_seq``.
+
+   The memo is bounded.  Evicting an entry is a graceful loss: that signature
+   returns to the pre-generation behaviour, where a straggler and a new round
+   are indistinguishable.
 #. **Hold the radix and the pipelined release.**  Both target the byte term,
    which does not dominate until ~140 KB of total modex, and the radix half is
    now measured as neutral-to-harmful.  Chunking ``xcast`` is still right for
@@ -1882,6 +1935,71 @@ Revised after the sweep, which moved two items and deleted one.
    ``alpha`` and ``beta`` constants that a single-host container swarm cannot
    supply — now demonstrated rather than asserted — and 2847 lines have
    already been spent on that bet once.
+
+The directive names the operation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``COLLECT_DATA`` question above was settled in 2026-08 and settled
+plainly: **the directive names the operation, and nothing else may.**
+``PMIX_COLLECT_DATA`` false or absent is a **barrier**; true is an
+**allgather**, and it stays an allgather even when some participants
+contribute zero bytes.
+
+That closes the certification reading this document put on the table.  A fence
+that asked for the data delivers the data; PRRTE does not reinterpret the
+directive into a commit barrier and leave ``PMIx_Get`` to fetch on demand.
+The lazy-delivery idea is not refuted by anything measured — it remains the
+only lever with an order-of-magnitude story — but it changes what a
+long-standing interface promises, and that is not a trade to make silently in
+the runtime underneath it.
+
+**Why the payload can never be the discriminator**, which is the part worth
+carrying forward.  The operation must be the same at every participant or the
+collective cannot converge: a fence has no originator, so every daemon has to
+reach the same answer independently, and a daemon that decided "barrier" while
+its peer decided "allgather" is the hang that withdrew the lateral movements.
+``PMIX_COLLECT_DATA`` is safe because it is a property of the *call* — every
+participant passes the same value, and PMIx has already forced the local
+participants of each daemon to agree before the upcall, refusing the fence
+locally with ``PMIX_COLLECT_INVALID`` if they do not.  The payload is a
+property of what the local procs happened to publish, and varies by daemon.
+Since the delta commit landed it varies all the way to nothing, so the naive
+rule would not merely be fragile, it would misfire on the second fence of
+every ordinary job.
+
+**What it bought immediately.**  A barrier now has no data path at all.  PMIx
+builds a blob for one — a lone ``PMIX_COLLECT_NO`` flag byte, compressed and
+wrapped — and PRRTE used to roll one of those up the tree from every daemon
+and broadcast the concatenation of all of them back down to everybody.  At ten
+thousand daemons that is ten thousand little blobs gathered and re-broadcast
+to say, collectively, nothing.  They are now dropped where they are built and
+nothing crosses the wire; PMIx in turn skips its store outright, which a
+present-but-empty payload does not let it do.
+
+**And it re-opens the two-radix release as a buildable thing.**  The 16x that
+"Separating the barrier from the modex" costed out needs the rollup and the
+release to run at different radices, and the release to be selected per
+operation.  Nothing could select per operation while the code could not tell
+the operations apart.  Now it can, on the tracker, from the first contribution
+onward.
+
+**One check became load-bearing in the process.**  PMIx compares a
+collect-flag byte per contribution inside ``store_modex`` and raises
+``collection-mismatch`` when servers disagree.  A barrier no longer puts
+anything on the wire for that comparison to see, so PRRTE has to catch the
+disagreement itself — it does, at the rollup, with a ``show_help`` and a
+sticky ``PMIX_ERR_INVALID_ARG`` that the release carries back to every
+participant.  Note that this is a *better* place to catch it than PMIx's: the
+rollup sees the disagreement while the fence is still in flight, rather than
+after a bucket has been assembled from contributions that meant different
+things.
+
+**Deliberately not done: a separate barrier entry point.**  It was considered.
+The two operations share the signature, the tracker, the rollup, the recovery
+restart, the epoch stamping, the timeout guard and the fault handler; the only
+difference is whether a payload rides along, which is three gates.  Splitting
+would fork several hundred lines of subtle recovery machinery to avoid them,
+and that machinery is exactly the part where a second copy would rot.
 
 Verification
 ------------
