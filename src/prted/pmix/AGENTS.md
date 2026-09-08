@@ -585,6 +585,20 @@ are load bearing:
   daemon, and `pmix_server_dmdx_recv()` arms the timer. That is why the
   attribute table registers `PMIX_TIMEOUT` under `PMIx_Get`.
 
+**The adds are answerable at the conversions, not one by one.**
+`register_nspace()` makes sixty-eight `PMIX_INFO_LIST_ADD` calls and tests
+three of them, and that is deliberate. An info list carries the first
+failure any add onto it hit, and `PMIX_INFO_LIST_CONVERT` reports it — so
+the four conversions in this function are where all sixty-eight are
+checked, and they are all checked. Adding a per-add test buys nothing;
+**leaving a conversion untested loses an entire array**, because the
+converter initializes the caller's `pmix_data_array_t` before anything can
+fail, so what an unchecked failure puts in the payload is an empty
+`PMIX_NODE_INFO_ARRAY` / `PMIX_APP_INFO_ARRAY` / `PMIX_PROC_INFO_ARRAY`
+under a registration that reports success. The three sub-list
+`PMIX_INFO_LIST_START` handles are screened for the same reason: a NULL one
+makes every add onto it fail, and the conversion is what says so.
+
 **`register_nspace()` is not called once per job.** The wildcard arm of
 `dmodex_req()` calls it again whenever a client asks a daemon that hosts none
 of the job's procs for job-level data the local server does not hold — once
@@ -981,6 +995,33 @@ Two things follow from that record, and they are the rest of the definition:
   the `connected-term` help topic. `pmix_terminate_connected=0` turns it off.
   The assemblage is marked `terminating` as it goes, so the failures its own
   teardown produces do not drive it again.
+
+  **That termination is transitive, and has to be.** Killing a job because a
+  job it was connected to failed is itself the loss of that job, so whatever
+  *it* was connected to has lost a member too. The case is ordinary rather
+  than exotic, because a spawn connects the child to the parent **process**: a
+  parent that spawns two children sits in `{parent, A}` and `{parent, B}`, and
+  neither assemblage names the other. Sweeping only the assemblages that name
+  A takes the parent down and stops — leaving B running with nothing left to
+  talk to, and the DVM waiting forever on a job that will never end. The
+  symptom is not an untidy exit but a **hang**: `prterun` does not return
+  while a job it launched is alive, which is how an `MPI_Comm_spawn` test
+  whose child aborts wedges an entire CI run instead of merely failing it.
+  So the sweep runs to a fixed point over the `condemned` set, each pass
+  seeing the jobs the pass before it condemned; `terminating` is what bounds
+  it, since an assemblage is marked as it is swept and never revisited.
+
+  The closure extends **only through jobs the sweep is itself taking down**.
+  A member that is already gone, or already flagged `PRTE_JOB_FLAG_ABORTED`,
+  is skipped and deliberately not added to `condemned`: a job that ended on
+  its own terms notified its assemblages when it went and killed nobody, and
+  reading it as a failure now would reach through a job that is no longer
+  there to take down peers that survived it.
+
+  `connector --siblings` in [`contrib/dockerswarm`](../../../contrib/dockerswarm/)
+  is the multi-node case, and `test_connection_fate_sharing()` in
+  [`test/unit/prted/`](../../../test/unit/prted/) the offline one; both fail
+  against a one-step sweep.
 
 **Dissolving is more generous than recording, deliberately.** Recording
 compares memberships exactly; a disconnect dissolves any assemblage all of
