@@ -262,6 +262,11 @@ static void init_complete(int sd, short args, void *cbdata)
     PMIX_RELEASE(caddy);
 }
 
+/* Whether any DVM-ready broadcast has gone out yet.  The first one describes
+ * a DVM starting up; every later one follows a grow, and the daemons reading
+ * it for the first time are the ones the grow added. */
+static bool first_vm_ready = true;
+
 static void vm_ready(int fd, short args, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
@@ -271,6 +276,7 @@ static void vm_ready(int fd, short args, void *cbdata)
     prte_proc_t *dmn;
     int32_t v;
     uint32_t epoch;
+    bool grown;
     pmix_value_t *val, *sval;
     pmix_status_t ret;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
@@ -332,6 +338,39 @@ static void vm_ready(int fd, short args, void *cbdata)
              * notice still in flight will also reach the new daemon, which is
              * routable by now, and the epoch is adopted by highest value seen
              * so the two orders agree. */
+            /* ...and whether the daemons reading this for the FIRST time
+             * joined a DVM that was already running collectives.
+             *
+             * A fence's round number is per-signature and is bootstrapped
+             * locally: a daemon with no record for a signature takes it as
+             * round 0.  That is right for a daemon present from the start and
+             * wrong for one a grow added, which would stamp 0 while every
+             * other participant is at some k and have its contribution
+             * dropped as ancient - hanging the fence.
+             *
+             * What travels is a flag rather than a count, and deliberately: a
+             * count would be stale on arrival, because this master goes on
+             * answering fences over other signatures while the grow completes,
+             * and there is no moment at which a number handed over here is
+             * still true.  The flag is always true when it is true.  It says
+             * only "you do not know your round numbers, so ask rather than
+             * assume", and a joiner stops needing it the moment it sees its
+             * first release for a signature.
+             *
+             * Broadcast to everyone, like the epoch, and harmless there: the
+             * receiver keeps the first answer it is given, so a daemon that
+             * has been through a wireup already is unaffected by this one. */
+            grown = !first_vm_ready;
+            first_vm_ready = false;
+            rc = PMIx_Data_pack(NULL, &buf, &grown, 1, PMIX_BOOL);
+            if (PMIX_SUCCESS != rc) {
+                PMIX_ERROR_LOG(rc);
+                PMIX_DATA_BUFFER_DESTRUCT(&buf);
+                PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
+                PMIX_RELEASE(caddy);
+                return;
+            }
+
             epoch = prte_grpcomm_current_epoch();
             rc = PMIx_Data_pack(NULL, &buf, &epoch, 1, PMIX_UINT32);
             if (PMIX_SUCCESS != rc) {
@@ -902,12 +941,19 @@ release:
      */
     session = jdata->session;
     if(NULL != session){
+        /* Drop this job from the session's list.  By identity, NOT by
+         * namespace: PMIX_CHECK_NSPACE answers "true" the moment either side
+         * is empty, and this array legitimately holds jobs that have no
+         * namespace yet - plm_base_receive puts a spawn request into it at
+         * "moveon", while prte_plm_base_setup_job does not mint the namespace
+         * until the job reaches JOB_STATE_INIT an event later.  A completing
+         * job whose walk reached such an entry first therefore cleared
+         * somebody else's slot and broke, unregistering a live job and
+         * leaving its own entry behind to dangle once it was freed. */
         for(i = 0; i < session->jobs->size; i++){
-            if(NULL != (jptr = pmix_pointer_array_get_item(session->jobs, i))){
-                if(PMIX_CHECK_NSPACE(jdata->nspace, jptr->nspace)){
-                    pmix_pointer_array_set_item(session->jobs, i, NULL);
-                    break;
-                }
+            if(jdata == (prte_job_t *) pmix_pointer_array_get_item(session->jobs, i)){
+                pmix_pointer_array_set_item(session->jobs, i, NULL);
+                break;
             }
         }
         /* Tell the session-control layer the job is gone. It records the
@@ -953,7 +999,6 @@ release:
                     !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
                     node->slots_inuse--;
                     node->num_procs--;
-                    node->next_node_rank--;
                 }
                 /* release the resources held by the proc - only the first
                  * cpu in the proc's cpuset was used to mark usage.  The
@@ -1110,21 +1155,6 @@ static void cleanup_job(int sd, short args, void *cbdata)
 }
 
 #ifdef PMIX_SPAWN_TREE_ROOT
-/* Do these two namespaces name the same thing?
- *
- * NOT PMIX_CHECK_NSPACE, which answers "true" the moment either side is
- * empty - wildcard semantics that are right for a match against a request
- * and wrong here.  Most jobs in a DVM carry an empty launcher, and reading
- * every one of them as a member of whatever tree we are asking about would
- * put a stranger's job in a tool's wait set. */
-static bool same_nspace(const char *a, const char *b)
-{
-    if (PMIX_NSPACE_INVALID(a) || PMIX_NSPACE_INVALID(b)) {
-        return false;
-    }
-    return (0 == strncmp(a, b, PMIX_MAX_NSLEN));
-}
-
 /* The root of the spawn tree JDATA belongs to.  prte_job_t::launcher already
  * holds it, recorded when the job was created and copied transitively from
  * the parent, so a grandchild names the same root as its parent does.  It is
@@ -1168,8 +1198,14 @@ static uint32_t spawn_tree_active(prte_job_t *jdata, const char *root)
             PRTE_FLAG_TEST(jptr, PRTE_JOB_FLAG_TOOL)) {
             continue;
         }
-        if (!same_nspace(jptr->launcher, root) &&
-            !same_nspace(jptr->nspace, root)) {
+        /* PMIX_CHECK_NSPACE_STRICT, not PMIX_CHECK_NSPACE: the latter
+         * answers "true" the moment either side is empty - wildcard
+         * semantics that are right for a match against a request and wrong
+         * here.  Most jobs in a DVM carry an empty launcher, and reading
+         * every one of them as a member of whatever tree we are asking
+         * about would put a stranger's job in a tool's wait set. */
+        if (!PMIX_CHECK_NSPACE_STRICT(jptr->launcher, root) &&
+            !PMIX_CHECK_NSPACE_STRICT(jptr->nspace, root)) {
             continue;
         }
         if (jptr->state < PRTE_JOB_STATE_TERMINATED) {

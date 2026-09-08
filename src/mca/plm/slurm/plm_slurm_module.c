@@ -349,16 +349,21 @@ static void launch_daemons(int fd, short args, void *cbdata)
     /* start one orted on each node */
     pmix_argv_append(&argc, &argv, "--ntasks-per-node=1");
 
-    if (!prte_get_attribute(&state->jdata->attributes, PRTE_JOB_RECOVERABLE, NULL, PMIX_BOOL) &&
-        !prte_get_attribute(&state->jdata->attributes, PRTE_JOB_CONTINUOUS, NULL, PMIX_BOOL) &&
-        !prte_elastic_mode) {
-        /* kill the job if any prteds die */
-        pmix_argv_append(&argc, &argv, "--kill-on-bad-exit");
-    } else {
-        /* don't kill if a node or prted dies */
-        pmix_argv_append(&argc, &argv, "--no-kill");
-        pmix_argv_append(&argc, &argv, "--kill-on-bad-exit=0");
-    }
+    /* Never let Slurm kill the step because one prted died.
+     *
+     * This is unconditional on purpose.  --kill-on-bad-exit tells srun to
+     * take down the WHOLE step when any one task exits non-zero, and --no-kill
+     * is what stops a single node's failure doing the same - so between them
+     * they decide whether losing one daemon costs us one daemon or all of the
+     * daemons that srun launched.  PRRTE decides what a lost daemon means
+     * (see errmgr/dvm, and the recoverable/continuous runtime options); the
+     * scheduler must not pre-empt that decision by killing the survivors.
+     *
+     * It matters far more now than it used to: a prted stays inside its step
+     * rather than daemonizing out of it, so these flags reach real, live
+     * daemons instead of a fork's parent that had already exited. */
+    pmix_argv_append(&argc, &argv, "--no-kill");
+    pmix_argv_append(&argc, &argv, "--kill-on-bad-exit=0");
 
     /* our daemons are not an MPI task */
     pmix_argv_append(&argc, &argv, "--mpi=none");
@@ -688,33 +693,38 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
                        proc->exit_code);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
     } else {
-        /* otherwise, check to see if this is the primary pid */
+        /* otherwise, check to see if this is the primary pid.
+         *
+         * We never pass --daemonize to the prteds we launch, so the process
+         * srun is tracking IS the daemon and not a fork's parent that exits
+         * the moment the daemon is up - see src/tools/prted/AGENTS.md for why
+         * a prted must stay inside its Slurm step. A clean exit here is
+         * therefore the daemons genuinely ending, so fire the trigger that
+         * lets prun/the HNP exit.
+         */
         if (primary_srun_pid == proc->pid) {
-            if (prte_debug_daemons_flag || prte_leave_session_attached) {
-                /* the prted stayed attached instead of forking off and
-                 * daemonizing, so the process srun is tracking really is
-                 * the persistent daemon - its clean exit means the DVM
-                 * is genuinely gone. Fire the proper trigger so mpirun
-                 * can exit.
-                 */
+            /* An elastic release ends the daemons this srun launched on
+             * purpose, and because the prted stays attached it ends them
+             * CLEANLY - so a zero exit reaches us for the same reason a
+             * non-zero one does below, and needs the same question asked of
+             * it. Without this the release of a node belonging to the
+             * primary step reads as the DVM ending and takes the whole DVM
+             * down with it. */
+            if (NULL != job_id && srun_exit_expected(*job_id)) {
                 PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
-                                     "%s plm:slurm: primary daemons complete!",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-                /* need to set the #terminated value to avoid an incorrect error msg */
-                jdata->num_terminated = jdata->num_procs;
-                PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
-            } else {
-                /* the prted forked and daemonized (the default): srun was
-                 * only ever tracking the fork's parent, which exits as
-                 * soon as the real daemon signals it is up and running.
-                 * A clean exit here is that hand-off, not termination -
-                 * daemon loss is instead caught when its RML connection
-                 * to the HNP actually drops. */
-                PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
-                                     "%s plm:slurm: primary srun exited after "
-                                     "daemon hand-off",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                                     "%s plm:slurm: srun for elastic job %" PRIu32
+                                     " exited cleanly after its daemons were released",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), *job_id));
+                free(job_id);
+                PMIX_RELEASE(t2);
+                return;
             }
+            PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output,
+                                 "%s plm:slurm: primary daemons complete!",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+            /* need to set the #terminated value to avoid an incorrect error msg */
+            jdata->num_terminated = jdata->num_procs;
+            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
         }
     }
 

@@ -160,6 +160,37 @@ PRTE_EXPORT int prte_rml_send_payload_cb_nb(pmix_rank_t rank,
     } while (0)
 
 /**
+ * As prte_rml_send_payload_cb_nb, but bypass the routing tree.
+ *
+ * This is the combination a broadcast on a *derived* tree needs and no other
+ * caller does: one packed payload shared by every destination, a completion
+ * callback (an undeliverable forward means that subtree's ack is never
+ * coming), and a destination chosen by a tree that is not the routing one.
+ * Sent routed, such a forward is relayed by whichever daemon the routing tree
+ * puts in between - which at a high routing radix is the controller itself,
+ * so the bytes cross the very link the second tree exists to keep them off
+ * and the fanout is not reduced at all.
+ *
+ * Falls back to a routed send when the peer's contact information is not
+ * available, exactly as prte_rml_send_buffer_direct_nb does.  Register the
+ * peer with prte_rml_lateral_register() unless it is also a tree neighbour.
+ */
+PRTE_EXPORT int prte_rml_send_payload_direct_cb_nb(pmix_rank_t rank,
+                                                   prte_rml_payload_t *payload,
+                                                   prte_rml_tag_t tag,
+                                                   prte_rml_buffer_callback_fn_t cbfunc,
+                                                   void *cbdata);
+
+#define PRTE_RML_SEND_PAYLOAD_DIRECT_CB(_r, r, p, t, cf, cd)               \
+    do {                                                                   \
+        pmix_output_verbose(2, prte_rml_base.rml_output,                   \
+                            "RML-SEND-PAYLOAD-DIRECT-CB(%s:%d): %s:%s:%d", \
+                            PMIX_RANK_PRINT(r), t,                         \
+                            __FILE__, __func__, __LINE__);                 \
+        (_r) = prte_rml_send_payload_direct_cb_nb(r, p, t, cf, cd);        \
+    } while (0)
+
+/**
  * As prte_rml_send_buffer_nb, but bypass the routing tree and deliver straight
  * to the named peer.
  *
@@ -180,6 +211,23 @@ PRTE_EXPORT int prte_rml_send_payload_cb_nb(pmix_rank_t rank,
 PRTE_EXPORT int prte_rml_send_buffer_direct_nb(pmix_rank_t rank,
                                                pmix_data_buffer_t *buffer,
                                                prte_rml_tag_t tag);
+
+/* As prte_rml_send_buffer_cb_nb, but bypass the routing tree.  The ack half of
+ * a derived tree's traffic needs this for the same reason the forward does. */
+PRTE_EXPORT int prte_rml_send_buffer_direct_cb_nb(pmix_rank_t rank,
+                                                  pmix_data_buffer_t *buffer,
+                                                  prte_rml_tag_t tag,
+                                                  prte_rml_buffer_callback_fn_t cbfunc,
+                                                  void *cbdata);
+
+#define PRTE_RML_SEND_DIRECT_CB(_r, r, b, t, cf, cd)               \
+    do {                                                           \
+        pmix_output_verbose(2, prte_rml_base.rml_output,           \
+                            "RML-SEND-DIRECT-CB(%s:%d): %s:%s:%d", \
+                            PMIX_RANK_PRINT(r), t,                 \
+                            __FILE__, __func__, __LINE__);         \
+        (_r) = prte_rml_send_buffer_direct_cb_nb(r, b, t, cf, cd); \
+    } while(0)
 
 #define PRTE_RML_SEND_DIRECT(_r, r, b, t)                       \
     do {                                                        \
@@ -304,6 +352,12 @@ typedef struct {
     pmix_list_t posted_recvs;
     pmix_list_t unmatched_msgs;
     int radix;
+    // Radix of the tree a collective's release fans out over. Separate from
+    // `radix` above because the two trees want opposite values - fanout is
+    // free on the way up and is the entire cost on the way down - and
+    // defaulting to `radix` keeps today's behaviour until someone asks for
+    // something else.
+    int radix2;
     bool static_ports;
 
     // # daemons before failures
@@ -352,6 +406,10 @@ typedef struct {
     // rank is a stale incarnation and is dropped. Grown on demand as ranks
     // appear; see prte_rml_epoch_ok / prte_rml_record_epoch.
     uint64_t *peer_epochs;
+    // Monotone count of departures and returns this daemon has learned of -
+    // the version of every tree derived from the live set. See
+    // prte_rml_tree_version().
+    uint32_t tree_version;
     size_t peer_epochs_size;
 
     // Track all ancestors up to HNP, to simplify fault handling
@@ -398,6 +456,23 @@ PRTE_EXPORT extern uint64_t prte_rml_boot_epoch;
  * that). prte_rml_record_epoch force-sets the authoritative epoch for a rank
  * (used by the revival path and the HNP's return validation);
  * prte_rml_get_epoch reads it (0 if unknown). */
+/* How many daemon departures and returns this process has learned of.
+ *
+ * A version number for every tree derived from the live set, and the only
+ * thing anything asks of it is "has the other end seen news I have not".  It
+ * therefore has to be **monotone**, which is why it counts events learned
+ * rather than the size of the failed set: a revival clears a bit, so a
+ * popcount of failed_dmns goes down, and a daemon that had processed the
+ * revival would read every peer that had not as being ahead of it - and wait
+ * for news that had already arrived.
+ *
+ * It counts ranks rather than notices, so a daemon told of three departures
+ * at once lands on the same number as one that learned them singly.  It is
+ * not a total order - two daemons can reach the same count having learned
+ * about different daemons - and is not meant to be; see the parking
+ * commentary in prte_grpcomm_xcast_recv for what is and is not concluded
+ * from it. */
+PRTE_EXPORT uint32_t prte_rml_tree_version(void);
 PRTE_EXPORT bool prte_rml_epoch_ok(pmix_rank_t rank, uint64_t epoch);
 PRTE_EXPORT void prte_rml_record_epoch(pmix_rank_t rank, uint64_t epoch);
 PRTE_EXPORT uint64_t prte_rml_get_epoch(pmix_rank_t rank);
@@ -465,6 +540,15 @@ PRTE_EXPORT int prte_rml_route_lost(pmix_rank_t route);
 PRTE_EXPORT pmix_rank_t prte_rml_get_route(pmix_rank_t target);
 PRTE_EXPORT int prte_rml_get_subtree_index(pmix_rank_t target);
 PRTE_EXPORT bool prte_rml_is_node_up(pmix_rank_t node);
+
+/* This daemon's parent and children in the RELEASE tree - the low-radix tree
+ * (prte_rml_base.radix2) a collective fans its release out over, as distinct
+ * from the routing tree its rollup gathers on. Derived, never agreed: every
+ * daemon computes the same shape from inputs they already hold in step.
+ * Answers PRTE_ERR_NOT_FOUND for a rank outside the DVM. The caller frees
+ * the children array. */
+PRTE_EXPORT int prte_rml_release_tree(pmix_rank_t me, pmix_rank_t *parent,
+                                      pmix_rank_t **children, size_t *nchildren);
 
 #define PRTE_RML_ACTIVATE_MESSAGE(m)                                           \
     do {                                                                       \

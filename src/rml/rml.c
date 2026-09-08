@@ -236,6 +236,17 @@ void prte_rml_load_dead_dmns(const char *spec)
             continue;
         }
         for (r = first; r <= last; r++) {
+            if (!pmix_bitmap_is_set_bit(&prte_rml_base.dead_dmns, (int) r)) {
+                /* Start this daemon's derived-tree version in step with the
+                 * DVM it is joining.  A daemon grown into a DVM that has
+                 * already lost members has learned of those departures right
+                 * here and nowhere else, and leaving it at zero would make it
+                 * read every peer as being ahead of it - so every forward it
+                 * received on a derived tree would be parked, waiting for
+                 * news it had already been given, until the next daemon
+                 * happened to die. */
+                prte_rml_base.tree_version++;
+            }
             pmix_bitmap_set_bit(&prte_rml_base.dead_dmns, (int) r);
         }
     }
@@ -286,6 +297,44 @@ void prte_rml_register(void)
         pmix_output(0, "PRRTE: routing tree radix %d is invalid (minimum is 2)"
                        " - using 2", prte_rml_base.radix);
         prte_rml_base.radix = 2;
+    }
+
+    /* The radix of the second tree - the low one a release fans out over,
+     * beside the high one the rollup gathers on.  They want opposite values:
+     * a gathering daemon sends one aggregate however many children it has,
+     * while a broadcasting one sends a copy per child, so fanout is free
+     * going up and is the whole cost coming down.  See
+     * docs/plans/scalable_collectives/two-radix-release.rst.
+     *
+     * Four, which changes nothing on its own: this radix is not consulted
+     * at all unless grpcomm_low_radix_release is turned on, and that is off.
+     * What it does is make turning that switch on do the useful thing with
+     * one parameter rather than two - it used to default to the routing
+     * radix, which made the same tree twice and left the feature a silent
+     * no-op for anyone who set only the switch.
+     *
+     * Four rather than three because the cost model's optimum, minimised
+     * over the radix at each of several DVM sizes and payloads, is 2, 3, 4 or
+     * 5 for every payload past the point where bandwidth overtakes the
+     * thread-divided software cost of a copy - and 4 is within a few percent
+     * of the best of them everywhere.  The release tree exists for exactly
+     * those payloads: it carries a fence release, which is the whole modex.
+     * The derivation, the crossover it turns on, and what remains unmeasured
+     * about it are in docs/plans/scalable_collectives/two-radix-release.rst
+     * under "Where does the release radix come from at scale". */
+    prte_rml_base.radix2 = 4;
+    (void) pmix_mca_base_var_register("prte", "rml", "base", "radix2",
+                                      "Radix of the tree used to fan a "
+                                      "collective's release out (minimum 2). "
+                                      "Consulted only when "
+                                      "grpcomm_low_radix_release is set.",
+                                      PMIX_MCA_BASE_VAR_TYPE_INT,
+                                      &prte_rml_base.radix2);
+    /* Same clamp and the same reason: the tree math divides by (radix - 1). */
+    if (2 > prte_rml_base.radix2) {
+        pmix_output(0, "PRRTE: release tree radix %d is invalid (minimum is 2)"
+                       " - using 2", prte_rml_base.radix2);
+        prte_rml_base.radix2 = 2;
     }
 
     /* The ranks that had already departed the DVM when we were launched. Only

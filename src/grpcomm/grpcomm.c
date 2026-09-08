@@ -38,16 +38,20 @@
 #include "src/mca/base/pmix_base.h"
 #include "src/util/pmix_output.h"
 
+#include "src/util/prte_show_help.h"
+
 #include "grpcomm_internal.h"
 
 prte_grpcomm_globals_t prte_grpcomm_globals = {
     .output = -1,
     .context_id = UINT32_MAX,
     .fence_ops = PMIX_LIST_STATIC_INIT(prte_grpcomm_globals.fence_ops),
-    .group_ops = PMIX_LIST_STATIC_INIT(prte_grpcomm_globals.group_ops)
+    .group_ops = PMIX_LIST_STATIC_INIT(prte_grpcomm_globals.group_ops),
+    .fence_generations = PMIX_LIST_STATIC_INIT(prte_grpcomm_globals.fence_generations)
 };
 
-prte_grpcomm_release_bcast_fn_t prte_grpcomm_release_bcast = prte_grpcomm_xcast;
+prte_grpcomm_release_bcast_fn_t prte_grpcomm_release_bcast =
+    prte_grpcomm_release_bcast_select;
 
 /* File scope, not a local: the MCA layer keeps the pointer it is handed and
  * writes through it whenever the variable is set, so a stack slot would be
@@ -82,6 +86,115 @@ void prte_grpcomm_register(void)
                                "grpcomm_base_verbose 1.",
                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                &prte_grpcomm_globals.enable_timing);
+
+    /* Fault injection for the fence's round discriminator.  Holding one
+     * daemon's contribution back, while a PMIX_TIMEOUT ends the fence without
+     * it, is what puts a contribution on the wire for a round that is already
+     * over - the straggler the generation exists to recognize.  Nothing else
+     * can arrange that window: it is otherwise a timing accident.
+     *
+     * Compiled in always, on purpose.  See src/grpcomm/AGENTS.md. */
+    prte_grpcomm_globals.release_delay_ms = 0;
+    prte_grpcomm_globals.release_delay_vpid = -1;
+    prte_grpcomm_globals.joined_late = false;
+    prte_grpcomm_globals.joined_late_known = false;
+
+    prte_grpcomm_globals.fence_delay_ms = 0;
+    pmix_mca_base_var_register("prte", "grpcomm", NULL, "fence_delay_ms",
+                               "Hold this daemon's own fence contribution back "
+                               "by this many milliseconds before sending it. "
+                               "Fault injection for the fence's round handling; "
+                               "0 (the default) sends immediately.",
+                               PMIX_MCA_BASE_VAR_TYPE_INT,
+                               &prte_grpcomm_globals.fence_delay_ms);
+
+    /* The other half of the pair: hold a daemon's own processing of a release
+     * back while its children get theirs on time.  That is the only way to
+     * reach the early-arrival window, where a contribution for the NEXT round
+     * lands on a daemon still finishing the previous one. */
+    prte_grpcomm_globals.release_delay_ms = 0;
+    pmix_mca_base_var_register("prte", "grpcomm", NULL, "release_delay_ms",
+                               "Hold this daemon's own processing of a fence "
+                               "release back by this many milliseconds. The "
+                               "forward to its children is not delayed. Fault "
+                               "injection; 0 (the default) processes at once.",
+                               PMIX_MCA_BASE_VAR_TYPE_INT,
+                               &prte_grpcomm_globals.release_delay_ms);
+
+    prte_grpcomm_globals.release_delay_vpid = -1;
+    pmix_mca_base_var_register("prte", "grpcomm", NULL, "release_delay_vpid",
+                               "Restrict grpcomm_release_delay_ms to the daemon "
+                               "with this vpid. -1 (the default) delays on "
+                               "every daemon that reads the parameter.",
+                               PMIX_MCA_BASE_VAR_TYPE_INT,
+                               &prte_grpcomm_globals.release_delay_vpid);
+
+    /* -1 means "whichever daemon this is", which is what a per-node MCA file
+     * wants; a vpid names one daemon in a DVM-wide setting, which is what a
+     * test driving the whole DVM from one command line wants. */
+    prte_grpcomm_globals.fence_delay_vpid = -1;
+    pmix_mca_base_var_register("prte", "grpcomm", NULL, "fence_delay_vpid",
+                               "Restrict grpcomm_fence_delay_ms to the daemon "
+                               "with this vpid. -1 (the default) delays on "
+                               "every daemon that reads the parameter.",
+                               PMIX_MCA_BASE_VAR_TYPE_INT,
+                               &prte_grpcomm_globals.fence_delay_vpid);
+
+    /* And the third: hold the forward itself back, so an operation is still
+     * travelling its tree when a daemon is killed underneath it.  Its two
+     * siblings both act after the forward has gone, which cannot reach the
+     * fault path at all - on eight daemons a release is over in microseconds.
+     *
+     * Non-routing trees only.  Stalling the routing tree would hold up the
+     * daemon command channel rather than injecting a fault. */
+    prte_grpcomm_globals.xcast_delay_ms = 0;
+    pmix_mca_base_var_register("prte", "grpcomm", NULL, "xcast_delay_ms",
+                               "Fault injection: hold a daemon's forward of a "
+                               "broadcast on a non-routing tree back by this "
+                               "many milliseconds, so the operation stays in "
+                               "flight long enough for a daemon loss to be "
+                               "aimed at it (0 = off)",
+                               PMIX_MCA_BASE_VAR_TYPE_INT,
+                               &prte_grpcomm_globals.xcast_delay_ms);
+
+    prte_grpcomm_globals.xcast_delay_vpid = -1;
+    pmix_mca_base_var_register("prte", "grpcomm", NULL, "xcast_delay_vpid",
+                               "Restrict grpcomm_xcast_delay_ms to the daemon "
+                               "with this vpid (-1 = every daemon)",
+                               PMIX_MCA_BASE_VAR_TYPE_INT,
+                               &prte_grpcomm_globals.xcast_delay_vpid);
+
+    /* Send a fence's release down the low-radix tree instead of the routing
+     * tree.  ON by default.  The radix it uses is rml_base_radix2.
+     *
+     * It shipped off, on the grounds that there was no data to choose a
+     * winner with.  There is now a model instead, and it is decisive in a way
+     * a measurement of one swarm would not have been: a broadcasting daemon's
+     * r copies cost ceil(r/t) software sends but r whole payloads on one NIC,
+     * so past a payload of B*c/t bytes the fanout is pure bandwidth and the
+     * optimum radix drops to 3-5 and stays there for every larger payload and
+     * every DVM size.  A fence release is the modex, which is far past that
+     * crossover on any machine - kilobytes at worst, and the crossover is
+     * kilobytes at best.  Radix 64 costs 6.1x to 6.4x the optimum there, and
+     * that figure survives sweeping the machine constants eightfold.
+     *
+     * What is not settled is where the crossover sits, which is a property of
+     * a real network and moves with B, c and prte_num_worker_threads.  It
+     * does not have to be settled to make this the default: nothing this
+     * tree carries is anywhere near it.  The derivation is in
+     * docs/plans/scalable_collectives/two-radix-release.rst.
+     *
+     * Turning it off restores the single-tree behaviour exactly - the release
+     * goes down the routing tree and none of the derived-tree code runs - so
+     * this remains the one switch to reach for if a release misbehaves. */
+    prte_grpcomm_globals.low_radix_release = true;
+    pmix_mca_base_var_register("prte", "grpcomm", NULL, "low_radix_release",
+                               "Fan a fence's release out over the low-radix "
+                               "release tree (rml_base_radix2) rather than the "
+                               "routing tree. On by default; turn it off to "
+                               "put every release back on the routing tree.",
+                               PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                               &prte_grpcomm_globals.low_radix_release);
 }
 
 /**
@@ -89,12 +202,35 @@ void prte_grpcomm_register(void)
  */
 int prte_grpcomm_init(void)
 {
+    /* A release tree at the routing tree's own radix IS the routing tree -
+     * same parent, same children, for every rank and every failure pattern
+     * (test_release_tree_matches_routing pins it).  rml_base_radix2 defaults
+     * to rml_base_radix, so turning the release onto its own tree and setting
+     * nothing else is the easy mistake, and it is a silent one: the fence
+     * still works, it just does the identical fanout through the derived-tree
+     * path.  Say so rather than let somebody measure it and conclude the idea
+     * does not help.
+     *
+     * The master alone, because every daemon reads the same two parameters
+     * and would otherwise say it once each. */
+    if (PRTE_PROC_IS_MASTER && prte_grpcomm_globals.low_radix_release
+        && prte_rml_base.radix2 == prte_rml_base.radix) {
+        prte_show_help("help-prte-grpcomm.txt", "release-radix-noop", true,
+                       prte_rml_base.radix, prte_rml_base.radix2);
+    }
+
+    /* Losing a lateral link is not a tree fault, so the RML deliberately does
+     * not repair on it - but a derived tree's broadcast may have been relying
+     * on that link, and nothing else will tell it.  See lateral_link_lost(). */
+    prte_rml_lateral_set_lost_callback(prte_grpcomm_xcast_lateral_lost);
+
     /* setup the trackers */
     PMIX_CONSTRUCT(&prte_grpcomm_globals.xcast_ops,
                    prte_grpcomm_xcast_t);
     PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_ops, pmix_list_t);
     PMIX_CONSTRUCT(&prte_grpcomm_globals.group_ops, pmix_list_t);
     PMIX_CONSTRUCT(&prte_grpcomm_globals.completed_group_ops, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_generations, pmix_list_t);
 
     /* xcast receives */
     PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST,
@@ -127,6 +263,7 @@ void prte_grpcomm_finalize(void)
     PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.fence_ops);
     PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.group_ops);
     PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.completed_group_ops);
+    PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.fence_generations);
 
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST);
     PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_XCAST_ACK);

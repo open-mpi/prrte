@@ -82,8 +82,31 @@ static int test_release_bcast_default(void)
 {
     int failures = 0;
 
-    CHECK("release path defaults to xcast",
-          prte_grpcomm_release_bcast == prte_grpcomm_xcast);
+    CHECK("release path is wired to the selector",
+          prte_grpcomm_release_bcast == prte_grpcomm_release_bcast_select);
+
+    /* ...and the selector routes by tag.  A fence release is the whole modex,
+     * so it is the one that moves onto the low-radix tree when that is asked
+     * for; a group release is small, where a low radix buys nothing and costs
+     * depth, so it stays on the routing tree either way.  With the knob off,
+     * nothing moves at all - which is the assertion that keeps the default
+     * being the tree we know works. */
+    prte_grpcomm_globals.low_radix_release = false;
+    CHECK("knob off: a fence release travels the routing tree",
+          PRTE_GRPCOMM_TOPO_ROUTING
+              == prte_grpcomm_release_topology(PRTE_RML_TAG_FENCE_RELEASE));
+    CHECK("knob off: a group release travels the routing tree",
+          PRTE_GRPCOMM_TOPO_ROUTING
+              == prte_grpcomm_release_topology(PRTE_RML_TAG_GROUP_RELEASE));
+
+    prte_grpcomm_globals.low_radix_release = true;
+    CHECK("knob on: a fence release travels the release tree",
+          PRTE_GRPCOMM_TOPO_RELEASE
+              == prte_grpcomm_release_topology(PRTE_RML_TAG_FENCE_RELEASE));
+    CHECK("knob on: a group release still travels the routing tree",
+          PRTE_GRPCOMM_TOPO_ROUTING
+              == prte_grpcomm_release_topology(PRTE_RML_TAG_GROUP_RELEASE));
+    prte_grpcomm_globals.low_radix_release = false;
 
     if (0 == failures) {
         fprintf(stdout, "PASSED test_release_bcast_default\n");
@@ -166,6 +189,10 @@ static int test_classes(void)
     prte_grpcomm_fence_t *fc = PMIX_NEW(prte_grpcomm_fence_t);
     CHECK("fence trk sig NULL", NULL == fc->sig);
     CHECK("fence trk status SUCCESS", PMIX_SUCCESS == fc->status);
+    /* a fresh tracker has not been told which collective it is in - and
+     * UNKNOWN has to be distinct from "barrier", or the first contribution
+     * to arrive would find its operation already decided for it */
+    CHECK("fence trk op UNKNOWN", PRTE_GRPCOMM_FENCE_OP_UNKNOWN == fc->op);
     CHECK("fence trk dmns NULL", NULL == fc->dmns);
     CHECK("fence trk ndmns 0", 0 == fc->ndmns);
     CHECK("fence trk nexpected 0", 0 == fc->nexpected);
@@ -481,7 +508,7 @@ static int test_fence_tracker(void)
     sig.sz = 1;
     PMIX_PROC_CREATE(sig.signature, 1);
     PMIX_LOAD_PROCID(&sig.signature[0], PRTE_PROC_MY_NAME->nspace, PMIX_RANK_WILDCARD);
-    coll = prte_grpcomm_fence_get_tracker(&sig, true);
+    coll = prte_grpcomm_fence_get_tracker(&sig, 0, PRTE_GRPCOMM_FENCE_STEP_ROLLUP, true);
     CHECK("tracker: a daemon-job fence resolves", NULL != coll);
     if (NULL != coll) {
         CHECK("tracker: every daemon means all of them, with no array",
@@ -489,21 +516,41 @@ static int test_fence_tracker(void)
         CHECK("tracker: expects our children plus ourselves",
               (size_t) prte_rml_base.n_children + 1 == coll->nexpected);
     }
-    /* the same signature must find that tracker rather than build a second */
-    again = prte_grpcomm_fence_get_tracker(&sig, true);
-    CHECK("tracker: the same signature returns the same tracker", again == coll);
+    /* the same signature AND round must find that tracker, not build a second */
+    again = prte_grpcomm_fence_get_tracker(&sig, 0, PRTE_GRPCOMM_FENCE_STEP_ROLLUP, true);
+    CHECK("tracker: the same identity returns the same tracker", again == coll);
     CHECK("tracker: and does not add another",
           1 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops));
+
+    /* ...but the NEXT round over those same participants is a different
+     * collective and gets a tracker of its own.  Both are live at once on
+     * purpose: xcast hands a release to a daemon's children before that
+     * daemon processes it, so a child can open round 1 and reach us while we
+     * are still finishing round 0.  Keyed by signature alone the two would
+     * be the same tracker and the new round's data would land in the old
+     * round's bucket. */
+    again = prte_grpcomm_fence_get_tracker(&sig, 1, PRTE_GRPCOMM_FENCE_STEP_ROLLUP, true);
+    CHECK("tracker: a later round is a different collective", again != coll);
+    CHECK("tracker: ...and both are live at once",
+          2 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops));
+    CHECK("tracker: ...each knowing which round it is",
+          NULL != again && 1 == again->generation && 0 == coll->generation);
+
+    /* the step is the third level of identity, and is where a dissemination
+     * exchange would separate the blocks of one collective from each other */
+    again = prte_grpcomm_fence_get_tracker(&sig, 0, PRTE_GRPCOMM_FENCE_STEP_ROLLUP + 1, true);
+    CHECK("tracker: a different step is a different collective too",
+          again != coll && 3 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops));
     PMIX_DESTRUCT(&sig);
 
     /* a signature naming nobody is refused rather than read as the "all
      * daemons" case above, which is what an empty nspace would otherwise
      * match */
     PMIX_CONSTRUCT(&sig, prte_grpcomm_fence_signature_t);
-    coll = prte_grpcomm_fence_get_tracker(&sig, true);
+    coll = prte_grpcomm_fence_get_tracker(&sig, 0, PRTE_GRPCOMM_FENCE_STEP_ROLLUP, true);
     CHECK("tracker: an empty signature is refused", NULL == coll);
     CHECK("tracker: and builds nothing",
-          1 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops));
+          3 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops));
     PMIX_DESTRUCT(&sig);
 
     /* a signature we cannot resolve at all - no such job, and nothing has
@@ -512,12 +559,12 @@ static int test_fence_tracker(void)
     sig.sz = 1;
     PMIX_PROC_CREATE(sig.signature, 1);
     PMIX_LOAD_PROCID(&sig.signature[0], "fence-nosuchjob", 0);
-    coll = prte_grpcomm_fence_get_tracker(&sig, true);
+    coll = prte_grpcomm_fence_get_tracker(&sig, 0, PRTE_GRPCOMM_FENCE_STEP_ROLLUP, true);
     CHECK("tracker: an unresolvable signature yields no tracker", NULL == coll);
     CHECK("tracker: and leaves no wreckage on the list",
-          1 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops));
+          3 == pmix_list_get_size(&prte_grpcomm_globals.fence_ops));
     /* ...so asking again is a fresh attempt, not a hand-back of the wreck */
-    coll = prte_grpcomm_fence_get_tracker(&sig, false);
+    coll = prte_grpcomm_fence_get_tracker(&sig, 0, PRTE_GRPCOMM_FENCE_STEP_ROLLUP, false);
     CHECK("tracker: nothing to find on a second look", NULL == coll);
     PMIX_DESTRUCT(&sig);
 
@@ -848,6 +895,454 @@ static int test_recovery_epoch(void)
     return failures;
 }
 
+/*
+ * Which operation a fence runs is named by PMIX_COLLECT_DATA and by nothing
+ * else.  Both halves of that are pinned here: the classifier, which reads the
+ * directive out of a caller's info array, and the merge, which is how a daemon
+ * decides whether an arriving contribution agrees with what it already knows.
+ *
+ * Note what the classifier's signature does not take: a payload.  A fence's
+ * operation cannot be inferred from whether a participant contributed bytes,
+ * because the bytes vary from daemon to daemon while the operation must not -
+ * a participant with nothing to publish is fully a participant in an
+ * allgather, and since PMIx learned to contribute only what changed that is
+ * the ordinary case rather than a corner one.  Deriving the operation from the
+ * payload would have daemons disagree about which collective they are running,
+ * and a fence has no originator to settle it.
+ */
+static int test_fence_operation(void)
+{
+    int failures = 0;
+#if PRTE_TEST_GRPCOMM_INTERNALS
+    pmix_info_t info[2];
+    prte_grpcomm_fence_t *coll;
+    bool flag;
+    int tmo = 30;
+
+    /* No directives at all.  The caller asked to synchronize and said nothing
+     * else, and that is a barrier - the absence of the flag has to mean the
+     * same as the flag being false, because a caller wanting a plain barrier
+     * has no reason to pass anything. */
+    CHECK("op: no directives is a barrier",
+          PRTE_GRPCOMM_FENCE_OP_BARRIER == prte_grpcomm_fence_op_from_info(NULL, 0));
+
+    flag = true;
+    PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, &flag, PMIX_BOOL);
+    CHECK("op: collect true is an allgather",
+          PRTE_GRPCOMM_FENCE_OP_ALLGATHER == prte_grpcomm_fence_op_from_info(info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+
+    flag = false;
+    PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, &flag, PMIX_BOOL);
+    CHECK("op: collect false is a barrier",
+          PRTE_GRPCOMM_FENCE_OP_BARRIER == prte_grpcomm_fence_op_from_info(info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+
+    /* Present with no value.  PMIx's convention is that the bare presence of
+     * an attribute means true, and this has to read it the same way PMIx's own
+     * fence does or a caller that set the flag that way would silently be
+     * given a barrier and then find its data missing. */
+    PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, NULL, PMIX_BOOL);
+    CHECK("op: a valueless collect flag is still true",
+          PRTE_GRPCOMM_FENCE_OP_ALLGATHER == prte_grpcomm_fence_op_from_info(info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+
+    /* An unrelated directive names no operation and must not be mistaken for
+     * one; and the flag is still found when it is not the first entry. */
+    PMIX_INFO_LOAD(&info[0], PMIX_TIMEOUT, &tmo, PMIX_INT);
+    CHECK("op: an unrelated directive leaves it a barrier",
+          PRTE_GRPCOMM_FENCE_OP_BARRIER == prte_grpcomm_fence_op_from_info(info, 1));
+    flag = true;
+    PMIX_INFO_LOAD(&info[1], PMIX_COLLECT_DATA, &flag, PMIX_BOOL);
+    CHECK("op: the flag is found past the first entry",
+          PRTE_GRPCOMM_FENCE_OP_ALLGATHER == prte_grpcomm_fence_op_from_info(info, 2));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
+
+    /* The merge.  A tracker that has heard nothing adopts; one that has heard
+     * something requires agreement. */
+    coll = PMIX_NEW(prte_grpcomm_fence_t);
+    CHECK("merge: an unknown tracker adopts",
+          prte_grpcomm_fence_op_merge(coll, PRTE_GRPCOMM_FENCE_OP_ALLGATHER));
+    CHECK("merge: and records what it adopted",
+          PRTE_GRPCOMM_FENCE_OP_ALLGATHER == coll->op);
+    CHECK("merge: the same answer again agrees",
+          prte_grpcomm_fence_op_merge(coll, PRTE_GRPCOMM_FENCE_OP_ALLGATHER));
+    /* An arrival that names no operation tells us nothing, so it cannot
+     * disagree with anything either - it must not be read as a barrier. */
+    CHECK("merge: an unknown arrival cannot disagree",
+          prte_grpcomm_fence_op_merge(coll, PRTE_GRPCOMM_FENCE_OP_UNKNOWN));
+    CHECK("merge: and does not disturb what was recorded",
+          PRTE_GRPCOMM_FENCE_OP_ALLGATHER == coll->op);
+    /* The disagreement this whole mechanism exists to catch.  It has to be
+     * caught here because it is otherwise invisible: a barrier now puts
+     * nothing on the wire, so PMIx's own per-blob collect-flag comparison
+     * never sees the two answers together. */
+    CHECK("merge: the opposite operation disagrees",
+          !prte_grpcomm_fence_op_merge(coll, PRTE_GRPCOMM_FENCE_OP_BARRIER));
+    CHECK("merge: and a disagreement changes nothing",
+          PRTE_GRPCOMM_FENCE_OP_ALLGATHER == coll->op);
+    PMIX_RELEASE(coll);
+
+    /* the same, adopting the other way round, so neither operation is
+     * privileged by the order the tests happen to run in */
+    coll = PMIX_NEW(prte_grpcomm_fence_t);
+    CHECK("merge: an unknown tracker adopts a barrier too",
+          prte_grpcomm_fence_op_merge(coll, PRTE_GRPCOMM_FENCE_OP_BARRIER));
+    CHECK("merge: barrier recorded",
+          PRTE_GRPCOMM_FENCE_OP_BARRIER == coll->op);
+    CHECK("merge: an allgather against a barrier disagrees",
+          !prte_grpcomm_fence_op_merge(coll, PRTE_GRPCOMM_FENCE_OP_ALLGATHER));
+    PMIX_RELEASE(coll);
+#endif
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_fence_operation\n");
+    }
+    return failures;
+}
+
+#if PRTE_TEST_GRPCOMM_INTERNALS
+/* Build a throwaway signature naming one proc, so the tests below have
+ * distinct collectives to talk about without a job to resolve them against. */
+static void gen_sig(prte_grpcomm_fence_signature_t *sig, const char *nspace,
+                    pmix_rank_t rank)
+{
+    PMIX_CONSTRUCT(sig, prte_grpcomm_fence_signature_t);
+    sig->sz = 1;
+    PMIX_PROC_CREATE(sig->signature, 1);
+    PMIX_LOAD_PROCID(&sig->signature[0], nspace, rank);
+}
+#endif
+
+/*
+ * Telling one round over a signature from the next.
+ *
+ * A fence signature is only its participant list, so a contribution that
+ * outlived the release ending its fence is otherwise indistinguishable from
+ * the first contribution to the next fence over the same procs - and the
+ * second one converges early on the first one's data.  What makes that
+ * reachable is abort_fence_op(), which ends a fence while contributions are
+ * still climbing the tree.
+ *
+ * The counter is driven by releases, and UNKNOWN is load-bearing: it is the
+ * state of a daemon grown into the DVM after the job started, which has
+ * released none of the earlier rounds.  It must not be confused with round 0,
+ * which every other daemon has long since retired.
+ */
+static int test_fence_generation(void)
+{
+    int failures = 0;
+#if PRTE_TEST_GRPCOMM_INTERNALS
+    prte_grpcomm_fence_signature_t a, b;
+    size_t i;
+
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_generations, pmix_list_t);
+    gen_sig(&a, "gen-nspace-a", PMIX_RANK_WILDCARD);
+    gen_sig(&b, "gen-nspace-b", PMIX_RANK_WILDCARD);
+
+    /* Nothing released yet, on a daemon that has been here since the start.
+     * The answer is round 0, and that is what bootstraps the counter: if an
+     * unseen signature answered "no claim" instead, no first round would ever
+     * be established, every contribution would be stamped UNKNOWN for ever,
+     * and the whole mechanism would be inert. */
+    prte_grpcomm_fence_note_join(false);
+    CHECK("gen: an original daemon starts an unseen signature at 0",
+          0 == prte_grpcomm_fence_gen_next(&a));
+    CHECK("gen: round 0 is not stale before it has been released",
+          !prte_grpcomm_fence_gen_is_stale(&a, 0));
+    CHECK("gen: ...nor is a later one",
+          !prte_grpcomm_fence_gen_is_stale(&a, 7));
+
+    /* ...and the same question on a daemon a grow added answers differently.
+     * It cannot claim 0 - every daemon that has been present is past it and
+     * would drop a 0 as ancient, hanging the fence - so it says it does not
+     * know, which a receiver takes into whatever round is current. */
+    prte_grpcomm_globals.joined_late_known = false;
+    prte_grpcomm_fence_note_join(true);
+    CHECK("gen: a daemon that joined late answers UNKNOWN instead",
+          PRTE_GRPCOMM_FENCE_GEN_UNKNOWN == prte_grpcomm_fence_gen_baseline());
+    CHECK("gen: ...and that is what an unseen signature gives it",
+          PRTE_GRPCOMM_FENCE_GEN_UNKNOWN == prte_grpcomm_fence_gen_next(&b));
+
+    /* The flag is settled by the FIRST wireup and never revised - a later one
+     * describes a DVM this daemon is already part of. */
+    prte_grpcomm_fence_note_join(false);
+    CHECK("gen: a later wireup does not revise how we joined",
+          PRTE_GRPCOMM_FENCE_GEN_UNKNOWN == prte_grpcomm_fence_gen_baseline());
+
+    /* back to an original daemon for the rest */
+    prte_grpcomm_globals.joined_late_known = false;
+    prte_grpcomm_fence_note_join(false);
+
+    /* An UNKNOWN stamp is silence, never staleness.  This is what a
+     * newly-grown daemon sends, and dropping it would hang the fence it is
+     * legitimately joining. */
+    prte_grpcomm_fence_gen_record(&a, 4);
+    CHECK("gen: an UNKNOWN stamp is never stale",
+          !prte_grpcomm_fence_gen_is_stale(&a, PRTE_GRPCOMM_FENCE_GEN_UNKNOWN));
+
+    /* Recording a release moves us to the next round. */
+    CHECK("gen: releasing 4 puts the next fence at 5",
+          5 == prte_grpcomm_fence_gen_next(&a));
+    CHECK("gen: round 4 is now stale", prte_grpcomm_fence_gen_is_stale(&a, 4));
+    CHECK("gen: as is anything below it",
+          prte_grpcomm_fence_gen_is_stale(&a, 0));
+    CHECK("gen: but the round we are on is not",
+          !prte_grpcomm_fence_gen_is_stale(&a, 5));
+    CHECK("gen: nor is one ahead of us",
+          !prte_grpcomm_fence_gen_is_stale(&a, 6));
+
+    /* Adopt, do not increment.  A daemon that missed rounds must be able to
+     * jump straight to the true number rather than count from its arrival. */
+    prte_grpcomm_fence_gen_record(&a, 20);
+    CHECK("gen: a release adopts its generation rather than incrementing",
+          21 == prte_grpcomm_fence_gen_next(&a));
+
+    /* ...and a release that arrives out of order cannot walk it backwards,
+     * which would un-stale contributions already correctly dropped. */
+    prte_grpcomm_fence_gen_record(&a, 6);
+    CHECK("gen: an out-of-order release does not move it back",
+          21 == prte_grpcomm_fence_gen_next(&a));
+
+    /* Signatures are independent - a fence over other procs is another
+     * collective entirely, and must not inherit this one's count. */
+    /* ...and it moved only for the signature it was recorded against. b is
+     * still at its baseline rather than having inherited a's count. */
+    CHECK("gen: a different signature is untouched",
+          0 == prte_grpcomm_fence_gen_next(&b));
+
+    /* The memo is bounded.  Eviction is a graceful loss - that signature
+     * returns to the old behaviour - but the list must not grow without end
+     * on a long-lived DVM that fences over many different proc sets. */
+    for (i = 0; i < PRTE_GRPCOMM_FENCE_MEMO_MAX + 8; i++) {
+        prte_grpcomm_fence_signature_t t;
+        char ns[PMIX_MAX_NSLEN + 1];
+        snprintf(ns, sizeof(ns), "gen-fill-%zu", i);
+        gen_sig(&t, ns, PMIX_RANK_WILDCARD);
+        prte_grpcomm_fence_gen_record(&t, 0);
+        PMIX_DESTRUCT(&t);
+    }
+    CHECK("gen: the memo stays bounded",
+          PRTE_GRPCOMM_FENCE_MEMO_MAX >=
+              pmix_list_get_size(&prte_grpcomm_globals.fence_generations));
+
+    PMIX_DESTRUCT(&a);
+    PMIX_DESTRUCT(&b);
+    PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.fence_generations);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_generations, pmix_list_t);
+#endif
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_fence_generation\n");
+    }
+    return failures;
+}
+
+/*
+ * The release tree: the second topology, derived rather than agreed.
+ *
+ * What matters is not whether one daemon's answer looks right but whether all
+ * the answers fit together - every live daemon except the root has exactly
+ * one parent, that parent claims it as a child, and everyone reaches the
+ * root. A derivation that disagreed with itself would satisfy a
+ * single-daemon check and strand a subtree in the field.
+ */
+static int check_release_tree(const char *label)
+{
+    int failures = 0;
+    pmix_rank_t r, live = 0, root = PMIX_RANK_INVALID, reached = 0;
+    pmix_rank_t *parent_of;
+    char buf[160];
+
+    parent_of = (pmix_rank_t *) malloc(prte_rml_base.n_dmns * sizeof(pmix_rank_t));
+    if (NULL == parent_of) {
+        return 1;
+    }
+    for (r = 0; r < prte_rml_base.n_dmns; r++) {
+        parent_of[r] = PMIX_RANK_INVALID;
+    }
+
+    for (r = 0; r < prte_rml_base.n_dmns; r++) {
+        pmix_rank_t parent = PMIX_RANK_INVALID, *kids = NULL;
+        size_t nkids = 0, i;
+
+        if (!prte_rml_is_node_up(r)) {
+            continue;
+        }
+        live++;
+        if (PRTE_SUCCESS != prte_rml_release_tree(r, &parent, &kids, &nkids)) {
+            snprintf(buf, sizeof(buf), "%s: a live rank %u got no tree", label, r);
+            CHECK(buf, false);
+            continue;
+        }
+        if (PMIX_RANK_INVALID == parent) {
+            if (PMIX_RANK_INVALID != root) {
+                snprintf(buf, sizeof(buf), "%s: a second root at %u", label, r);
+                CHECK(buf, false);
+            }
+            root = r;
+        } else {
+            parent_of[r] = parent;
+            /* a parent must be alive - promoting past a dead ancestor is the
+             * whole point of sharing the routing tree's machinery */
+            if (!prte_rml_is_node_up(parent)) {
+                snprintf(buf, sizeof(buf), "%s: %u's parent %u is dead",
+                         label, r, parent);
+                CHECK(buf, false);
+            }
+        }
+        /* every child claimed must name us back */
+        for (i = 0; i < nkids; i++) {
+            pmix_rank_t cp = PMIX_RANK_INVALID, *ck = NULL;
+            size_t cn = 0;
+            if (!prte_rml_is_node_up(kids[i])) {
+                snprintf(buf, sizeof(buf), "%s: %u claims dead child %u",
+                         label, r, kids[i]);
+                CHECK(buf, false);
+                continue;
+            }
+            if (PRTE_SUCCESS == prte_rml_release_tree(kids[i], &cp, &ck, &cn)) {
+                if (cp != r) {
+                    snprintf(buf, sizeof(buf),
+                             "%s: %u claims %u as a child, but %u's parent is %u",
+                             label, r, kids[i], kids[i], cp);
+                    CHECK(buf, false);
+                }
+                if (NULL != ck) {
+                    free(ck);
+                }
+            }
+        }
+        if ((size_t) prte_rml_base.radix2 < nkids) {
+            snprintf(buf, sizeof(buf), "%s: rank %u has %d children, over radix",
+                     label, r, (int) nkids);
+            CHECK(buf, false);
+        }
+        if (NULL != kids) {
+            free(kids);
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "%s: exactly one root", label);
+    CHECK(buf, PMIX_RANK_INVALID != root || 0 == live);
+
+    for (r = 0; r < prte_rml_base.n_dmns; r++) {
+        pmix_rank_t walk = r;
+        int hops = 0;
+        if (!prte_rml_is_node_up(r)) {
+            continue;
+        }
+        while (PMIX_RANK_INVALID != parent_of[walk] && hops <= (int) live) {
+            walk = parent_of[walk];
+            hops++;
+        }
+        if (walk == root && hops <= (int) live) {
+            reached++;
+        }
+    }
+    snprintf(buf, sizeof(buf), "%s: every live daemon reaches the root", label);
+    CHECK(buf, reached == live);
+
+    free(parent_of);
+    return failures;
+}
+
+/* How many edges move when one daemon dies?  This is the number that decided
+ * the design: promoting in place moves the edges below the casualty, while
+ * renumbering over the live daemons moves roughly half the tree - and every
+ * moved edge is a lateral connection to open while the DVM is recovering. */
+static int count_moved_edges(pmix_rank_t victim)
+{
+    pmix_rank_t r, before[128], moved = 0;
+
+    for (r = 0; r < prte_rml_base.n_dmns && r < 128; r++) {
+        pmix_rank_t p = PMIX_RANK_INVALID, *k = NULL;
+        size_t n = 0;
+        before[r] = PMIX_RANK_INVALID;
+        if (prte_rml_is_node_up(r) &&
+            PRTE_SUCCESS == prte_rml_release_tree(r, &p, &k, &n)) {
+            before[r] = p;
+            if (NULL != k) { free(k); }
+        }
+    }
+    pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, victim);
+    for (r = 0; r < prte_rml_base.n_dmns && r < 128; r++) {
+        pmix_rank_t p = PMIX_RANK_INVALID, *k = NULL;
+        size_t n = 0;
+        if (r == victim || !prte_rml_is_node_up(r)) {
+            continue;
+        }
+        if (PRTE_SUCCESS == prte_rml_release_tree(r, &p, &k, &n)) {
+            if (p != before[r]) {
+                moved++;
+            }
+            if (NULL != k) { free(k); }
+        }
+    }
+    pmix_bitmap_clear_bit(&prte_rml_base.failed_dmns, victim);
+    return (int) moved;
+}
+
+static int test_release_tree(void)
+{
+    int failures = 0;
+    pmix_rank_t save_dmns = prte_rml_base.n_dmns;
+    int save_r2 = prte_rml_base.radix2, moved;
+    pmix_rank_t p = PMIX_RANK_INVALID, *k = NULL;
+    size_t n = 0;
+
+    PMIX_CONSTRUCT(&prte_rml_base.failed_dmns, pmix_bitmap_t);
+    pmix_bitmap_init(&prte_rml_base.failed_dmns, 128);
+
+    /* several radices, and sizes that are not powers of them - a complete
+     * tree is the easy case and not the one that breaks */
+    prte_rml_base.n_dmns = 16;
+    prte_rml_base.radix2 = 2;  failures += check_release_tree("16 daemons radix 2");
+    prte_rml_base.radix2 = 3;  failures += check_release_tree("16 daemons radix 3");
+    prte_rml_base.radix2 = 64; failures += check_release_tree("16 daemons radix 64");
+    prte_rml_base.n_dmns = 1;  failures += check_release_tree("1 daemon");
+    prte_rml_base.n_dmns = 2;  failures += check_release_tree("2 daemons");
+    prte_rml_base.n_dmns = 7;  failures += check_release_tree("7 daemons radix 3");
+    prte_rml_base.n_dmns = 13; failures += check_release_tree("13 daemons radix 3");
+
+    /* the release radix is genuinely independent of the routing radix */
+    prte_rml_base.n_dmns = 16;
+    prte_rml_base.radix2 = 3;
+    CHECK("release tree: radix2 is not the routing radix",
+          prte_rml_base.radix2 != prte_rml_base.radix || 3 == prte_rml_base.radix);
+
+    /* failures: a dead node is promoted past, not routed to */
+    pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, 1);
+    failures += check_release_tree("16 daemons, an interior daemon dead");
+    pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, 5);
+    pmix_bitmap_set_bit(&prte_rml_base.failed_dmns, 11);
+    failures += check_release_tree("16 daemons, several dead");
+    pmix_bitmap_clear_all_bits(&prte_rml_base.failed_dmns);
+
+    /* ...and the property that chose promotion over renumbering. Losing one
+     * daemon must disturb a bounded neighbourhood, not half the tree. */
+    prte_rml_base.n_dmns = 64;
+    prte_rml_base.radix2 = 3;
+    moved = count_moved_edges(1);
+    CHECK("release tree: losing a daemon moves few edges, not half the tree",
+          moved <= 2 * prte_rml_base.radix2);
+
+    /* a radix below 2 is not a degenerate tree, it is a division by zero */
+    prte_rml_base.radix2 = 1;
+    CHECK("release tree: radix below 2 is refused",
+          PRTE_SUCCESS != prte_rml_release_tree(0, &p, &k, &n));
+    prte_rml_base.radix2 = save_r2;
+
+    PMIX_DESTRUCT(&prte_rml_base.failed_dmns);
+    prte_rml_base.n_dmns = save_dmns;
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_release_tree\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -876,6 +1371,9 @@ int main(void)
     failures += test_member_departed();
 #endif
     failures += test_group_directives();
+    failures += test_fence_operation();
+    failures += test_fence_generation();
+    failures += test_release_tree();
     failures += test_fence_tracker();
     failures += test_fence_fault_handler();
     failures += test_recovery_epoch();
