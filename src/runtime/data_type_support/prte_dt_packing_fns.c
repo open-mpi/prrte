@@ -97,6 +97,7 @@ static int pack_proc_map(pmix_data_buffer_t *bkt, prte_job_t *job, prte_app_idx_
 {
     char **fields = NULL, **micro;
     char *tmp;
+    char rankstr[16];
     prte_node_t *node;
     prte_proc_t *proc;
     int n, m, rc;
@@ -118,7 +119,17 @@ static int pack_proc_map(pmix_data_buffer_t *bkt, prte_job_t *job, prte_app_idx_
             if (proc->app_idx != idx) {
                 continue;
             }
-            PMIx_Argv_append_nosize(&micro, PRTE_VPID_PRINT(proc->name.rank));
+            /* Render the rank, do NOT print it.  PRTE_VPID_PRINT is a
+             * display helper: it renders each of the five sentinel ranks as
+             * a word - PMIX_RANK_INVALID as "INVALID" - and the decoder
+             * reads this field with strtoul, which makes that word a zero.
+             * A proc left unranked by the mapper would therefore have
+             * silently overwritten rank 0's node, app and local rank on
+             * every daemon.  "%u" is what the helper emits for every real
+             * rank, so this changes nothing that ever worked; a sentinel
+             * now arrives above num_procs and is rejected there. */
+            snprintf(rankstr, sizeof(rankstr), "%u", proc->name.rank);
+            PMIx_Argv_append_nosize(&micro, rankstr);
         }
         if (NULL == micro) {
             PMIx_Argv_append_nosize(&fields, "-");
@@ -270,9 +281,9 @@ int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job, prte_job_pack_mode_t
                 continue;
             }
             rc = prte_app_pack(bkt, app);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                return prte_pmix_convert_status(rc);
+            if (PRTE_SUCCESS != rc) {
+                PRTE_ERROR_LOG(rc);
+                return rc;
             }
         }
     }
@@ -348,9 +359,9 @@ int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job, prte_job_pack_mode_t
                 continue;
             }
             rc = prte_proc_pack(bkt, proc, devices, mode);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                return prte_pmix_convert_status(rc);
+            if (PRTE_SUCCESS != rc) {
+                PRTE_ERROR_LOG(rc);
+                return rc;
             }
         }
     }
@@ -393,9 +404,9 @@ int prte_job_pack(pmix_data_buffer_t *bkt, prte_job_t *job, prte_job_pack_mode_t
      */
     if (NULL != job->map) {
         rc = prte_map_pack(bkt, job->map);
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
-            return prte_pmix_convert_status(rc);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            return rc;
         }
     }
 
@@ -446,8 +457,11 @@ int prte_node_pack(pmix_data_buffer_t *bkt, prte_node_t *node)
 
     /* do not pack the daemon name or launch id */
 
-    /* pack the number of procs on the node */
-    rc = PMIx_Data_pack(NULL, bkt, (void *) &node->num_procs, 1, PMIX_PROC_RANK);
+    /* pack the number of procs on the node.  This counts procs, not ranks:
+     * the field is a prte_node_rank_t (uint16_t), so PMIX_PROC_RANK would
+     * read four bytes out of a two-byte object and put its trailing padding
+     * on the wire.  See the type table in AGENTS.md. */
+    rc = PMIx_Data_pack(NULL, bkt, (void *) &node->num_procs, 1, PMIX_UINT16);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         return prte_pmix_convert_status(rc);
@@ -464,7 +478,7 @@ int prte_node_pack(pmix_data_buffer_t *bkt, prte_node_t *node)
     }
 
     /* pack the state */
-    rc = PMIx_Data_pack(NULL, bkt, (void *) &node->state, 1, PMIX_UINT8);
+    rc = PMIx_Data_pack(NULL, bkt, (void *) &node->state, 1, PMIX_INT8);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         return prte_pmix_convert_status(rc);
@@ -577,13 +591,14 @@ int prte_proc_pack(pmix_data_buffer_t *bkt, prte_proc_t *proc, bool devices,
 
     /* NO ATTRIBUTE LIST GOES ON THE WIRE.
      *
-     * Exactly one proc attribute exists anywhere in this tree -
-     * PRTE_PROC_NOBARRIER - and it is PRTE_ATTR_LOCAL, which this filter
-     * excluded; it is also set by the odls on the daemon that forks the
-     * proc, which is after this packing and on the far side of it. So the
-     * count was 4 bytes per proc introducing a list that has been empty in
-     * every job ever launched - 512 KB of a 1.9 MB launch message at
-     * 1000 nodes x 128 ppn, buying nothing at any scale.
+     * NO proc attribute exists anywhere in this tree.  There was exactly
+     * one - PRTE_PROC_NOBARRIER - and it was PRTE_ATTR_LOCAL, which this
+     * filter excluded, and was set by the odls on the daemon that forks the
+     * proc, which is after this packing and on the far side of it; it has
+     * since been retired.  So the count was 4 bytes per proc introducing a
+     * list that has been empty in every job ever launched - 512 KB of a
+     * 1.9 MB launch message at 1000 nodes x 128 ppn, buying nothing at any
+     * scale.
      *
      * If you add a PRTE_ATTR_GLOBAL proc attribute, it has to come back
      * here and in prte_proc_unpack, together. The check below is what will
@@ -616,7 +631,7 @@ int prte_app_pack(pmix_data_buffer_t *bkt, prte_app_context_t *app)
     prte_attribute_t *kv;
 
     /* pack the application index (for multiapp jobs) */
-    rc = PMIx_Data_pack(NULL, bkt, &app->idx, 1, PMIX_INT32);
+    rc = PMIx_Data_pack(NULL, bkt, &app->idx, 1, PMIX_UINT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         return prte_pmix_convert_status(rc);
@@ -685,7 +700,7 @@ int prte_app_pack(pmix_data_buffer_t *bkt, prte_app_context_t *app)
     }
 
     /* pack the flags */
-    rc = PMIx_Data_pack(NULL, bkt, &app->flags, 1, PMIX_INT8);
+    rc = PMIx_Data_pack(NULL, bkt, &app->flags, 1, PMIX_UINT8);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         return prte_pmix_convert_status(rc);
@@ -756,7 +771,7 @@ int prte_map_pack(pmix_data_buffer_t *bkt, struct prte_job_map_t *mp)
     }
 
     /* pack the number of nodes involved in the job */
-    rc = PMIx_Data_pack(NULL, bkt, &map->num_nodes, 1, PMIX_UINT32);
+    rc = PMIx_Data_pack(NULL, bkt, &map->num_nodes, 1, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         return prte_pmix_convert_status(rc);

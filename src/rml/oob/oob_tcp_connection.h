@@ -44,14 +44,23 @@ typedef struct {
     pmix_object_t super;
     prte_oob_tcp_peer_t *peer;
     prte_event_t ev;
+    /* an inbound connection's handshake, as far as it has arrived: the
+     * accept path's one-shot read event is re-armed until it is all in */
+    prte_oob_tcp_handshake_t hshake;
 } prte_oob_tcp_conn_op_t;
 PMIX_CLASS_DECLARATION(prte_oob_tcp_conn_op_t);
 
+/* PMIx's src/mca/ptl/ptl_types.h defines this too, and every file here
+ * reaches that header first, so it is PMIx's definition that is used.  Keep
+ * this one identical to it: callers rely on the variable being left at -1. */
 #ifndef CLOSE_THE_SOCKET
-#define CLOSE_THE_SOCKET(socket) \
-    do {                         \
-        shutdown(socket, 2);     \
-        close(socket);           \
+#define CLOSE_THE_SOCKET(s)   \
+    do {                      \
+        if (0 <= (s)) {       \
+            shutdown((s), 2); \
+            close((s));       \
+            (s) = -1;         \
+        }                     \
     } while (0)
 #endif
 
@@ -97,8 +106,20 @@ PRTE_EXPORT void prte_oob_tcp_peer_start_connect(int fd, short args, void *cbdat
 PRTE_EXPORT void prte_oob_tcp_peer_dump(prte_oob_tcp_peer_t *peer, const char *msg);
 PRTE_EXPORT bool prte_oob_tcp_peer_accept(prte_oob_tcp_peer_t *peer);
 PRTE_EXPORT void prte_oob_tcp_peer_complete_connect(prte_oob_tcp_peer_t *peer);
+/* Read and act on a connect handshake arriving on `sd` - an outbound one's
+ * reply when `peer` is given (read into peer->hshake), an inbound one when it
+ * is NULL (read into the caller's `hs`).
+ *
+ * Never waits for bytes that have not arrived: PRTE_ERR_WOULD_BLOCK means the
+ * handshake is incomplete, `hs` holds what came, and the caller calls again
+ * when the socket is next readable.  Every other failure has already disposed
+ * of the connection - the peer closed, or the socket when there is no peer to
+ * close - so a caller must not close it again. */
 PRTE_EXPORT int prte_oob_tcp_peer_recv_connect_ack(prte_oob_tcp_peer_t *peer, int sd,
-                                                          prte_oob_tcp_hdr_t *dhdr);
+                                                   prte_oob_tcp_handshake_t *hs,
+                                                   prte_oob_tcp_hdr_t *dhdr);
+/* return a handshake record to empty, freeing any payload it holds */
+PRTE_EXPORT void prte_oob_tcp_handshake_reset(prte_oob_tcp_handshake_t *hs);
 PRTE_EXPORT void prte_oob_tcp_peer_close(prte_oob_tcp_peer_t *peer);
 
 #endif /* _MCA_OOB_TCP_CONNECTION_H_ */

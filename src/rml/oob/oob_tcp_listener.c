@@ -74,25 +74,17 @@
 #include "src/rml/oob/oob_tcp_listener.h"
 #include "src/rml/oob/oob_tcp_peer.h"
 
-static void connection_event_handler(int incoming_sd, short flags, void *cbdata);
 static void *listen_thread(pmix_object_t *obj);
-static int create_listen(void);
-#if PRTE_ENABLE_IPV6
-static int create_listen6(void);
-#endif
+static int create_listeners(int family);
+static void unadvertise(char ***conns, char ***masks);
 static void connection_handler(int sd, short flags, void *cbdata);
 static void connection_event_handler(int sd, short flags, void *cbdata);
 
 /*
- * Component initialization - create a module for each available
- * TCP interface and initialize the static resources associated
- * with that module.
- *
- * Also initializes the list of devices that will be used/supported by
- * the module, using the if_include and if_exclude variables.  This is
- * the only place that this sorting should occur -- all other places
- * should use the tcp_avaiable_devices list.  This is a change from
- * previous versions of this component.
+ * Open the listening sockets on the interfaces prte_oob_open selected, and
+ * start harvesting connections from them: on a thread in the DVM master, on
+ * the event base everywhere else.  A family that cannot be listened on is
+ * dropped from our contact URI.
  */
 int prte_oob_tcp_start_listening(void)
 {
@@ -110,25 +102,21 @@ int prte_oob_tcp_start_listening(void)
     }
 
     /* create listen socket(s) for incoming connection attempts */
-    rc = create_listen();
-
-#if PRTE_ENABLE_IPV6
-    int rc2;
-    /* create listen socket(s) for incoming connection attempts */
-    rc2 = create_listen6();
-    if (PRTE_SUCCESS != rc && PRTE_SUCCESS != rc2) {
-        /* we were unable to open any listening sockets */
-        prte_show_help("help-oob-tcp.txt", "no-listeners", true);
-        return PRTE_ERR_FATAL;
-    }
-#else
+    rc = create_listeners(AF_INET);
     if (PRTE_SUCCESS != rc) {
-        /* we were unable to open any listening sockets */
-        prte_show_help("help-oob-tcp.txt", "no-listeners", true);
-        return PRTE_ERR_FATAL;
+        unadvertise(&prte_oob_base.ipv4conns, &prte_oob_base.ipv4masks);
+    }
+#if PRTE_ENABLE_IPV6
+    rc = create_listeners(AF_INET6);
+    if (PRTE_SUCCESS != rc) {
+        unadvertise(&prte_oob_base.ipv6conns, &prte_oob_base.ipv6masks);
     }
 #endif
-
+    if (0 == pmix_list_get_size(&prte_oob_base.listeners)) {
+        /* we were unable to open any listening sockets */
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "no-listeners", true);
+        return PRTE_ERR_SOCKET_NOT_AVAILABLE;
+    }
 
     /* if I am the HNP, start a listening thread so we can
      * harvest connection requests as rapidly as possible
@@ -165,7 +153,7 @@ int prte_oob_tcp_start_listening(void)
     {
         listener->ev_active = true;
         prte_event_set(prte_event_base, &listener->event, listener->sd,
-                       PRTE_EV_READ | PRTE_EV_PERSIST, connection_event_handler, 0);
+                       PRTE_EV_READ | PRTE_EV_PERSIST, connection_event_handler, listener);
         PMIX_POST_OBJECT(listener);
         prte_event_add(&listener->event, 0);
     }
@@ -173,395 +161,361 @@ int prte_oob_tcp_start_listening(void)
     return PRTE_SUCCESS;
 }
 
-/*
- * Create an IPv4 listen socket and bind to all interfaces.
- *
- * At one time, this also registered a callback with the event library
- * for when connections were received on the listen socket.  This is
- * no longer the case -- the caller must register any events required.
- *
- * Called by both the threaded and event based listen modes.
- */
-static int create_listen(void)
+/* The ports a family's listeners may use, in the order to try them.  A static
+ * port is the one every daemon is known to listen on, so only the first entry
+ * of a static list means anything; a dynamic range is tried in order; with
+ * neither, "0" lets the kernel choose. */
+static char **candidate_ports(int family, bool *isstatic)
 {
-    int flags, i;
-    uint16_t port = 0;
-    struct sockaddr_storage inaddr;
-    prte_socklen_t addrlen;
+    char **static_ports = prte_oob_base.tcp_static_ports;
+    char **dyn_ports = prte_oob_base.tcp_dyn_ports;
     char **ports = NULL;
-    int sd = -1;
-    char *tconn;
-    prte_oob_tcp_listener_t *conn;
 
-    /* If an explicit range of ports was given, find the first open
-     * port in the range.  Otherwise, tcp_port_min will be 0, which
-     * means "pick any port"
-     */
-    if (NULL != prte_oob_base.tcp_static_ports) {
-        /* if static ports were provided, take the
-         * first entry in the list
-         */
-        PMIx_Argv_append_nosize(&ports, prte_oob_base.tcp_static_ports[0]);
-        /* flag that we are using static ports */
-        prte_static_ports = true;
-    } else if (NULL != prte_oob_base.tcp_dyn_ports) {
-        /* take the entire range */
-        ports = PMIx_Argv_copy(prte_oob_base.tcp_dyn_ports);
-        prte_static_ports = false;
+    if (AF_INET6 == family) {
+        static_ports = prte_oob_base.tcp6_static_ports;
+        dyn_ports = prte_oob_base.tcp6_dyn_ports;
+    }
+
+    *isstatic = false;
+    if (NULL != static_ports) {
+        PMIx_Argv_append_nosize(&ports, static_ports[0]);
+        *isstatic = true;
+    } else if (NULL != dyn_ports) {
+        ports = PMIx_Argv_copy(dyn_ports);
     } else {
-        /* flag the system to dynamically take any available port */
         PMIx_Argv_append_nosize(&ports, "0");
-        prte_static_ports = false;
     }
-
-    /* bozo check - this should be impossible, but... */
-    if (NULL == ports) {
-        return PRTE_ERROR;
-    }
-
-    /* get the address info for this interface */
-    memset(&inaddr, 0, sizeof(inaddr));
-    ((struct sockaddr_in *) &inaddr)->sin_family = AF_INET;
-    ((struct sockaddr_in *) &inaddr)->sin_addr.s_addr = INADDR_ANY;
-    addrlen = sizeof(struct sockaddr_in);
-
-    /* loop across all the specified ports, establishing a socket
-     * for each one - note that application procs will ONLY have
-     * one socket, but that prun and daemons will have multiple
-     * sockets to support more flexible wireup protocols
-     */
-    for (i = 0; i < PMIx_Argv_count(ports); i++) {
-        pmix_output_verbose(5, prte_oob_base.output,
-                            "%s attempting to bind to IPv4 port %s",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), ports[i]);
-        /* get the port number */
-        port = strtol(ports[i], NULL, 10);
-        /* convert it to network-byte-order */
-        port = htons(port);
-
-        ((struct sockaddr_in *) &inaddr)->sin_port = port;
-
-        /* create a listen socket for incoming connections on this port */
-        sd = socket(AF_INET, SOCK_STREAM, 0);
-        if (sd < 0) {
-            if (EAFNOSUPPORT != prte_socket_errno) {
-                pmix_output(0, "prte_oob_create_listen: socket() failed: %s (%d)",
-                            strerror(prte_socket_errno), prte_socket_errno);
-            }
-            PMIx_Argv_free(ports);
-            return PRTE_ERR_IN_ERRNO;
-        }
-
-        /* Enable/disable reusing ports */
-        if (prte_static_ports) {
-            flags = 1;
-        } else {
-            flags = 0;
-        }
-        if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, (const char *) &flags, sizeof(flags)) < 0) {
-            pmix_output(0,
-                        "prte_oob_create_listen: unable to set the "
-                        "SO_REUSEADDR option (%s:%d)\n",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-
-        /* Set the socket to close-on-exec so that no children inherit
-           this FD */
-        if (pmix_fd_set_cloexec(sd) != PRTE_SUCCESS) {
-            pmix_output(0,
-                        "prte_oob_create_listen: unable to set the "
-                        "listening socket to CLOEXEC (%s:%d)\n",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-
-        if (bind(sd, (struct sockaddr *) &inaddr, addrlen) < 0) {
-            if ((EADDRINUSE == prte_socket_errno) || (EADDRNOTAVAIL == prte_socket_errno)) {
-                continue;
-            }
-            pmix_output(0, "%s bind() failed for port %d: %s (%d)",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (int) ntohs(port),
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-        /* resolve assigned port */
-        if (getsockname(sd, (struct sockaddr *) &inaddr, &addrlen) < 0) {
-            pmix_output(0, "prte_oob_create_listen: getsockname(): %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-
-        /* setup listen backlog to maximum allowed by kernel */
-        if (listen(sd, SOMAXCONN) < 0) {
-            pmix_output(0, "prte_oob_create_listen: listen(): %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-
-        /* set socket up to be non-blocking, otherwise accept could block */
-        if ((flags = fcntl(sd, F_GETFL, 0)) < 0) {
-            pmix_output(0, "prte_oob_create_listen init: fcntl(F_GETFL) failed: %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-        flags |= O_NONBLOCK;
-        if (fcntl(sd, F_SETFL, flags) < 0) {
-            pmix_output(0, "prte_oob_create_listen init: fcntl(F_SETFL) failed: %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-
-        /* add this port to our connections */
-        conn = PMIX_NEW(prte_oob_tcp_listener_t);
-        conn->sd = sd;
-        conn->port = ntohs(((struct sockaddr_in *) &inaddr)->sin_port);
-        if (0 == prte_process_info.my_port) {
-            /* save the first one */
-            prte_process_info.my_port = conn->port;
-        }
-        pmix_list_append(&prte_oob_base.listeners, &conn->item);
-        /* and to our ports */
-        pmix_asprintf(&tconn, "%d", ntohs(((struct sockaddr_in *) &inaddr)->sin_port));
-        PMIx_Argv_append_nosize(&prte_oob_base.ipv4ports, tconn);
-        free(tconn);
-        if (OOB_TCP_DEBUG_CONNECT
-            <= pmix_output_get_verbosity(prte_oob_base.output)) {
-            port = ntohs(((struct sockaddr_in *) &inaddr)->sin_port);
-            pmix_output(0, "%s assigned IPv4 port %d", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), port);
-        }
-
-        if (!PRTE_PROC_IS_MASTER) {
-            /* only the HNP binds to multiple ports */
-            break;
-        }
-    }
-    /* done with this, so release it */
-    PMIx_Argv_free(ports);
-
-    if (0 == pmix_list_get_size(&prte_oob_base.listeners)) {
-        /* cleanup */
-        if (0 <= sd) {
-            CLOSE_THE_SOCKET(sd);
-        }
-        return PRTE_ERR_SOCKET_NOT_AVAILABLE;
-    }
-
-    return PRTE_SUCCESS;
+    return ports;
 }
 
-#if PRTE_ENABLE_IPV6
-/*
- * Create an IPv6 listen socket and bind to all interfaces.
- *
- * At one time, this also registered a callback with the event library
- * for when connections were received on the listen socket.  This is
- * no longer the case -- the caller must register any events required.
- *
- * Called by both the threaded and event based listen modes.
- */
-static int create_listen6(void)
+static uint16_t get_port(struct sockaddr_storage *addr)
 {
-    int flags, i;
-    uint16_t port = 0;
-    struct sockaddr_storage inaddr;
-    prte_socklen_t addrlen;
-    char **ports = NULL;
-    int sd;
-    char *tconn;
-    prte_oob_tcp_listener_t *conn;
+    if (AF_INET6 == addr->ss_family) {
+        return ntohs(((struct sockaddr_in6 *) addr)->sin6_port);
+    }
+    return ntohs(((struct sockaddr_in *) addr)->sin_port);
+}
 
-    /* If an explicit range of ports was given, find the first open
-     * port in the range.  Otherwise, tcp_port_min will be 0, which
-     * means "pick any port"
-     */
-    if (PRTE_PROC_IS_DAEMON) {
-        if (NULL != prte_oob_base.tcp6_static_ports) {
-            /* if static ports were provided, take the
-             * first entry in the list
-             */
-            PMIx_Argv_append_nosize(&ports, prte_oob_base.tcp6_static_ports[0]);
-            /* flag that we are using static ports */
-            prte_static_ports = true;
-        } else if (NULL != prte_oob_base.tcp6_dyn_ports) {
-            /* take the entire range */
-            ports = PMIx_Argv_copy(prte_oob_base.tcp6_dyn_ports);
-            prte_static_ports = false;
-        } else {
-            /* flag the system to dynamically take any available port */
-            PMIx_Argv_append_nosize(&ports, "0");
-            prte_static_ports = false;
-        }
+static void set_port(struct sockaddr_storage *addr, uint16_t port)
+{
+    if (AF_INET6 == addr->ss_family) {
+        ((struct sockaddr_in6 *) addr)->sin6_port = htons(port);
     } else {
-        if (NULL != prte_oob_base.tcp6_static_ports) {
-            /* if static ports were provided, take the
-             * first entry in the list
-             */
-            PMIx_Argv_append_nosize(&ports, prte_oob_base.tcp6_static_ports[0]);
-            /* flag that we are using static ports */
-            prte_static_ports = true;
-        } else if (NULL != prte_oob_base.tcp6_dyn_ports) {
-            /* take the entire range */
-            ports = PMIx_Argv_copy(prte_oob_base.tcp6_dyn_ports);
-            prte_static_ports = false;
-        } else {
-            /* flag the system to dynamically take any available port */
-            PMIx_Argv_append_nosize(&ports, "0");
-            prte_static_ports = false;
+        ((struct sockaddr_in *) addr)->sin_port = htons(port);
+    }
+}
+
+static bool same_address(struct sockaddr_storage *a, struct sockaddr_storage *b)
+{
+    if (a->ss_family != b->ss_family) {
+        return false;
+    }
+    if (AF_INET6 == a->ss_family) {
+        return 0 == memcmp(&((struct sockaddr_in6 *) a)->sin6_addr,
+                           &((struct sockaddr_in6 *) b)->sin6_addr, sizeof(struct in6_addr));
+    }
+    return ((struct sockaddr_in *) a)->sin_addr.s_addr == ((struct sockaddr_in *) b)->sin_addr.s_addr;
+}
+
+/*
+ * Open one non-blocking, close-on-exec listening socket on @c addr, at the
+ * port @c addr already carries (0 lets the kernel choose).  On success the
+ * address actually bound - including the chosen port - is written back into
+ * @c addr.
+ *
+ * Returns PRTE_SUCCESS; PRTE_ERR_TAKE_NEXT_OPTION when that address:port is
+ * taken or cannot be assigned, so the caller may try another port; or an error
+ * for anything else.
+ */
+static int open_listener(struct sockaddr_storage *addr, bool isstatic, int *sdout)
+{
+    int flags, sd, err;
+    prte_socklen_t addrlen;
+
+    addrlen = (AF_INET6 == addr->ss_family) ? sizeof(struct sockaddr_in6)
+                                            : sizeof(struct sockaddr_in);
+
+    sd = socket(addr->ss_family, SOCK_STREAM, 0);
+    if (0 > sd) {
+        if (EAFNOSUPPORT != prte_socket_errno) {
+            pmix_output(0, "%s oob:tcp:listen: socket() failed: %s (%d)",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        strerror(prte_socket_errno), prte_socket_errno);
         }
+        return PRTE_ERR_IN_ERRNO;
     }
 
-    /* bozo check - this should be impossible, but... */
-    if (NULL == ports) {
+    /* Enable/disable reusing ports */
+    flags = isstatic ? 1 : 0;
+    if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, (const char *) &flags, sizeof(flags)) < 0) {
+        pmix_output(0, "%s oob:tcp:listen: unable to set the SO_REUSEADDR option (%s:%d)",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                    strerror(prte_socket_errno), prte_socket_errno);
+        CLOSE_THE_SOCKET(sd);
         return PRTE_ERROR;
     }
 
-    /* get the address info for this interface */
-    memset(&inaddr, 0, sizeof(inaddr));
-    ((struct sockaddr_in6 *) &inaddr)->sin6_family = AF_INET6;
-    ((struct sockaddr_in6 *) &inaddr)->sin6_addr = in6addr_any;
-    addrlen = sizeof(struct sockaddr_in6);
+    /* Set the socket to close-on-exec so that no children inherit this FD */
+    if (PRTE_SUCCESS != pmix_fd_set_cloexec(sd)) {
+        pmix_output(0, "%s oob:tcp:listen: unable to set the listening socket to CLOEXEC (%s:%d)",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                    strerror(prte_socket_errno), prte_socket_errno);
+        CLOSE_THE_SOCKET(sd);
+        return PRTE_ERROR;
+    }
 
-    /* loop across all the specified ports, establishing a socket
-     * for each one - note that application procs will ONLY have
-     * one socket, but that prun and daemons will have multiple
-     * sockets to support more flexible wireup protocols
-     */
-    for (i = 0; i < PMIx_Argv_count(ports); i++) {
-        pmix_output_verbose(5, prte_oob_base.output,
-                            "%s attempting to bind to IPv6 port %s",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), ports[i]);
-        /* get the port number */
-        port = strtol(ports[i], NULL, 10);
-        /* convert it to network-byte-order */
-        port = htons(port);
+#ifdef IPV6_V6ONLY
+    if (AF_INET6 == addr->ss_family) {
+        /* accept only V6 connections here: an IPv4-mapped connection belongs
+         * to the IPv4 listeners (cf. mca_btl_tcp_create_listen) */
+        flags = 1;
+        if (setsockopt(sd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *) &flags, sizeof(flags)) < 0) {
+            pmix_output(0, "%s oob:tcp:listen: unable to set the IPV6_V6ONLY option (%s:%d)",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        strerror(prte_socket_errno), prte_socket_errno);
+        }
+    }
+#endif
 
-        ((struct sockaddr_in6 *) &inaddr)->sin6_port = port;
+    if (bind(sd, (struct sockaddr *) addr, addrlen) < 0) {
+        err = prte_socket_errno;
+        CLOSE_THE_SOCKET(sd);
+        if (EADDRINUSE == err || EADDRNOTAVAIL == err) {
+            return PRTE_ERR_TAKE_NEXT_OPTION;
+        }
+        pmix_output(0, "%s bind() failed for %s port %d: %s (%d)",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                    pmix_net_get_hostname((struct sockaddr *) addr), (int) get_port(addr),
+                    strerror(err), err);
+        return PRTE_ERROR;
+    }
 
-        /* create a listen socket for incoming connections on this port */
-        sd = socket(AF_INET6, SOCK_STREAM, 0);
-        if (sd < 0) {
-            if (EAFNOSUPPORT != prte_socket_errno) {
-                pmix_output(0, "prte_oob_create_listen6: socket() failed: %s (%d)",
-                            strerror(prte_socket_errno), prte_socket_errno);
+    /* resolve assigned port */
+    if (getsockname(sd, (struct sockaddr *) addr, &addrlen) < 0) {
+        pmix_output(0, "%s oob:tcp:listen: getsockname(): %s (%d)",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                    strerror(prte_socket_errno), prte_socket_errno);
+        CLOSE_THE_SOCKET(sd);
+        return PRTE_ERROR;
+    }
+
+    /* setup listen backlog to maximum allowed by kernel */
+    if (listen(sd, SOMAXCONN) < 0) {
+        pmix_output(0, "%s oob:tcp:listen: listen(): %s (%d)",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                    strerror(prte_socket_errno), prte_socket_errno);
+        CLOSE_THE_SOCKET(sd);
+        return PRTE_ERROR;
+    }
+
+    /* set socket up to be non-blocking, otherwise accept could block */
+    if ((flags = fcntl(sd, F_GETFL, 0)) < 0 ||
+        fcntl(sd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        pmix_output(0, "%s oob:tcp:listen: fcntl() failed: %s (%d)",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                    strerror(prte_socket_errno), prte_socket_errno);
+        CLOSE_THE_SOCKET(sd);
+        return PRTE_ERROR;
+    }
+
+    *sdout = sd;
+    return PRTE_SUCCESS;
+}
+
+/*
+ * Listen on every selected address of @c family, all at the same port.
+ *
+ * One port, because a contact URI carries one port for all of its addresses
+ * (set_addr pairs each address with the first port listed), and because a
+ * static port is by definition the same everywhere.  With @c port 0 the
+ * kernel chooses it for the first address and the rest are bound to match.
+ *
+ * All or nothing: if any address cannot take the port, every socket this call
+ * opened is closed again and the caller may try another port.
+ */
+static int listen_on_port(int family, uint16_t port, bool isstatic, uint16_t *bound)
+{
+    pmix_list_t opened;
+    pmix_pif_t *intf;
+    prte_oob_tcp_listener_t *listener, *prior;
+    struct sockaddr_storage addr;
+    bool dup;
+    int rc, sd;
+
+    PMIX_CONSTRUCT(&opened, pmix_list_t);
+    PMIX_LIST_FOREACH(intf, &prte_oob_base.local_ifs, pmix_pif_t)
+    {
+        if (family != intf->af_family) {
+            continue;
+        }
+        memcpy(&addr, &intf->if_addr, sizeof(addr));
+        set_port(&addr, port);
+
+        /* an address can appear on the interface list more than once, and
+         * binding it twice would fail on the port we just took */
+        dup = false;
+        PMIX_LIST_FOREACH(prior, &opened, prte_oob_tcp_listener_t)
+        {
+            if (same_address(&prior->addr, &addr)) {
+                dup = true;
+                break;
             }
-            return PRTE_ERR_IN_ERRNO;
         }
-        /* Set the socket to close-on-exec so that no children inherit
-           this FD */
-        if (pmix_fd_set_cloexec(sd) != PRTE_SUCCESS) {
-            pmix_output(0,
-                        "prte_oob_create_listen6: unable to set the "
-                        "listening socket to CLOEXEC (%s:%d)\n",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
+        if (dup) {
+            continue;
         }
 
-        /* Enable/disable reusing ports */
-        if (prte_static_ports) {
-            flags = 1;
-        } else {
-            flags = 0;
+        rc = open_listener(&addr, isstatic, &sd);
+        if (PRTE_SUCCESS != rc) {
+            /* releasing each listener closes its socket */
+            PMIX_LIST_DESTRUCT(&opened);
+            return rc;
         }
-        if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, (const char *) &flags, sizeof(flags)) < 0) {
-            pmix_output(0,
-                        "prte_oob_tcp_create_listen: unable to set the "
-                        "SO_REUSEADDR option (%s:%d)\n",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
+        listener = PMIX_NEW(prte_oob_tcp_listener_t);
+        listener->tcp6 = (AF_INET6 == family);
+        listener->sd = sd;
+        listener->port = get_port(&addr);
+        memcpy(&listener->addr, &addr, sizeof(addr));
+        pmix_list_append(&opened, &listener->item);
+        /* the remaining addresses take whatever port the first one got */
+        port = listener->port;
 
-        if (bind(sd, (struct sockaddr *) &inaddr, addrlen) < 0) {
-            if ((EADDRINUSE == prte_socket_errno) || (EADDRNOTAVAIL == prte_socket_errno)) {
-                continue;
-            }
-            pmix_output(0, "%s bind() failed for port %d: %s (%d)",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (int) ntohs(port),
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            PMIx_Argv_free(ports);
-            return PRTE_ERROR;
-        }
-        /* resolve assigned port */
-        if (getsockname(sd, (struct sockaddr *) &inaddr, &addrlen) < 0) {
-            pmix_output(0, "prte_oob_create_listen6: getsockname(): %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            CLOSE_THE_SOCKET(sd);
-            return PRTE_ERROR;
-        }
+        pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
+                            "%s oob:tcp:listen: listening on %s port %d",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            pmix_net_get_hostname((struct sockaddr *) &addr), (int) port);
+    }
 
-        /* setup listen backlog to maximum allowed by kernel */
-        if (listen(sd, SOMAXCONN) < 0) {
-            pmix_output(0, "prte_oob_create_listen6: listen(): %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            return PRTE_ERROR;
-        }
+    while (NULL != (listener = (prte_oob_tcp_listener_t *) pmix_list_remove_first(&opened))) {
+        pmix_list_append(&prte_oob_base.listeners, &listener->item);
+    }
+    PMIX_DESTRUCT(&opened);
+    *bound = port;
+    return PRTE_SUCCESS;
+}
 
-        /* set socket up to be non-blocking, otherwise accept could block */
-        if ((flags = fcntl(sd, F_GETFL, 0)) < 0) {
-            pmix_output(0, "prte_oob_create_listen6: fcntl(F_GETFL) failed: %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            return PRTE_ERROR;
-        }
-        flags |= O_NONBLOCK;
-        if (fcntl(sd, F_SETFL, flags) < 0) {
-            pmix_output(0, "prte_oob_create_listen6: fcntl(F_SETFL) failed: %s (%d)",
-                        strerror(prte_socket_errno), prte_socket_errno);
-            return PRTE_ERROR;
-        }
+/* How many kernel-chosen ports to try before giving up, when the port the
+ * first address was given turns out to be taken on another one */
+#define PRTE_OOB_TCP_EPHEMERAL_ATTEMPTS 8
 
-        /* add this port to our connections */
-        conn = PMIX_NEW(prte_oob_tcp_listener_t);
-        conn->tcp6 = true;
-        conn->sd = sd;
-        conn->port = ntohs(((struct sockaddr_in6 *) &inaddr)->sin6_port);
-        pmix_list_append(&prte_oob_base.listeners, &conn->item);
-        /* and to our ports */
-        pmix_asprintf(&tconn, "%d", ntohs(((struct sockaddr_in6 *) &inaddr)->sin6_port));
-        PMIx_Argv_append_nosize(&prte_oob_base.ipv6ports, tconn);
-        free(tconn);
-        if (OOB_TCP_DEBUG_CONNECT
-            <= pmix_output_get_verbosity(prte_oob_base.output)) {
-            pmix_output(0, "%s assigned IPv6 port %d", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                        (int) ntohs(((struct sockaddr_in6 *) &inaddr)->sin6_port));
-        }
+/*
+ * Create the listening sockets for one address family: one per address
+ * prte_oob_open selected, never a wildcard.  Binding the wildcard would accept
+ * connections on interfaces the user excluded - and, for a DVM confined to
+ * loopback, expose a port on every external interface it was meant to keep
+ * off.  Nothing loses by it: a peer reaches us only at the addresses our
+ * contact URI names, and those are exactly these.
+ *
+ * Returns PRTE_ERR_NOT_FOUND, quietly, when the family has no selected address.
+ */
+static int create_listeners(int family)
+{
+    char **ports, ***portlist, *tconn;
+    pmix_pif_t *intf;
+    bool isstatic, found = false;
+    uint16_t port = 0, bound = 0;
+    int i, n, attempts, rc = PRTE_ERR_SOCKET_NOT_AVAILABLE;
 
-        if (!PRTE_PROC_IS_MASTER) {
-            /* only the HNP binds to multiple ports */
+    PMIX_LIST_FOREACH(intf, &prte_oob_base.local_ifs, pmix_pif_t)
+    {
+        if (family == intf->af_family) {
+            found = true;
             break;
         }
     }
-    if (0 == pmix_list_get_size(&prte_oob_base.listeners)) {
-        /* cleanup */
-        CLOSE_THE_SOCKET(sd);
-        PMIx_Argv_free(ports);
-        return PRTE_ERR_SOCKET_NOT_AVAILABLE;
+    if (!found) {
+        return PRTE_ERR_NOT_FOUND;
     }
 
-    /* done with this, so release it */
+    ports = candidate_ports(family, &isstatic);
+    for (i = 0; NULL != ports && NULL != ports[i]; i++) {
+        port = (uint16_t) strtol(ports[i], NULL, 10);
+        attempts = (0 == port) ? PRTE_OOB_TCP_EPHEMERAL_ATTEMPTS : 1;
+        for (n = 0; n < attempts; n++) {
+            pmix_output_verbose(5, prte_oob_base.output,
+                                "%s attempting to bind to %s port %d",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                (AF_INET6 == family) ? "IPv6" : "IPv4", (int) port);
+            rc = listen_on_port(family, port, isstatic, &bound);
+            if (PRTE_ERR_TAKE_NEXT_OPTION != rc) {
+                break;
+            }
+        }
+        if (PRTE_ERR_TAKE_NEXT_OPTION != rc) {
+            break;
+        }
+    }
     PMIx_Argv_free(ports);
+    if (PRTE_ERR_TAKE_NEXT_OPTION == rc) {
+        rc = PRTE_ERR_SOCKET_NOT_AVAILABLE;
+    }
+    if (PRTE_SUCCESS != rc) {
+        pmix_output_verbose(5, prte_oob_base.output,
+                            "%s oob:tcp:listen: no %s listener could be opened - "
+                            "not advertising that family",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                            (AF_INET6 == family) ? "IPv6" : "IPv4");
+        return rc;
+    }
 
+    portlist = (AF_INET6 == family) ? &prte_oob_base.ipv6ports : &prte_oob_base.ipv4ports;
+    pmix_asprintf(&tconn, "%d", (int) bound);
+    PMIx_Argv_append_nosize(portlist, tconn);
+    free(tconn);
+    if (0 == prte_process_info.my_port) {
+        prte_process_info.my_port = bound;
+    }
+    pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
+                        "%s assigned %s port %d", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                        (AF_INET6 == family) ? "IPv6" : "IPv4", (int) bound);
     return PRTE_SUCCESS;
 }
+
+/* A family we could not listen on must not be advertised: a peer handed its
+ * addresses would dial a port nobody holds. */
+static void unadvertise(char ***conns, char ***masks)
+{
+    if (NULL != *conns) {
+        PMIx_Argv_free(*conns);
+        *conns = NULL;
+    }
+    if (NULL != *masks) {
+        PMIx_Argv_free(*masks);
+        *masks = NULL;
+    }
+}
+
+/*
+ * Is this accept() failure about the one connection being accepted, rather
+ * than about the listening socket?  A client that resets before we accept it
+ * yields ECONNABORTED, and Linux also hands back the pending network error of
+ * the new connection (see accept(2)).  None of those is a reason to stop
+ * listening, or even to say anything: the next connection is unaffected.
+ */
+static bool accept_error_is_transient(int err)
+{
+    switch (err) {
+    case EINTR:
+    case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
 #endif
+    case ECONNABORTED:
+    case EPROTO:
+    case ENOPROTOOPT:
+    case EHOSTDOWN:
+    case EHOSTUNREACH:
+    case ENETDOWN:
+    case ENETUNREACH:
+    case EOPNOTSUPP:
+#ifdef ENONET
+    case ENONET:
+#endif
+        return true;
+    default:
+        return false;
+    }
+}
 
 /*
  * The listen thread created when listen_mode is threaded.  Accepts
@@ -573,7 +527,7 @@ static int create_listen6(void)
 static void *listen_thread(pmix_object_t *obj)
 {
     int rc, max, accepted_connections, sd;
-    prte_socklen_t addrlen = sizeof(struct sockaddr_storage);
+    prte_socklen_t addrlen;
     prte_oob_tcp_pending_connection_t *pending_connection;
     struct timeval timeout;
     fd_set readfds;
@@ -647,6 +601,9 @@ static void *listen_thread(pmix_object_t *obj)
                 pending_connection = PMIX_NEW(prte_oob_tcp_pending_connection_t);
                 prte_event_set(prte_event_base, &pending_connection->ev, -1, PRTE_EV_WRITE,
                                connection_handler, pending_connection);
+                /* accept() overwrites this with the length of the address it
+                 * returned, which is shorter for IPv4 than for IPv6 */
+                addrlen = sizeof(pending_connection->addr);
                 pending_connection->fd = accept(sd, (struct sockaddr *) &(pending_connection->addr),
                                                 &addrlen);
 
@@ -655,7 +612,7 @@ static void *listen_thread(pmix_object_t *obj)
                     PMIX_RELEASE(pending_connection);
 
                     /* Non-fatal errors */
-                    if (EAGAIN == prte_socket_errno || EWOULDBLOCK == prte_socket_errno) {
+                    if (accept_error_is_transient(prte_socket_errno)) {
                         continue;
                     }
 
@@ -664,8 +621,9 @@ static void *listen_thread(pmix_object_t *obj)
                        problem) and abandon all hope. */
                     else if (EMFILE == prte_socket_errno) {
                         CLOSE_THE_SOCKET(sd);
+                        listener->sd = -1;
                         PRTE_ERROR_LOG(PRTE_ERR_SYS_LIMITS_SOCKETS);
-                        prte_show_help("help-oob-tcp.txt", "accept failed", true,
+                        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "accept failed", true,
                                        prte_process_info.nodename, prte_socket_errno,
                                        strerror(prte_socket_errno), "Out of file descriptors");
                         goto done;
@@ -674,7 +632,7 @@ static void *listen_thread(pmix_object_t *obj)
                     /* For all other cases, print a
                        warning but try to continue */
                     else {
-                        prte_show_help("help-oob-tcp.txt", "accept failed", true,
+                        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "accept failed", true,
                                        prte_process_info.nodename, prte_socket_errno,
                                        strerror(prte_socket_errno),
                                        "Unknown cause; job will try to continue");
@@ -701,7 +659,7 @@ static void *listen_thread(pmix_object_t *obj)
                     if (1024 < inport) {
                         /* someone tried to cross-connect privileges,
                          * say something */
-                        prte_show_help("help-oob-tcp.txt", "privilege failure", true,
+                        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "privilege failure", true,
                                        prte_process_info.nodename, listener->port,
                                        pmix_net_get_hostname(
                                            (struct sockaddr *) &pending_connection->addr),
@@ -755,50 +713,54 @@ static void connection_handler(int sd, short flags, void *cbdata)
  */
 static void connection_event_handler(int incoming_sd, short flags, void *cbdata)
 {
-    struct sockaddr addr;
-    prte_socklen_t addrlen = sizeof(struct sockaddr);
-    int sd;
-    PRTE_HIDE_UNUSED_PARAMS(flags, cbdata);
+    prte_oob_tcp_listener_t *listener = (prte_oob_tcp_listener_t *) cbdata;
+    /* big enough for either family: accept() truncates to what it is given */
+    struct sockaddr_storage addr;
+    prte_socklen_t addrlen = sizeof(addr);
+    int sd, err;
+    PRTE_HIDE_UNUSED_PARAMS(flags);
 
     sd = accept(incoming_sd, (struct sockaddr *) &addr, &addrlen);
-    pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
-                        "%s connection_event_handler: working connection "
-                        "(%d, %d) %s:%d\n",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), sd, prte_socket_errno,
-                        pmix_net_get_hostname((struct sockaddr *) &addr),
-                        pmix_net_get_port((struct sockaddr *) &addr));
     if (sd < 0) {
         /* Non-fatal errors */
-        if (EINTR == prte_socket_errno || EAGAIN == prte_socket_errno
-            || EWOULDBLOCK == prte_socket_errno) {
+        if (accept_error_is_transient(prte_socket_errno)) {
             return;
         }
+
+        /* Give up on this listener.  Its event is persistent, so it has to
+         * come off the base before the socket is closed - left armed on a
+         * dead descriptor it would fire, or watch whatever next reuses the
+         * number - and the destructor must not close it a second time. */
+        err = prte_socket_errno;
+        prte_event_del(&listener->event);
+        listener->ev_active = false;
+        CLOSE_THE_SOCKET(incoming_sd);
+        listener->sd = -1;
 
         /* If we run out of file descriptors, log an extra warning (so
            that the user can know to fix this problem) and abandon all
            hope. */
-        else if (EMFILE == prte_socket_errno) {
-            CLOSE_THE_SOCKET(incoming_sd);
+        if (EMFILE == err) {
             PRTE_ERROR_LOG(PRTE_ERR_SYS_LIMITS_SOCKETS);
-            prte_show_help("help-oob-tcp.txt", "accept failed", true, prte_process_info.nodename,
-                           prte_socket_errno, strerror(prte_socket_errno),
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "accept failed", true,
+                           prte_process_info.nodename, err, strerror(err),
                            "Out of file descriptors");
-            return;
-        }
-
-        /* For all other cases, close the socket, print a warning but
-           try to continue */
-        else {
-            CLOSE_THE_SOCKET(incoming_sd);
-            prte_show_help("help-oob-tcp.txt", "accept failed", true, prte_process_info.nodename,
-                           prte_socket_errno, strerror(prte_socket_errno),
+        } else {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "accept failed", true,
+                           prte_process_info.nodename, err, strerror(err),
                            "Unknown cause; job will try to continue");
-            return;
         }
+        return;
     }
+    pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
+                        "%s connection_event_handler: working connection "
+                        "(%d) %s:%d\n",
+                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), sd,
+                        pmix_net_get_hostname((struct sockaddr *) &addr),
+                        pmix_net_get_port((struct sockaddr *) &addr));
 
     /* process the connection */
-    prte_oob_accept_connection(sd, &addr);
+    prte_oob_accept_connection(sd, (struct sockaddr *) &addr);
 }
 
 static void tcp_ev_cons(prte_oob_tcp_listener_t *event)

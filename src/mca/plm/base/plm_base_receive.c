@@ -717,7 +717,7 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
         tmp = PMIx_Argv_join(jdata->personality, ',');
         jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(tmp);
         if (NULL == jdata->schizo) {
-            prte_show_help("help-schizo-base.txt", "no-proxy", true, prte_tool_basename, tmp);
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-schizo-base.txt", "no-proxy", true, prte_tool_basename, tmp);
             free(tmp);
             rc = PRTE_ERR_NOT_FOUND;
             goto ANSWER_LAUNCH;
@@ -1145,9 +1145,9 @@ moveon:
             jdata = prte_get_job_data_object(job);
             debugging = false;
             if (NULL != jdata &&
-                (prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_ON_EXEC, NULL, PMIX_BOOL) ||
-                 prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_INIT, NULL, PMIX_BOOL) ||
-                 prte_get_attribute(&jdata->attributes, PRTE_JOB_STOP_IN_APP, NULL, PMIX_BOOL))) {
+                (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_STOP_ON_EXEC) ||
+                 PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_STOP_IN_INIT) ||
+                 PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_STOP_IN_APP))) {
                 debugging = true;
             }
             count = 1;
@@ -1346,7 +1346,7 @@ moveon:
         }
         /* record that we heard back from a daemon during app launch */
         jdata->num_daemons_reported++;
-        found = prte_get_attribute(&jdata->attributes, PRTE_JOB_SHOW_PROGRESS, NULL, PMIX_BOOL);
+        found = PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_SHOW_PROGRESS);
         if (found) {
             if (0 == jdata->num_daemons_reported % 100 ||
                 jdata->num_daemons_reported == prte_process_info.num_daemons) {

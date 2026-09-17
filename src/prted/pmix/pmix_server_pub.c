@@ -95,7 +95,7 @@ int prte_pmix_server_init_pubsub(void)
     }
     server_init_rc = init_server();
     if (PRTE_SUCCESS != server_init_rc) {
-        prte_show_help("help-prted.txt", "noserver", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prted.txt", "noserver", true,
                        (NULL == prte_data_server_uri) ? "NULL" : prte_data_server_uri);
     }
     return server_init_rc;
@@ -128,7 +128,7 @@ static int init_server(void)
             filename = strchr(prte_data_server_uri, ':');
             if (NULL == filename) {
                 /* filename is not correctly formatted */
-                prte_show_help("help-prun.txt", "prun:ompi-server-filename-bad", true,
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "prun:ompi-server-filename-bad", true,
                                prte_tool_basename, prte_data_server_uri);
                 return PRTE_ERR_BAD_PARAM;
             }
@@ -136,7 +136,7 @@ static int init_server(void)
 
             if (0 >= strlen(filename)) {
                 /* they forgot to give us the name! */
-                prte_show_help("help-prun.txt", "prun:ompi-server-filename-missing", true,
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "prun:ompi-server-filename-missing", true,
                                prte_tool_basename, prte_data_server_uri);
                 return PRTE_ERR_BAD_PARAM;
             }
@@ -144,14 +144,14 @@ static int init_server(void)
             /* open the file and extract the uri */
             fp = fopen(filename, "r");
             if (NULL == fp) { /* can't find or read file! */
-                prte_show_help("help-prun.txt", "prun:ompi-server-filename-access", true,
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "prun:ompi-server-filename-access", true,
                                prte_tool_basename, prte_data_server_uri);
                 return PRTE_ERR_BAD_PARAM;
             }
             if (NULL == fgets(input, 1024, fp)) {
                 /* something malformed about file */
                 fclose(fp);
-                prte_show_help("help-prun.txt", "prun:ompi-server-file-bad", true,
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "prun:ompi-server-file-bad", true,
                                prte_tool_basename, prte_data_server_uri, prte_tool_basename);
                 return PRTE_ERR_BAD_PARAM;
             }
@@ -222,12 +222,20 @@ static void scan_directives(prte_pmix_server_req_t *req,
 {
     size_t n;
     pmix_status_t rc;
+    uint8_t u8;
     int tmo;
 
     for (n = 0; n < ninfo; n++) {
         if (PMIX_CHECK_KEY(&info[n], PMIX_RANGE)) {
-            if (PMIX_DATA_RANGE == info[n].value.type) {
-                req->range = info[n].value.data.range;
+            /* read the way the data server reads it, so that a range given
+             * as a plain integer is routed to the store that will hold it.
+             * Honoring only PMIX_DATA_RANGE here sent an int-typed LOCAL
+             * publish to the global server, which stored it as LOCAL - where
+             * a local-range lookup, routed to this daemon, never looks.  A
+             * range neither side can read is refused by the data server,
+             * wherever it is routed. */
+            if (PMIX_SUCCESS == prte_ds_get_named_uint8(&info[n].value, PMIX_DATA_RANGE, &u8)) {
+                req->range = u8;
             }
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_TIMEOUT)) {
             /* the data server is what honors this - it is recorded here only

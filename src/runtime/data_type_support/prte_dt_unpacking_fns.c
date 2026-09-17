@@ -190,8 +190,14 @@ static int unpack_layout(pmix_data_buffer_t *bkt, prte_job_t *jptr,
             }
             ranks = PMIx_Argv_split(fields[n], ',');
             for (i = 0; NULL != ranks && NULL != ranks[i]; i++) {
-                pmix_rank_t rank = (pmix_rank_t) strtoul(ranks[i], NULL, 10);
-                if (jptr->num_procs <= rank) {
+                char *end = NULL;
+                pmix_rank_t rank = (pmix_rank_t) strtoul(ranks[i], &end, 10);
+                /* strtoul reports "I parsed nothing" by leaving end at the
+                 * start of the string, and gives 0 for it - so a field that
+                 * is not a number has to be caught here or it lands on rank
+                 * 0.  end is never NULL; it is *end that says where it
+                 * stopped. */
+                if (end == ranks[i] || '\0' != *end || jptr->num_procs <= rank) {
                     PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
                     rc = PRTE_ERR_BAD_PARAM;
                     goto cleanup;
@@ -213,6 +219,17 @@ static int unpack_layout(pmix_data_buffer_t *bkt, prte_job_t *jptr,
                 /* apps outermost, node->procs order within: the same walk
                  * compute_local_rank() makes */
                 proc->local_rank = lranks[n]++;
+                /* applist holds one entry per proc of the job, which is the
+                 * most an app can have.  Nothing else bounds this: the
+                 * bounds check above vets each rank, but not how many of
+                 * them the map names, so a map that repeats a rank - or
+                 * simply names more of them than the job has - would write
+                 * off the end of the allocation. */
+                if ((size_t) jptr->num_procs <= napp) {
+                    PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+                    rc = PRTE_ERR_BAD_PARAM;
+                    goto cleanup;
+                }
                 applist[napp++] = rank;
             }
             PMIx_Argv_free(ranks);
@@ -277,7 +294,7 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
                     prte_job_pack_mode_t *mode)
 {
     int rc;
-    int32_t k, n, count, bookmark;
+    int32_t k, n, count, bookmark, mapflag;
     prte_job_t *jptr;
     prte_app_idx_t j;
     prte_attribute_t *kv;
@@ -343,6 +360,11 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
     }
     for (k = 0; k < count; k++) {
         kv = PMIX_NEW(prte_attribute_t);
+        if (NULL == kv) {
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            PMIX_RELEASE(jptr);
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
         n = 1;
         rc = PMIx_Data_unpack(NULL, bkt, &kv->key, &n, PMIX_UINT16);
         if (PMIX_SUCCESS != rc) {
@@ -351,6 +373,7 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
             PMIX_RELEASE(kv);
             return prte_pmix_convert_status(rc);
         }
+        n = 1;
         rc = PMIx_Data_unpack(NULL, bkt, &kv->data, &n, PMIX_VALUE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
@@ -371,6 +394,11 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
     }
     if (0 < count) {
         cache = PMIX_NEW(pmix_list_t);
+        if (NULL == cache) {
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            PMIX_RELEASE(jptr);
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
         prte_set_attribute(&jptr->attributes, PRTE_JOB_INFO_CACHE, PRTE_ATTR_LOCAL, (void *) cache,
                            PMIX_POINTER);
         for (k = 0; k < count; k++) {
@@ -382,6 +410,12 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
                 return prte_pmix_convert_status(rc);
             }
             val = PMIX_NEW(prte_info_item_t);
+            if (NULL == val) {
+                PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+                PMIX_INFO_DESTRUCT(&pval);
+                PMIX_RELEASE(jptr);
+                return PRTE_ERR_OUT_OF_RESOURCE;
+            }
             PMIX_INFO_XFER(&val->info, &pval);
             PMIX_INFO_DESTRUCT(&pval);
             pmix_list_append(cache, &val->super);
@@ -420,12 +454,11 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
     if (0 < jptr->num_apps) {
         prte_app_context_t *app;
         for (j = 0; j < jptr->num_apps; j++) {
-            n = 1;
             rc = prte_app_unpack(bkt, &app);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
+            if (PRTE_SUCCESS != rc) {
+                PRTE_ERROR_LOG(rc);
                 PMIX_RELEASE(jptr);
-                return prte_pmix_convert_status(rc);
+                return rc;
             }
             pmix_pointer_array_add(jptr->apps, app);
         }
@@ -492,20 +525,19 @@ int prte_job_unpack(pmix_data_buffer_t *bkt, prte_job_t **job,
      * nothing to pack. Instead, we packed a flag to indicate whether or not
      * the map is included */
     n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &j, &n, PMIX_INT32);
+    rc = PMIx_Data_unpack(NULL, bkt, &mapflag, &n, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(jptr);
         return prte_pmix_convert_status(rc);
     }
-    if (0 < j) {
+    if (0 < mapflag) {
         /* unpack the map */
-        n = 1;
         rc = prte_map_unpack(bkt, &(jptr->map));
-        if (PMIX_SUCCESS != rc) {
-            PMIX_ERROR_LOG(rc);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
             PMIX_RELEASE(jptr);
-            return prte_pmix_convert_status(rc);
+            return rc;
         }
     }
 
@@ -571,9 +603,10 @@ int prte_node_unpack(pmix_data_buffer_t *bkt, prte_node_t **nd)
         return prte_pmix_convert_status(rc);
     }
 
-    /* unpack the number of procs on the node */
+    /* unpack the number of procs on the node - a prte_node_rank_t, so two
+     * bytes; see prte_node_pack */
     n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &node->num_procs, &n, PMIX_PROC_RANK);
+    rc = PMIx_Data_unpack(NULL, bkt, &node->num_procs, &n, PMIX_UINT16);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(node);
@@ -594,7 +627,7 @@ int prte_node_unpack(pmix_data_buffer_t *bkt, prte_node_t **nd)
 
     /* unpack the state */
     n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &node->state, &n, PMIX_UINT8);
+    rc = PMIx_Data_unpack(NULL, bkt, &node->state, &n, PMIX_INT8);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(node);
@@ -611,6 +644,11 @@ int prte_node_unpack(pmix_data_buffer_t *bkt, prte_node_t **nd)
     }
     for (k = 0; k < count; k++) {
         kv = PMIX_NEW(prte_attribute_t);
+        if (NULL == kv) {
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            PMIX_RELEASE(node);
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
         n = 1;
         rc = PMIx_Data_unpack(NULL, bkt, &kv->key, &n, PMIX_UINT16);
         if (PMIX_SUCCESS != rc) {
@@ -619,6 +657,7 @@ int prte_node_unpack(pmix_data_buffer_t *bkt, prte_node_t **nd)
             PMIX_RELEASE(kv);
             return prte_pmix_convert_status(rc);
         }
+        n = 1;
         rc = PMIx_Data_unpack(NULL, bkt, &kv->data, &n, PMIX_VALUE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
@@ -738,7 +777,7 @@ int prte_app_unpack(pmix_data_buffer_t *bkt, prte_app_context_t **ap)
 
     /* get the app index number */
     n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &app->idx, &n, PMIX_INT32);
+    rc = PMIx_Data_unpack(NULL, bkt, &app->idx, &n, PMIX_UINT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(app);
@@ -813,6 +852,7 @@ int prte_app_unpack(pmix_data_buffer_t *bkt, prte_app_context_t **ap)
     }
 
     /* unpack the cwd */
+    n = 1;
     rc = PMIx_Data_unpack(NULL, bkt, &app->cwd, &n, PMIX_STRING);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
@@ -822,7 +862,7 @@ int prte_app_unpack(pmix_data_buffer_t *bkt, prte_app_context_t **ap)
 
     /* get the flags */
     n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &app->flags, &n, PMIX_INT8);
+    rc = PMIx_Data_unpack(NULL, bkt, &app->flags, &n, PMIX_UINT8);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(app);
@@ -830,6 +870,7 @@ int prte_app_unpack(pmix_data_buffer_t *bkt, prte_app_context_t **ap)
     }
 
     /* unpack the attributes */
+    n = 1;
     rc = PMIx_Data_unpack(NULL, bkt, &count, &n, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
@@ -838,6 +879,11 @@ int prte_app_unpack(pmix_data_buffer_t *bkt, prte_app_context_t **ap)
     }
     for (k = 0; k < count; k++) {
         kv = PMIX_NEW(prte_attribute_t);
+        if (NULL == kv) {
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            PMIX_RELEASE(app);
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
         n = 1;
         rc = PMIx_Data_unpack(NULL, bkt, &kv->key, &n, PMIX_UINT16);
         if (PMIX_SUCCESS != rc) {
@@ -846,6 +892,7 @@ int prte_app_unpack(pmix_data_buffer_t *bkt, prte_app_context_t **ap)
             PMIX_RELEASE(kv);
             return prte_pmix_convert_status(rc);
         }
+        n = 1;
         rc = PMIx_Data_unpack(NULL, bkt, &kv->data, &n, PMIX_VALUE);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
@@ -903,8 +950,7 @@ int prte_map_unpack(pmix_data_buffer_t *bkt, struct prte_job_map_t **mp)
 
     /* unpack the number of nodes involved in the job */
     n = 1;
-    n = 1;
-    rc = PMIx_Data_unpack(NULL, bkt, &map->num_nodes, &n, PMIX_UINT32);
+    rc = PMIx_Data_unpack(NULL, bkt, &map->num_nodes, &n, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         PMIX_RELEASE(map);

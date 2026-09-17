@@ -127,7 +127,7 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
     if (0 == nobjs) {
         // if this is not a default binding policy, then error out
         if (PRTE_BINDING_POLICY_IS_SET(jdata->map->binding)) {
-            prte_show_help("help-prte-rmaps-base.txt", "rmaps:binding-target-not-found",
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "rmaps:binding-target-not-found",
                            true, prte_hwloc_base_print_binding(jdata->map->binding), node->name);
             return PRTE_ERR_SILENT;
         }
@@ -226,7 +226,7 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
         }
         /* there aren't any appropriate targets under this object */
         if (PRTE_BINDING_REQUIRED(jdata->map->binding)) {
-            prte_show_help("help-prte-rmaps-base.txt", "rmaps:no-available-cpus", true, node->name);
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "rmaps:no-available-cpus", true, node->name);
             return PRTE_ERR_SILENT;
         } else {
             return PRTE_SUCCESS;
@@ -240,7 +240,7 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
     if (4 < pmix_output_get_verbosity(prte_rmaps_base_framework.framework_output)) {
         char *tmp1;
         bool physical;
-        physical = prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_PHYSICAL_CPUS, NULL, PMIX_BOOL);
+        physical = PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_REPORT_PHYSICAL_CPUS);
         tmp1 = prte_hwloc_base_cset2str(trg_obj->cpuset, options->use_hwthreads,
                                         physical, node->topology->topo);
         pmix_output(prte_rmaps_base_framework.framework_output, "%s BOUND PROC %s[%s] TO %s",
@@ -278,7 +278,7 @@ static int bind_generic(prte_job_t *jdata, prte_proc_t *proc,
     if (NULL == tmp_obj) {
         PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
         if (PRTE_BINDING_REQUIRED(jdata->map->binding)) {
-            prte_show_help("help-prte-rmaps-base.txt", "rmaps:no-available-cpus", true, node->name);
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "rmaps:no-available-cpus", true, node->name);
             return PRTE_ERR_SILENT;
         } else {
             return PRTE_SUCCESS;
@@ -311,16 +311,22 @@ static int bind_to_cpuset(prte_job_t *jdata,
     pmix_output_verbose(5, prte_rmaps_base_framework.framework_output,
                         "mca:rmaps: bind job %s to cpus %s %s",
                         PRTE_JOBID_PRINT(jdata->nspace),
-                        options->cpuset,
+                        (NULL == options->cpuset) ? "(all assigned)" : options->cpuset,
                         options->ordered ? "ordered" : "not-ordered");
 
-    if (NULL == options->cpuset) {
+    /* Every entry in the list has a proc already.  That is the end of an
+     * ordered list, and of a list that may not be overloaded - but an
+     * unordered list binds each proc to the whole set, and when overloading
+     * is allowed the next proc simply shares it.  Failing here refused
+     * "pe-list=0,1 --bind-to core:overload-allowed -n 3" with nothing but an
+     * error log. */
+    if (NULL == options->cpuset && (options->ordered || !options->overload)) {
         /* not enough cpus were specified */
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
-    cpus = PMIx_Argv_split(options->cpuset, ',');
+    cpus = (NULL == options->cpuset) ? NULL : PMIx_Argv_split(options->cpuset, ',');
     /* take the first one */
-    idx = strtoul(cpus[0], NULL, 10);
+    idx = (NULL == cpus) ? 0 : strtoul(cpus[0], NULL, 10);
     if (options->use_hwthreads) {
         type = HWLOC_OBJ_PU;
     } else {
@@ -346,8 +352,16 @@ static int bind_to_cpuset(prte_job_t *jdata,
         }
         tset = obj->cpuset;
     } else {
-        /* bind the proc to all assigned cpus */
+        /* bind the proc to all assigned cpus - the ones still free, or, once
+         * every one of them is taken and overloading is allowed, the whole
+         * list again.  Binding to what is still free alone handed the proc
+         * after that an EMPTY cpuset. */
         tset = options->target;
+        if (options->overload
+            && (NULL == tset || hwloc_bitmap_iszero(tset))
+            && NULL != options->job_cpuset) {
+            tset = options->job_cpuset;
+        }
     }
     /* sanity check - are all the target cpus in a single
      * package, or do they span packages?
@@ -363,7 +377,7 @@ static int bind_to_cpuset(prte_job_t *jdata,
         }
     }
     if (!included) {
-        prte_show_help("help-prte-rmaps-base.txt", "span-packages-cpuset", true,
+        prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "span-packages-cpuset", true,
                        prte_rmaps_base_print_mapping(jdata->map->mapping),
                        prte_hwloc_base_print_binding(jdata->map->binding),
                        options->cpuset);
@@ -372,6 +386,12 @@ static int bind_to_cpuset(prte_job_t *jdata,
     }
     /* bind to the specified cpuset */
     hwloc_bitmap_list_asprintf(&proc->cpuset, tset);
+
+    if (NULL == cpus) {
+        /* an overloading proc on a list already fully assigned - there is
+         * no entry left to consume and no cpu left to mark */
+        return PRTE_SUCCESS;
+    }
 
     /* remove one of the CPUs from the cpuset to indicate that
      * we assigned a proc to this range */
@@ -452,7 +472,7 @@ static int bind_multiple(prte_job_t *jdata, prte_proc_t *proc,
             /* if we get here, then there are no packages that can completely
              * cover the request - so return an error */
             hwloc_bitmap_free(result);
-            prte_show_help("help-prte-rmaps-base.txt", "span-packages-multiple", true,
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "span-packages-multiple", true,
                            prte_rmaps_base_print_mapping(jdata->map->mapping),
                            prte_hwloc_base_print_binding(jdata->map->binding),
                            options->cpus_per_rank,
@@ -475,7 +495,7 @@ static int bind_multiple(prte_job_t *jdata, prte_proc_t *proc,
     hwloc_bitmap_list_asprintf(&proc->cpuset, result);
     hwloc_bitmap_free(result);
     if (NULL == proc->cpuset || 0 == strlen(proc->cpuset)) {
-        prte_show_help("help-prte-rmaps-base.txt", "not-enough-cpus", true,
+        prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "not-enough-cpus", true,
                        options->pprn, hwloc_obj_type_string(options->maptype),
                        options->cpus_per_rank);
         return PRTE_ERR_SILENT;

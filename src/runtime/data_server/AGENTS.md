@@ -11,8 +11,9 @@ project rules. When this file and the docs disagree, **the docs win**.
 
 The data server backs PMIx's publish/lookup/unpublish service — the
 key/value rendezvous MPI applications use for `MPI_Publish_name` and
-friends. It is a **single store on one process** (normally the HNP) that
-every other participant reaches over the RML.
+friends. The DVM-wide store lives on the HNP, and every other participant
+reaches it over the RML; each daemon also holds a store of its own for
+`PMIX_RANGE_LOCAL` data (see "There is a store on every daemon" below).
 
 ```
 app proc ──PMIx──▶ its prted ──RML(PRTE_RML_TAG_DATA_SERVER)──▶ HNP
@@ -29,9 +30,9 @@ app proc ◀─PMIx── its prted ◀──RML(PRTE_RML_TAG_DATA_CLIENT)──
 |------|------|
 | `prte_data_server.h` | The public surface: init/finalize, the RML receive callback, and the four command codes. |
 | `ds.h` | The internal objects — `prte_data_object_t` (one published item), `prte_data_req_t` (one parked lookup), `prte_ds_info_t`, and the `prte_data_store` singleton. |
-| `ds_main.c` | `prte_data_server()` — the RML receive that unpacks the room number and command and dispatches; the access check and the two range checks; all the class instances. |
+| `ds_main.c` | `prte_data_server()` — the RML receive that unpacks the room number and command and dispatches; the access check and the two range checks; the per-uid accounting and eviction; all the class instances. |
 | `ds_publish.c` | Store an item, then satisfy any parked lookups it answers. |
-| `ds_lookup.c` | Answer from the store, or park the request if the caller asked to wait. |
+| `ds_lookup.c` | Answer from the store, or park the request if the caller asked to wait; `prte_ds_collect()`, the one resolver both lookup and publish use. |
 | `ds_unpublish.c` | Remove the caller's own items by key. |
 | `ds_purge.c` | Remove everything a (departing) process owns. |
 | `ds_relay.c` | Reissue a request to an **external** data server — one living in another DVM — over a PMIx tool connection, and answer the requesting daemon when it replies. |
@@ -59,6 +60,15 @@ has to *release* the buffer, or every waiting lookup leaks one. And a
 handler that has already sent the buffer must not return an error, or the
 caller sends a freed buffer.
 
+**A send that fails has disposed of nothing, and the handler that then
+releases the buffer has.** `PRTE_RML_RELIABLE_SEND` refuses a peer that is
+down — the requesting daemon died while its request was in flight — and
+leaves the buffer with the caller. The handler releases it and must return
+`PMIX_SUCCESS`: all three handlers used to return the send's error instead,
+so `prte_data_server()` packed a status into the buffer they had just freed,
+sent it, and released it a second time. There is nobody to answer at that
+point, which is exactly why "disposed of" is the right description.
+
 The room number leads every reply because it is how the requesting PMIx
 client matches an answer to its outstanding request. A reply that omits it,
 or that carries a status without the payload the status implies, wedges the
@@ -76,8 +86,9 @@ status. Keep the two in separate variables.
 `prte_pmix_server_uri` names a data server living in a **different DVM**, so
 that jobs launched by different invocations can find each other's data
 (`MPI_Publish_name` / `MPI_Comm_accept` across `mpirun`s). When it is set,
-this DVM stores nothing of its own: `prte_data_server()` hands every request
-straight to `prte_ds_relay()`.
+this DVM keeps only its local-range data: `prte_data_server()` hands every
+other request straight to `prte_ds_relay()` (see "A local-range request must
+not be relayed" below).
 
 **It is not reachable over the RML, and no amount of work here would make it
 so.** The RML addresses a peer by *rank*, stamping the sender's own namespace
@@ -110,6 +121,16 @@ Three things follow, and each is load-bearing:
   is trying to act under a peer's identity, and it is dropped. Call it
   *after* your own directive scan, or the relay's `PMIX_USERID` lands on top
   of the claim.
+- **A relay can be relaying for a relay**, and the claim it received is the
+  one it passes on. A DVM that is the external server for one DVM and points
+  at another in turn receives requests from the first DVM's master *as a
+  tool*, carrying `PMIX_REQUESTOR`. `prte_ds_relay_directives()` resolves the
+  requester through `prte_ds_check_requestor()` — the same rule a local store
+  applies — strips every incoming claim key, and appends exactly one. It
+  used to relay the tool itself, so every item that first DVM published
+  belonged to one tool: a `NAMESPACE`-range item was visible to all of its
+  jobs, and the first job-end purge took everything any of them had
+  published.
 - **The primary server must be named per operation.** PMIx sends a tool's
   client-side call to whichever attached server is currently primary, and a
   master may also be attached to a scheduler. `prte_pmix_set_primary_server()`
@@ -117,9 +138,32 @@ Three things follow, and each is load-bearing:
   call, never once at startup.
 
 The purge command carries a directive array for this reason — it is the only
-way `PMIX_REQUESTOR` can reach `ds_purge`. Three senders pack it
-(`pmix_server_unpublish_fn`, `state_dvm.c`, `state_base_fns.c`) and one reader
-unpacks it; they change together.
+way `PMIX_REQUESTOR` can reach `ds_purge`. Two senders pack it
+(`pmix_server_unpublish_fn`, `send_purge()` in `state_base_fns.c`) and two
+readers unpack it (`prte_ds_purge`, `prte_ds_relay`); they change together.
+
+**Only a job that has used the external server is purged there.**
+`prte_ds_relay()` sets `PRTE_JOB_FLAG_EXTERNAL_DATA` on the requester's job
+(the master holds every job object, and every relay runs on the master), and
+`purge_data()` relays no horizon for a job without it. The `PROC` horizon
+fires once per terminating process, so relaying it regardless cost every
+process in the DVM a round trip to another DVM that could only answer
+"nothing here". A purge does not set the flag, and a process claimed by a
+tool of another DVM has no job object here — its purges come from its own
+master.
+
+**A purge that arrives as a message must name a namespace**, and `ds_purge`
+refuses one that does not. The empty namespace is a wildcard to
+`PMIX_CHECK_PROCID`, which the `SESSION` horizon relies on when the master
+purges its *own* store by a direct call — but a session id is a counter each
+DVM starts from 1, so it names nothing at the far end. The master used to
+relay its session purges anyway: the external server took *its own* jobs'
+session data whenever the ids coincided - both count from 1 - and released every
+lookup parked in its store without answering it. `purge_data()` no longer
+relays the `SESSION` horizon (see `docs/todo.rst` for what that leaves), and
+the server refuses the shape if anything else sends it. The horizon and its
+qualifier are read through their types, like the publish directives: a purge
+is an unpublish naming no keys, so the array can be a client's own.
 
 ---
 
@@ -146,6 +190,19 @@ either. It can still unpublish it — see below.) A refusal is
 A restriction the publisher gave and we cannot parse **fails the publish**.
 Storing it anyway would store the data unrestricted, which is the one
 outcome nobody asked for.
+
+That includes the range and the persistence. Both arrive typed however the
+client typed them — PMIx forwards the array without looking — so they are
+read with `prte_ds_get_named_uint8()`: the named type directly, any plain
+integer converted with its width checked, anything else refused. Reading the
+union member regardless turned an `int` holding `PMIX_RANGE_NAMESPACE` into
+`PMIX_RANGE_UNDEF`, open to everyone, on a big-endian host. The daemon's
+router (`scan_directives()` in `pmix_server_pub.c`) reads the range with the
+same helper, and has to: it used to honor only `PMIX_DATA_RANGE`, so an
+int-typed `LOCAL` publish was routed to the global store and stored there as
+`LOCAL`, where no local-range lookup looks. A value neither family defines
+is refused as well — an unknown persistence is one no purge horizon takes and
+the sweep never touches, and an unknown range admits nobody.
 
 This depends on PMIx handing us both ids. The library appends `PMIX_USERID`
 and `PMIX_GRPID` to the info array of every publish, lookup and unpublish —
@@ -187,16 +244,17 @@ consult and `range_admits` refuses it.
 The requester's half used to be missing entirely: `ds_lookup` unpacked
 `PMIX_RANGE` and put it only on a *parked* request, where nothing read it,
 so a lookup that asked to search its own namespace searched everything its
-publishers would let it see. Both checks now run in `ds_lookup` and in
-`ds_publish`'s pending-request loop, and the default on both sides is
-`PMIX_RANGE_SESSION` — the constructors say so, which is why `rqcon` sets a
-range at all.
+publishers would let it see. Both checks now run in `prte_ds_collect()`,
+the one place a lookup is resolved against the store, and the default on
+both sides is `PMIX_RANGE_SESSION` — the constructors say so, which is why
+`rqcon` sets a range at all.
 
-### Removal: ownership, and nothing else
+### Removal: ownership, then which of the owner's items is this one
 
-`ds_unpublish` applies neither rule. **An owner may unpublish what it
+`ds_unpublish` applies neither read rule. **An owner may unpublish what it
 published on any range**, and the range the unpublish itself names does not
-narrow that.
+narrow that — with one qualification, below, about *which* of a user's
+items a given process reaches.
 
 **The owner is the publishing USER**, not the publishing process:
 `prte_data_server_owns()` compares the requestor's effective uid against the
@@ -227,6 +285,21 @@ impossible to remove — the owner falls outside its own item's range — while
 still answering `PMIX_SUCCESS`, so the item sat in the store until its job
 ended.
 
+**But a user is not one set of processes on every range.** `NAMESPACE`,
+`LOCAL` and `PROC_LOCAL` name sets narrower than a user, the duplicate rule
+lets each such set publish the same key, and each of those is a different
+item — two concurrent jobs of one user each publishing a `NAMESPACE`-range
+name for their own processes is the ordinary case. Ownership alone let
+either job's unpublish take both, out from under a job still running. So on
+those three ranges an owner's item is reached only from inside its own set
+(`reaches()` in `ds_unpublish.c`, which asks `prte_data_server_check_range()`
+— the publisher-anchored range test, not the access test). That is the same
+reach `PRTE_PUBLISH_REPLACE` has, and the same set a publish by the
+requestor would collide in. Every other range holds one item per key for the
+whole user, so there the owner reaches it from anywhere — which is what lets
+a later job take back a name its predecessor left, and what keeps `RM` and
+`CUSTOM` items removable.
+
 `data->proxy` and `req->proxy` are what the `LOCAL` rule compares, and
 `PMIX_NEW` does not zero its allocation, so both constructors have to
 `PMIX_PROC_CONSTRUCT` them. They did not, and the `LOCAL` check was reading
@@ -251,12 +324,20 @@ lookup resolves to was a function of unrelated publish/unpublish history.
 **"Same range" is a set of processes, not the `pmix_data_range_t` word.**
 `PMIX_RANGE_NAMESPACE` published by two processes of different namespaces
 names two disjoint sets; refusing the second would refuse a publish the
-Standard permits. So `same_data_range()` tests the range word **and** asks
-whether the new publisher could itself have looked the stored item up
-(`prte_data_server_check_access` then `prte_data_server_check_range`) —
-which for `NAMESPACE`, `LOCAL` and `PROC_LOCAL` is exactly set equality, is
-trivially true for `SESSION`, `GLOBAL` and `RM`, and separates two users'
-identically-keyed items because neither can see the other's.
+Standard permits. So `prte_data_server_same_range()` (in `ds_main.c`) tests
+the range word **and** asks whether the stored item falls within the new
+publisher's view of that range (`prte_data_server_check_range`) — which for
+`NAMESPACE`, `LOCAL` and `PROC_LOCAL` is exactly set equality, and is
+trivially true for `SESSION`, `GLOBAL` and `RM`.
+
+Between two **users** it also applies the access check, which separates
+identically-keyed items because neither can see the other's. But the access
+check is the wrong test for the publisher's **own** items, which collide
+whether or not it may read them: a publisher may leave itself off its own
+accessor list, and asking "could it read this?" once answered no — so its
+second publish of the key was stored beside the first, the readers it named
+got whichever sat in the lower slot, and `PRTE_PUBLISH_REPLACE` could not
+reach the first. Ownership (`prte_data_server_owns()`) is checked first.
 
 The scan runs in two passes and the order is the point: `count_duplicates()`
 decides, `drop_prior()` acts. A publish that is going to be refused must
@@ -293,20 +374,48 @@ scan, so the gate has to sit between that scan and
 
 ## Persistence and parked requests
 
-`PMIX_PERSIST_FIRST_READ` removes an item from `data->info` as soon as it is
-returned. Both `ds_lookup` (returning from the store) and `ds_publish`
-(satisfying a parked request) implement it, and both then have to notice
-that an object whose `info` list is now empty must leave the store —
-`ds_lookup` did not, so an item read by an ordinary lookup stayed in the
-store as an empty shell, matching nothing and removed only by a purge.
-`data` there is the loop variable of the scan over the store, so nothing may
-touch it after the drop; the `break` is what makes that safe.
+**One function resolves a lookup against the store: `prte_ds_collect()`**
+in `ds_lookup.c`. It applies the access check and both range checks to every
+item, and it has two modes. Given an `answers` list it copies each value
+found onto it, restamps the item's retention clock, and takes a
+`PMIX_PERSIST_FIRST_READ` value out of the item — dropping an item left
+empty, since an empty shell matches nothing and would sit in the store until
+a purge. Given `NULL` it only **counts**, and changes nothing. `data` there
+is the loop variable of the scan over the store, so nothing may touch it
+after the drop; the `break`, and `found` ending the scan, are what make that
+safe.
 
-A lookup carrying `PMIX_WAIT` that cannot be fully satisfied is parked on
-`prte_data_store.pending` with **only the keys it is still missing**. When a
-later publish resolves the rest, `complete_resolved` is what says the
-request is finished — do not re-derive it by counting `req->keys`, because
-that array has already been swapped for the unresolved remainder.
+The counting mode exists for `PMIX_WAIT`, and the rule it enforces is
+**decide before taking anything**. A parked request gets exactly **one**
+reply: `pmix_server_keyval_client()` frees the room on the first answer it
+receives. So:
+
+- A `PMIX_WAIT` lookup that cannot yet be given what it is waiting for is
+  parked with **all** of its keys and takes nothing. It used to take what it
+  could find and park the rest — the values found were dropped with the
+  buffer holding them (a `FIRST_READ` value among them was gone from the
+  store too), and the eventual answer carried only what the later publish
+  supplied, as a complete success.
+- A publish answers a parked request only when `prte_ds_answer_parked()`
+  finds the **whole store** can now meet it, and then answers once with
+  everything. It used to answer whatever the one new item resolved, as
+  `PMIX_ERR_PARTIAL_SUCCESS`, and leave the request parked — so the next
+  matching publish replied to a room already freed, or already reissued to
+  some unrelated request, and consumed its `FIRST_READ` value on the way.
+  `answers_request()` in `ds_publish.c` is only a filter ahead of that scan:
+  a parked request can become answerable only through an item it can see
+  that holds one of its keys.
+- What a request is waiting for is `PMIX_WAIT`'s value, which is a **count**
+  (`req->nwait`, 0 meaning all of the keys, and anything that is not a
+  number — a bool is common — meaning the same). A request answered with
+  fewer than all of its keys gets `PMIX_ERR_PARTIAL_SUCCESS` with the values
+  it did get.
+
+Satisfying a request can drop the very item the publish just stored, so the
+pending loop in `ds_publish` holds a reference of its own on it. And a parked
+request whose answer cannot be delivered — its daemon is gone, or the pack
+failed — is still finished with: it is removed and released rather than left
+for the next publish to try again.
 
 A `PMIX_TIMEOUT` given with the wait bounds it: the parked request carries
 an event armed for that many seconds (`lookup_timeout` in `ds_lookup.c`),
@@ -430,9 +539,9 @@ permanent allocation made by a process that no longer exists;
 `PMIX_PERSIST_FIRST_READ` is the same shape when the read it waits for never
 comes. `prte_data_server_timeout` (default 300 s) removes either once it has
 been **idle** that long — `last_access` is stamped at publish and restamped
-by every lookup that returns one of the item's keys, in *both* places that
-answer a lookup (`ds_lookup.c`, and `ds_publish.c` where a publish satisfies
-a parked request).
+by every lookup that returns one of the item's keys (`prte_ds_collect()`,
+which answers immediate and parked lookups alike; a count-only pass returns
+nothing and stamps nothing).
 
 Idle rather than a lifetime, deliberately: a rendezvous name in active use
 must not be pulled out from under its readers. Nothing else is swept — a
@@ -461,16 +570,28 @@ rendezvous name out.
 
 `prte_ds_usage_t` holds one running byte total per uid, on a list in the
 store — as many records as there are users publishing here, which is a small
-number. Three rules keep it honest:
+number. These rules keep it honest:
 
-- **Every removal goes through `prte_ds_drop()`.** There are seven paths —
+- **Every removal goes through `prte_ds_drop()`.** There are six paths —
   the duplicate drop, an unpublish, a `FIRST_READ` read that empties an item
-  (in *both* places that answer a lookup), each purge horizon, the expiry
-  sweep, and eviction itself — and one that forgets to uncharge leaves a uid
-  unable to publish anything ever again. That is why it is one function and
-  not a line repeated seven times.
+  (`prte_ds_collect()`, which answers every lookup, parked or not), each
+  purge horizon, the expiry sweep, and eviction itself — and one that
+  forgets to uncharge leaves a uid unable to publish anything ever again.
+  That is why it is one function and not a line repeated at every path.
 - **Every shrink calls `prte_ds_charge()`.** An item that loses a key to a
   `FIRST_READ` read is smaller than what its publisher is charged for.
+- **What an item costs is what it packs to**, for every type but a string
+  or a byte object (measured directly, being what nearly everybody
+  publishes). `value_size()` used to charge anything else the size of the
+  `pmix_value_t` union — and a `PMIX_DATA_ARRAY`, like every structured
+  type, is a *pointer* in that union, so an array of any length cost the
+  price of an integer and the cap bounded nothing for a publisher who
+  chose that type.
+- **A uid's usage record can vanish mid-eviction.** `prte_ds_drop()`
+  releases the record with the uid's last byte, so `prte_ds_make_room()`
+  looks it up again on every pass. Evicting the only item a user holds to
+  make room for a second is the ordinary way to get there, and holding the
+  pointer across the drop read and wrote freed memory.
 - **The cap gate runs last**, after the duplicate scan and the directive
   scan, immediately before `pmix_pointer_array_add()`. It is the only gate
   that *modifies* the store, so a publish that is going to be refused must
@@ -508,9 +629,22 @@ publish has been getting — as a side effect of reading `APP` correctly.
 lifetime asks for `APP` and gets it.
 
 A lifecycle purge drops both the departing process's published items *and*
-any lookup it left parked; a request that outlives its requestor would
-otherwise have a later publish trying to reply to a process that no longer
-exists.
+any lookup it left parked. A request that outlives its requestor is worse
+than a leak: a later publish that satisfies it takes a `FIRST_READ` value on
+behalf of a process that cannot receive it, so the reader actually waiting
+for that value finds nothing, and the requestor's daemon holds the room
+until then. The drop lives in `purge_store()`, which both the direct call
+and the message form go through — it used to be only in the message form,
+so once the state machine's purges became calls nothing dropped them at all.
+Each dropped request is *answered* (nobody reads it; it is what lets the
+daemon free the room) and released.
+
+Only the `PROC` and `NSPACE` horizons drop parked lookups, because only
+their targets name the requestors. An `APP` target is the whole namespace
+and a parked request does not record which application asked, so dropping by
+it would cancel the lookups of applications still running — and each process
+of the app that ended was already purged at `PROC`. A `SESSION` target is
+anybody. An explicit unpublish-all (`INVALID`) ends nothing.
 
 ---
 
@@ -559,6 +693,13 @@ answer — including when it has already sent a failure.
   side of it you are on.
 - **`PMIX_RELEASE(req)` while `req` is still on `pending` leaves a freed
   item on the list.** Remove it first.
+- **A directive `ds_publish` does not consume becomes data.** Anything in
+  the info array the directive scan does not recognize is stored as a
+  published key, and PMIx passes every directive through. `PMIX_TIMEOUT`,
+  which the Standard defines for `PMIx_Publish`, was once missing from the
+  scan: it was stored under `pmix.timeout`, and the same user's next publish
+  carrying a timeout collided with it and was refused as a duplicate. A new
+  directive has to be added to the scan, not just to the daemon.
 - **Success paths free too.** `ds_publish` unpacks a `pmix_info_t` array,
   copies what it keeps into the data object, and has to `PMIX_INFO_FREE` the
   array — that was happening only on the unpack-failure path, so a
@@ -568,13 +709,20 @@ answer — including when it has already sent a failure.
   the stack to carry the requestor into `check_range`.
 - **An access rule is not an ownership rule.** See the section above: what
   may be read and what may be removed are different questions, and the
-  answer to the first one refused owners their own data.
+  answer to the first one refused owners their own data. Nor is ownership
+  the whole of removal: on a range narrower than a user, a same-user item in
+  another set is somebody else's item.
 - **Decide before you remove.** The duplicate scan is two passes for a
   reason: a refused publish must leave the store untouched, so nothing may
   be dropped until every collision has been found and attributed.
 - **A range word is not a range.** Two publications can carry the same
   `pmix_data_range_t` and still name disjoint sets of processes. Never
   compare `data->range` alone and call it "the same range".
+- **A parked request gets one reply.** The daemon frees its room on the
+  first answer, so a second answer to the same room lands on whatever
+  request was given that room next. Never answer a parked request until it
+  is finished, and never take a `FIRST_READ` value on behalf of one that is
+  not.
 - **A parked request can own an armed timer.** Remove it from `pending` and
   `PMIX_RELEASE` it; never `free` around it, and never leave the list
   holding one you have released.
@@ -598,8 +746,23 @@ answer — including when it has already sent a failure.
 every range value in both directions — `prte_data_server_check_range` from
 the publisher's side and `prte_data_server_check_search_range` from the
 requester's — and the object constructors' initialization contract,
-including the `PMIX_RANGE_SESSION` default a request carries. Neither needs
-the RML.
+including the `PMIX_RANGE_SESSION` default a request carries. And
+`prte_ds_collect()` against a hand-built store (`test_data_server_collect`):
+that counting takes nothing — a `FIRST_READ` value is still there and still
+counted afterwards — that collecting returns every value and drops the item
+it empties, and that another user's item holding the key is reported as
+denied. And the relay's directive array (`test_data_server_relay_directives`):
+one claim goes out, naming a tool's claimed process or an application
+itself. And an unpublish's reach (`test_data_server_unpublish_reach`): an
+owner's `NAMESPACE`-range item in another job survives, a `SESSION` or `RM`
+one does not. And the purge (`test_data_server_purge_parked`): which horizons drop
+a parked lookup, by direct call and by message, and that a message naming no
+namespace, or a horizon that cannot be read, is refused. And the cap
+(`test_data_server_cap`): that evicting a user's only
+item makes room and leaves one fresh usage record, and that a data array is
+charged for its contents. None of it needs the RML. The eviction case pins
+the behavior; the use-after-free it once had shows only under a memory
+checker.
 
 **Multi-node — `contrib/dockerswarm`, the `test_runtime` phase.** The store
 is on the HNP and the clients are elsewhere, so the interesting paths only
@@ -608,8 +771,11 @@ the range and access rules between real processes, a namespace-scoped lookup
 that must *not* reach another job's data, an accessor list that admits or
 refuses a real reader (and is answered with `PMIX_ERR_NO_PERMISSIONS`),
 unpublish — including an owner removing data published on a range it does
-not itself fall within — and the `PMIX_WAIT` path, both where a later
-publish satisfies it and where `PMIX_TIMEOUT` ends it. The `dataserver`
+not itself fall within, and one job's unpublish leaving the same key another
+job holds on its own namespace — and the `PMIX_WAIT` path, both where a later
+publish satisfies it and where `PMIX_TIMEOUT` ends it — and where its
+requestor is killed while parked, which must leave a later `FIRST_READ`
+value for the reader that comes after. The `dataserver`
 helper takes the publish range, the unpublish range and an access spec as
 separate arguments for those cases.
 
@@ -621,6 +787,17 @@ rather than the relay, that a parked `PMIX_WAIT` lookup in one client is woken
 by a publish in the other, that an ended job's data is purged from the server
 and that the purge takes *only* that job's data — plus the control, that a
 DVM which was not given the URI sees none of it.
+
+A **chained** relay (`ds_chained_relay_case`) needs three DVMs in a line,
+A → B → C, and no fewer: the claim at risk is the one A's master attaches,
+and only a B that relays onward has to pass it on rather than consume it.
+The case runs two jobs in A and asserts a NAMESPACE-range item stays with
+its own job, that the answer names the publishing process, and that one
+job's end purges its data at C without taking the other's. Removing the
+`prte_ds_check_requestor()` call from `prte_ds_relay_directives()` turns
+three of its seven assertions red. The one-hop cases above cannot see
+that: a master relaying for its own process receives no claim, so the call
+changes nothing there.
 
 The swarm covers the timeout with `--prtemca prte_data_server_timeout` set
 to a few seconds — no debug-only knob and no `PRTE_ENABLE_DEBUG` build. Note

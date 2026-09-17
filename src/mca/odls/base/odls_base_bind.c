@@ -84,24 +84,18 @@
    cannot read the child's actual applied binding - the child does not
    exist yet - but for a successful bind the two are identical, and this
    keeps the (allocating) rendering out of the async-signal-safe child. */
-static void report_binding(prte_job_t *jobdat, int rank, hwloc_cpuset_t cpuset)
+static void report_binding(prte_odls_spawn_caddy_t *cd, int rank, hwloc_cpuset_t cpuset)
 {
     char *tmp1;
-    bool use_hwthread_cpus;
-    bool physical;
 
     if (NULL == cpuset || hwloc_bitmap_iszero(cpuset)) {
         pmix_output(0, "Rank %d is not bound (or bound to all available processors)", rank);
         return;
     }
-    /* check for type of cpu being used */
-    if (prte_get_attribute(&jobdat->attributes, PRTE_JOB_HWT_CPUS, NULL, PMIX_BOOL)) {
-        use_hwthread_cpus = true;
-    } else {
-        use_hwthread_cpus = false;
-    }
-    physical = prte_get_attribute(&jobdat->attributes, PRTE_JOB_REPORT_PHYSICAL_CPUS, NULL, PMIX_BOOL);
-    tmp1 = prte_hwloc_base_cset2str(cpuset, use_hwthread_cpus, physical, prte_hwloc_topology);
+    /* the job's attributes were resolved onto the caddy before dispatch -
+     * this runs on a worker thread, where the list itself is off limits */
+    tmp1 = prte_hwloc_base_cset2str(cpuset, cd->hwt_cpus, cd->report_physical_cpus,
+                                    prte_hwloc_topology);
     pmix_output(0, "Rank %d bound to %s", rank, tmp1);
     free(tmp1);
 }
@@ -293,7 +287,7 @@ void prte_odls_base_prepare_binding(prte_odls_spawn_caddy_t *cd)
         return;
     }
 
-    report = prte_get_attribute(&jobdat->attributes, PRTE_JOB_REPORT_BINDINGS, NULL, PMIX_BOOL);
+    report = cd->report_bindings;
 
     /* Compute process affinity, if given */
     if (NULL == child->cpuset || 0 == strlen(child->cpuset)) {
@@ -303,13 +297,13 @@ void prte_odls_base_prepare_binding(prte_odls_spawn_caddy_t *cd)
                available processors */
             root = hwloc_get_root_obj(prte_hwloc_topology);
             if (NULL == root->userdata) {
-                prte_show_help("help-prte-odls-default.txt", "incorrectly bound", true,
+                prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-default.txt", "incorrectly bound", true,
                                prte_process_info.nodename, context->app);
             }
             cd->bind_cpuset = hwloc_bitmap_dup(
                 hwloc_topology_get_allowed_cpuset(prte_hwloc_topology));
             if (report) {
-                report_binding(jobdat, child->name.rank, cd->bind_cpuset);
+                report_binding(cd, child->name.rank, cd->bind_cpuset);
             }
         } else if (report) {
             pmix_output(0, "Rank %d is not bound (or bound to all available processors)",
@@ -333,7 +327,7 @@ void prte_odls_base_prepare_binding(prte_odls_spawn_caddy_t *cd)
                 && PRTE_BINDING_POLICY_IS_SET(jobdat->map->binding)) {
                 cd->bind_fatal = true;
             } else if (PRTE_BINDING_POLICY_IS_SET(jobdat->map->binding)) {
-                prte_show_help("help-prte-odls-default.txt", "not bound", true,
+                prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-default.txt", "not bound", true,
                                prte_process_info.nodename, context->app,
                                "unable to apply the requested binding");
             }
@@ -341,7 +335,7 @@ void prte_odls_base_prepare_binding(prte_odls_spawn_caddy_t *cd)
         }
         cd->bind_cpuset = cpuset;
         if (report) {
-            report_binding(jobdat, child->name.rank, cd->bind_cpuset);
+            report_binding(cd, child->name.rank, cd->bind_cpuset);
         }
         /* precompute the memory-binding policy from prte_hwloc_base_map so
            the child need not read any MCA state */

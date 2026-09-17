@@ -1632,6 +1632,128 @@ DS=/opt/prte/prte/bin/dataserver
 # ...and the same for the slow stdin reader, for the same reason.
 SC=/opt/prte/prte/bin/slowcat
 
+# A CHAINED relay: DVM A points at DVM B, and B is A's data server while
+# itself pointing at DVM C, which holds the store.  Three DVMs, and no fewer:
+# the claim that goes wrong is the one A's master attaches to what it sends B,
+# and only a B that relays onward has to carry it rather than consume it.
+#
+# B sees A's master as a tool acting for one of A's processes.  It used to
+# relay under the TOOL's identity and drop the claim, so at C every item from
+# every job in A belonged to A's master.  Three consequences, one assertion
+# each: a NAMESPACE-range item was visible to every job in A, a lookup answer
+# named A's master rather than the publisher, and the first job in A to end
+# purged everything A had published.  Each is asserted against a control that
+# shows the chain was working at all, so a broken chain cannot pass as a
+# correct range or a correct purge.
+#
+# Its own function so it can be run alone; test_runtime calls it.
+ds_chained_relay_case() {
+    local out nsid
+
+    banner "runtime/data_server: a chained relay keeps each job's identity"
+    cleanup_swarm
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+        return
+    fi
+    if ! dvm_start_uri /tmp/dsc-c.uri 'node2:2' ''; then
+        bad "could not start DVM C, the store at the end of the chain"
+        cleanup_swarm
+        return
+    fi
+    if ! dvm_start_uri /tmp/dsc-b.uri 'node3:2' \
+                       '--prtemca pmix_server_uri file:/tmp/dsc-c.uri'; then
+        bad "could not start DVM B, the relay in the middle of the chain"
+        RUN "timeout -k 5 30 pterm --dvm-uri file:/tmp/dsc-c.uri" >/dev/null 2>&1
+        cleanup_swarm
+        return
+    fi
+    if ! dvm_start_uri /tmp/dsc-a.uri 'node4:2,node5:2' \
+                       '--prtemca pmix_server_uri file:/tmp/dsc-b.uri'; then
+        bad "could not start DVM A, the client at the head of the chain"
+        for u in /tmp/dsc-b.uri /tmp/dsc-c.uri; do
+            RUN "timeout -k 5 30 pterm --dvm-uri file:$u" >/dev/null 2>&1
+        done
+        cleanup_swarm
+        return
+    fi
+    ok "three DVMs are up in a chain: A -> B -> C"
+
+    # Job S holds a SESSION-range key for the whole case; it is both the
+    # identity probe and the survivor the purge must leave alone.  Job P is
+    # MPMD: its first app publishes a NAMESPACE-range key and its second, in
+    # the same namespace, waits for it - the control that says a
+    # NAMESPACE-range item is reachable through the chain at all.
+    PRUN_URI_BG /tmp/dsc-a.uri /tmp/dsc-s.out \
+        "--host node5:1 -n 1 $DS publish prte.test.chain.id who session 90"
+    PRUN_URI_BG /tmp/dsc-a.uri /tmp/dsc-p.out \
+        "--host node4:2 -n 1 $DS publish prte.test.chain.ns mine namespace 40 : --host node4:2 -n 1 $DS lookupwait prte.test.chain.ns 30 namespace"
+    sleep 12
+    if ! RUN 'grep -q "^PUBLISHED prte.test.chain.id" /tmp/dsc-s.out'; then
+        bad "the SESSION-range publish through the chain never happened: $(RUN 'cat /tmp/dsc-s.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+    elif ! RUN 'grep -q "^PUBLISHED prte.test.chain.ns" /tmp/dsc-p.out'; then
+        bad "the NAMESPACE-range publish through the chain never happened: $(RUN 'cat /tmp/dsc-p.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+    else
+        ok "two jobs in DVM A published through B into C"
+
+        RUN 'grep -q "^FOUND prte.test.chain.ns mine" /tmp/dsc-p.out' \
+            && ok "a NAMESPACE-range key is found from its own job across the chain" \
+            || bad "a NAMESPACE-range key was not found even from its own job: $(RUN 'cat /tmp/dsc-p.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+
+        # ...and not from another job of the same DVM.  With the claim lost
+        # at B, both jobs were A's master at C, and this found it.
+        out=$(PRUN_URI /tmp/dsc-a.uri "--host node5:1 -n 1 $DS lookup prte.test.chain.ns 15 namespace" 2>&1)
+        if ! echo "$out" | grep -q '^STATUS'; then
+            bad "the other job's NAMESPACE-range lookup did not run: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        elif echo "$out" | grep -q '^FOUND prte.test.chain.ns'; then
+            bad "another job in DVM A saw a NAMESPACE-range key - the chain collapsed both jobs into one owner"
+        else
+            ok "...and not from another job in the same DVM, as NAMESPACE requires"
+        fi
+
+        # The answer names the publisher.  Its namespace is on its own
+        # NSPACE line, so this asserts the identity and not merely that one
+        # was named.  With the claim lost this usually fails as NOT_FOUND
+        # rather than as a wrong name: the lookup job above has already
+        # ended, and its purge - issued for A's master - took S's key too.
+        # Either way it is red, and the purge assertions below say which.
+        nsid=$(RUN 'sed -n "s/^NSPACE //p" /tmp/dsc-s.out' 2>/dev/null | tr -d '\r' | head -1)
+        out=$(PRUN_URI /tmp/dsc-a.uri "--host node5:1 -n 1 $DS lookup prte.test.chain.id 15" 2>&1)
+        if ! echo "$out" | grep -q '^FOUND prte.test.chain.id who'; then
+            bad "a SESSION-range key was not found across the chain: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        elif [ -n "$nsid" ] && echo "$out" | grep -qF "(from $nsid:0)"; then
+            ok "...and the answer names the publishing process, $nsid:0"
+        else
+            bad "the answer did not name the publisher ($nsid:0): $(echo "$out" | grep '^FOUND' | tr -d '\r')"
+        fi
+
+        # The purge.  A short job publishes and ends; its key must be gone
+        # from C - the purge travels the whole chain - and S's key must not.
+        out=$(PRUN_URI /tmp/dsc-a.uri "--host node5:1 -n 1 $DS publish prte.test.chain.gone bye session 2" 2>&1)
+        if ! echo "$out" | grep -q '^PUBLISHED prte.test.chain.gone'; then
+            bad "the short-lived publish through the chain failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        else
+            sleep 8
+            out=$(PRUN_URI /tmp/dsc-a.uri "--host node5:1 -n 1 $DS lookup prte.test.chain.gone 15" 2>&1)
+            if ! echo "$out" | grep -q '^STATUS'; then
+                bad "the post-purge lookup did not run: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            elif echo "$out" | grep -q '^FOUND prte.test.chain.gone'; then
+                bad "an ended job's key survived at the end of the chain - its purge never arrived"
+            else
+                ok "an ended job's key was purged at the far end of the chain"
+            fi
+            out=$(PRUN_URI /tmp/dsc-a.uri "--host node5:1 -n 1 $DS lookup prte.test.chain.id 15" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.chain.id who' \
+                && ok "...and the purge took only that job's data, not all of DVM A's" \
+                || bad "one job's purge took another running job's key: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+    fi
+    for u in /tmp/dsc-a.uri /tmp/dsc-b.uri /tmp/dsc-c.uri; do
+        RUN "timeout -k 5 30 pterm --dvm-uri file:$u" >/dev/null 2>&1
+    done
+    cleanup_swarm
+}
+
 test_runtime() {
     local out n rc
 
@@ -1758,6 +1880,77 @@ test_runtime() {
     fi
     cleanup_swarm
 
+    banner "runtime/data_server: a waiting lookup answers with every key, once"
+    # A PMIX_WAIT lookup for two keys when only one is published yet.  The
+    # daemon frees a request's room on the FIRST reply, so the parked
+    # request gets exactly one answer, and it has to carry both values.
+    # The lookup used to take the key it could find -- consuming it, since
+    # it is FIRST_READ -- drop it on the floor, and park for the other; the
+    # later publish then answered with that one key alone, as a complete
+    # success.  So the early key is the one to watch.
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the two-key waiting-lookup test"
+    else
+        out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.wait.early early first-read 0" 2>&1)
+        echo "$out" | grep -q '^PUBLISHED prte.test.wait.early' \
+            || bad "the early first-read publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        PRUN_BG /tmp/ds-wait2.out "--host node3:1 -n 1 $DS lookup2wait prte.test.wait.early prte.test.wait.late 60"
+        sleep 8
+        if ! RUN 'grep -q "^WAITING" /tmp/ds-wait2.out'; then
+            skp "the two-key waiting lookup never started; the next case is weaker"
+        else
+            RUN 'grep -q "^FOUND" /tmp/ds-wait2.out' \
+                && bad "a lookup waiting for two keys answered with one: $(RUN 'cat /tmp/ds-wait2.out' 2>&1 | tr '\n' ' ' | tail -c 250)" \
+                || ok "a lookup waiting for two keys, one published, is still waiting"
+        fi
+        PRUN_BG /tmp/ds-late2.out "--host node4:1 -n 1 $DS publish prte.test.wait.late late session 40"
+        sleep 12
+        RUN 'grep -q "^FOUND prte.test.wait.early early" /tmp/ds-wait2.out' \
+            && ok "the answer carries the key that was already published" \
+            || bad "the key found before parking was lost: $(RUN 'cat /tmp/ds-wait2.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        RUN 'grep -q "^FOUND prte.test.wait.late late" /tmp/ds-wait2.out' \
+            && ok "...and the key published while it waited" \
+            || bad "the key published while the lookup waited is missing: $(RUN 'cat /tmp/ds-wait2.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        RUN 'grep -qE "^STATUS SUCCESS|^STATUS .*(PMIX_SUCCESS)" /tmp/ds-wait2.out' \
+            && ok "...reported as a complete result" \
+            || bad "a two-key wait completed with the wrong status: $(RUN 'grep "^STATUS" /tmp/ds-wait2.out' 2>&1 | tr -d '\r')"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "runtime/data_server: a dead waiter takes nothing"
+    # A process parks a PMIX_WAIT lookup and is killed.  Its lookup must go
+    # with it: left parked, the next publish of the key answered a process
+    # that no longer exists, and a FIRST_READ value was consumed on its
+    # behalf -- so the reader that came later, the one actually waiting for
+    # the handover, found nothing.  The lifecycle purges became direct calls
+    # and only the old message form dropped parked requests.
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the dead-waiter test"
+    else
+        PRUN_BG /tmp/ds-orphan.out "--host node3:1 -n 1 $DS lookupwait prte.test.orphan 60"
+        sleep 8
+        if ! RUN 'grep -q "^WAITING" /tmp/ds-orphan.out'; then
+            skp "the waiting lookup never started; the dead-waiter case cannot run"
+        else
+            ON 3 'pkill -9 -f "dataserver lookupwait prte.test.orphan"; true'
+            sleep 5
+            out=$(PRUN "--host node2:1 -n 1 $DS persist prte.test.orphan handed first-read 0" 2>&1)
+            echo "$out" | grep -q '^PUBLISHED prte.test.orphan' \
+                || bad "the first-read publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            out=$(PRUN "--host node4:1 -n 1 $DS lookup prte.test.orphan" 2>&1)
+            echo "$out" | grep -q '^FOUND prte.test.orphan handed' \
+                && ok "a killed process's parked lookup did not consume the value" \
+                || bad "the value went to a dead waiter: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
     banner "runtime/data_server: unpublish removes the data"
     # Only the publisher may unpublish its own keys, so this runs in one
     # process: publish, confirm, unpublish, confirm gone.
@@ -1791,6 +1984,25 @@ test_runtime() {
         [ "$n" = 1 ] \
             && ok "an owner unpublished its GLOBAL-range data naming SESSION" \
             || bad "an owner could not remove its own data (FOUND $n times): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        banner "runtime/data_server: an unpublish leaves another job's namespace alone"
+        # Removal is owned by the USER, and two jobs of one user may each
+        # publish the same key on PMIX_RANGE_NAMESPACE -- two sets of
+        # processes, two items.  One job unpublishing its copy used to take
+        # the other's too, out from under a job still running.  Job one is
+        # MPMD so a second app in the SAME namespace can look the key up
+        # after job two has unpublished its own.
+        PRUN_BG /tmp/ds-nsdup.out "--host node2:2 -n 1 $DS publish prte.test.nsdup one namespace 22 : --host node2:2 -n 1 bash -c 'sleep 16; $DS lookup prte.test.nsdup 1 namespace'"
+        sleep 8
+        out=$(PRUN "--host node3:1 -n 1 $DS unpublish prte.test.nsdup 1 namespace namespace" 2>&1)
+        echo "$out" | grep -q '^UNPUBLISHED prte.test.nsdup' \
+            || bad "the second job's unpublish did not run: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 14
+        RUN 'grep -q "^FOUND prte.test.nsdup one" /tmp/ds-nsdup.out' \
+            && ok "the first job's own NAMESPACE-range key survived another job's unpublish" \
+            || bad "another job's unpublish took this job's key: $(RUN 'cat /tmp/ds-nsdup.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+        # the case below needs every node2 slot, so let job one finish
+        sleep 6
 
         banner "runtime/data_server: access permissions decide who may read"
         # Absent an accessor list, published data belongs to its publisher:
@@ -1944,6 +2156,45 @@ test_runtime() {
             echo "$out" | grep -q '^FOUND prte.test.dup taken' \
                 && ok "...and node2's value is still what a lookup returns" \
                 || bad "another process's key was disturbed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+            banner "runtime/data_server: an owner's key collides even where it may not read it"
+            # A publisher may leave itself off its own accessor list.  The
+            # collision test used to ask whether the publisher could READ
+            # the stored item, found it could not, and stored the second
+            # publish beside the first -- so the readers it named got
+            # whichever sat in the lower slot, and replace could not reach
+            # the first one.  An owned item is on its range regardless.
+            PRUN_BG /tmp/ds-dup-self.out "--host node2:1 -n 1 $DS publish prte.test.dup.self hidden session 40 other-uid"
+            sleep 8
+            if ! RUN 'grep -q "^PUBLISHED prte.test.dup.self" /tmp/ds-dup-self.out'; then
+                bad "the self-excluded publish never happened: $(RUN 'cat /tmp/ds-dup-self.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+            else
+                out=$(PRUN "--host node3:1 -n 1 $DS dup prte.test.dup.self again 0" 2>&1)
+                echo "$out" | grep -q 'STATUS PMIX_ERR_DUPLICATE_KEY' \
+                    && ok "a second publish of a key its owner may not read was refused" \
+                    || bad "a key its owner may not read was published twice: $(echo "$out" | grep '^STATUS' | tr -d '\r')"
+                out=$(PRUN "--host node3:1 -n 1 $DS dup prte.test.dup.self replaced 0 session replace" 2>&1)
+                echo "$out" | grep -q 'STATUS PMIX_SUCCESS' \
+                    && ok "...and its owner could replace it" \
+                    || bad "an owner could not replace a key it may not read: $(echo "$out" | grep '^STATUS' | tr -d '\r')"
+            fi
+
+            banner "runtime/data_server: PMIX_TIMEOUT on a publish is a directive, not data"
+            # PMIx hands the host every directive a publish carried, and
+            # ds_publish stored the one it did not recognize -- PMIX_TIMEOUT,
+            # which the Standard defines for PMIx_Publish -- as a published
+            # key.  The same user's next publish with a timeout then collided
+            # with "pmix.timeout" and was refused as a duplicate.
+            out=$(PRUN "--host node3:1 -n 1 $DS pubtimeout prte.test.tmo.one prte.test.tmo.two 0" 2>&1)
+            echo "$out" | grep -q '^STATUS1 PMIX_SUCCESS' \
+                && ok "a publish carrying PMIX_TIMEOUT succeeded" \
+                || bad "a publish carrying PMIX_TIMEOUT failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            echo "$out" | grep -q '^STATUS2 PMIX_SUCCESS' \
+                && ok "...and so did a second one, for a different key" \
+                || bad "a second publish carrying PMIX_TIMEOUT was refused: $(echo "$out" | grep '^STATUS2' | tr -d '\r')"
+            echo "$out" | grep -q '^TIMEOUTKEY PMIX_ERR_NOT_FOUND' \
+                && ok "...and nothing was stored under the directive's name" \
+                || bad "PMIX_TIMEOUT was stored as published data: $(echo "$out" | grep '^TIMEOUTKEY' | tr -d '\r')"
         fi
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
@@ -2512,6 +2763,8 @@ test_runtime() {
     fi
     cleanup_swarm
 
+    ds_chained_relay_case
+
     banner "runtime: a DVM tears down cleanly with jobs and sessions built"
     # The object destructors -- and the ownership rules they encode -- only
     # run for real at teardown.  prte_session_t was registered against the
@@ -2644,6 +2897,48 @@ test_pmix() {
     [ "$undef" = 0 ] \
         && ok "...and no local proc reported UNDEF" \
         || bad "$undef local procs reported UNDEF"
+
+    banner "pmix: the proc table reports a departed proc as departed"
+    # A daemon's copy of a job is the launch message's snapshot, and it
+    # advances pid/state/exit_code for its OWN local children and nothing
+    # else -- no message carries a peer daemon's proc states back down the
+    # tree, because no daemon needs them.  Only the master is told.  So
+    # PMIX_QUERY_PROC_TABLE answered locally reported every off-node rank
+    # with the state the launch message shipped, for the life of the DVM: a
+    # rank that exited seconds ago came back as LAUNCH_UNDERWAY.  The whole
+    # key now goes to the master when the table reaches a proc this daemon
+    # does not host.
+    #
+    # This cannot be seen on one host -- there the only daemon IS the master
+    # -- and it does not show up in the two cases above either, because a
+    # freshly launched job is one whose stale entries happen to be right.
+    # Ranks 1 and 3 leave; rank 0 asks six seconds later.
+    #
+    # Run it BOTH ways.  The master's own answer was correct all along, so a
+    # case that only asks a non-master cannot tell a fix from a daemon that
+    # stopped answering at all -- and the point of the fix is that the two
+    # placements agree.
+    for site in node2:2,node3:2 node1:2,node2:2; do
+        case "$site" in
+            node1:*) who="the master" ;;
+            *)       who="a non-master daemon" ;;
+        esac
+        out=$(PRUN "--host $site -n 4 --map-by node $PT departed 6" 2>&1)
+        gone=$(echo "$out" | awk '$1=="PROC" && ($2==1 || $2==3) {print $5}')
+        n=$(echo "$gone" | grep -c 'TERMINATED' | tr -d ' ')
+        if [ "$n" = 2 ]; then
+            ok "$who reported both departed ranks as TERMINATED"
+        else
+            bad "$who reported the departed ranks as [$(echo "$gone" | tr '\n' ' ')]: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        fi
+        # the survivors must still read as alive -- a table that called
+        # everything terminated would pass the assertion above
+        n=$(echo "$out" | awk '$1=="PROC" && ($2==0 || $2==2) {print $4}' \
+            | awk '$1 < 15' | grep -c . | tr -d ' ')
+        [ "$n" = 2 ] \
+            && ok "...and both surviving ranks as still running" \
+            || bad "$who reported $n of 2 survivors as alive: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    done
 
     banner "pmix: every daemon serves every node's PMIX_SERVER_URI"
     # The consumer of this query is a TOOL, not a daemon -- daemons reach
@@ -4432,6 +4727,38 @@ test_connect() {
         && bad "the parent ran to completion despite the failure" \
         || ok "...and it did not reach the end of its own run"
 
+    banner "connect: the termination that failure causes is transitive"
+    # A spawn connects the child to the parent PROCESS, so a parent with two
+    # children sits in the two assemblages {parent, A} and {parent, B} and
+    # neither of them names the other.  When A fails, terminating the parent
+    # is only the first step: B is connected to a job that is now coming down
+    # for a failure, and comes down with it.  Sweeping only the assemblages
+    # that name A stops after the parent, and B keeps running with nothing
+    # left to talk to -- so the DVM never sees its last job end and prterun
+    # does not exit at all.  That is how an mpi4py MPI_Comm_spawn test whose
+    # child aborts wedges a whole CI run rather than merely failing.
+    #
+    # No explicit connect here on purpose: the assemblages under test are the
+    # ones the two spawns create by themselves.
+    out=$(PRUN "--host node1:1 -n 1 $CN --siblings --child-host node2 --wait 25" 2>&1)
+    n=$(echo "$out" | grep -c 'CNCT parent 0 CHILD ')
+    if [ "$n" = 2 ]; then
+        ok "the parent spawned two children, in two assemblages that do not name each other"
+    else
+        skp "only $n child job(s) spawned -- the sibling case is not being tested"
+    fi
+    echo "$out" | grep -q 'CNCT bystander 0 ALIVE' \
+        && ok "...and the second child was running when the first one failed" \
+        || skp "the second child never reported running -- nothing to orphan"
+    echo "$out" | grep -q 'A job is being terminated because a job it was connected to has failed' \
+        && ok "...and the failure terminated the job connected to it" \
+        || bad "nothing was terminated by the failure: $(echo "$out" | tr '\n' ' ' | tail -c 400)"
+    # the assertion that separates the fix from the bug: orphaned, the second
+    # child runs its wait out and reports DONE
+    echo "$out" | grep -q 'CNCT bystander 0 DONE' \
+        && bad "the second child outlived its parent -- prterun waits on it, and the run hangs" \
+        || ok "...including the sibling of the job that failed"
+
     banner "connect: a member that disconnected first is left out of that"
     # ...and the same failure, after both halves have disconnected, is the
     # child's own business.  This is what shows the teardown is driven by the
@@ -5087,8 +5414,11 @@ test_fence_straggler() {
 # nothing, which is why this cannot be a single-host test.
 #
 # The endpoint read-back is the second half.  Every rank posts one value and
-# never commits or fences it, so nothing but the group exchange can carry it;
-# the gets are OPTIONAL, so they cannot leave the process to find it.
+# commits it but never collects it in a fence, so nothing but the group
+# exchange can carry it - a group contribution is built from what each member
+# COMMITTED, so the commit is required, not a shortcut around the test.  The
+# gets ask under the group's context id and are OPTIONAL, so they cannot
+# leave the process to find it.
 test_grpcomm_invite() {
     local out n
 
@@ -6531,6 +6861,51 @@ test_rml() {
         || ok "...without crashing"
     cleanup_swarm
 
+    # ...and the sockets are bound to that interface alone.  The listener used
+    # to take the wildcard address whatever had been selected, so an excluded
+    # interface still answered on the OOB port.  Check both the HNP and a
+    # remote daemon, since they open their listeners on different paths (a
+    # thread in the HNP, the event base in a prted).
+    RUN 'nohup prte --daemonize --prtemca prte_if_include eth0 --host node1:1,node2:1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    for n in 1 2; do
+        w=prte; [ "$n" = 1 ] || w=prted
+        a=$(ON "$n" "ip -4 -o addr show eth0 | awk '{print \$4}' | cut -d/ -f1" | tr -d '\r')
+        l=$(ON "$n" "ss -Hltnp | grep '\"$w\"' | awk '{print \$4}'" | tr -d '\r')
+        echo "$l" | grep -q "^$a:" \
+            && ok "node$n: $w listens on eth0 ($a)" \
+            || bad "node$n: no $w listener on eth0 ($a): $(echo "$l" | tr '\n' ' ')"
+        echo "$l" | grep -qE '^(0\.0\.0\.0|\*|\[::\]):' \
+            && bad "node$n: $w listens on the wildcard address: $(echo "$l" | tr '\n' ' ')" \
+            || ok "node$n: ...and on no wildcard address"
+    done
+    RUN 'pterm' >/dev/null 2>&1
+    cleanup_swarm
+
+    # Confining a single-node job to loopback.  Loopback used to be dropped
+    # before the include list was consulted, so naming it - on any host with
+    # another interface - left nothing and the job refused to start.
+    out=$(RUN 'timeout -k 5 60 prterun --prtemca prte_if_include lo -np 2 hostname' 2>&1); rc=$?
+    n=$(echo "$out" | grep -cE '^node1$')
+    [ "$rc" = 0 ] && [ "$n" = 2 ] \
+        && ok "if_include lo runs a single-node job" \
+        || bad "if_include lo refused a single-node job (rc=$rc, lines=$n): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    l=$(RUN 'timeout -k 5 30 prterun --prtemca prte_if_include lo -np 1 sleep 6 >/dev/null 2>&1 & sleep 3; ss -Hltnp | grep "\"prterun\"" | awk "{print \$4}"' 2>/dev/null | tr -d '\r')
+    [ -n "$l" ] && ! echo "$l" | grep -qvE '^(127\.[0-9.]+|\[::1\]):' \
+        && ok "...and every prterun listener is on loopback" \
+        || bad "if_include lo left a non-loopback prterun listener: $(echo "$l" | tr '\n' ' ')"
+    cleanup_swarm
+
+    # A DVM confined to loopback cannot reach another node, so asking it to
+    # start a daemon there has to fail.  The remote daemon finds no usable
+    # interface and exits; the HNP used to report that and then wait for the
+    # daemon to call in, which it never would, until killed.
+    out=$(RUN 'timeout -k 5 60 prterun --prtemca prte_if_include lo \
+                  --host node1:1,node2:1 -np 2 --map-by node hostname' 2>&1); rc=$?
+    [ "$rc" != 124 ] && [ "$rc" != 0 ] \
+        && ok "a loopback-only DVM asked for a remote node failed instead of hanging (rc=$rc)" \
+        || bad "a loopback-only DVM asked for a remote node: rc=$rc: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    cleanup_swarm
+
     banner "rml: losing a daemon under a live DVM is detected, not hung on"
     # Killing an interior daemon drops its sockets; the peers' recv handlers
     # see the close, run prte_oob_tcp_peer_close (which must complete every
@@ -7084,6 +7459,63 @@ test_include() {
     echo "$out" | grep -qiE 'slot|oversubscribe|not enough|available' \
         && ok "the message explains what was short" \
         || bad "no recognisable diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    cleanup_swarm
+}
+
+test_resize_elastic() {
+    local out rc n
+
+    banner "ras: a DVM that is not elastic refuses to change size"
+    # Outside elastic mode the DVM's daemons are fixed for its lifetime, and
+    # none of the grow bookkeeping exists.  --add-host used to be served
+    # anyway: its daemon was launched, and when that daemon did not start the
+    # job that asked waited forever on a daemon count nothing would complete.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --host node1:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        out=$(RUN 'timeout -k 5 60 prun --add-host node2:1 -n 1 hostname' 2>&1); rc=$?
+        [ "$rc" != 0 ] && [ "$rc" != 124 ] \
+            && ok "--add-host refused by a non-elastic DVM (rc=$rc)" \
+            || bad "--add-host on a non-elastic DVM: rc=$rc: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q "elastic mode" \
+            && ok "...and said the DVM is not elastic" \
+            || bad "no elastic-mode diagnostic: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        [ "$(prted_count 2)" = 0 ] && ok "...without launching a daemon" \
+                                   || bad "a daemon was launched on node2 anyway"
+        out=$(RUN 'timeout -k 5 60 prun --activate node2 -n 1 hostname' 2>&1); rc=$?
+        [ "$rc" != 0 ] && [ "$rc" != 124 ] \
+            && ok "--activate refused by a non-elastic DVM (rc=$rc)" \
+            || bad "--activate on a non-elastic DVM: rc=$rc: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(RUN 'timeout -k 5 30 prun -n 2 hostname' 2>&1); rc=$?
+        n=$(echo "$out" | grep -cE '^node1$')
+        [ "$rc" = 0 ] && [ "$n" = 2 ] && ok "the DVM still runs jobs after the refusals" \
+                                      || bad "DVM unusable after a refused resize (rc=$rc, lines=$n)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the non-elastic resize test"
+    fi
+    cleanup_swarm
+
+    banner "plm: an elastic grow whose daemon cannot start fails the job, not the DVM"
+    # The launch agent is the DVM's, so every daemon launched after formation
+    # fails to start - which is exactly the grow under test.  The grow
+    # campaign rolls the node back out, so the job that asked is told and the
+    # DVM carries on.
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 --prtemca prte_launch_agent /bin/false --host node1:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        out=$(RUN 'timeout -k 5 60 prun --add-host node2:1 --host node2:1 -n 1 hostname' 2>&1); rc=$?
+        [ "$rc" != 0 ] && [ "$rc" != 124 ] \
+            && ok "a grow whose daemon failed to start failed the job (rc=$rc)" \
+            || bad "a grow whose daemon failed to start: rc=$rc: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(RUN 'timeout -k 5 30 prun -n 2 hostname' 2>&1); rc=$?
+        n=$(echo "$out" | grep -cE '^node1$')
+        [ "$rc" = 0 ] && [ "$n" = 2 ] && ok "...and the DVM still runs jobs" \
+                                      || bad "DVM unusable after a failed grow (rc=$rc, lines=$n)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1; rc=$?
+        [ "$rc" = 0 ] && ok "...and pterm takes it down" || bad "pterm failed after a failed grow (rc=$rc)"
+    else
+        bad "could not start an elastic DVM for the failed-grow test"
+    fi
     cleanup_swarm
 }
 
@@ -8063,7 +8495,8 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     # --daemonize, because a daemonized HNP detaches from its output and the
     # trace this case reads would go nowhere.
     cleanup_swarm
-    RUN_BG /tmp/prte.out 'prte --prtemca plm_base_verbose 5 --host node1:1,node2:1'
+    # --add-host changes the DVM, which only an elastic one may do.
+    RUN_BG /tmp/prte.out 'prte --prtemca prte_elastic_mode 1 --prtemca plm_base_verbose 5 --host node1:1,node2:1'
     sleep 8
     if RUN 'pgrep -x prte >/dev/null'; then
         first=$(RUN 'grep -c "setup_vm add new daemon" /tmp/prte.out' | tr -d '\r')
@@ -8721,7 +9154,7 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     # chain only runs multi-node, and its parser is separate from the flex
     # hostfile parser precisely so it can accept the slots=+N adjust syntax.
     cleanup_swarm
-    RUN 'nohup prte --daemonize --host node1:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 --host node1:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
     if RUN 'pgrep -x prte >/dev/null'; then
         RUN 'printf "node2 slots=2\nnode3 slots=2\n" > /tmp/addhosts.txt'
         out=$(RUN 'timeout 90 prun --add-hostfile /tmp/addhosts.txt --host node2:2,node3:2 -n 4 --map-by node hostname' 2>&1)
@@ -8748,6 +9181,8 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     fi
     cleanup_swarm
 
+    test_resize_elastic
+
     banner "ras/hosts: --activate brings an allocated-but-idle node into the DVM"
     # The other half of the resize surface, and the only one permitted where a
     # scheduler owns the allocation: it starts a daemon on a node the
@@ -8765,7 +9200,7 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     cleanup_swarm
     # four allocated, two in the DVM: node3 exercises the named form and node4
     # the "+all" form, so neither is already in when its turn comes
-    RUN 'nohup prte --daemonize --prtemca prte_max_vm_size 2 --host node1:2,node2:2,node3:2,node4:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 --prtemca prte_max_vm_size 2 --host node1:2,node2:2,node3:2,node4:2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
     if RUN 'pgrep -x prte >/dev/null'; then
         [ "$(prted_count 3 4)" = 0 ] \
             && ok "max_vm_size left node3+node4 allocated with no daemon" \
@@ -9199,6 +9634,51 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     [ "$(prted_settle 10 2)" = 0 ] \
         && ok "the daemon the grow added was told to exit, not left orphaned" \
         || bad "a prted from the in-flight grow is still running on node2"
+    cleanup_swarm
+
+    # A job submitted while a grow is in flight is held by the launch fence
+    # and admitted once the grow completes -- but the grow's own VM_READY
+    # message, which goes out first, catches every daemon up on the jobs in
+    # the DVM, and a held job was one of them.  Every daemon then already
+    # held the namespace when the job's launch message arrived, so it forked
+    # nothing: the master launched its share and the job waited forever on
+    # the rest.  The job here deliberately has no procs on the master's node.
+    #
+    # The grow is several nodes wide so that it is still waiting on daemons
+    # when the prun arrives; a prun that happens to lose that race is not
+    # held and passes either way.
+    banner "elastic DVM: a job held across a grow launches on every node"
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if ! RUN 'pgrep -x prte >/dev/null'; then
+        bad "could not start an elastic DVM for the held-job test"
+    elif ! pmix_cap PMIX_CAP_TOOL_FINALIZED; then
+        # without it the grown nodes stay reserved to the exited elastic
+        # tool, so a later prun cannot be placed on them by name
+        skp "job held across a grow (PMIx predates PMIX_CAP_TOOL_FINALIZED)"
+    else
+        out=$(RUN 'timeout 90 elastic grow node2:1,node3:1' 2>&1)
+        if ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
+            bad "grow node2+node3 did not complete -- cannot test a held job"
+        else
+            sleep 2
+            RUN 'nohup timeout 120 elastic grow node4:1,node5:1,node6:1,node7:1,node8:1 \
+                     >/tmp/heldgrow.out 2>&1 &' >/dev/null 2>&1
+            out=$(RUN 'timeout 60 prun --host node2:1,node3:1 -n 2 --map-by node hostname' 2>&1); rc=$?
+            n=$(echo "$out" | grep -cE '^node[23]$')
+            [ "$rc" = 0 ] && [ "$n" = 2 ] \
+                && ok "a job submitted mid-grow ran on both of its nodes" \
+                || bad "a job submitted mid-grow did not complete (rc=$rc, $n of 2 ran): $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+            for _ in $(seq 60); do
+                RUN 'grep -q PMIX_DVM_IS_READY /tmp/heldgrow.out' 2>/dev/null && break
+                sleep 1
+            done
+            RUN 'grep -q PMIX_DVM_IS_READY /tmp/heldgrow.out' 2>/dev/null \
+                && ok "...and the grow it was held for completed" \
+                || bad "the grow the job was held for did not complete"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
     cleanup_swarm
 }
 

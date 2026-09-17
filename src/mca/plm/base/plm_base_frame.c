@@ -237,7 +237,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
      * launch the daemons - the user really wants to just
      * look at the proposed process map
      */
-    if (prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         /* set the state to indicate the daemons reported - this
          * will trigger the daemons_reported event and cause the
          * job to move to the following step
@@ -291,7 +291,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
     }
 
     // otherwise, this is an error
-    prte_show_help("help-plm-base.txt", "no-available-pls", true);
+    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-base.txt", "no-available-pls", true);
     PRTE_ACTIVATE_JOB_STATE(state->jdata, PRTE_JOB_STATE_FAILED_TO_START);
     PMIX_RELEASE(state);
 }

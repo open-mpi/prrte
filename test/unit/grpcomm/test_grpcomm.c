@@ -58,6 +58,8 @@
 #include "src/util/proc_info.h"
 
 #include "src/class/pmix_bitmap.h"
+#include "src/event/event-internal.h"
+#include "src/mca/rmaps/rmaps_types.h"
 #include "src/rml/rml.h"
 #include "src/runtime/prte_globals.h"
 
@@ -1343,6 +1345,298 @@ static int test_release_tree(void)
     return failures;
 }
 
+/*
+ * A controller asked to fence over a namespace it has no map for - a tool
+ * connected to it, say - hosts those participants itself, and says so by
+ * counting itself in.  What it must not do is stop reading the signature
+ * there: the daemons hosting the entries after that one are participants
+ * too.  Stopping used to leave the rollup expecting nobody, so the
+ * controller released the answer on its own contribution before anyone else
+ * had reported.
+ */
+static int test_fence_tracker_mapless(void)
+{
+    int failures = 0;
+#if PRTE_TEST_GRPCOMM_INTERNALS
+    prte_grpcomm_fence_signature_t sig;
+    prte_grpcomm_fence_t *coll;
+    prte_job_t *mapped;
+    pmix_rank_t save_rank = PRTE_PROC_MY_NAME->rank;
+    pmix_nspace_t save_nspace, mapped_nspace;
+    bool have_self = false, have_host = false;
+    size_t n;
+
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_ops, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_rml_base.failed_dmns, pmix_bitmap_t);
+    pmix_bitmap_init(&prte_rml_base.failed_dmns, 8);
+    if (NULL == prte_job_data) {
+        prte_job_data = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_job_data, 8, INT_MAX, 8);
+    }
+    PMIX_LOAD_NSPACE(save_nspace, PRTE_PROC_MY_NAME->nspace);
+    PMIX_LOAD_NSPACE(PRTE_PROC_MY_NAME->nspace, "prte-unit-dvm");
+    PRTE_PROC_MY_NAME->rank = 0;
+
+    /* no map at all for the first; the second has one, and its rank 3 sits
+     * on daemon 3 */
+    build_job("fence-mapless", 1);
+    build_job("fence-mapped", 4);
+    PMIX_LOAD_NSPACE(mapped_nspace, "fence-mapped");
+    mapped = prte_get_job_data_object(mapped_nspace);
+    mapped->map = PMIX_NEW(prte_job_map_t);
+    mapped->map->num_nodes = 4;
+
+    PMIX_CONSTRUCT(&sig, prte_grpcomm_fence_signature_t);
+    sig.sz = 2;
+    PMIX_PROC_CREATE(sig.signature, 2);
+    PMIX_LOAD_PROCID(&sig.signature[0], "fence-mapless", 0);
+    PMIX_LOAD_PROCID(&sig.signature[1], "fence-mapped", 3);
+    coll = prte_grpcomm_fence_get_tracker(&sig, 0, PRTE_GRPCOMM_FENCE_STEP_ROLLUP, true);
+    CHECK("mapless: the signature resolves", NULL != coll);
+    if (NULL != coll) {
+        for (n = 0; n < coll->ndmns; n++) {
+            if (0 == coll->dmns[n]) {
+                have_self = true;
+            } else if (3 == coll->dmns[n]) {
+                have_host = true;
+            }
+        }
+        CHECK("mapless: the controller counts itself in", have_self);
+        CHECK("mapless: and the entry after it is still resolved", have_host);
+        CHECK("mapless: nobody else", 2 == coll->ndmns);
+    }
+    PMIX_DESTRUCT(&sig);
+
+    PRTE_PROC_MY_NAME->rank = save_rank;
+    PMIX_LOAD_NSPACE(PRTE_PROC_MY_NAME->nspace, save_nspace);
+    PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.fence_ops);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_ops, pmix_list_t);
+    PMIX_DESTRUCT(&prte_rml_base.failed_dmns);
+#endif
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_fence_tracker_mapless\n");
+    }
+    return failures;
+}
+
+#if PRTE_TEST_GRPCOMM_INTERNALS
+static int failing_release_calls;
+
+/* Refuse the first release, accept everything after it - what a controller
+ * sees when it cannot emit a fence's answer but can still emit the smaller
+ * abort. */
+static int stub_release_fails_once(prte_rml_tag_t tag, pmix_data_buffer_t *msg)
+{
+    failing_release_calls++;
+    if (1 == failing_release_calls) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    return stub_xcast(tag, msg);
+}
+#endif
+
+/*
+ * A controller whose fence has converged must get an answer out, even when
+ * the answer itself cannot be sent.  Convergence latches the tracker, and the
+ * recovery restart deliberately leaves a converged tracker alone on the
+ * controller - its release is supposed to be on the wire already - so a
+ * release that failed to go out used to leave every participant in the DVM
+ * blocked for good.  The controller now falls back to the abort, which is
+ * only a signature and a status.
+ *
+ * Driven through the restart because that is the one way to converge a fence
+ * with no message in hand: a tracker whose daemon set resolves to nobody is
+ * complete the moment its expectation is recomputed.
+ */
+static int test_fence_release_failure(void)
+{
+    int failures = 0;
+#if PRTE_TEST_GRPCOMM_INTERNALS
+    prte_grpcomm_fence_t *coll;
+    uint32_t epoch;
+
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.xcast_ops, prte_grpcomm_xcast_t);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_ops, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.group_ops, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.completed_group_ops, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_rml_base.failed_dmns, pmix_bitmap_t);
+    pmix_bitmap_init(&prte_rml_base.failed_dmns, 8);
+
+    coll = add_fence_op("fence-release-fails");
+    coll->nexpected = 1;
+    coll->nreported = 0;
+
+    prte_grpcomm_release_bcast = stub_release_fails_once;
+    failing_release_calls = 0;
+    fence_xcast_calls = 0;
+
+    epoch = prte_grpcomm_current_epoch() + 1;
+    prte_grpcomm_advance_epoch(epoch);
+
+    CHECK("release failure: the fence converged", coll->converged);
+    CHECK("release failure: the release was attempted, then the abort",
+          2 == failing_release_calls);
+    CHECK("release failure: the abort went out", 1 == fence_xcast_calls);
+    CHECK("release failure: the abort is a release on the fence tag",
+          PRTE_RML_TAG_FENCE_RELEASE == fence_xcast_tag);
+    CHECK("release failure: the abort carries a failure",
+          PMIX_SUCCESS != fence_xcast_status);
+    CHECK("release failure: the tracker is being torn down", coll->aborting);
+
+    prte_grpcomm_release_bcast = prte_grpcomm_xcast;
+    prte_grpcomm_globals.recovery_epoch = 0;
+    PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.fence_ops);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.fence_ops, pmix_list_t);
+    PMIX_DESTRUCT(&prte_grpcomm_globals.xcast_ops);
+    PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.group_ops);
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.group_ops, pmix_list_t);
+    PMIX_LIST_DESTRUCT(&prte_grpcomm_globals.completed_group_ops);
+    PMIX_DESTRUCT(&prte_rml_base.failed_dmns);
+#endif
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_fence_release_failure\n");
+    }
+    return failures;
+}
+
+#if PRTE_TEST_GRPCOMM_INTERNALS
+/* A forward, packed the way pack_forward_msg() packs one. An op id of zero is
+ * an originator's relay, which the controller numbers on receipt. */
+static pmix_data_buffer_t *xcast_forward(prte_grpcomm_topology_t topo, size_t op_id)
+{
+    pmix_data_buffer_t *buf;
+    uint8_t t = (uint8_t) topo;
+    uint32_t version = 0;
+    pmix_rank_t ack_id = 0;
+    prte_rml_tag_t tag = PRTE_RML_TAG_INVALID;
+    bool compressed = false;
+    char payload[] = "payload";
+    pmix_byte_object_t bo;
+
+    bo.bytes = payload;
+    bo.size = sizeof(payload);
+    PMIX_DATA_BUFFER_CREATE(buf);
+    (void) PMIx_Data_pack(NULL, buf, &t, 1, PMIX_UINT8);
+    (void) PMIx_Data_pack(NULL, buf, &op_id, 1, PMIX_SIZE);
+    (void) PMIx_Data_pack(NULL, buf, &version, 1, PMIX_UINT32);
+    (void) PMIx_Data_pack(NULL, buf, &ack_id, 1, PMIX_PROC_RANK);
+    (void) PMIx_Data_pack(NULL, buf, &tag, 1, PRTE_RML_TAG);
+    (void) PMIx_Data_pack(NULL, buf, &compressed, 1, PMIX_BOOL);
+    (void) PMIx_Data_pack(NULL, buf, &bo, 1, PMIX_BYTE_OBJECT);
+    return buf;
+}
+#endif
+
+/*
+ * Every tree numbers its broadcasts from 1, so an op id names one broadcast
+ * per tree and the in-flight list holds broadcasts of both trees at once.
+ * The lookup and the insertion used to compare the id alone: a routing-tree
+ * broadcast arriving while a release-tree broadcast of the same number was
+ * still in flight was taken for a duplicate of it, and was never forwarded or
+ * delivered - a lost launch message, or a lost fence release.
+ *
+ * Driven on the controller, which numbers every broadcast itself.  The
+ * release op is held in flight with the forward-delay knob (which by design
+ * never holds the routing tree), and the routing op has no children, so it
+ * completes on receipt - or would, if it were not mistaken for the other.
+ */
+static int test_xcast_tree_identity(void)
+{
+    int failures = 0;
+#if PRTE_TEST_GRPCOMM_INTERNALS
+    pmix_data_buffer_t *buf;
+    pmix_proc_t self;
+    pmix_rank_t save_dmns = prte_rml_base.n_dmns;
+    int save_r2 = prte_rml_base.radix2;
+    int save_nchildren = prte_rml_base.n_children;
+    int save_delay = prte_grpcomm_globals.xcast_delay_ms;
+    int save_vpid = prte_grpcomm_globals.xcast_delay_vpid;
+    pmix_rank_t save_rank = PRTE_PROC_MY_NAME->rank;
+    prte_grpcomm_tree_state_t *routing, *release;
+
+    /* the held forward arms a timer, and delivery posts the payload - both
+     * need an event base, which prte_init_util() does not open.  Nothing
+     * runs the loop, so neither is ever dispatched */
+    if (PRTE_SUCCESS != prte_event_base_open()) {
+        fprintf(stderr, "FAIL [xcast identity]: cannot open an event base\n");
+        return 1;
+    }
+
+    PMIX_CONSTRUCT(&prte_grpcomm_globals.xcast_ops, prte_grpcomm_xcast_t);
+    PMIX_CONSTRUCT(&prte_rml_base.failed_dmns, pmix_bitmap_t);
+    pmix_bitmap_init(&prte_rml_base.failed_dmns, 8);
+    routing = &prte_grpcomm_globals.xcast_ops.tree[PRTE_GRPCOMM_TOPO_ROUTING];
+    release = &prte_grpcomm_globals.xcast_ops.tree[PRTE_GRPCOMM_TOPO_RELEASE];
+
+    /* the controller has one release-tree child and no routing-tree ones */
+    PRTE_PROC_MY_NAME->rank = 0;
+    prte_rml_base.n_dmns = 2;
+    prte_rml_base.radix2 = 4;
+    prte_rml_base.n_children = 0;
+    prte_grpcomm_globals.xcast_delay_ms = 1000000;
+    prte_grpcomm_globals.xcast_delay_vpid = -1;
+    PMIX_LOAD_PROCID(&self, PRTE_PROC_MY_NAME->nspace, PRTE_PROC_MY_NAME->rank);
+
+    buf = xcast_forward(PRTE_GRPCOMM_TOPO_RELEASE, 0);
+    prte_grpcomm_xcast_recv(PRTE_SUCCESS, &self, buf, PRTE_RML_TAG_XCAST, NULL);
+    PMIX_DATA_BUFFER_RELEASE(buf);
+    CHECK("xcast identity: the release op is numbered 1", 1 == release->op_id_inited);
+    CHECK("xcast identity: the release op is held in flight",
+          1 == pmix_list_get_size(&prte_grpcomm_globals.xcast_ops.ops));
+
+    buf = xcast_forward(PRTE_GRPCOMM_TOPO_ROUTING, 0);
+    prte_grpcomm_xcast_recv(PRTE_SUCCESS, &self, buf, PRTE_RML_TAG_XCAST, NULL);
+    PMIX_DATA_BUFFER_RELEASE(buf);
+    CHECK("xcast identity: the routing op is numbered 1 too", 1 == routing->op_id_inited);
+    CHECK("xcast identity: the routing op completed rather than being taken "
+          "for the release op", 1 == routing->op_id_completed);
+    CHECK("xcast identity: the release op is still in flight",
+          0 == release->op_id_completed &&
+          1 == pmix_list_get_size(&prte_grpcomm_globals.xcast_ops.ops));
+
+    /* and an ack is counted against the op of its own tree: a routing-tree
+     * ack for op 1 must not complete the release op 1 still waiting on its
+     * child */
+    PMIX_DATA_BUFFER_CREATE(buf);
+    {
+        uint8_t t = (uint8_t) PRTE_GRPCOMM_TOPO_ROUTING;
+        size_t op_id = 1;
+        pmix_rank_t ack_id = 0;
+        bool is_request = false;
+        (void) PMIx_Data_pack(NULL, buf, &t, 1, PMIX_UINT8);
+        (void) PMIx_Data_pack(NULL, buf, &op_id, 1, PMIX_SIZE);
+        (void) PMIx_Data_pack(NULL, buf, &ack_id, 1, PMIX_PROC_RANK);
+        (void) PMIx_Data_pack(NULL, buf, &is_request, 1, PMIX_BOOL);
+    }
+    PMIX_LOAD_PROCID(&self, PRTE_PROC_MY_NAME->nspace, 1);
+    prte_grpcomm_xcast_ack(PRTE_SUCCESS, &self, buf, PRTE_RML_TAG_XCAST_ACK, NULL);
+    PMIX_DATA_BUFFER_RELEASE(buf);
+    CHECK("xcast identity: another tree's ack does not complete the op",
+          0 == release->op_id_completed &&
+          1 == pmix_list_get_size(&prte_grpcomm_globals.xcast_ops.ops));
+
+    /* The held op's timer is still armed and holds a reference; it is never
+     * dispatched here, because nothing runs the event loop.  Tearing the list
+     * down drops the list's own reference. */
+    PMIX_DESTRUCT(&prte_grpcomm_globals.xcast_ops);
+    PMIX_DESTRUCT(&prte_rml_base.failed_dmns);
+    prte_rml_base.n_dmns = save_dmns;
+    prte_rml_base.radix2 = save_r2;
+    prte_rml_base.n_children = save_nchildren;
+    prte_grpcomm_globals.xcast_delay_ms = save_delay;
+    prte_grpcomm_globals.xcast_delay_vpid = save_vpid;
+    PRTE_PROC_MY_NAME->rank = save_rank;
+    prte_event_base_close();
+#endif
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_xcast_tree_identity\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -1377,6 +1671,9 @@ int main(void)
     failures += test_fence_tracker();
     failures += test_fence_fault_handler();
     failures += test_recovery_epoch();
+    failures += test_fence_tracker_mapless();
+    failures += test_fence_release_failure();
+    failures += test_xcast_tree_identity();
 
     PMIx_server_finalize();
     prte_finalize();

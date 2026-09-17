@@ -260,7 +260,34 @@ These live in `state_base_fns.c` and are wired into components' tables
 | `prte_state_base_report_progress` | Prints the "App launch reported: N daemons / M procs" line. |
 | `prte_state_base_check_fds` | Debug leak check: enumerates open fds after a job completes (enabled by `state_base_check_fds`). |
 | `prte_state_base_purge_proc` / `_purge_app` / `_purge_nspace` / `_purge_session` | Tell the data store a lifetime ended, so it drops the published data that was not to outlive it. Each purges **this process's own** store with a direct call — no message, and nothing at all when nothing was ever published, which is what makes the per-process one affordable. The master additionally relays to an *external* data server where one is configured, since that store lives in another DVM behind a PMIx tool connection only the master holds. Which one a caller reaches for is which lifetime it can observe: a daemon sees its own child exit and is told when a namespace is over; it does **not** see an application end DVM-wide, and its own share of a job finishing is not a lifetime at all. Sending the DVM-wide purge from there used to let the first node to finish purge the whole namespace out of the master's store mid-job. |
-| `prte_state_base_recover_resources` | Idempotently returns one proc's slot/cpu resources to its node and drops the node from the map when empty — used on daemon-loss / partial-failure recovery paths. Written to tolerate being called twice for the same proc. |
+| `prte_state_base_recover_resources` | Idempotently returns one proc's slot/cpu resources to its node and drops the node from the map when empty — used on daemon-loss / partial-failure recovery paths. Written to tolerate being called twice for the same proc, **and to tolerate having neither a node nor a map to work on** (see below). |
+
+### A proc outlives its node, and a job outlives its map
+
+`prte_state_base_recover_resources()` reaches through `pptr->node` and
+`jdata->map`, and by the time errmgr/dvm calls it — from six different proc
+states, as a job absorbs a failure and keeps running — **either can
+legitimately be NULL**. Neither is corruption:
+
+- `prte_node_destruct()` clears `proc->node` on every proc in its array,
+  with a comment saying why: the backpointer is *borrowed*, and a proc
+  outlives its node because the job holds a reference too. So every proc on
+  a node that has been released holds NULL there. `prte_proc_construct()`
+  starts it NULL as well, for a proc that was never placed. errmgr/dvm
+  knows this — it prints `(NULL == pptr->node) ? "unknown" : pptr->node->name`
+  five lines before it calls here for `PRTE_PROC_STATE_KILLED_BY_RELEASE`.
+- `state/dvm`'s `check_complete` releases the map and sets `jdata->map =
+  NULL`. Since this routine exists *because* a proc arrives twice (a daemon
+  loss marks `TERM_WO_SYNC`, a later abort delivers a second terminal
+  state), the second arrival can land after that.
+
+Reading either unconditionally took the HNP down — and on the HNP that is
+the whole DVM, not one job. Both are now a no-op return at the top, and
+[`test/unit/state/test_state.c`](../../../test/unit/state/test_state.c)
+pins both. The same care applies to the two **copies** of this logic named
+under "Gotchas" in [`dvm/AGENTS.md`](dvm/AGENTS.md): `check_complete` and
+`state/prted`'s `track_procs` walk the map themselves and must reach the
+same conclusions.
 
 ### Every handler here is wired — keep it that way
 
@@ -547,6 +574,22 @@ contention — the process's role decides which machine it runs.
   it was found through hwloc's `memory not bound` warning, which adds a pipe
   record and a `show_help` render to `do_parent` before the `RUNNING`
   activation.
+- **A job's state must never go backwards either.** The job-level `RUNNING`
+  and `REGISTERED` are counted up from per-proc reports, so they inherit the
+  same disorder: a proc can exit, and the job reach `TERMINATED`, while its
+  launch report is still held up (on the DVM master the spawn thread can sit
+  in a PMIx call - a stalled PMIx progress thread is enough). `track_procs`
+  then counts the late `RUNNING` and activates the job `RUNNING`, and
+  `prte_plm_base_post_launch` used to write that over `TERMINATED`.
+  `state/dvm`'s `check_complete` finishes asynchronously, after PMIx
+  deregisters the namespace, and its continuation decides whether anything
+  is still alive by testing `state < TERMINATED` - it found the job itself,
+  took the "other work remains" path, and a `prterun` never exited. So the
+  handlers that write a job's forward states (`post_launch`, `registered` in
+  `plm/base`) leave a job at or past `PRTE_JOB_STATE_UNTERMINATED` alone. Do
+  not "fix" this at the activation instead: the job's state is written only
+  when a handler runs, so at activation time the termination may still be
+  queued behind it.
 - **Never do real work in the activator.** Activation only queues an
   event; the handler runs later on the progress thread. Don't assume the
   handler has run when `PRTE_ACTIVATE_*_STATE` returns, and don't read
