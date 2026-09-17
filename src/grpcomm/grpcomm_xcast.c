@@ -390,9 +390,15 @@ void prte_grpcomm_xcast_recv(
     uint32_t sender_version;
     if(PMIX_SUCCESS != unpack_sig(buffer, &sig)) return;
     {
+        /* treated like every other field of the forward - a broadcast that
+         * cannot be read is lost to this daemon's whole subtree, and dropping
+         * it without a word left nothing to say where it went */
         int32_t cnt = 1;
-        if (PMIX_SUCCESS != PMIx_Data_unpack(NULL, buffer, &sender_version,
-                                             &cnt, PMIX_UINT32)) {
+        int rc = PMIx_Data_unpack(NULL, buffer, &sender_version,
+                                  &cnt, PMIX_UINT32);
+        if (PMIX_SUCCESS != rc) {
+            PMIX_ERROR_LOG(rc);
+            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
             return;
         }
     }
@@ -1009,7 +1015,7 @@ static void begin_xcast(int sd, short args, void* cbdata){
     PRTE_RML_RELIABLE_SEND(
         rc, PRTE_PROC_MY_HNP->rank, xcast_msg, PRTE_RML_TAG_XCAST
     );
-    if (PMIX_SUCCESS != rc) {
+    if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
         if (NULL != pc) {
             pmix_list_remove_item(&XCAST.pending_completions, &pc->super);
@@ -1180,7 +1186,7 @@ static void finish_op(op_t* op) {
     }
 #define DIRECT_XCAST_UNPACK(buf, ptr, type)                            \
     {                                                                  \
-        int _count = 1;                                                \
+        int32_t _count = 1;                                            \
         int rc = PMIx_Data_unpack(NULL, buf, ptr, &_count, type);      \
         if (PMIX_SUCCESS != rc) {                                      \
             PMIX_ERROR_LOG(rc);                                        \
@@ -1267,59 +1273,60 @@ static int pack_forward_msg(pmix_data_buffer_t* buffer, op_t* op){
     return rc;
 }
 
+/* An op is found by its whole identity - the tree AND the id.  Every tree
+ * numbers its ops from 1, so the id alone names one op per tree, and the list
+ * holds ops of every tree at once.  Matching on the id alone handed a release
+ * broadcast the routing op that happened to share its number: the release was
+ * taken for a duplicate and never forwarded or delivered, and an ack for one
+ * was counted against the other. */
 static op_t* find_op(signature_t* sig){
     op_t* op = NULL;
     PMIX_LIST_FOREACH(op, &XCAST.ops, op_t){
-        if(sig->op_id == op->sig.op_id) return op;
+        if(sig->topology == op->sig.topology && sig->op_id == op->sig.op_id){
+            return op;
+        }
     }
     return NULL;
 }
 
+/* Ops are held in op-id order *within each tree*; the ops of different trees
+ * interleave in whatever order they arrived, and their ids say nothing about
+ * each other.  So both the position and the duplicate test look only at ops of
+ * the same tree - placing an op before the first higher id of ANY tree can put
+ * it ahead of a lower id of its own, and finish_op then retires the two out of
+ * order. */
 static op_t* insert_forwarded_op(signature_t* sig) {
     op_t* op = PMIX_NEW(op_t);
+    op_t* next_op;
     op->sig = *sig;
 
+    /* The ordinary case, and the one every broadcast takes: the newest op of
+     * its tree belongs after every op of that tree already held, so it goes
+     * on the end without walking the list.  Our caller has already looked it
+     * up, so it cannot be a duplicate. */
     if(sig->op_id == TREE_OF(*sig).op_id_inited){
         pmix_list_append(&XCAST.ops, &op->super);
-    } else {
-        op_t* next_op = NULL;
-        PMIX_LIST_FOREACH(next_op, &XCAST.ops, op_t){
-            if(next_op->sig.op_id > sig->op_id) break;
-        }
-        pmix_list_insert_pos(&XCAST.ops, &next_op->super, &op->super);
+        return op;
     }
 
-    op_t* prev = (op_t*) pmix_list_get_prev(op);
-    bool dup = prev != (op_t*) &XCAST.ops.pmix_list_sentinel
-        && prev->sig.op_id == op->sig.op_id;
-    if(dup){
-        PRTE_ERROR_LOG(PRTE_ERR_DUPLICATE_MSG);
-        pmix_list_remove_item(&XCAST.ops, &op->super);
-        PMIX_RELEASE(op);
-        return prev;
+    PMIX_LIST_FOREACH(next_op, &XCAST.ops, op_t){
+        if(next_op->sig.topology != sig->topology){
+            continue;
+        }
+        if(next_op->sig.op_id == sig->op_id){
+            PRTE_ERROR_LOG(PRTE_ERR_DUPLICATE_MSG);
+            PMIX_RELEASE(op);
+            return next_op;
+        }
+        if(next_op->sig.op_id > sig->op_id){
+            pmix_list_insert_pos(&XCAST.ops, &next_op->super, &op->super);
+            return op;
+        }
     }
+    pmix_list_append(&XCAST.ops, &op->super);
     return op;
 }
 
-/* MOVEMENT: send the whole payload to each routing-tree child.
- *
- * Right for a small message, where the cost is the depth of the tree and a
- * high radix makes that 1 or 2 hops.  Wrong for a large one: a node with r
- * children serializes r full copies of the payload on its outbound link, at
- * every level, so the bandwidth term is d*r*M*beta - which is the entire cost
- * of broadcasting a launch message or a preload chunk at scale.
- *
- * The forward is byte-for-byte identical for every child - it carries the
- * op-id, the ack-id and the payload, none of which depend on the destination -
- * so it is packed once here and shared by every send.  Packing it per child
- * cost a full copy of the payload per child, and all of those copies were made
- * on the progress thread inside this one event callback, before any of them
- * could reach the wire: at the default radix, 64 copies of a launch message
- * made and held before the first byte moved.
- *
- * That is why pack_forward_msg takes no destination.  If a forward ever does
- * need to differ per child, this is the loop that has to go back to packing
- * inside it - the sharing is not an optimization the RML can make on its own. */
 /* Who this daemon relays to, and who relays to it, in a given tree.
  *
  * The routing tree's answer is already computed and cached - it is consulted
@@ -1388,6 +1395,25 @@ static pmix_rank_t topo_parent(prte_grpcomm_topology_t topo)
     return PRTE_PROC_MY_PARENT->rank;
 }
 
+/* MOVEMENT: send the whole payload to each child in the op's tree.
+ *
+ * Right for a small message, where the cost is the depth of the tree and a
+ * high radix makes that 1 or 2 hops.  Wrong for a large one: a node with r
+ * children serializes r full copies of the payload on its outbound link, at
+ * every level, so the bandwidth term is d*r*M*beta - which is the entire cost
+ * of broadcasting a launch message or a preload chunk at scale.
+ *
+ * The forward is byte-for-byte identical for every child - it carries the
+ * op-id, the ack-id and the payload, none of which depend on the destination -
+ * so it is packed once here and shared by every send.  Packing it per child
+ * cost a full copy of the payload per child, and all of those copies were made
+ * on the progress thread inside this one event callback, before any of them
+ * could reach the wire: at the default radix, 64 copies of a launch message
+ * made and held before the first byte moved.
+ *
+ * That is why pack_forward_msg takes no destination.  If a forward ever does
+ * need to differ per child, this is the loop that has to go back to packing
+ * inside it - the sharing is not an optimization the RML can make on its own. */
 static void tree_whole_forward(op_t* op){
     pmix_rank_t* children;
     prte_rml_payload_t* payload;
@@ -1486,8 +1512,7 @@ static void forward_op(op_t* op){
      * object nobody set it. */
     prte_job_t* daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
     if(NULL != daemons &&
-       prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH,
-                          NULL, PMIX_BOOL)){
+       PRTE_ATTR_IS_TRUE(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH)){
         return;
     }
 
@@ -1543,10 +1568,11 @@ static void forward_op(op_t* op){
  *
  * Dropping the expectation is the answer rather than failing the broadcast,
  * because a daemon that joins after op N was never going to see op N anyway:
- * the late-joiner catch-up in insert_forwarded_op has it adopt ops 1..N-1 as
- * complete when it arrives.  This only makes the sender agree with that.  A
- * child that genuinely died is a separate story and still takes the fault
- * handler's path, which recomputes nexpected and starts a fresh ack round. */
+ * the late-joiner catch-up in prte_grpcomm_xcast_recv has it adopt ops
+ * 1..N-1 as complete when it arrives.  This only makes the sender agree with
+ * that.  A child that genuinely died is a separate story and still takes the
+ * fault handler's path, which recomputes nexpected and starts a fresh ack
+ * round. */
 static void forward_lost(int status, pmix_proc_t *peer,
                          pmix_data_buffer_t *buffer,
                          prte_rml_tag_t tag, void *cbdata)
@@ -1817,7 +1843,7 @@ static void process_msg(op_t* op){
             (uint8_t**) &decomp_msg.bytes, &decomp_msg.size
         );
         if(!success){
-            prte_show_help("help-prte-runtime.txt", "failed-to-uncompress",
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-runtime.txt", "failed-to-uncompress",
                            true, prte_process_info.nodename);
             PMIX_BYTE_OBJECT_DESTRUCT(&decomp_msg);
             PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);

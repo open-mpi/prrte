@@ -53,9 +53,7 @@
  *
  *  - the hostfile parser left its FILE* open and the flex buffer live on
  *    every error path, so the next hostfile parsed in the same process
- *    resumed in the middle of the failed one; and its exclusion pass in
- *    prte_util_get_ordered_host_list() walked the list through an item it
- *    had already released.
+ *    resumed in the middle of the failed one.
  *
  *  - prte_util_filter_hostfile_nodes() stopped recognizing an allocated node
  *    once its daemon reported a different hostname for it, because the node
@@ -94,6 +92,10 @@
 #include "src/util/pmix_argv.h"
 #include "src/util/proc_info.h"
 #include "src/util/sys_limits.h"
+
+extern int test_hostfile_corpus(void);
+extern int test_rankfile_corpus(void);
+extern int test_textfile(void);
 
 #define CHECK(label, cond)                                              \
     do {                                                                \
@@ -564,7 +566,7 @@ static int test_attr_round_trip(void)
     int failures = 0;
     pmix_list_t attrs;
     int ival = 42, iout = 0, *iptr = &iout;
-    bool bout = false, *bptr = &bout;
+
     char *sout = NULL;
     pmix_envar_t envar, *eout = NULL;
     prte_attribute_t *kv;
@@ -590,26 +592,59 @@ static int test_attr_round_trip(void)
     CHECK("a reset does not duplicate the entry", 1 == pmix_list_get_size(&attrs));
 
     /* asking for the wrong type must fail rather than reinterpret bytes */
-    CHECK("a type mismatch on get is refused",
-          !prte_get_attribute(&attrs, PRTE_JOB_ROOM_NUM, (void **) &bptr, PMIX_BOOL));
     CHECK("a type mismatch on set is refused",
-          PRTE_ERR_TYPE_MISMATCH == prte_set_attribute(&attrs, PRTE_JOB_ROOM_NUM,
-                                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL));
+          PRTE_ERR_TYPE_MISMATCH == prte_set_bool_attribute(&attrs, PRTE_JOB_ROOM_NUM, PRTE_ATTR_GLOBAL, true));
+    CHECK("a type mismatch on the bool get answers NOT_SET",
+          PRTE_ATTR_NOT_SET == prte_get_bool_attribute(&attrs, PRTE_JOB_ROOM_NUM));
 
-    /* bool: presence means true, and setting false removes the entry */
-    CHECK("set a bool by presence",
-          PRTE_SUCCESS == prte_set_attribute(&attrs, PRTE_JOB_DEBUG_TARGET, PRTE_ATTR_GLOBAL,
-                                             NULL, PMIX_BOOL));
-    bptr = &bout;
-    CHECK("a present bool reads true",
-          prte_get_attribute(&attrs, PRTE_JOB_DEBUG_TARGET, (void **) &bptr, PMIX_BOOL)
-              && bout);
-    bout = false;
-    CHECK("setting a bool false removes it",
-          PRTE_SUCCESS == prte_set_attribute(&attrs, PRTE_JOB_DEBUG_TARGET, PRTE_ATTR_GLOBAL,
-                                             &bout, PMIX_BOOL));
-    CHECK("a removed bool is absent",
+    /*** BOOLEANS ARE THREE-STATE ***
+     *
+     * "false" and "nobody has said" are different answers, and the whole
+     * point of the dedicated accessor is that a caller can tell them apart -
+     * a default is what NOT_SET is for. The generic accessors refuse
+     * PMIX_BOOL outright so that no reader can collapse the three into a
+     * bool by accident, which is how PMIX_DO_NOT_LAUNCH=false came to mean
+     * "do not launch".
+     */
+    CHECK("the generic getter refuses a boolean",
           !prte_get_attribute(&attrs, PRTE_JOB_DEBUG_TARGET, NULL, PMIX_BOOL));
+    CHECK("the generic setter refuses a boolean",
+          PRTE_ERR_BAD_PARAM == prte_set_attribute(&attrs, PRTE_JOB_DEBUG_TARGET,
+                                                   PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL));
+
+    CHECK("an unmentioned bool is NOT_SET",
+          PRTE_ATTR_NOT_SET == prte_get_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET));
+    CHECK("...and PRTE_ATTR_IS_TRUE says no",
+          !PRTE_ATTR_IS_TRUE(&attrs, PRTE_JOB_DEBUG_TARGET));
+
+    CHECK("set a bool true",
+          PRTE_SUCCESS == prte_set_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET, PRTE_ATTR_GLOBAL, true));
+    CHECK("a true bool reads TRUE",
+          PRTE_ATTR_TRUE == prte_get_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET));
+    CHECK("...and PRTE_ATTR_IS_TRUE says yes",
+          PRTE_ATTR_IS_TRUE(&attrs, PRTE_JOB_DEBUG_TARGET));
+
+    /* the crux: a false value is STORED, not removed */
+    CHECK("set the same bool false",
+          PRTE_SUCCESS == prte_set_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET, PRTE_ATTR_GLOBAL, false));
+    CHECK("a false bool reads FALSE, not NOT_SET",
+          PRTE_ATTR_FALSE == prte_get_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET));
+    CHECK("...and is still on the list",
+          NULL != prte_fetch_attribute(&attrs, NULL, PRTE_JOB_DEBUG_TARGET));
+    CHECK("...and PRTE_ATTR_IS_TRUE says no",
+          !PRTE_ATTR_IS_TRUE(&attrs, PRTE_JOB_DEBUG_TARGET));
+
+    /* and removing it is how a key goes back to "nobody has said" */
+    prte_remove_attribute(&attrs, PRTE_JOB_DEBUG_TARGET);
+    CHECK("a removed bool is NOT_SET again",
+          PRTE_ATTR_NOT_SET == prte_get_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET));
+
+    /* setting false on a key nobody has mentioned still records the answer */
+    CHECK("set an absent bool false",
+          PRTE_SUCCESS == prte_set_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET, PRTE_ATTR_GLOBAL, false));
+    CHECK("an absent key set false reads FALSE",
+          PRTE_ATTR_FALSE == prte_get_bool_attribute(&attrs, PRTE_JOB_DEBUG_TARGET));
+    prte_remove_attribute(&attrs, PRTE_JOB_DEBUG_TARGET);
 
     /* string - unload allocates */
     CHECK("set a string",
@@ -789,12 +824,10 @@ static int test_dash_host(void)
     free(spec);
     nd = find_node(&nodes, "nodeA");
     CHECK("the increment is recorded on nodeA",
-          NULL != nd && prte_get_attribute(&nd->attributes, PRTE_NODE_ADD_SLOTS, NULL,
-                                           PMIX_BOOL));
+          NULL != nd && PRTE_ATTR_IS_TRUE(&nd->attributes, PRTE_NODE_ADD_SLOTS));
     nd = find_node(&nodes, "nodeB");
     CHECK("the increment does not leak onto nodeB",
-          NULL != nd && !prte_get_attribute(&nd->attributes, PRTE_NODE_ADD_SLOTS, NULL,
-                                            PMIX_BOOL));
+          NULL != nd && !PRTE_ATTR_IS_TRUE(&nd->attributes, PRTE_NODE_ADD_SLOTS));
     CHECK("nodeB's absolute count is intact", NULL != nd && 3 == nd->slots);
     PMIX_LIST_DESTRUCT(&nodes);
 
@@ -886,31 +919,6 @@ static int test_hostfile(void)
     nd = find_node(&nodes, "hostC");
     CHECK("a host with no count gets one slot", NULL != nd && 1 == nd->slots);
     PMIX_LIST_DESTRUCT(&nodes);
-
-    /*
-     * The exclusion pass. get_ordered_host_list keeps duplicates, so a name
-     * that appears twice and is then excluded exercised the loop that walked
-     * on through an item it had already released.
-     */
-    if (NULL == write_hostfile("hostA\n"
-                               "hostB\n"
-                               "hostA\n"
-                               "hostC\n"
-                               "^hostA\n",
-                               badpath, sizeof(badpath))) {
-        fprintf(stderr, "FAIL [hostfile]: could not write a temp hostfile\n");
-        unlink(path);
-        return failures + 1;
-    }
-    PMIX_CONSTRUCT(&nodes, pmix_list_t);
-    rc = prte_util_get_ordered_host_list(&nodes, badpath);
-    CHECK("an ordered list with an exclusion parses", PRTE_SUCCESS == rc);
-    CHECK("both copies of the excluded host are gone", NULL == find_node(&nodes, "hostA"));
-    CHECK("the other hosts survived", NULL != find_node(&nodes, "hostB")
-                                          && NULL != find_node(&nodes, "hostC"));
-    CHECK("exactly the survivors remain", 2 == pmix_list_get_size(&nodes));
-    PMIX_LIST_DESTRUCT(&nodes);
-    unlink(badpath);
 
     /* a hostfile that does not exist is an error, not a silent no-op */
     PMIX_CONSTRUCT(&nodes, pmix_list_t);
@@ -1062,6 +1070,116 @@ static int test_hostfile(void)
     }
     PMIX_LIST_DESTRUCT(&nodes);
 
+    /*
+     * A hostfile that only excludes still says something.  It used to name
+     * nothing positively, so the filter took it for an empty file and
+     * returned "take next option" - the job was mapped across every node,
+     * the excluded ones included, and the excluded nodes were leaked.
+     */
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, path);
+    if (PRTE_SUCCESS == rc) {
+        char filterpath[256];
+
+        if (NULL != write_hostfile("^hostB\n", filterpath, sizeof(filterpath))) {
+            rc = prte_util_filter_hostfile_nodes(&nodes, filterpath, true);
+            CHECK("an exclusion-only hostfile filters", PRTE_SUCCESS == rc);
+            CHECK("...leaving every node it did not exclude",
+                  2 == pmix_list_get_size(&nodes) && NULL != find_node(&nodes, "hostA")
+                      && NULL != find_node(&nodes, "hostC"));
+            CHECK("...and not the one it did", NULL == find_node(&nodes, "hostB"));
+            unlink(filterpath);
+        }
+    }
+    PMIX_LIST_DESTRUCT(&nodes);
+
+    /* marking for a daemon (remove == false) honors the exclusion too */
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    rc = prte_util_add_hostfile_nodes(&nodes, path);
+    if (PRTE_SUCCESS == rc) {
+        char filterpath[256];
+
+        if (NULL != write_hostfile("^hostB\n", filterpath, sizeof(filterpath))) {
+            rc = prte_util_filter_hostfile_nodes(&nodes, filterpath, false);
+            CHECK("an exclusion-only hostfile marks", PRTE_SUCCESS == rc);
+            nd = find_node(&nodes, "hostA");
+            CHECK("...the nodes it did not exclude",
+                  NULL != nd && PRTE_FLAG_TEST(nd, PRTE_NODE_FLAG_MAPPED));
+            nd = find_node(&nodes, "hostB");
+            CHECK("...and not the one it did",
+                  NULL != nd && !PRTE_FLAG_TEST(nd, PRTE_NODE_FLAG_MAPPED));
+            unlink(filterpath);
+        }
+    }
+    PMIX_LIST_DESTRUCT(&nodes);
+
+    /*
+     * A node named by position that the job cannot have is refused, as one
+     * named outright is.  It used to be skipped without a word, so "+n0"
+     * and "+n1" selected one node when the other was not on the list.
+     * prte_hnp_is_allocated is false here, so "+n<K>" is pool slot K+1.
+     */
+    {
+        prte_node_t *pool[3];
+        static const char *poolnames[3] = {"poolHNP", "poolX", "poolY"};
+        char filterpath[256];
+        int j;
+
+        for (j = 0; j < 3; j++) {
+            pool[j] = PMIX_NEW(prte_node_t);
+            pool[j]->name = strdup(poolnames[j]);
+            pool[j]->slots = 4;
+            pool[j]->index = pmix_pointer_array_add(prte_node_pool, pool[j]);
+        }
+        if (NULL != write_hostfile("+n0\n+n1\n", filterpath, sizeof(filterpath))) {
+            /* the job's list holds poolX only */
+            PMIX_CONSTRUCT(&nodes, pmix_list_t);
+            PMIX_RETAIN(pool[1]);
+            pmix_list_append(&nodes, &pool[1]->super);
+            rc = prte_util_filter_hostfile_nodes(&nodes, filterpath, true);
+            CHECK("a relative node the job does not have is refused", PRTE_ERR_SILENT == rc);
+            PMIX_LIST_DESTRUCT(&nodes);
+            unlink(filterpath);
+        }
+        if (NULL != write_hostfile("+n0\n", filterpath, sizeof(filterpath))) {
+            PMIX_CONSTRUCT(&nodes, pmix_list_t);
+            PMIX_RETAIN(pool[1]);
+            pmix_list_append(&nodes, &pool[1]->super);
+            PMIX_RETAIN(pool[2]);
+            pmix_list_append(&nodes, &pool[2]->super);
+            rc = prte_util_filter_hostfile_nodes(&nodes, filterpath, true);
+            CHECK("a relative node the job has is selected",
+                  PRTE_SUCCESS == rc && 1 == pmix_list_get_size(&nodes)
+                      && NULL != find_node(&nodes, "poolX"));
+            PMIX_LIST_DESTRUCT(&nodes);
+            unlink(filterpath);
+        }
+        for (j = 0; j < 3; j++) {
+            pmix_pointer_array_set_item(prte_node_pool, pool[j]->index, NULL);
+            PMIX_RELEASE(pool[j]);
+        }
+    }
+
+    /*
+     * The default hostfile, asked for by name and not there, is reported
+     * through show_help - so it must come back silent, or the allocator
+     * logs "PRTE ERROR: Not found" against its own source on top of it.
+     */
+    {
+        char *saved_default = prte_default_hostfile;
+        bool saved_given = prte_default_hostfile_given;
+
+        prte_default_hostfile = "prte-no-such-default-hostfile";
+        prte_default_hostfile_given = true;
+        PMIX_CONSTRUCT(&nodes, pmix_list_t);
+        rc = prte_util_add_hostfile_nodes(&nodes, prte_default_hostfile);
+        CHECK("a missing default hostfile asked for by name is refused silently",
+              PRTE_ERR_SILENT == rc);
+        PMIX_LIST_DESTRUCT(&nodes);
+        prte_default_hostfile = saved_default;
+        prte_default_hostfile_given = saved_given;
+    }
+
     /* a hostfile naming a host the allocation does not have is refused */
     PMIX_CONSTRUCT(&nodes, pmix_list_t);
     rc = prte_util_add_hostfile_nodes(&nodes, path);
@@ -1210,6 +1328,9 @@ int main(void)
     failures += test_attr_round_trip();
     failures += test_dash_host();
     failures += test_hostfile();
+    failures += test_textfile();
+    failures += test_hostfile_corpus();
+    failures += test_rankfile_corpus();
     failures += test_sys_limits();
 
     prte_finalize();

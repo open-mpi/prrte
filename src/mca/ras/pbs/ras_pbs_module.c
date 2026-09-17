@@ -100,7 +100,7 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
      * is an unrecoverable error - report it
      */
     if (pmix_list_is_empty(nodes)) {
-        prte_show_help("help-ras-pbs.txt", "no-nodes-found", true, filename);
+        prte_show_help(PRTE_JOB_NSPACE(jdata), "help-ras-pbs.txt", "no-nodes-found", true, filename);
         return PRTE_ERR_NOT_FOUND;
     }
 
@@ -133,7 +133,6 @@ static int finalize(void)
 
 static int discover(pmix_list_t *nodelist, char *pbs_jobid)
 {
-    int32_t nodeid;
     prte_node_t *node;
     FILE *fp;
     char *hostname, *cppn;
@@ -156,7 +155,7 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
      */
     if (prte_mca_ras_pbs_component.smp_mode) {
         if (NULL == (cppn = getenv("PBS_PPN"))) {
-            prte_show_help("help-ras-pbs.txt", "smp-error", true);
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-pbs.txt", "smp-error", true);
             return PRTE_ERR_NOT_FOUND;
         }
         ppn = strtol(cppn, NULL, 10);
@@ -170,7 +169,7 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
         /* try the Cobalt variant */
         filename = getenv("COBALT_NODEFILE");
         if (NULL == filename) {
-            prte_show_help("help-ras-pbs.txt", "no-nodefile", true);
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-pbs.txt", "no-nodefile", true);
             return PRTE_ERR_NOT_FOUND;
         }
     }
@@ -185,7 +184,6 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
        resolving to the same hostname (i.e., vcpu's on a single
        host). */
 
-    nodeid = 0;
     while (NULL != (hostname = pbs_getline(fp))) {
 
         PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
@@ -199,7 +197,7 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
             if (0 == strcmp(node->name, hostname)) {
                 if (prte_mca_ras_pbs_component.smp_mode) {
                     /* this cannot happen in smp mode */
-                    prte_show_help("help-ras-pbs.txt", "smp-multi", true);
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-pbs.txt", "smp-multi", true);
                     fclose(fp);
                     free(hostname);
                     return PRTE_ERR_BAD_PARAM;
@@ -226,8 +224,6 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
 
             node = PMIX_NEW(prte_node_t);
             node->name = hostname;
-            prte_set_attribute(&node->attributes, PRTE_NODE_LAUNCH_ID,
-                               PRTE_ATTR_LOCAL, &nodeid, PMIX_INT32);
             node->slots_inuse = 0;
             node->slots_max = 0;
             node->slots = ppn;
@@ -241,8 +237,6 @@ static int discover(pmix_list_t *nodelist, char *pbs_jobid)
             free(hostname);
         }
 
-        /* up the nodeid */
-        nodeid++;
     }
     fclose(fp);
 

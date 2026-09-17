@@ -26,7 +26,7 @@
 # $HEADER$
 #
 
-SUBDIRS = hostfile
+SUBDIRS = hostfile rankfile
 
 noinst_LTLIBRARIES = libprrteutil.la
 
@@ -58,7 +58,8 @@ headers = \
         prte_show_help.h \
         session_dir.h \
         stacktrace.h \
-        sys_limits.h
+        sys_limits.h \
+        textfile.h
 
 sources = \
         attr.c \
@@ -76,14 +77,17 @@ sources = \
         session_dir.c \
         stacktrace.c \
         sys_limits.c \
+        textfile.c \
         prte_show_help_content.c
 
 libprrteutil_la_SOURCES = $(headers) $(sources)
 
 libprrteutil_la_LIBADD = \
-        hostfile/libprrteutilhostfile.la
+        hostfile/libprrteutilhostfile.la \
+        rankfile/libprrteutilrankfile.la
 libprrteutil_la_DEPENDENCIES = \
-        hostfile/libprrteutilhostfile.la
+        hostfile/libprrteutilhostfile.la \
+        rankfile/libprrteutilrankfile.la
 
 prte_show_help_content.c: prte-convert-help.py
 if PRTE_PICKY_COMPILERS

@@ -10,23 +10,28 @@ this file and those disagree, **the docs win** — and please fix this file.
 
 ## What lives here
 
-The hostfile parser: a flex scanner (`hostfile_lex.l`) and three entry points
-over it (`hostfile.c`). A hostfile is one node per line, optionally with
-keyword modifiers.
+The hostfile parser: `hostfile.c`, reading one line at a time through
+[`src/util/textfile.h`](../textfile.h), and two entry points over it. A
+hostfile is one node per line, optionally with keyword modifiers.
 
 | Entry point | Used for | Behavior |
 |-------------|----------|----------|
 | `prte_util_add_hostfile_nodes()` | building an allocation (`prte --hostfile`, `--add-hostfile`) | Adds every named node to the caller's list, merging duplicates and dropping the excluded ones. |
 | `prte_util_filter_hostfile_nodes()` | selecting for a job (`prun --hostfile`) | Removes from the caller's list every node the hostfile does not name, and caps the ones it keeps (see below). Returns `PRTE_ERR_TAKE_NEXT_OPTION` if the hostfile was empty, and refuses a hostfile naming a node the allocation does not have. |
-| `prte_util_get_ordered_host_list()` | `rmaps/seq`, `rmaps/rank_file` | Keeps duplicates and order: the list *is* the sequence of placements. |
 
-`hostfile_lex.c` is **generated** by flex from `hostfile_lex.l` and is not in
-git. Change the `.l` file, then `rm src/util/hostfile/hostfile_lex.c` and
-rebuild — the Make rule will not notice on its own in every configuration.
+There is no lexer any more. `prte_textfile_next()` hands back one logical
+line, already stripped of comments and split into fields with `=` always a
+field of its own, and this file decides what the fields mean: field 0 is the
+host entry, and the rest are `<key> = <value>` groups looked up in one
+keyword table. The four name *types* the scanner used to distinguish —
+string, hostname, IPv4, IPv6 — were never once told apart by this file or by
+the rankfile parser, both of which funnelled all four into the same branch;
+what replaces them is `valid_nodename()`, which asks only whether the field
+is made of characters a name may contain.
 
 ---
 
-## Syntax the lexer accepts
+## Syntax the parser accepts
 
 ```
 # comment                    // also a comment, and /* block */ comments
@@ -36,20 +41,60 @@ hostname slots=4 max_slots=8             also slots-max=, max-slots=, cpu_max=
 user@hostname                            username recorded as PRTE_NODE_USERNAME
 hostname port=2222                       ssh port
 ^hostname                                EXCLUDE this node
+^user@hostname                           also EXCLUDE: the "^" leads the whole entry
 192.168.1.10   /  fe80::1                IPv4 and IPv6, with or without user@
 +n3                                      relative: the 3rd node of the allocation
 +e   /  +e:2                             relative: all / N currently-empty nodes
 rank 0=hostname                           rankfile form (the rank is ignored here)
 ```
 
-The `^` exclusion is easy to break and was in fact broken for a long time:
-the `^` was allowed only inside the *optional* `user@` group, and the `@`
-makes that group mandatory, so a bare `^host` line never matched the hostname
-rule at all — it fell through to the catch-all and the **whole hostfile** was
-rejected as a parse error. `hostfile_parse_line()` had always known how to
-strip the `^` and move the node to the exclude list; it simply never saw one.
-If you touch the hostname pattern, keep the leading `\^?` **outside** the
-`user@` group, and keep the swarm case that reads a hostfile with a `^` line.
+The `^` exclusion is easy to break and was in fact broken for a long time.
+Under the old scanner the `^` was allowed only inside the *optional* `user@`
+group, and the `@` makes that group mandatory, so a bare `^host` line never
+matched the hostname rule at all — it fell through to the catch-all and the
+**whole hostfile** was rejected as a parse error. `hostfile_parse_line()` had
+always known how to strip the `^` and move the node to the exclude list; it
+simply never saw one. `valid_nodename()` now takes a leading `^` on any name,
+with or without a `user@`, which is the shape that regex could not express in
+one rule. Keep the swarm case that reads a hostfile with a `^` line.
+
+**Take the `^` off the entry before the user is split away.** The parser
+used to look for it on the node name after the split, which found it only
+when there was no user: `^someone@hostA` gave the user the name `^someone`,
+and — since hostA was already on the list — counted it as one more slot of
+a node to use. The exclusion that was asked for became an addition. `user@^host`
+is not a spelling of this and is refused, as the scanner refused it.
+
+## An exclusion-only hostfile is a selection, not an empty file
+
+`prte_util_filter_hostfile_nodes()` answers `PRTE_ERR_TAKE_NEXT_OPTION` for
+a hostfile that names nothing, and its caller treats that as "no filter". A
+file of nothing but `^host` lines also names nothing positively, and used to
+get the same answer — so `prun --hostfile` with `^nodeA` in it mapped the job
+across every node, `nodeA` included, and leaked the exclude list. It now
+selects every node on the caller's list except the excluded ones (with
+`remove`, the others are released; without, the survivors are marked
+`PRTE_NODE_FLAG_MAPPED`). Where a file names nodes *and* excludes some, an
+exclusion only takes a node back out of what the file named — which is why
+the two cases are handled apart.
+
+`PRTE_ERR_TAKE_NEXT_OPTION` is therefore only "the file was empty", and
+`prte_rmaps_base_filter_nodes()` must go on to the `-host` filter when it
+gets one. It used to return it straight away, logging it as a `PRTE ERROR`
+on the way, and the `-host` given beside an empty hostfile was never applied.
+
+## What the goldens are for
+
+`test/unit/util/test_hostfile_corpus.c` pairs 78 hostfile bodies with a
+canonical rendering of what parsing each one produces — every field the
+parser can set on a node, plus the return code. It exists because this parser
+was rewritten from a scanner to a line reader, and a rewrite of that size can
+only be done honestly against a written-down "before". Seven goldens changed
+in that rewrite and each is argued in the commit that changed it; the rest
+reproduce exactly.
+
+That makes it the right place to add a case for anything you change here, and
+the wrong place to quietly re-baseline. A golden that moves is a decision.
 
 ---
 
@@ -57,15 +102,18 @@ If you touch the hostname pattern, keep the leading `\^?` **outside** the
 
 A hostfile is user input, and every way of getting it wrong has to come back
 as a `prte_show_help()` message out of `help-hostfile.txt` carrying
-`cur_hostfile_name` and `prte_util_hostfile_line`. Two failures did not:
+`cur_hostfile_name` and `cur_hostfile_line`. Two failures did not:
 
-- A value with more than one `@` — `hostfile_parse_username()` takes one
-  field as a hostname and two as `user@hostname`, and anything else is a
-  typo. It used to print `WARNING: Unhandled user@host-combination` through
-  `pmix_output` at two sites (the plain host entry and the `rank N=<host>`
-  form), naming neither the file nor the line, and it is the failure a user
-  is most likely to reach by typo. Both sites now go through the one helper
-  and the `user-host` topic.
+- A value that is neither `host` nor `user@host` — a second `@`, or an `@`
+  with nothing before or after it. It used to print `WARNING: Unhandled
+  user@host-combination` through `pmix_output` at two sites (the plain host
+  entry and the `rank N=<host>` form), naming neither the file nor the line,
+  and it is the failure a user is most likely to reach by typo. Both sites
+  now go through `hostfile_parse_username()` and the `user-host` topic.
+  That helper finds the `@` itself: `PMIx_Argv_split()` drops empty fields,
+  so while it was used `someone@` was a node named `someone` — added to the
+  allocation for a launcher to try to reach — and `@hostA` and
+  `someone@@hostA` were accepted as `hostA`.
 - A `rank N` whose `=` never arrives. The loop that skips to the `=` runs to
   the end of the file, and the `done` arm returned a bare error with no
   message at all.
@@ -76,29 +124,39 @@ drops `PRTE_ERR_SILENT` and prints everything else, and the callers
 (`prte_ras_base_allocate`, `prte_rmaps_base_filter_nodes`) log whatever they
 are handed — so a `PRTE_ERROR` return put `PRTE ERROR: Error in file
 ras_base_allocate.c at line 408` above the user's own diagnostic, pointing
-at our source for their typo.
+at our source for their typo. The default hostfile, asked for by name and
+missing, returned `PRTE_ERR_NOT_FOUND` after its message for the same
+effect; it is silent now too.
+
+A read that fails part way is refused the same way (`read-error`), not taken
+for the end of the file: `prte_textfile_next()` returns NULL for both, and
+`hostfile_parse()` checks `tf.failed` after its loop. A hostfile on a network
+file system that stopped answering was otherwise an allocation of the nodes
+that happened to arrive.
 
 ---
 
 ## The parser state is process-global
 
-`prte_util_hostfile_in` (the `FILE*`), `prte_util_hostfile_line` (the line
-counter), `prte_util_hostfile_value` and the flex buffer are all globals, and
-`cur_hostfile_name` is a file-scope static. Consequences:
+The open file and its line counter now live in a `prte_textfile_t` on
+`hostfile_parse()`'s stack, which is what removed most of this section: there
+is no shared `FILE*`, no shared scanner buffer, and no line counter to forget
+to reset. What is left global is `cur_hostfile_name` and `cur_hostfile_line`,
+file-scope statics the error helpers read so that every message can name the
+file and the line without every call site passing them. Consequences:
 
-- **Close and destroy on every exit path**, not just the clean one. The error
-  paths used to `goto` straight past `fclose()` and
-  `prte_util_hostfile_lex_destroy()`, leaking a descriptor per failed parse
-  and leaving the flex buffer live for the next one.
-- **Reset the line counter per file.** It is only ever incremented, so every
-  hostfile after the first reported its parse errors at a line number carried
-  over from the ones before it.
+- **Close on every exit path**, not just the clean one — route every exit
+  through `cleanup:`. The error paths used to `goto` straight past
+  `fclose()` and `prte_util_hostfile_lex_destroy()`, leaking a descriptor
+  per failed parse and leaving the scanner buffer live for the next one.
+  `prte_textfile_close()` is safe on a file that was never opened, which is
+  what lets the error paths all go through one label.
 - The parser is **not reentrant** and must not be called from two threads.
   Everything that calls it runs on the PRRTE progress thread.
-- A top-level token the parser does not understand must set an error return.
-  It used to call `pmix_show_help()` and then fall out of the loop with
-  whatever `rc` the previous line left behind — reporting a parse error and
-  returning success.
+- A line the parser does not understand must set an error return. It used to
+  call `pmix_show_help()` and then fall out of the loop with whatever `rc`
+  the previous line left behind — reporting a parse error and returning
+  success.
 
 ---
 
@@ -114,10 +172,13 @@ found on it". It matters in three places here:
   same node is an error (`slots-given`), not a silent overwrite.
 - The relative forms (`+n<K>`, `+e[:N]`) are **placeholders**: they name a node
   without saying anything about its size. A placeholder's `slots` is the
-  constructor's zero, so `prte_util_get_ordered_host_list()` has to check the
-  flag before treating it as a subdivision request — otherwise every node a
-  bare `+n0` or `+e` resolved to came back with zero slots and the launch was
-  refused for lack of resources.
+  constructor's zero, so anything reading it has to check the flag before
+  treating it as a subdivision request — otherwise every node a bare `+n0` or
+  `+e` resolved to would be capped to zero slots.
+- In the filter, a count means the same thing whether the entry named its
+  node outright or by position: `hostfile_cap_for_job()` applies it to a node
+  selected by name, by `+n<K>`, and to each node `+e` takes. The positional
+  forms used to have their `slots=` parsed and then dropped.
 
 "Empty", for `+e`, means `slots_inuse == 0` — not `num_procs == 0`, which is
 the count the mapper is still *building* for the job being mapped. The
@@ -137,9 +198,14 @@ if (!prte_hnp_is_allocated) {
 }
 ```
 
-All three places that resolve `+n<K>` — here, `prte_util_get_ordered_host_list()`,
-and dash-host's `parse_dash_host()` — must make the same adjustment, or the
-same index means a different node depending on which one the user typed it at.
+Both places that resolve `+n<K>` — here and dash-host's `parse_dash_host()` —
+must make the same adjustment, or the same index means a different node
+depending on which one the user typed it at.
+
+In the filter, a `+n<K>` whose node is not on the caller's list is refused
+with `hostfile:extra-node-not-found`, exactly as a node named outright is.
+It used to be skipped without a word, so a file of `+n1` and `+n2` mapped a
+job onto one node when the other was not available to it.
 
 ---
 
@@ -180,11 +246,15 @@ Every early return therefore has to either restore or release that list —
 those are the **caller's** nodes, and dropping them on the floor leaks node
 objects. Route every exit through the single `cleanup:` label.
 
+A list of nodes is torn down with `PMIX_LIST_DESTRUCT`, never
+`PMIX_DESTRUCT`: the plain destructor releases none of the items. The filter
+used the plain one on its parse-failure and empty-file returns, which leaked
+every node read before a bad line, once per job. Every refusal inside its
+resolution loop also leaked the entry being resolved, which has already been
+taken off `newnodes`; `cleanup:` releases it now.
+
 The same applies to walking a list while removing from it: save the successor
-*before* releasing the item. The exclusion pass in
-`prte_util_get_ordered_host_list()` kept iterating from the item it had just
-released, which is a use-after-free on every hostfile that excludes a host
-appearing more than once.
+*before* releasing the item.
 
 ---
 
@@ -192,15 +262,27 @@ appearing more than once.
 
 - `test/unit/rmaps/test_resize.c` (`test_hostfile_cap`) covers the section
   above: that the cap applies and is recorded when selecting for a map, that
-  it is restored, that VM-setup marking leaves the node alone, and that a
-  count *larger* than the node changes nothing. It lives under `rmaps`
-  because the record/restore list is a framework global that needs the
-  framework opened.
+  it is restored, that VM-setup marking leaves the node alone, that a
+  count *larger* than the node changes nothing, that `+n<K> slots=` and
+  `+e slots=` cap what they select, that an empty hostfile does not stop a
+  `-host` beside it from filtering, and every relative form the filter
+  resolves — either case of the letter, an index past the pool or too large
+  for an int, a bad letter, and an `+e:N` asking for more nodes than there
+  are. It lives under `rmaps` because the record/restore list is a framework
+  global that needs the framework opened.
+- `test/unit/util/test_hostfile_corpus.c` is the golden corpus described
+  above — 78 bodies against their parse results. Add a case there for
+  anything you change.
+- `test/unit/util/test_textfile.c` covers the line reader underneath it:
+  where a line ends, where a comment does, and that there is no maximum line
+  length.
 - `test/unit/util/test_util.c` writes temporary hostfiles and parses them:
   slot counts, `max_slots`, comments, the `^` exclusion (including a duplicated
   excluded name), a `user@host` entry and the refusal of a second `@` in both
   the plain and the `rank N=` form, a `rank` entry with no host, a malformed
-  file, and a good file parsed straight after a failed one.
+  file, a good file parsed straight after a failed one, an exclusion-only
+  filter both selecting and marking, and a missing default hostfile
+  refused silently.
 - `contrib/dockerswarm/run-tests.sh` `test_util` covers what a single node
   cannot: that a `^host` line removes *that* machine and no other, and that a
   failed parse does not poison the next one across a real launch.

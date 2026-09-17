@@ -44,6 +44,17 @@ which is ``PMIX_PERSIST_NSPACE`` — and no reported problem depends on it.  See
 ``docs/plans/datastore/`` for the specification and the design the rest of
 that work follows.
 
+**An external data server never reclaims ``PMIX_PERSIST_SESSION`` data at
+its session's end.**  A session id is a counter each DVM starts from 1, so the
+master does not relay the ``SESSION`` horizon to a server in another DVM
+(``purge_data()`` in ``src/mca/state/base/state_base_fns.c``), and the server
+refuses a purge naming no namespace (``prte_ds_purge``).  It could not have
+selected the right items anyway: a relayed publish has no job object at the
+server, so the item records no session at all.  Such an item is held until its
+publisher unpublishes it or the server DVM ends — never shorter than asked.
+Making it work needs the relay to carry a session identity that is unique
+across DVMs at publish and to name the same identity at purge.
+
 **``ras/flux`` has no ``modify()``.**  It returns ``PMIX_ERR_NOT_SUPPORTED``
 (``src/mca/ras/flux/ras_flux_module.c``), so the elastic extend/release
 surface exists for SLURM only.  Everything above the component is
@@ -416,11 +427,11 @@ the marker is stale.
        ``PMIX_QUERY_*_RESOURCE_USAGE``
      - two resource-usage queries are recognized and answer nothing
 
-Two families of marker are **not** ours, and are deliberately absent from
-that table: the ``TODO`` comments in ``hostfile_lex.c`` and
-``rmaps_rank_file_lex.c``, which come from flex's generated skeleton, and the
-``FIXME`` comments throughout ``config/libtool.m4`` and ``config/ltmain.sh``,
-which are vendored Autotools.
+One family of marker is **not** ours, and is deliberately absent from that
+table: the ``FIXME`` comments throughout ``config/libtool.m4`` and
+``config/ltmain.sh``, which are vendored Autotools.  (There used to be a
+second, the ``TODO`` comments flex left in its generated scanners; PRRTE no
+longer uses flex.)
 
 Review status
 -------------
@@ -916,3 +927,32 @@ stays — it is what lets the cpuset scatter be answered — but this entry is
 closed, not deferred.  Reopen it only on a measurement showing that the table
 PMIx actually builds is what hurts, and that is a PMIx question, not a PRRTE
 one.
+
+Attribute keys with only one end
+--------------------------------
+
+An attribute key that is only ever written, or only ever read, is a feature
+that does nothing.  ``PMIX_NOTIFY_COMPLETION`` was such a case for a long
+time: the spawn path recorded it as ``PRTE_JOB_NOTIFY_COMPLETION``, which
+nothing read, while ``state/dvm``'s ``dvm_notify()`` asked for
+``PRTE_JOB_SILENT_TERMINATION``, which nothing wrote.  Both halves compiled
+and each looked live on its own, so a tool asking not to be notified when
+its spawned job ended was told nothing and notified anyway.
+
+``test/unit/check_attr_pairing.py`` now fails ``make check`` on a new one.
+Six were present when it was written.  Five have since been removed, their
+function having been superseded by PMIx attributes --- ``PRTE_JOB_NO_VM``,
+``PRTE_NODE_LAUNCH_ID``, ``PRTE_PROC_NOBARRIER``, ``PRTE_JOB_NON_PRTE_JOB``
+and ``PRTE_JOB_FWDIO_TO_TOOL``.  Their numeric offsets are marked retired in
+``src/util/attr.h`` and must not be reused: offsets are hand-assigned, and
+reusing one silently makes two keys compare equal.
+
+All six are now closed.  Five were removed, and ``PRTE_JOB_CANCELLED`` has
+been given the writer it was missing: ``pmix_server_job_ctrl.c`` sets it for
+a job named by ``PMIX_JOB_CTRL_KILL``, and for every job still running when
+``PMIX_JOB_CTRL_TERMINATE`` arrives with no targets --- which is the
+``pterm`` path.  A cancelled job now reports ``PMIX_ERR_JOB_CANCELED``
+rather than whatever status its processes happened to die with.  Note that
+this is a different symbol from the error code ``PRTE_ERR_JOB_CANCELLED``,
+which is live in ``ras/slurm`` for a cancelled SLURM allocation.  The
+checker's ``EXEMPT`` set is empty, and is meant to stay that way.

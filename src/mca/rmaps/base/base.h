@@ -206,11 +206,13 @@ PRTE_EXPORT void prte_rmaps_base_get_cpuset(prte_job_t *jdata,
  * was given, and "end" releases the context.  A caller that places more than
  * one process per device calls "locale" repeatedly with the same index.
  *
- * "begin" also performs the two checks that must happen before any process
- * is placed on the node: that the requested binding is not coarser than the
- * devices are local to, and whether every device shares one locality (which
- * is a warning, not an error). */
-PRTE_EXPORT int prte_rmaps_base_devices_begin(prte_node_t *node,
+ * "begin" also performs the checks that must happen before any process is
+ * placed on the node: that every GPU carries an identity its runtime
+ * accepts, that the requested binding is not coarser than the devices are
+ * local to, and whether every device shares one locality (a warning, not an
+ * error).  Its diagnostics are about "jdata". */
+PRTE_EXPORT int prte_rmaps_base_devices_begin(prte_job_t *jdata,
+                                              prte_node_t *node,
                                               prte_rmaps_options_t *opts,
                                               void **ctx);
 PRTE_EXPORT unsigned prte_rmaps_base_devices_count(prte_node_t *node,
@@ -219,14 +221,20 @@ PRTE_EXPORT unsigned prte_rmaps_base_devices_count(prte_node_t *node,
 PRTE_EXPORT hwloc_obj_t prte_rmaps_base_devices_locale(prte_node_t *node,
                                                        prte_rmaps_options_t *opts,
                                                        void *ctx, unsigned j);
-PRTE_EXPORT void prte_rmaps_base_devices_record(prte_proc_t *proc,
-                                                prte_rmaps_options_t *opts,
-                                                void *ctx, unsigned j);
+PRTE_EXPORT int prte_rmaps_base_devices_record(prte_proc_t *proc,
+                                               prte_rmaps_options_t *opts,
+                                               void *ctx, unsigned j);
 PRTE_EXPORT void prte_rmaps_base_devices_end(void *ctx);
 /* How many processes the whole node list can take, for the "are there
- * enough?" check a mapper makes before placing any of them. */
-PRTE_EXPORT size_t prte_rmaps_base_devices_total(pmix_list_t *node_list,
-                                                 prte_rmaps_options_t *opts);
+ * enough?" check a mapper makes before placing any of them.  Counts the
+ * devices only - none of begin()'s checks - and fails if a node cannot be
+ * enumerated at all. */
+PRTE_EXPORT int prte_rmaps_base_devices_total(pmix_list_t *node_list,
+                                              prte_rmaps_options_t *opts,
+                                              size_t *total);
+/* True when a --map-by device= value names one device rather than a class.
+ * A named device is shared by every process placed near it. */
+PRTE_EXPORT bool prte_rmaps_base_devices_named(const char *spec);
 
 PRTE_EXPORT int prte_rmaps_base_check_support(prte_job_t *jdata,
                                               prte_node_t *node,

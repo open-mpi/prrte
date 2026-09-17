@@ -27,6 +27,8 @@ linked into `libprrte`. There are no MCA components here.
 | **Attributes** | `attr.[ch]` | The typed key/value store hung off `prte_job_t`, `prte_app_context_t`, `prte_node_t` and `prte_proc_t`. Get/set/append/prepend/fetch/remove, the load/unload marshalling, the key→name renderer, and the flag pretty-printers. |
 | **Names** | `name_fns.[ch]` | Rendering and parsing of `pmix_proc_t`/`pmix_nspace_t`, and `prte_util_compare_name_fields()`. |
 | **Node specifications** | [`hostfile/`](hostfile/AGENTS.md), [`dash_host/`](dash_host/AGENTS.md) | The two ways a user names machines. Each has its own AGENTS.md. |
+| **Rankfile** | [`rankfile/`](rankfile/AGENTS.md) | Reading the per-rank placement file. Here rather than in `rmaps/rank_file` because parsing a file the user wrote is not a mapping policy. |
+| **Line-oriented files** | `textfile.[ch]` | One logical line at a time, comments stripped and fields split, for the two parsers above. What replaced PRRTE's flex scanners. |
 | **Nidmap** | `nidmap.[ch]` | The compressed node-name/daemon-vpid map the HNP ships to every daemon. |
 | **Errors and states** | `error.[ch]`, `error_strings.[ch]` | `prte_strerror()`, `PRTE_ERROR_LOG()`, and the four state→name renderers. |
 | **Process info** | `proc_info.[ch]` | The `prte_process_info` global: hostname and its aliases, uid/gid, session-dir paths, proc type. |
@@ -76,9 +78,23 @@ Things that are easy to get wrong:
   *always* packed, so the mapper sees an unpacked **copy** of the job — any
   attribute the mapper must read has to be `PRTE_ATTR_GLOBAL`. This has bitten
   the mapper before.
-- **A `PMIX_BOOL` attribute means "true" by its presence.** `prte_set_attribute`
-  with `NULL` data records true; setting it to `false` *removes the entry*.
-  Test with `prte_get_attribute(list, key, NULL, PMIX_BOOL)`.
+- **A `PMIX_BOOL` attribute is THREE-STATE, and has its own accessors.**
+  `prte_get_bool_attribute()` answers `PRTE_ATTR_TRUE`, `PRTE_ATTR_FALSE` or
+  `PRTE_ATTR_NOT_SET`, and `prte_set_bool_attribute()` stores **both** truths
+  — a false value is not removed, because "false" and "nobody has said" are
+  different answers and only the second is what a caller applies a default
+  to. `prte_remove_attribute()` is how a key goes back to unset.
+  `PRTE_ATTR_IS_TRUE(list, key)` is the shorthand for "explicitly on" and is
+  false for `FALSE` and `NOT_SET` alike; reach past it wherever the three
+  states differ.
+
+  `prte_get_attribute()`/`prte_set_attribute()` **refuse `PMIX_BOOL`**, and
+  [`test/unit/check_attr_pairing.py`](../../test/unit/check_attr_pairing.py)
+  fails the build on one. That is not tidiness: reads used to be by presence
+  while the setter *removed* a false boolean already on the list but
+  *appended* one that was not, so the same call did opposite things — and a
+  stored false read as **true**, which is how `PMIX_DO_NOT_LAUNCH=false` came
+  to mean "do not launch".
 - **`prte_get_attribute` refuses a type mismatch** rather than reinterpreting
   the bytes, and logs it. Pass the type the setter used.
 - **Unload allocates for the pointer types** (`PMIX_STRING`, `PMIX_BYTE_OBJECT`,
@@ -156,6 +172,21 @@ finding the live DVM. Anything that leaves a session directory behind is a
 bug, and `contrib/dockerswarm/run-tests.sh` clears all three prefixes between
 cases for exactly this reason.
 
+**The ownership check lives here, not in PMIx.** The top-level name is
+predictable by anyone on the node and sits under a world-writable root, so
+another user can create it first. `pmix_os_dirpath_create()` answers
+`PMIX_ERR_EXISTS` for such a directory and deliberately does not ask who owns
+it — its generic callers hand it `/tmp` itself and shared user-named output
+directories. `_check_owner()` therefore refuses any directory PRRTE composes
+(top, job, rank) that is not owned by our euid or is group/other-writable,
+inspecting it through an `O_NOFOLLOW` descriptor. It never examines
+`tmpdir_base`: that was handed to us, and on macOS it is reached through the
+root-owned `/tmp` symlink. A job whose directory is refused must also forget
+the path (`jdata->session_dir = NULL`), because finalize recursively destroys
+whatever that names. Verifying the foreign-owner refusal needs a second uid,
+so it was checked in the dockerswarm image as root planting the name for the
+`ubuntu` user; a planted *symlink* is already refused by PMIx.
+
 `prte_job_session_dir_finalize()` keeps non-empty `output-*` files (that is
 what `--output file=...` wrote) and removes everything else. The
 `prte_process_info.rm_session_dirs` flag means the resource manager will clean
@@ -199,10 +230,16 @@ because they answer the same question, *what does the DVM currently consist
 of*, and because that message is sent on exactly the event that changes the
 answer. Three things about them:
 
-- **The job being launched is excluded.** A daemon that already holds a
-  namespace *drops* the copy in the launch message, so a catch-up entry for
-  a job that has not been mapped yet would leave every daemon holding a
-  procless version of it for good.
+- **No job whose launch message is still to come is caught up** — not the
+  job being launched, and not the jobs the elastic launch fence is holding
+  for the grow this message completes (`PRTE_JOB_FLAG_LAUNCH_PENDING`, set
+  when `setup_job` registers the job and cleared once its launch message has
+  been broadcast). That message reaches every daemon in the DVM, so the
+  catch-up copy is not redundant but fatal: a daemon that already holds the
+  namespace cannot take the launch message for it, and the job forks nothing
+  anywhere but on the master. The fence makes this the ordinary case, not a
+  race — `vm_ready` packs this catch-up *before* `grow_drain` admits the
+  held jobs.
 - **The procs' placement comes out of `prte_job_pack`'s own maps.** It
   packs a node map and a proc map per app, from which the receiver rebuilds
   each proc's rank and hosting daemon; the catch-up needs nothing of its own
@@ -210,9 +247,9 @@ answer. Three things about them:
   time alongside. It does mean this decode has to run **after** the nidmap
   in the same message, since that is what puts the nodes in the pool.
 - **The decode registers each new namespace with the local PMIx server and
-  does not wait.** Nothing later in the message depends on it, and the
-  launch message that might care cannot have been built yet — the master
-  sends this at `VM_READY` and the launch message several states later.
+  does not wait.** Nothing later in the message depends on it, and no launch
+  message can be about one of these jobs: every job caught up has already
+  had its launch message broadcast (see the first point).
 
 This replaced a block at the head of the launch message, which tied that
 message's size to the number of jobs resident in the DVM and still left a
@@ -276,17 +313,49 @@ own output. The message is built and thrown away. The head node looks
 fine only because there the daemon's PMIx server is the one holding the
 tool connection (and under `prterun` it *is* the tool).
 
-`prte_show_help()` has the same signature and the same rendering, and:
+`prte_show_help()` has the same rendering, one extra leading argument
+(below), and:
 
 - on the **HNP**, on a **tool**, or in an **application**, delivers
   locally, exactly as `pmix_show_help()` would;
 - on any **other daemon**, renders locally and ships the text to the HNP
   over `PRTE_RML_TAG_SHOW_HELP`, where `prte_show_help_recv()` delivers
   it. Aggregation and duplicate suppression then happen **once**, on the
-  HNP, keyed by the same filename/topic — which is what you want anyway
-  when 500 nodes hit the same error.
+  HNP — which is what you want anyway when 500 nodes hit the same error.
+  The relayed buffer carries the nspace alongside the filename and topic;
+  a DVM is single-version by rule, so that wire has no format marker and
+  its packer and unpacker change together or not at all.
 - falls back to local delivery if there is no HNP to send to yet (early
   startup, or teardown), so a message is never simply lost.
+
+### The first argument names the job the message is about
+
+PMIx keys duplicate suppression on `(nspace, filename, topic)`, so every
+call has to say which job it is talking about. This is not bookkeeping: a
+DVM is one process that runs many jobs, in parallel and one after another
+for as long as it lives, and suppression that could not tell them apart
+told the first job to trip a diagnostic about it and left every later one
+in silence — for days, on a persistent DVM.
+
+Most messages are about the DVM or the tool rather than any job a user
+submitted — command-line parsing, startup failures, daemon launch — and
+those pass `PRTE_PROC_MY_NAME->nspace`, which *is* that job. It is a
+global reachable from anywhere, so no call site is unable to answer.
+
+A message that stems from a particular job names it, through
+`PRTE_JOB_NSPACE(jdata)`: all of `rmaps`, because a mapping failure is a
+failure to map one job; the binding-policy parsing in `src/hwloc` for the
+same reason; spawn, allocation, file pre-positioning, the `odls` binding
+and launch paths, and the `state`/`errmgr` reports of a job ending.
+
+**Use the macro, not `jdata->nspace`.** Policy parsing takes NULL for
+"set the DVM-wide default rather than this job's value" and branches on
+it, so a bare dereference at those sites is a crash on the error path —
+the one path nobody exercises. `PRTE_JOB_NSPACE()`
+([`src/runtime/prte_globals.h`](../runtime/prte_globals.h)) answers our
+own job for a NULL. Where the job object is *gone* rather than absent —
+`prte_state_base_orphaned_proc()` exists precisely for that case — pass
+the proc's own `nspace`; the report is still about that job.
 
 **The whole tree is converted** — every one of the ~420 call sites that
 used to say `pmix_show_help(` now says `prte_show_help(`, so a plain
@@ -298,8 +367,9 @@ identical outside a daemon, so there is no case where the PMIx spelling
 is the better choice.
 
 (`pmix_show_help_string()` and `pmix_show_help_norender()` are different
-functions with different signatures and are untouched; `prte_show_help()`
-is built on top of them.)
+functions with different signatures; `prte_show_help()` is built on top
+of them. `pmix_show_help_norender()` takes the nspace too — that is how
+the job reaches PMIx's suppression.)
 
 `prte-convert-help.py` recognizes both spellings when it scans for help
 citations, so converting a call site does not remove it from the

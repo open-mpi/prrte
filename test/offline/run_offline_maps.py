@@ -268,6 +268,9 @@ class TopoModel:
         model = cls(os.path.splitext(os.path.basename(path))[0], by_level)
         model.ngpus = _count_gpus(root)
         model.gpus_nameable = _gpus_nameable(root)
+        model.osdev_names = frozenset(
+            o.get("name") for o in root.iter("object")
+            if "OSDev" == o.get("type") and o.get("name"))
         return model
 
     def objects_at(self, level):
@@ -826,6 +829,63 @@ def hostcap_cases(topo):
                "capped", "nodeA0:4", [("nodeA0", 4)], map_by="core", n=4,
                alloc_args=small, expect_counts={"nodeA0": 4}, expect="map")
 
+    # max_slots is a hard bound that permission to oversubscribe does not
+    # lift, whichever mapper is placing.  The batch mappers - by-slot,
+    # by-node and pe-list - checked it once before handing a node its whole
+    # share, so they put four procs on nodes that may hold three; the object
+    # mapper checks per proc and was already right.  Six fit exactly, and
+    # eight do not fit at all.
+    maxed = ("--prtemca", "ras", "simulator",
+             "--prtemca", "ras_simulator_num_nodes", "2",
+             "--prtemca", "ras_simulator_slots", "2",
+             "--prtemca", "ras_simulator_max_slots", "3")
+    twopool = [("nodeA0", 2), ("nodeA1", 2)]
+    # pe-list takes its binding as an extra argument rather than as bind_to:
+    # an unordered pe-list binds each proc to the whole list, which is not
+    # the one-core span check_binding() holds "core" to.  Its third proc on a
+    # node overloads the list, and used to be bound to an EMPTY cpuset -
+    # which the map parser refuses, so the case still catches that.
+    for tag, mb, bt, extra in (
+            ("node", "node:oversubscribe", "none", ()),
+            ("slot", "slot:oversubscribe", "none", ()),
+            ("core", "core:oversubscribe", "none", ()),
+            ("pelist", "pe-list=0,1:oversubscribe", None,
+             ("--bind-to", "core:overload-allowed"))):
+        yield Case("hostcap.%s.maxslots-oversub.m-%s" % (topo.name, tag),
+                   "hostcap", topo, "capped", "nodeA0:2,nodeA1:2", twopool,
+                   map_by=mb, bind_to=bt, extra_args=extra, n=6,
+                   alloc_args=maxed,
+                   expect_counts={"nodeA0": 3, "nodeA1": 3}, expect="map")
+        yield Case("hostcap.%s.maxslots-exceeded.m-%s" % (topo.name, tag),
+                   "hostcap", topo, "capped", "nodeA0:2,nodeA1:2", twopool,
+                   map_by=mb, bind_to=bt, extra_args=extra, n=8,
+                   alloc_args=maxed, expect="reject")
+
+    # by-node offers every node the same even share, and a node that can
+    # take less than its share has to leave the rest for the others.  The cap
+    # used to be written over the share itself, so a one-slot node at the
+    # head of the list shrank what every later node was offered, and a job
+    # that exactly fits these nodes failed to map.
+    for cid, spec, cnt in (
+            ("bynode-uneven", "node0:1,node1:4,node2:4",
+             {"node0": 1, "node1": 4, "node2": 4}),
+            ("bynode-lopsided", "node0:1,node1:10",
+             {"node0": 1, "node1": 10})):
+        pool = [(h.split(":")[0], int(h.split(":")[1])) for h in spec.split(",")]
+        yield Case("hostcap.%s.%s" % (topo.name, cid), "hostcap", topo,
+                   "capped", spec, pool, map_by="node", bind_to="none",
+                   n=sum(cnt.values()), expect_counts=cnt, expect="map")
+
+    # An unordered pe-list binds each proc to the whole list, and once every
+    # entry has a proc an overloading one simply shares it.  The third proc
+    # here used to fail the map with nothing but an error log.  (The binding
+    # is passed as an extra argument: check_binding() holds "core" to a
+    # one-core span, which is not what a pe-list binding is.)
+    yield Case("hostcap.%s.pelist-overload" % topo.name, "hostcap", topo,
+               "capped", "node0:4", [("node0", 4)], map_by="pe-list=0,1",
+               extra_args=("--bind-to", "core:overload-allowed"), n=3,
+               expect_counts={"node0": 3}, expect="map")
+
 
 def device_cases(topo):
     """--map-by device=, whose placement is pinned by golden snapshots.
@@ -865,9 +925,25 @@ def device_cases(topo):
                hostspec, pool, map_by="device=gpu", rank_by="slot",
                bind_to="core", n=2 * n, expect="reject",
                expect_banner="Processes placeable")
+    # permission to oversubscribe reaches a device map too: with two slots
+    # and a device per proc, placing one proc on each device is a map once
+    # the user allows more procs than slots.  It used to get one pass, so
+    # the permission changed nothing and the refusal said "Success".
+    yield Case("device.%s.gpu-oversub" % topo.name, "device", topo, "single",
+               "node0:2", [("node0", 2)], map_by="device=gpu:oversubscribe",
+               rank_by="slot", bind_to="core", n=n, expect="map",
+               expect_counts={"node0": n})
     yield Case("device.%s.gpu-shared" % topo.name, "device", topo, "single",
                hostspec, pool, map_by="device=gpu:shared", rank_by="slot",
                bind_to="core", n=2 * n, expect="map")
+
+    # a named device is "every process near this one", the old dist policy:
+    # the processes share it by definition, so more of them than the one
+    # device is a map and not the refusal a class would get
+    if "mlx5_0" in getattr(topo, "osdev_names", ()):
+        yield Case("device.%s.named" % topo.name, "device", topo, "single",
+                   hostspec, pool, map_by="device=mlx5_0", rank_by="slot",
+                   bind_to="core", n=n, expect="map")
 
     # the reverse ratio: N procs on each device
     yield Case("device.%s.ppr2" % topo.name, "device", topo, "single",

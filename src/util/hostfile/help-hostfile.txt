@@ -225,6 +225,10 @@ PRRTE allows a user to expand an existing DVM prior to launching an
 application.  Users can specify a hostfile that contains a list of
 nodes to be added to the DVM using normal hostfile syntax.
 
+Only a DVM started in elastic mode ("--prtemca prte_elastic_mode 1")
+can change its membership.  Any other DVM is fixed for its lifetime,
+and this option is refused.
+
 The list can include nodes that are already part of the DVM — in this
 case, the number of slots available on those nodes will be set to the
 new specification, or adjusted as directed:
@@ -269,15 +273,26 @@ The hostfile given is not a regular file:
 A directory (or a device, socket, or similar) cannot be read as a hostfile.
 Check to make sure the path and filename are correct.
 #
+[read-error]
+
+PRTE could not read the hostfile to its end:
+
+   %s
+
+The read stopped after line %d. Nothing in the file was used, because a
+hostfile that was only partly read would name only some of the nodes it
+lists. Check that the file is still readable - on a network file system,
+that the server is reachable - and try again.
+#
 [port]
 
 PRTE detected a bad parameter in the hostfile:
 
    %s
 
-The port parameter is less than 0:
+The port parameter is not a whole number:
 
-   port=%d
+   port=%s
 #
 [slots]
 
@@ -285,9 +300,9 @@ PRTE detected a bad parameter in the hostfile:
 
    %s
 
-The slots parameter is less than 0:
+The slots parameter is not a whole number:
 
-   slots=%d
+   slots=%s
 #
 [max_slots]
 
@@ -295,9 +310,9 @@ PRTE detected a bad parameter in the hostfile:
 
    %s
 
-The max_slots parameter is less than 0:
+The max_slots parameter is not a whole number:
 
-   max_slots=%d
+   max_slots=%s
 #
 [max_slots_lt]
 
@@ -310,38 +325,19 @@ The max_slots parameter is less than the slots parameter:
    slots=%d
    max_slots=%d
 #
-[parse_error_string]
-
-PRTE detected a parse error in the hostfile:
-
-   %s
-
-It occurred on line number %d on token %d:
-
-   %s
-#
-[parse_error_int]
-
-PRTE detected a parse error in the hostfile:
-
-   %s
-
-It occurred on line number %d on token %d:
-
-   %d
-#
 [user-host]
 
 PRTE detected a parse error in the hostfile:
 
    %s
 
-The entry on line number %d contains more than one "@" separator:
+The entry on line number %d is not a hostname or a "user@hostname":
 
    %s
 
-An entry may name at most one user, in the form "user@hostname". Please
-correct the hostfile and try again.
+An entry may name at most one user, in the form "user@hostname", and both
+the user and the hostname must be given. Please correct the hostfile and
+try again.
 #
 [parse_error]
 
@@ -349,7 +345,12 @@ PRTE detected a parse error in the hostfile:
 
    %s
 
-It occurred on line number %d on token %d.
+Line number %d could not be understood. The parser stopped at:
+
+   %s
+
+A line names one host, optionally followed by any of "slots=",
+"max_slots=", "username=" and "port=", each with a value.
 #
 [not-all-mapped-alloc]
 

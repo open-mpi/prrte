@@ -527,7 +527,7 @@ static int raw_preposition_files(prte_job_t *jdata,
             continue;
         }
 
-        if (prte_get_attribute(&app->attributes, PRTE_APP_PRELOAD_BIN, NULL, PMIX_BOOL)) {
+        if (PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_PRELOAD_BIN)) {
             /* add the executable to our list */
             PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                                  "%s filem:raw: preload executable %s",
@@ -556,8 +556,7 @@ static int raw_preposition_files(prte_job_t *jdata,
              */
             fs->remote_target = strdup(prte_filem_base_strip_leading_dots(app->app));
             /* ensure the app uses that location as its cwd */
-            prte_set_attribute(&app->attributes, PRTE_APP_SSNDIR_CWD,
-                               PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+            prte_set_bool_attribute(&app->attributes, PRTE_APP_SSNDIR_CWD, PRTE_ATTR_GLOBAL, true);
         }
 
         filestring = NULL;
@@ -652,7 +651,7 @@ static int raw_preposition_files(prte_job_t *jdata,
         if (NULL == fs->remote_target || '\0' == fs->remote_target[0] ||
             0 == strcmp(fs->remote_target, ".") ||
             prte_filem_base_has_dotdot(fs->remote_target)) {
-            prte_show_help("help-prte-filem-raw.txt", "preload-bad-path", true,
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-filem-raw.txt", "preload-bad-path", true,
                            fs->local_target);
             PMIX_LIST_DESTRUCT(&fsets);
             if (NULL != cbfunc) {
@@ -677,7 +676,7 @@ static int raw_preposition_files(prte_job_t *jdata,
             prte_filem_base_file_set_t *fs2 = (prte_filem_base_file_set_t *) itm;
             if (0 == strcmp(fs->remote_target, fs2->remote_target) &&
                 !same_source(fs->local_target, fs2->local_target)) {
-                prte_show_help("help-prte-filem-raw.txt", "preload-name-clash", true,
+                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-filem-raw.txt", "preload-name-clash", true,
                                fs->local_target, fs2->local_target, fs->remote_target);
                 PMIX_LIST_DESTRUCT(&fsets);
                 if (NULL != cbfunc) {
@@ -1039,7 +1038,7 @@ static int place_file(char *my_dir, char *wdir, char *fname)
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fname, dest));
             goto cleanup;
         }
-        prte_show_help("help-prte-filem-raw.txt", "preload-collision", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-filem-raw.txt", "preload-collision", true,
                        fname, wdir, prte_process_info.nodename);
         rc = PRTE_ERR_PRELOAD_CONFLICT;
         goto cleanup;
@@ -1241,7 +1240,7 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
         files = PMIx_Argv_split(filestring, ',');
         free(filestring);
     }
-    if (prte_get_attribute(&app->attributes, PRTE_APP_PRELOAD_BIN, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_PRELOAD_BIN)) {
         /* add the app itself to the list */
         bname = pmix_basename(app->app);
         PMIx_Argv_append_nosize(&files, bname);
@@ -1348,7 +1347,7 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
             }
         }
         if (!staged) {
-            prte_show_help("help-prte-filem-raw.txt", "preload-not-staged", true,
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-filem-raw.txt", "preload-not-staged", true,
                            files[j], prte_process_info.nodename);
             PMIx_Argv_free(files);
             return PRTE_ERR_FILE_OPEN_FAILURE;

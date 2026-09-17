@@ -408,7 +408,6 @@ void prte_pmix_server_connection_spawned(prte_job_t *jdata)
 {
     prte_job_t *parent;
     pmix_proc_t *proxy = NULL, members[2];
-    bool sep = false, *sepptr = &sep;
 
     if (!registry_live() || NULL == jdata) {
         return;
@@ -427,8 +426,10 @@ void prte_pmix_server_connection_spawned(prte_job_t *jdata)
     if (NULL == parent || PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL)) {
         goto done;
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_CHILD_SEP,
-                           (void **) &sepptr, PMIX_BOOL) && sep) {
+    /* PMIX_SPAWN_CHILD_SEP opts the child out of being connected to its
+     * parent.  Only an explicit TRUE does so: not having said is not an
+     * opt-out, and the PMIx default is that a spawn connects the two. */
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_CHILD_SEP)) {
         goto done;
     }
 
@@ -547,7 +548,7 @@ void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace)
 
                 /* the user is about to lose a job they did not ask about, so say
                  * why - "connected" is not a property they can see in ps */
-                prte_show_help("help-prted.txt", "connected-term", true,
+                prte_show_help(PRTE_JOB_NSPACE(jptr), "help-prted.txt", "connected-term", true,
                                cause, jptr->nspace);
 
                 PMIX_LOAD_PROCID(&target, jptr->nspace, PMIX_RANK_WILDCARD);

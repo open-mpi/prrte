@@ -97,7 +97,8 @@ prte_oob_base_t prte_oob_base = {
     .ipv6ports = NULL,
 
     .local_ifs = PMIX_LIST_STATIC_INIT(prte_oob_base.local_ifs),
-    .if_masks = NULL,
+    .ipv4masks = NULL,
+    .ipv6masks = NULL,
     .num_hnp_ports = 1,
     .listeners = PMIX_LIST_STATIC_INIT(prte_oob_base.listeners),
     .listen_thread_active = false,
@@ -110,6 +111,54 @@ prte_oob_base_t prte_oob_base = {
     .max_recon_attempts = 0
 };
 
+/* Does @c intf survive the address-family, virtual-interface and
+ * include/exclude filters?  Returns PRTE_SUCCESS if it does,
+ * PRTE_ERR_TAKE_NEXT_OPTION if it does not, and PRTE_ERR_BAD_PARAM (having
+ * said why) if one of the user's network specifications cannot be parsed. */
+static int interface_selected(pmix_pif_t *intf, char **interfaces, bool including)
+{
+    int rc;
+
+    /* ignore non-ip4/6 interfaces */
+    if (AF_INET != intf->if_addr.ss_family
+#if PRTE_ENABLE_IPV6
+        && AF_INET6 != intf->if_addr.ss_family
+#endif
+        ) {
+        return PRTE_ERR_TAKE_NEXT_OPTION;
+    }
+
+    /* ignore any virtual interfaces */
+    if (0 == strncmp(intf->if_name, "vir", 3)) {
+        return PRTE_ERR_TAKE_NEXT_OPTION;
+    }
+
+    if (NULL == interfaces) {
+        return PRTE_SUCCESS;
+    }
+
+    /* pmix_ifmatches speaks PMIx status codes: a match, no match, or a
+     * specification it could not parse (which it has already reported) */
+    rc = pmix_ifmatches(intf->if_kernel_index, interfaces);
+    if (PMIX_SUCCESS != rc && PMIX_ERR_NOT_FOUND != rc) {
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "not-parseable", true);
+        return PRTE_ERR_BAD_PARAM;
+    }
+    if (including && PMIX_SUCCESS != rc) {
+        pmix_output_verbose(20, prte_oob_base.output,
+                            "%s oob:tcp:init rejecting interface %s (not in include list)",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), intf->if_name);
+        return PRTE_ERR_TAKE_NEXT_OPTION;
+    }
+    if (!including && PMIX_SUCCESS == rc) {
+        pmix_output_verbose(20, prte_oob_base.output,
+                            "%s oob:tcp:init rejecting interface %s (in exclude list)",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), intf->if_name);
+        return PRTE_ERR_TAKE_NEXT_OPTION;
+    }
+    return PRTE_SUCCESS;
+}
+
 int prte_oob_open(void)
 {
     pmix_pif_t *copied_interface, *selected_interface;
@@ -119,6 +168,8 @@ int prte_oob_open(void)
     int kindex;
     int i, rc;
     bool keeploopback = false;
+    bool have_nonloopback = false;
+    bool host_has_nonloopback = false;
     bool including = false;
 
     pmix_output_verbose(5, prte_oob_base.output,
@@ -135,7 +186,8 @@ int prte_oob_open(void)
     prte_oob_base.ipv4ports = NULL;
     prte_oob_base.ipv6conns = NULL;
     prte_oob_base.ipv6ports = NULL;
-    prte_oob_base.if_masks = NULL;
+    prte_oob_base.ipv4masks = NULL;
+    prte_oob_base.ipv6masks = NULL;
 
     PMIX_CONSTRUCT(&prte_oob_base.local_ifs, pmix_list_t);
         PMIX_CONSTRUCT(&prte_oob_base.peers, pmix_list_t);
@@ -154,77 +206,65 @@ int prte_oob_open(void)
                                    "exclude", &interfaces);
     }
 
-    /* if we are the master, then check the interfaces for loopbacks
-     * and keep loopbacks only if no non-loopback interface exists */
-    if (PRTE_PROC_IS_MASTER) {
-        keeploopback = true;
-        PMIX_LIST_FOREACH(selected_interface, &pmix_if_list, pmix_pif_t)
-        {
-            if (!(selected_interface->if_flags & IFF_LOOPBACK)) {
-                keeploopback = false;
-                break;
-            }
+    /* A loopback address is useless to any daemon but the DVM master, and to
+     * the master only when no daemon on another node will need to reach it.
+     * So the master keeps loopback in two cases: the user's include list
+     * selected it and nothing else, or the host has nothing else at all.
+     *
+     * The first case has to be decided after the include list is applied.
+     * Deciding over every interface on the host threw away a loopback the
+     * user had explicitly included, as the only interface wanted, whenever the
+     * host also had a real one - so confining a single-node job to loopback
+     * was impossible.  An exclude list is not such a request: one that
+     * removes every real interface leaves nothing a remote daemon could use,
+     * and falling back to loopback would only move the failure to the first
+     * daemon launched. */
+    PMIX_LIST_FOREACH(selected_interface, &pmix_if_list, pmix_pif_t)
+    {
+        if (selected_interface->if_flags & IFF_LOOPBACK) {
+            continue;
+        }
+        rc = interface_selected(selected_interface, NULL, false);
+        if (PRTE_SUCCESS != rc) {
+            continue;
+        }
+        host_has_nonloopback = true;
+        rc = interface_selected(selected_interface, interfaces, including);
+        if (PRTE_ERR_BAD_PARAM == rc) {
+            PMIx_Argv_free(interfaces);
+            return rc;
+        }
+        if (PRTE_SUCCESS == rc) {
+            have_nonloopback = true;
+            break;
         }
     }
+    keeploopback = PRTE_PROC_IS_MASTER && !have_nonloopback &&
+                   (including || !host_has_nonloopback);
 
     /* look at all available interfaces */
     PMIX_LIST_FOREACH(selected_interface, &pmix_if_list, pmix_pif_t)
     {
-        if ((selected_interface->if_flags & IFF_LOOPBACK) &&
-            !keeploopback) {
+        rc = interface_selected(selected_interface, interfaces, including);
+        if (PRTE_ERR_BAD_PARAM == rc) {
+            PMIx_Argv_free(interfaces);
+            return rc;
+        }
+        if (PRTE_SUCCESS != rc) {
             continue;
         }
-
+        if ((selected_interface->if_flags & IFF_LOOPBACK) &&
+            !keeploopback) {
+            pmix_output_verbose(20, prte_oob_base.output,
+                                "%s oob:tcp:init rejecting loopback interface %s",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), selected_interface->if_name);
+            continue;
+        }
 
         i = selected_interface->if_index;
         kindex = selected_interface->if_kernel_index;
         memcpy((struct sockaddr *) &my_ss, &selected_interface->if_addr,
                MIN(sizeof(struct sockaddr_storage), sizeof(selected_interface->if_addr)));
-
-        /* ignore non-ip4/6 interfaces */
-        if (AF_INET != my_ss.ss_family
-#if PRTE_ENABLE_IPV6
-            && AF_INET6 != my_ss.ss_family
-#endif
-            ) {
-            continue;
-        }
-
-        /* ignore any virtual interfaces */
-        if (0 == strncmp(selected_interface->if_name, "vir", 3)) {
-            continue;
-        }
-
-        /* handle include/exclude directives */
-        if (NULL != interfaces) {
-            /* check for match */
-            rc = pmix_ifmatches(kindex, interfaces);
-            /* if one of the network specifications isn't parseable, then
-             * error out as we can't do what was requested
-             */
-            if (PRTE_ERR_NETWORK_NOT_PARSEABLE == rc) {
-                prte_show_help("help-oob-tcp.txt", "not-parseable", true);
-                PMIx_Argv_free(interfaces);
-                return PRTE_ERR_BAD_PARAM;
-            }
-            /* if we are including, then ignore this if not present */
-            if (including) {
-                if (PMIX_SUCCESS != rc) {
-                    pmix_output_verbose(20, prte_oob_base.output,
-                                        "%s oob:tcp:init rejecting interface %s (not in include list)",
-                                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), selected_interface->if_name);
-                    continue;
-                }
-            } else {
-                /* we are excluding, so ignore if present */
-                if (PMIX_SUCCESS == rc) {
-                    pmix_output_verbose(20, prte_oob_base.output,
-                                        "%s oob:tcp:init rejecting interface %s (in exclude list)",
-                                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), selected_interface->if_name);
-                    continue;
-                }
-            }
-        }
 
         /* Refs ticket #3019
          * it would probably be worthwhile to print out a warning if PRRTE detects multiple
@@ -234,31 +274,28 @@ int prte_oob_open(void)
          * them so that applications won't hang.
          */
 
-        /* add this address to our connections */
+        /* add this address to our connections - each family keeps its own
+         * masks, because each family's URI carries its own mask list, indexed
+         * like its own address list */
+        snprintf(string, 50, "%d", selected_interface->if_mask);
         if (AF_INET == my_ss.ss_family) {
             pmix_output_verbose(10, prte_oob_base.output,
-                                "%s oob:tcp:init adding %s to our list of %s connections",
-                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                pmix_net_get_hostname((struct sockaddr *) &my_ss),
-                                (AF_INET == my_ss.ss_family) ? "V4" : "V6");
-            PMIx_Argv_append_nosize(&prte_oob_base.ipv4conns,
-                                           pmix_net_get_hostname((struct sockaddr *) &my_ss));
-        } else if (AF_INET6 == my_ss.ss_family) {
-#if PRTE_ENABLE_IPV6
-            pmix_output_verbose(10, prte_oob_base.output,
-                                "%s oob:tcp:init adding %s to our list of %s connections",
-                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
-                                pmix_net_get_hostname((struct sockaddr *) &my_ss),
-                                (AF_INET == my_ss.ss_family) ? "V4" : "V6");
-            PMIx_Argv_append_nosize(&prte_oob_base.ipv6conns,
-                                           pmix_net_get_hostname((struct sockaddr *) &my_ss));
-#endif // PRTE_ENABLE_IPV6
-        } else {
-            pmix_output_verbose(10, prte_oob_base.output,
-                                "%s oob:tcp:init ignoring %s from out list of connections",
+                                "%s oob:tcp:init adding %s to our list of V4 connections",
                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                 pmix_net_get_hostname((struct sockaddr *) &my_ss));
-            continue;
+            PMIx_Argv_append_nosize(&prte_oob_base.ipv4conns,
+                                    pmix_net_get_hostname((struct sockaddr *) &my_ss));
+            PMIx_Argv_append_nosize(&prte_oob_base.ipv4masks, string);
+        } else {
+#if PRTE_ENABLE_IPV6
+            pmix_output_verbose(10, prte_oob_base.output,
+                                "%s oob:tcp:init adding %s to our list of V6 connections",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                pmix_net_get_hostname((struct sockaddr *) &my_ss));
+            PMIx_Argv_append_nosize(&prte_oob_base.ipv6conns,
+                                    pmix_net_get_hostname((struct sockaddr *) &my_ss));
+            PMIx_Argv_append_nosize(&prte_oob_base.ipv6masks, string);
+#endif // PRTE_ENABLE_IPV6
         }
         copied_interface = PMIX_NEW(pmix_pif_t);
         if (NULL == copied_interface) {
@@ -281,9 +318,6 @@ int prte_oob_open(void)
         memcpy(&copied_interface->if_mac, &selected_interface->if_mac,
                sizeof(copied_interface->if_mac));
         copied_interface->ifmtu = selected_interface->ifmtu;
-        /* Add the if_mask to the list */
-        snprintf(string, 50, "%d", selected_interface->if_mask);
-        PMIx_Argv_append_nosize(&prte_oob_base.if_masks, string);
         pmix_list_append(&prte_oob_base.local_ifs, &(copied_interface->super));
     }
     if (NULL != interfaces) {
@@ -298,14 +332,13 @@ int prte_oob_open(void)
         /* say so: this is reachable straight from user input (an if_include or
          * if_exclude that leaves nothing), and the caller can only turn the
          * bare error code into an abort */
-        prte_show_help("help-oob-tcp.txt", "no-interfaces", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "no-interfaces", true,
                        prte_process_info.nodename);
         return PRTE_ERR_NOT_AVAILABLE;
     }
 
-    // start the listeners
+    // start the listeners - which says for itself why none could be opened
     if (PRTE_SUCCESS != (rc = prte_oob_tcp_start_listening())) {
-        prte_show_help("help-oob-tcp.txt", "no-listeners", true);
         PRTE_ERROR_LOG(rc);
     }
     return rc;
@@ -375,8 +408,11 @@ void prte_oob_close(void)
         PMIx_Argv_free(prte_oob_base.ipv6ports);
     }
 #endif
-    if (NULL != prte_oob_base.if_masks) {
-        PMIx_Argv_free(prte_oob_base.if_masks);
+    if (NULL != prte_oob_base.ipv4masks) {
+        PMIx_Argv_free(prte_oob_base.ipv4masks);
+    }
+    if (NULL != prte_oob_base.ipv6masks) {
+        PMIx_Argv_free(prte_oob_base.ipv6masks);
     }
 
     if (0 <= prte_oob_base.output) {
@@ -473,7 +509,7 @@ int prte_oob_register(void)
         /* can't have both static and dynamic ports! */
         if (prte_static_ports) {
             char *err = PMIx_Argv_join(prte_oob_base.tcp_static_ports, ',');
-            prte_show_help("help-oob-tcp.txt", "static-and-dynamic", true, err, dyn_port_string);
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "static-and-dynamic", true, err, dyn_port_string);
             free(err);
             return PRTE_ERROR;
         }
@@ -503,7 +539,7 @@ int prte_oob_register(void)
             if (NULL != prte_oob_base.tcp6_static_ports) {
                 err6 = PMIx_Argv_join(prte_oob_base.tcp6_static_ports, ',');
             }
-            prte_show_help("help-oob-tcp.txt", "static-and-dynamic-ipv6", true,
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "static-and-dynamic-ipv6", true,
                            (NULL == err4) ? "N/A" : err4, (NULL == err6) ? "N/A" : err6,
                            dyn_port_string6);
             if (NULL != err4) {
@@ -658,12 +694,30 @@ static void recv_handler(int sd, short flags, void *user);
  */
 void prte_oob_accept_connection(const int accepted_fd, const struct sockaddr *addr)
 {
+    int flags;
+
     pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
                         "%s accept_connection: %s:%d\n", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         pmix_net_get_hostname(addr), pmix_net_get_port(addr));
 
     /* setup socket options */
     prte_oob_tcp_set_socket_options(accepted_fd);
+
+    /* The handshake is read as its bytes arrive, which only works on a
+     * socket that says so when it has none - and an accepted socket need not
+     * inherit the listener's non-blocking flag (on Linux it never does).  A
+     * blocking one would park the progress thread in recv() until the far end
+     * sent the rest, which anything able to reach the port could simply never
+     * do.  So a socket that cannot be made non-blocking is not used at all. */
+    flags = fcntl(accepted_fd, F_GETFL, 0);
+    if (0 > flags || 0 > fcntl(accepted_fd, F_SETFL, flags | O_NONBLOCK)) {
+        pmix_output(0, "%s accept_connection: unable to make socket %d non-blocking: %s (%d)",
+                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), accepted_fd,
+                    strerror(prte_socket_errno), prte_socket_errno);
+        shutdown(accepted_fd, 2);
+        close(accepted_fd);
+        return;
+    }
 
     /* use a one-time event to wait for receipt of peer's
      *  process ident message to complete this connection
@@ -681,9 +735,9 @@ void prte_oob_accept_connection(const int accepted_fd, const struct sockaddr *ad
 static void recv_handler(int sd, short flg, void *cbdata)
 {
     prte_oob_tcp_conn_op_t *op = (prte_oob_tcp_conn_op_t *) cbdata;
-    int flags;
     prte_oob_tcp_hdr_t hdr;
     prte_oob_tcp_peer_t *peer;
+    int rc;
     PRTE_HIDE_UNUSED_PARAMS(flg);
 
     PMIX_ACQUIRE_OBJECT(op);
@@ -692,7 +746,15 @@ static void recv_handler(int sd, short flg, void *cbdata)
                         "%s:tcp:recv:handler called", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
 
     /* get the handshake */
-    if (PRTE_SUCCESS != prte_oob_tcp_peer_recv_connect_ack(NULL, sd, &hdr)) {
+    rc = prte_oob_tcp_peer_recv_connect_ack(NULL, sd, &op->hshake, &hdr);
+    if (PRTE_ERR_WOULD_BLOCK == rc) {
+        /* the rest of it has not arrived - the op holds what has, so wait
+         * for the socket to become readable again */
+        PMIX_POST_OBJECT(op);
+        prte_event_add(&op->ev, 0);
+        return;
+    }
+    if (PRTE_SUCCESS != rc) {
         goto cleanup;
     }
 
@@ -704,34 +766,34 @@ static void recv_handler(int sd, short flg, void *cbdata)
          * belongs to, so put the two back together */
         PRTE_OOB_TCP_HDR_PROC(&hdr, hdr.origin, &sender);
         if (NULL == (peer = prte_oob_tcp_peer_lookup(&sender))) {
-            /* should never happen */
+            /* should never happen - the handshake records the peer */
+            CLOSE_THE_SOCKET(sd);
             goto cleanup;
         }
-        /* set socket up to be non-blocking */
-        if ((flags = fcntl(sd, F_GETFL, 0)) < 0) {
-            pmix_output(0, "%s prte_oob_tcp_recv_connect: fcntl(F_GETFL) failed: %s (%d)",
-                        PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerror(prte_socket_errno),
-                        prte_socket_errno);
-        } else {
-            flags |= O_NONBLOCK;
-            if (fcntl(sd, F_SETFL, flags) < 0) {
-                pmix_output(0, "%s prte_oob_tcp_recv_connect: fcntl(F_SETFL) failed: %s (%d)",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), strerror(prte_socket_errno),
-                            prte_socket_errno);
-            }
-        }
-        /* is the peer instance willing to accept this connection */
-        peer->sd = sd;
-        if (prte_oob_tcp_peer_accept(peer) == false) {
-            if (OOB_TCP_DEBUG_CONNECT
-                <= pmix_output_get_verbosity(prte_oob_base.output)) {
-                pmix_output(0,
-                            "%s-%s prte_oob_tcp_recv_connect: "
-                            "rejected connection from %s connection state %d",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&(peer->name)),
-                            PRTE_NAME_PRINT(&sender), peer->state);
-            }
+        /* the socket was made non-blocking when it was accepted */
+        /* is the peer instance willing to accept this connection.  A peer
+         * that is already connected is not, and its socket must not be
+         * overwritten on the way to finding that out - that would strand the
+         * working connection behind a descriptor we are about to close */
+        if (MCA_OOB_TCP_CONNECTED == peer->state) {
+            pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
+                                "%s-%s prte_oob_tcp_recv_connect: "
+                                "rejected connection from %s - already connected",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                PRTE_NAME_PRINT(&(peer->name)), PRTE_NAME_PRINT(&sender));
             CLOSE_THE_SOCKET(sd);
+            goto cleanup;
+        }
+        peer->sd = sd;
+        if (!prte_oob_tcp_peer_accept(peer)) {
+            /* peer_accept has closed the peer, and this socket with it:
+             * closing sd again would close whatever descriptor another
+             * thread has been handed that number since */
+            pmix_output_verbose(OOB_TCP_DEBUG_CONNECT, prte_oob_base.output,
+                                "%s-%s prte_oob_tcp_recv_connect: "
+                                "unable to accept connection from %s",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                PRTE_NAME_PRINT(&(peer->name)), PRTE_NAME_PRINT(&sender));
         }
     }
 
@@ -800,7 +862,7 @@ void prte_oob_split_and_resolve(char **orig_str, char *name,
         tmp = strdup(argv[i]);
         str = strchr(argv[i], '/');
         if (NULL == str) {
-            prte_show_help("help-oob-tcp.txt", "invalid if_inexclude",
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename,
                            tmp, "Invalid specification (missing \"/\")");
             free(tmp);
@@ -815,7 +877,7 @@ void prte_oob_split_and_resolve(char **orig_str, char *name,
                         &((struct sockaddr_in*) &argv_inaddr)->sin_addr);
 
         if (1 != ret) {
-            prte_show_help("help-oob-tcp.txt", "invalid if_inexclude",
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename, tmp,
                            "Invalid specification (inet_pton() failed)");
             free(tmp);
@@ -870,7 +932,7 @@ void prte_oob_split_and_resolve(char **orig_str, char *name,
         }
         /* If we didn't find a match, keep trying */
         if (0 == match_count) {
-            prte_show_help("help-oob-tcp.txt", "invalid if_inexclude",
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "invalid if_inexclude",
                            true, name, prte_process_info.nodename, tmp,
                            "Did not find interface matching this subnet");
             free(tmp);
