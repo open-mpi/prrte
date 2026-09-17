@@ -26,6 +26,6 @@ noinst_LTLIBRARIES = lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la
 
 # Source code files
 
-libprrteutilhostfile_la_SOURCES = \
+lib@PRTE_BINARY_PREFIX@prrteutilhostfile_la_SOURCES = \
         hostfile.h \
         hostfile.c

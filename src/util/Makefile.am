@@ -84,9 +84,11 @@ sources = \
 lib@PRTE_BINARY_PREFIX@prrteutil_la_SOURCES = $(headers) $(sources)
 
 lib@PRTE_BINARY_PREFIX@prrteutil_la_LIBADD = \
-        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la
+        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la \
+        rankfile/lib@PRTE_BINARY_PREFIX@prrteutilrankfile.la
 lib@PRTE_BINARY_PREFIX@prrteutil_la_DEPENDENCIES = \
-        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la
+        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la \
+        rankfile/lib@PRTE_BINARY_PREFIX@prrteutilrankfile.la
 
 prte_show_help_content.c: prte-convert-help.py
 if PRTE_PICKY_COMPILERS
@@ -99,13 +101,6 @@ else
 		--root $(abs_top_srcdir) \
 		--out prte_show_help_content.c
 endif
-
-libprrteutil_la_LIBADD = \
-        hostfile/libprrteutilhostfile.la \
-        rankfile/libprrteutilrankfile.la
-libprrteutil_la_DEPENDENCIES = \
-        hostfile/libprrteutilhostfile.la \
-        rankfile/libprrteutilrankfile.la
 
 prte_show_help_content.c: prte-convert-help.py
 if PRTE_PICKY_COMPILERS

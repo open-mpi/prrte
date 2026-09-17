@@ -20,10 +20,10 @@
 #
 
 
-noinst_LTLIBRARIES = libprrteutilrankfile.la
+noinst_LTLIBRARIES = lib@PRTE_BINARY_PREFIX@prrteutilrankfile.la
 
 # Source code files
 
-libprrteutilrankfile_la_SOURCES = \
+lib@PRTE_BINARY_PREFIX@prrteutilrankfile_la_SOURCES = \
         rankfile.h \
         rankfile.c
