@@ -194,7 +194,7 @@ collective and the other is just freeing memory.
   by a *signature* — for `fence`, the array of participating procs
   (matched **byte-for-byte** with `memcmp`, so the order PMIx hands down
   is load-bearing); for `group`, the `groupID` + operation; for `xcast`,
-  an HNP-assigned globally-unique `op_id`. A signature lets
+  the pair (tree, `op_id`) — see *An op is its tree and its id* below. A signature lets
   independently-arriving pieces of the same collective find each other.
 - **Trackers.** Each daemon keeps a per-collective tracker on a global
   list, counting `nexpected` vs `nreported`. When a tracker completes
@@ -225,7 +225,8 @@ The most intricate file. `prte_grpcomm_xcast()` is just
    The initiating op is then discarded — it is not the tracked op. A
    master originator also enqueues one entry on `pending_completions`.
 3. **HNP assigns the op-id.** `sig.op_id == 0` becomes
-   `++op_id_inited` — globally unique and monotonic. A non-zero op-id
+   `++op_id_inited` for the tree the broadcast travels — unique and
+   monotonic **within that tree**, not across trees. A non-zero op-id
    arriving at the HNP is a bug (`PRTE_ERR_DUPLICATE_MSG`).
 4. **Forward down the tree** to each routing-tree child, then process
    locally.
@@ -475,6 +476,32 @@ by ~250:1. Any compression number read off it is fiction; `--entropy` fills with
 an xorshift stream instead, which is the floor. Real modex data — endpoints,
 keys, addresses — sits much closer to the floor than to the ramp.
 
+### An op is its tree and its id
+
+Every tree keeps its own op-id sequence (`XCAST.tree[]`), and each starts
+at 1, so a routing-tree broadcast and a release-tree broadcast routinely
+carry the same number while both are in flight in the one `XCAST.ops`
+list. Anything that looks an op up or places it must compare **both**:
+
+- `find_op()` matches on topology and id. Matching on the id alone handed
+  a broadcast the other tree's op of the same number — the arrival was
+  taken for a duplicate and never forwarded or delivered (a lost launch
+  message, or a fence release that hung every participant), an ack was
+  counted against the wrong op, and on the master the
+  `pending_completions` FIFO was never popped, so every later callback
+  fired for the wrong broadcast. Nothing about it is rare at scale: a
+  full-modex release is in flight for seconds, and any routing broadcast
+  numbered the same in that window collides.
+- `insert_forwarded_op()` keeps ops in id order **per tree**; the trees
+  interleave freely. Its position and duplicate tests skip ops of other
+  trees — "before the first higher id of any tree" can put an op ahead of
+  a lower id of its own, and `finish_op()` then retires them out of order.
+  The newest op of a tree is simply appended, which is the path every
+  ordinary broadcast takes, so keep that case free of the walk.
+
+`test_xcast_tree_identity` (`test/unit/grpcomm`) drives the controller's
+receive and ack paths with one op of each tree held in flight.
+
 ### Ordering and fault tolerance
 
 The in-file comments are the real spec — read them. The load-bearing ideas:
@@ -719,6 +746,14 @@ can never complete, and the next fence with the same signature would
 *find* it, see a rollup expecting nothing, and answer immediately with
 data it never gathered.
 
+**A controller with no map for a participant's namespace counts itself in
+and keeps reading.** That is a namespace whose participants can only be on
+the controller (a tool connected to it, for instance). The resolution used
+to *stop* there, which dropped the daemons hosting every later entry of the
+signature and left the controller out too — the rollup expected nobody,
+converged on the controller's own contribution, and released before any
+other participant reported. `test_fence_tracker_mapless` pins both halves.
+
 **Every exit from the `fence()` handler destructs the signature it built
 and completes the caller.** The signature is a stack object with a
 malloc'd proc array that `get_tracker()` copies rather than adopts, so
@@ -853,6 +888,15 @@ otherwise microseconds.  Drive it at `rml_base_radix 1` so the tree is a chain
 and the delayed daemon is genuinely interior; hanging it off the HNP as a leaf
 tests nothing.  See the *"a contribution for the next round does not join this
 one"* case in `contrib/dockerswarm`.
+
+**A controller that cannot emit the release must abort, not return.**
+`converged` is latched before the release is built, and the recovery
+restart skips a converged tracker on the controller, so a pack or
+broadcast failure there used to hang every participant for good.
+`check_complete()` falls back to `abort_fence_op()`, the smallest release
+there is — the same rule the group collective follows.
+`test_fence_release_failure` drives it through the restart, the one way to
+converge a fence with no message in hand.
 
 **A release with no local callback still has data to free.** A daemon
 holding a tracker only because it relayed for its subtree has no `cbfunc`
@@ -1018,11 +1062,29 @@ client if the handler bails out: a silent `return` leaves it blocked in
 `PMIx_Group_construct` with no collective in flight to release it. Every
 failure therefore leaves by the `error:` label. That label does two things
 and both are load-bearing — it invokes `cd->cbfunc` with the reason, and it
-first clears `coll->cbfunc`/`coll->cbdata`, because the tracker itself
-*stays* (a release from the controller, which can still abort the
+first takes this call's entry off `coll->pending`, because the tracker
+itself *stays* (a release from the controller, which can still abort the
 operation, has to find it) and a release arriving later would otherwise
 complete the same client a second time with the same `cbdata`. This is the
 same rule the fence entry point follows — see *Retire before you deliver*.
+
+**Only this call's entry comes off, and that is why it is a list.** The
+group tracker is keyed on `{groupID, op}`, and a bootstrap group produces
+**one PMIx up-call per participating proc** — its leaders and its
+add-members all name the same group — so several completions can be queued
+on one tracker at once. `coll` used to hold a single `cbfunc`/`cbdata`
+pair, which got both halves of this wrong: each new participant *overwrote*
+the previous one's callback, and this error label cleared *everyone's*.
+`pmix_server_grp_fn_t` promises the host will invoke the callback it was
+given, with the cbdata it was given, once per call, so a dropped one is a
+completion PRRTE took ownership of and never discharged — the PMIx block
+behind it is never released. PMIx covers for the *participants* (its
+`_grpcbfunc` answers every block sharing the group id off whichever
+completion does arrive, precisely because this host answers once), but it
+cannot free a block whose completion never comes, so those leak for the
+life of the server. Hence `prte_grpcomm_grp_pending_t` and
+`coll->pending`: append on the way in, walk and invoke the whole list on
+completion, remove only your own on the error label.
 
 **A controller that cannot build the release must abort, not return.** By
 the time `check_complete()` starts packing, `converged` is latched, so
@@ -1173,8 +1235,9 @@ previous one of that name is over.
   outlives it (a signature, a tracker) has to hold a copy. Both halves of
   that rule have been broken historically.
 - **Every entry-point handler owns its caddy/op — release it on *all*
-  paths.** The tracker caches only `cbfunc`/`cbdata`, never the caddy, so
-  the handler is the last owner. Historic leaks here — `begin_xcast` never
+  paths.** The tracker caches only the completion (`cbfunc`/`cbdata`, on
+  `coll->pending` for a group), never the caddy, so the handler is the last
+  owner. Historic leaks here — `begin_xcast` never
   releasing the initiating `op_t`, the `group()` success returns never
   releasing `cd`, `fence_recv` never freeing its unpacked `info` — were all
   "return added, free forgotten" mistakes. Trace each new `return` back to

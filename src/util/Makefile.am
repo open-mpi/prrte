@@ -26,7 +26,7 @@
 # $HEADER$
 #
 
-SUBDIRS = hostfile
+SUBDIRS = hostfile rankfile
 
 noinst_LTLIBRARIES = lib@PRTE_BINARY_PREFIX@prrteutil.la
 
@@ -58,7 +58,8 @@ headers = \
         prte_show_help.h \
         session_dir.h \
         stacktrace.h \
-        sys_limits.h
+        sys_limits.h \
+        textfile.h
 
 sources = \
         $(headers) \
@@ -77,14 +78,17 @@ sources = \
         session_dir.c \
         stacktrace.c \
         sys_limits.c \
+        textfile.c \
         prte_show_help_content.c
 
 lib@PRTE_BINARY_PREFIX@prrteutil_la_SOURCES = $(headers) $(sources)
 
 lib@PRTE_BINARY_PREFIX@prrteutil_la_LIBADD = \
-        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la
+        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la \
+        rankfile/lib@PRTE_BINARY_PREFIX@prrteutilrankfile.la
 lib@PRTE_BINARY_PREFIX@prrteutil_la_DEPENDENCIES = \
-        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la
+        hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la \
+        rankfile/lib@PRTE_BINARY_PREFIX@prrteutilrankfile.la
 
 prte_show_help_content.c: prte-convert-help.py
 if PRTE_PICKY_COMPILERS
@@ -97,7 +101,6 @@ else
 		--root $(abs_top_srcdir) \
 		--out prte_show_help_content.c
 endif
-
 
 prte_show_help_content.c: prte-convert-help.py
 if PRTE_PICKY_COMPILERS

@@ -107,6 +107,9 @@ typedef struct {
     uint32_t uid;
     uint32_t gid;
     pmix_data_range_t range;
+    /* how many of the keys a PMIX_WAIT lookup is waiting for; 0 is all of
+     * them, which is also the Standard's default */
+    size_t nwait;
     char **keys;
 } prte_data_req_t;
 PMIX_CLASS_DECLARATION(prte_data_req_t);
@@ -129,13 +132,6 @@ typedef struct {
     bool warned;
 } prte_ds_usage_t;
 PMIX_CLASS_DECLARATION(prte_ds_usage_t);
-
-
-/* define a container for data object cleanups */
-typedef struct {
-    pmix_list_item_t super;
-    prte_data_object_t *data;
-} prte_data_cleanup_t;
 
 
 /* define a caddy for pointing to pmix_info_t that
@@ -211,10 +207,10 @@ PRTE_EXPORT void prte_ds_charge(prte_data_object_t *data);
 /* Take an item out of the store: uncharge it, clear its slot, release it.
  *
  * EVERY removal path has to go through this, or a uid's total drifts up
- * until it can publish nothing.  There are seven of them - the duplicate
- * drop, an unpublish, a FIRST_READ read that empties an item (in both
- * places that answer a lookup), each purge horizon, the expiry sweep, and
- * eviction - which is exactly why it is one function. */
+ * until it can publish nothing.  There are six of them - the duplicate
+ * drop, an unpublish, a FIRST_READ read that empties an item
+ * (prte_ds_collect), each purge horizon, the expiry sweep, and eviction -
+ * which is exactly why it is one function. */
 PRTE_EXPORT void prte_ds_drop(prte_data_object_t *data);
 
 /* Make room for an item about to be stored, evicting the publishing uid's
@@ -260,6 +256,39 @@ PRTE_EXPORT bool prte_data_server_expires_by(pmix_persistence_t persist,
 PRTE_EXPORT pmix_status_t prte_data_server_check_search_range(prte_data_req_t *req,
                                                               prte_data_object_t *data);
 
+/* Resolve a lookup's keys against this store, applying the same three
+ * tests to every item: the publisher's access permissions, its range, and
+ * the range the requestor asked us to search.  Returns how many of the
+ * keys were found.
+ *
+ * With "answers" NULL this only counts, and changes nothing - which is how
+ * a PMIX_WAIT lookup decides whether it can be answered yet without
+ * consuming a PMIX_PERSIST_FIRST_READ value it would then have nowhere to
+ * deliver.  With "answers" given, each value found is copied onto it as a
+ * prte_ds_info_t, its item's retention clock is restamped, and a FIRST_READ
+ * value is taken out of the store (dropping an item left empty).
+ *
+ * "denied", which may be NULL, is set when a key was held by an item the
+ * requestor was refused. */
+PRTE_EXPORT size_t prte_ds_collect(prte_data_req_t *req, char **keys,
+                                   pmix_list_t *answers, bool *denied);
+
+/* Answer a parked PMIX_WAIT lookup if the store can now meet what it is
+ * waiting for.  Returns true once the request is finished with - answered,
+ * or impossible to answer - and the caller must then take it off
+ * prte_data_store.pending and release it.  Returns false, having changed
+ * nothing, while it must keep waiting. */
+PRTE_EXPORT bool prte_ds_answer_parked(prte_data_req_t *req);
+
+/* Send a parked request its one reply: room number, the command it
+ * answers, the status, and - when "pbo" is given - the values.  A status
+ * with no payload is read as the whole answer by the daemon-side receiver,
+ * so this is also how a parked request is told it failed.  It does not
+ * take the request off prte_data_store.pending or release it; the caller
+ * does both. */
+PRTE_EXPORT void prte_ds_reply_parked(prte_data_req_t *req, pmix_status_t status,
+                                      pmix_byte_object_t *pbo);
+
 /* Relay a request to the external data server named by
  * prte_data_server_uri, and answer the requesting daemon when it replies.
  * Returns PMIX_SUCCESS once it owns the request - including when the
@@ -268,6 +297,18 @@ PRTE_EXPORT pmix_status_t prte_data_server_check_search_range(prte_data_req_t *r
 PRTE_EXPORT pmix_status_t prte_ds_relay(pmix_proc_t *sender, int room_number,
                                         uint8_t command,
                                         pmix_data_buffer_t *buffer);
+
+/* Build the directive array prte_ds_relay() hands to PMIx: the requester's
+ * own directives, less any identity claim, plus exactly one claim of our
+ * own - PMIX_REQUESTOR, PRTE_PUBLISH_REQ_UID and PRTE_PUBLISH_REQ_GID -
+ * naming the process the far end must attribute the operation to.  A
+ * requester that is itself a relay (a tool, under the rule
+ * prte_ds_check_requestor() applies) has its claim passed on; anybody else
+ * is named as itself.  "requestor" is updated to the identity relayed, and
+ * *out is the caller's to PMIX_INFO_FREE. */
+PRTE_EXPORT pmix_status_t prte_ds_relay_directives(const pmix_info_t *info, size_t ninfo,
+                                                   pmix_proc_t *requestor,
+                                                   pmix_info_t **out, size_t *nout);
 
 /* Honor the identity a RELAYED request claims: PMIX_REQUESTOR names the
  * process it is being made on behalf of, and PRTE_PUBLISH_REQ_UID /
@@ -299,6 +340,14 @@ PRTE_EXPORT void prte_ds_check_requestor(pmix_proc_t *owner,
  * read. */
 PRTE_EXPORT bool prte_data_server_owns(uint32_t uid, uint32_t gid,
                                        prte_data_object_t *data);
+
+/* Would a publication on "range", by the publisher "rq" describes, collide
+ * with this stored item?  The range word must match, the item must fall
+ * within the publisher's view of that range, and it must be either the
+ * publisher's own or one the publisher may read.  See ds_main.c. */
+PRTE_EXPORT bool prte_data_server_same_range(prte_data_req_t *rq,
+                                             prte_data_object_t *data,
+                                             pmix_data_range_t range);
 
 END_C_DECLS
 

@@ -51,19 +51,22 @@ PRTE_MODULE_EXPORT int prte_rmaps_rr_byslot(prte_job_t *jdata, prte_app_context_
  *
  * "Map one proc per target, wrapping until the node is full or the procs run
  * out" is the same loop whatever the targets are; only the way they are
- * listed differs.  byobj lists the hwloc objects of a single type, and that
- * is the only enumerator today - but the loop it drives is the subtlest one
- * in this component (the redo/check_avail interplay and the oversubscribe
- * second pass have both been the source of real bugs), so a second kind of
- * target is added by writing an enumerator rather than by copying the loop.
+ * listed differs.  byobj lists the hwloc objects of a single type and
+ * bydevice the devices rmaps/base enumerates - and the loop they drive is
+ * the subtlest one in this component (the redo/check_avail interplay and the
+ * oversubscribe passes have both been the source of real bugs), so another
+ * kind of target is added by writing an enumerator rather than by copying
+ * the loop.
  *
  * "ctx" is enumerator-private per-node state: "begin" may allocate it and
  * "end" releases it.  An enumerator that needs neither leaves both NULL, in
  * which case "ctx" is always NULL. */
 typedef struct {
     /* Called once per node before anything is placed on it.  Returns
-     * PRTE_SUCCESS, or an error that fails the map.  May be NULL. */
-    int (*begin)(prte_node_t *node, prte_rmaps_options_t *opts, void **ctx);
+     * PRTE_SUCCESS, or an error that fails the map; a diagnostic it prints
+     * is about "jdata".  May be NULL. */
+    int (*begin)(prte_job_t *jdata, prte_node_t *node, prte_rmaps_options_t *opts,
+                 void **ctx);
     /* How many targets this node offers.  Zero is not an error here - the
      * caller decides what it means. */
     unsigned (*count)(prte_node_t *node, prte_rmaps_options_t *opts, void *ctx);
@@ -71,17 +74,19 @@ typedef struct {
     hwloc_obj_t (*item)(prte_node_t *node, prte_rmaps_options_t *opts, void *ctx,
                         unsigned j);
     /* Called after a proc has been placed against the j-th target, so the
-     * enumerator can record what that target was.  May be NULL. */
-    void (*placed)(prte_proc_t *proc, prte_rmaps_options_t *opts, void *ctx,
-                   unsigned j);
+     * enumerator can record what that target was.  Anything but PRTE_SUCCESS
+     * fails the map.  May be NULL. */
+    int (*placed)(prte_proc_t *proc, prte_rmaps_options_t *opts, void *ctx,
+                  unsigned j);
     /* Release whatever "begin" allocated.  May be NULL. */
     void (*end)(void *ctx);
     /* What a target is called, for diagnostics ("core", "numa", ...). */
     const char *name;
-    /* When true, a target takes at most one proc: the loop lays one proc on
-     * each target and stops rather than coming round again.  A target that
-     * cannot be shared - a device, which is assigned rather than subdivided
-     * - sets this unless the user has allowed overloading. */
+    /* When true, a target takes at most one proc: the loop never comes round
+     * to a target again, and a later pass resumes at the first target the
+     * node has not handed out.  A target that cannot be shared - a device,
+     * which is assigned rather than subdivided - sets this unless the user
+     * has said the devices may be shared. */
     bool nowrap;
 } prte_rmaps_target_enum_t;
 

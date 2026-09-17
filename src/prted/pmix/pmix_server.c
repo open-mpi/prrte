@@ -510,7 +510,8 @@ void pmix_server_register_params(void)
     /* whether or not to support remote connections */
     prte_pmix_server_globals.remote_connections = false;
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "remote_connections",
-                                      "Whether or not to support remote connections",
+                                      "Whether or not to support remote connections (the "
+                                      "listener then honors prte_if_include/prte_if_exclude)",
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.remote_connections);
 
@@ -1127,6 +1128,27 @@ int pmix_server_init(void)
         return rc;
     }
 
+    /* A server that accepts remote tool connections listens on a network
+     * interface, and it has to be one the user permitted: the OOB honors
+     * prte_if_include/prte_if_exclude, and a tool listener that ignored them
+     * would still expose a port on an interface the user excluded.  Without
+     * remote connections the listener is on loopback, where no network
+     * selection applies - and passing one there would do harm, since PMIx
+     * then insists the list leave it a loopback interface, and an include
+     * list naming only real interfaces would fail the server's init. */
+    if (prte_pmix_server_globals.remote_connections) {
+        if (NULL != prte_if_include) {
+            PMIX_INFO_LIST_ADD(prc, ilist, PMIX_TCP_IF_INCLUDE, prte_if_include, PMIX_STRING);
+        } else if (NULL != prte_if_exclude) {
+            PMIX_INFO_LIST_ADD(prc, ilist, PMIX_TCP_IF_EXCLUDE, prte_if_exclude, PMIX_STRING);
+        }
+        if (PMIX_SUCCESS != prc) {
+            PMIX_INFO_LIST_RELEASE(ilist);
+            rc = prte_pmix_convert_status(prc);
+            return rc;
+        }
+    }
+
     PMIX_INFO_LIST_ADD(prc, ilist, PMIX_ALLOW_CLIENT_CLONES,
                       (void*)&prte_pmix_server_globals.allow_client_clones, PMIX_BOOL);
     if (PMIX_SUCCESS != prc) {
@@ -1199,7 +1221,7 @@ int pmix_server_init(void)
     if (PMIX_SUCCESS == prc) {
         // check the version
         if (val->data.uint32 < PRTE_PMIX_MINIMUM_VERSION) {
-            prte_show_help("help-prted.txt", "min-pmix-violation", true,
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prted.txt", "min-pmix-violation", true,
                            PRTE_PMIX_MINIMUM_VERSION, val->data.uint32);
             PMIX_VALUE_RELEASE(val);
             return PRTE_ERR_SILENT;
@@ -2469,7 +2491,7 @@ static void pmix_server_log(int status, pmix_proc_t *sender,
         rc = PMIX_ERR_NOT_FOUND;
         goto respond;
     }
-    noagg = prte_get_attribute(&jdata->attributes, PRTE_JOB_NOAGG_HELP, NULL, PMIX_BOOL);
+    noagg = PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_NOAGG_HELP);
 
     /* unpack the number of info */
     cnt = 1;
@@ -3008,6 +3030,17 @@ int pmix_server_cache_job_info(prte_job_t *jdata, pmix_info_t *info)
 /****    INSTANTIATE LOCAL OBJECTS    ****/
 static void opcon(prte_pmix_server_op_caddy_t *p)
 {
+    /* PMIX_NEW mallocs and does not zero, so a member this constructor
+     * skips is whatever the previous occupant of the block left there -
+     * the same trap rqcon() below documents for the request tracker.
+     * Every member gets a value here, including the ones only one or two
+     * paths use, because the caddy is a union of everything any operation
+     * needs and a handler cannot tell which of them its creator set. */
+    p->status = PMIX_SUCCESS;
+    p->codes = NULL;
+    p->ncodes = 0;
+    memset(&p->proc, 0, sizeof(pmix_proc_t));
+    p->msg = NULL;
     memset(&p->proct, 0, sizeof(pmix_proc_t));
     p->procs = NULL;
     p->nprocs = 0;
@@ -3022,6 +3055,8 @@ static void opcon(prte_pmix_server_op_caddy_t *p)
     p->ndirs = 0;
     p->apps = NULL;
     p->napps = 0;
+    p->queries = NULL;
+    p->nqueries = 0;
     p->cbfunc = NULL;
     p->infocbfunc = NULL;
     p->toolcbfunc = NULL;

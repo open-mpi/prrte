@@ -30,6 +30,7 @@
  */
 
 #include "prte_config.h"
+
 #include "constants.h"
 
 #ifdef HAVE_SYS_WAIT_H
@@ -39,6 +40,7 @@
 #    include <sys/time.h>
 #endif /* HAVE_SYS_TIME_H */
 #include <ctype.h>
+#include <limits.h>
 
 #include "src/class/pmix_pointer_array.h"
 #include "src/hwloc/hwloc-internal.h"
@@ -131,7 +133,7 @@ void prte_plm_base_daemons_reported(int fd, short args, void *cbdata)
 
     /* if we are not launching, then we just assume that all
      * daemons share our topology */
-    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
         if (NULL == node || NULL == node->topology) {
             PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
@@ -244,7 +246,7 @@ void prte_plm_base_allocation_complete(int fd, short args, void *cbdata)
     /* if we don't want to launch, then we at least want
      * to map so we can see where the procs would have
      * gone - so skip to the mapping state */
-    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         node = (prte_node_t*)pmix_pointer_array_get_item(prte_node_pool, 0);
         if (NULL == node) {
             // should never happen
@@ -662,7 +664,7 @@ static void job_timeout_cb(int fd, short event, void *cbdata)
     PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_TIMEOUT);
 
     /* see if they want proc states reported */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_REPORT_STATE, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_REPORT_STATE)) {
         /* output the results - note that the output might need to go to a
          * tool instead of just to stderr, so we use the PMIx IOF deliver
          * function to ensure it gets where it needs to go. */
@@ -675,7 +677,7 @@ static void job_timeout_cb(int fd, short event, void *cbdata)
     }
 
     /* see if they want stacktraces */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_STACKTRACES, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_STACKTRACES)) {
         /* if they asked for stack_traces, attempt to get them, but timeout
          * if we cannot do so */
         rc = get_traces(jdata);
@@ -792,6 +794,15 @@ void prte_plm_base_setup_job(int fd, short args, void *cbdata)
             return;
         }
     }
+    /* ...and until its launch message has been broadcast, it must not be
+     * copied to the daemons by anybody else's.  A grow's VM_READY catch-up
+     * walks prte_job_data, and a daemon that already holds a namespace cannot
+     * take the launch message for it - so a job admitted after that catch-up
+     * (the launch fence holds every job that reaches VM_READY or LAUNCH_APPS
+     * while a grow is in flight, and releases them only once the grow's
+     * catch-up has gone out) would reach every daemon as a procless copy and
+     * launch nowhere but here.  Cleared by prte_plm_base_send_launch_msg. */
+    PRTE_FLAG_SET(caddy->jdata, PRTE_JOB_FLAG_LAUNCH_PENDING);
 
     /* Now - and only now - is the job recorded as an owner of the
      * reservation(s) it was cleared to run in.  That grant is what lets it
@@ -847,13 +858,12 @@ void prte_plm_base_setup_job(int fd, short args, void *cbdata)
 
     // if we are not going to launch this job, then ensure we output something - otherwise,
     // we will simply silently exit
-    if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL) &&
-        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_MAP, NULL, PMIX_BOOL) &&
-        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, NULL, PMIX_BOOL) &&
-        !prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_REPORT_BINDINGS, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&caddy->jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH) &&
+        !PRTE_ATTR_IS_TRUE(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_MAP) &&
+        !PRTE_ATTR_IS_TRUE(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP) &&
+        !PRTE_ATTR_IS_TRUE(&caddy->jdata->attributes, PRTE_JOB_REPORT_BINDINGS)) {
         // default to the devel map
-        prte_set_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, PRTE_ATTR_GLOBAL,
-                           NULL, PMIX_BOOL);
+        prte_set_bool_attribute(&caddy->jdata->attributes, PRTE_JOB_DISPLAY_DEVEL_MAP, PRTE_ATTR_GLOBAL, true);
     }
 
     /* set the job state to the next position */
@@ -935,7 +945,7 @@ void prte_plm_base_launch_apps(int fd, short args, void *cbdata)
                          PRTE_JOBID_PRINT(jdata->nspace)));
 
     /* pack the appropriate add_local_procs command */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_FIXED_DVM, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_FIXED_DVM)) {
         command = PRTE_DAEMON_DVM_ADD_PROCS;
     } else {
         command = PRTE_DAEMON_ADD_LOCAL_PROCS;
@@ -1004,7 +1014,7 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
                          jdata->num_procs));
 
     /* if we don't want to launch the apps, now is the time to leave */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         /* go ahead and register the job - the completion callback
          * advances the job state once the registration is done */
         rc = prte_pmix_server_register_nspace(jdata, donotlaunch_reg_complete, jdata);
@@ -1046,6 +1056,9 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
     }
     PMIX_DATA_BUFFER_DESTRUCT(&jdata->launch_msg);
     PMIX_DATA_BUFFER_CONSTRUCT(&jdata->launch_msg);
+    /* every daemon now in the DVM has been sent the job, so a daemon that
+     * joins from here on has to be caught up with it instead */
+    PRTE_FLAG_UNSET(jdata, PRTE_JOB_FLAG_LAUNCH_PENDING);
 
     /* track that we automatically are considered to have reported - used
      * only to report launch progress
@@ -1255,7 +1268,7 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
     }
 
     /* if the response has already been sent, don't do it again */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_SPAWN_NOTIFIED, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_SPAWN_NOTIFIED)) {
         return PRTE_SUCCESS;
     }
 
@@ -1315,7 +1328,7 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
      * error status carried by the spawn response itself, which is what
      * releases it from PMIx_Spawn. */
     if (PMIX_SUCCESS == status &&
-        prte_get_attribute(&jdata->attributes, PRTE_JOB_DVM_JOB, NULL, PMIX_BOOL)) {
+        PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_DVM_JOB)) {
 
         /* dvm job => launch was requested by a TOOL, so we notify the launch proxy
          * and NOT the originator (as that would be us) */
@@ -1431,8 +1444,7 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
      * (inside pmix_server_notify_spawn), so a process that answered by sending
      * would answer again on every later call - and each of those extra
      * responses arrives at a requestor whose request is long retired */
-    prte_set_attribute(&jdata->attributes, PRTE_JOB_SPAWN_NOTIFIED,
-                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+    prte_set_bool_attribute(&jdata->attributes, PRTE_JOB_SPAWN_NOTIFIED, PRTE_ATTR_GLOBAL, true);
 
     return PRTE_SUCCESS;
 }
@@ -1469,8 +1481,18 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
         PMIX_RELEASE(caddy);
         return;
     }
-    /* update job state */
-    caddy->jdata->state = caddy->job_state;
+    /* update job state - but never back out of termination. The job goes
+     * RUNNING once every proc's launch has been counted, and nothing makes
+     * that count arrive before the procs finish: a proc that exits while its
+     * launch report is still on its way (the spawn thread held up in a
+     * PMIx call, say) completes the job first. check_complete has then
+     * already marked it TERMINATED, and overwriting that with RUNNING makes
+     * the rest of the termination believe the job is still alive - so a
+     * prterun never shuts down. Everything else here still applies to a job
+     * that ended quickly. */
+    if (PRTE_JOB_STATE_UNTERMINATED > caddy->jdata->state) {
+        caddy->jdata->state = caddy->job_state;
+    }
 
     /* complete wiring up the iof */
     PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
@@ -1551,8 +1573,12 @@ void prte_plm_base_registered(int fd, short args, void *cbdata)
         PMIX_RELEASE(caddy);
         return;
     }
-    /* update job state */
-    jdata->state = caddy->job_state;
+    /* update job state, unless the job has already terminated - every proc
+     * registering is no more guaranteed to be counted before they all exit
+     * than their launch is (see prte_plm_base_post_launch) */
+    if (PRTE_JOB_STATE_UNTERMINATED > jdata->state) {
+        jdata->state = caddy->job_state;
+    }
 
     PMIX_RELEASE(caddy);
 }
@@ -1695,7 +1721,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
 
     /* get the daemon job */
     jdatorted = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    show_progress = prte_get_attribute(&jdatorted->attributes, PRTE_JOB_SHOW_PROGRESS, NULL, PMIX_BOOL);
+    show_progress = PRTE_ATTR_IS_TRUE(&jdatorted->attributes, PRTE_JOB_SHOW_PROGRESS);
 
     /* multiple daemons could be in this buffer, so unpack until we exhaust the data */
     idx = 1;
@@ -1906,7 +1932,7 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                         goto CLEANUP;
                     }
                 } else {
-                    prte_show_help("help-prte-runtime.txt", "failed-to-uncompress",
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-runtime.txt", "failed-to-uncompress",
                                    true, prte_process_info.nodename);
                     prted_failed_launch = true;
                     PMIX_BYTE_OBJECT_DESTRUCT(&pbo);
@@ -1995,6 +2021,36 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                 break;
             }
             if (!found) {
+                /* This node looks like nothing we have already recorded.
+                 *
+                 * Ordinarily that is simply a heterogeneous allocation, which
+                 * PRRTE discovers and handles.  Under --uniform-nodes it is
+                 * not: the user has told us the allocation is homogeneous and
+                 * PRRTE has believed them, to the point that only daemon 1 is
+                 * asked for a topology at all and every other node is handed
+                 * what that one reported.  A daemon whose hardware differs
+                 * says the assertion was false, and every node but this one
+                 * has been given the wrong hardware to be mapped and bound
+                 * against.  Nothing else would report it: the option's whole
+                 * effect is to stop asking.
+                 *
+                 * Only when our own node is IN the allocation, because only
+                 * then is our topology a statement about the allocation.  A
+                 * launcher may be sitting on a login node that is legitimately
+                 * unlike the compute nodes - which is exactly why the
+                 * homo_nodes path adopts daemon 1's topology rather than ours
+                 * instead of comparing the two. */
+                if (prte_homo_nodes && prte_hnp_is_allocated) {
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-runtime.txt",
+                                   "uniform-nodes-mismatch", true,
+                                   daemon->node->name);
+                    if (NULL != ptopo.source) {
+                        free(ptopo.source);
+                    }
+                    hwloc_topology_destroy(ptopo.topology);
+                    prted_failed_launch = true;
+                    goto CLEANUP;
+                }
                 // this is a new topology
                 t = PMIX_NEW(prte_topology_t);
                 t->topo = ptopo.topology;
@@ -2656,7 +2712,7 @@ static int setup_virtual_machine(prte_job_t *jdata)
 
     /* if this job is being launched against a fixed DVM, then there is
      * nothing for us to do - the DVM will stand as is */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_FIXED_DVM, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_FIXED_DVM)) {
         /* mark that the daemons have reported so we can proceed - the
          * accounting above already says "nothing to launch" */
         daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
@@ -2665,7 +2721,7 @@ static int setup_virtual_machine(prte_job_t *jdata)
 
     PMIX_CONSTRUCT(&nodes, pmix_list_t);
 
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_EXTEND_DVM, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_EXTEND_DVM)) {
         // nodes have been added, so extend the DVM
         prte_remove_attribute(&jdata->attributes, PRTE_JOB_EXTEND_DVM);
         /* A grow launches daemons on the nodes THIS request added, and only
@@ -2805,8 +2861,8 @@ static int setup_virtual_machine(prte_job_t *jdata)
      * look across all jobs and ensure that the "VM" contains
      * all nodes with application procs on them
      */
-    multi_sim = prte_get_attribute(&jdata->attributes, PRTE_JOB_MULTI_DAEMON_SIM, NULL, PMIX_BOOL);
-    if (prte_get_attribute(&daemons->attributes, PRTE_JOB_NO_VM, NULL, PMIX_BOOL) || multi_sim) {
+    multi_sim = PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_MULTI_DAEMON_SIM);
+    if (multi_sim) {
         /* loop across all nodes and include those that have
          * num_procs > 0 && no daemon already on them
          */
@@ -3110,7 +3166,7 @@ process:
         }
         if (PMIX_RANK_VALID - 1 <= vpid) {
             /* no more daemons available */
-            prte_show_help("help-prte-rmaps-base.txt", "out-of-vpids", true);
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "out-of-vpids", true);
             PMIX_RELEASE(proc);
             PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_OUT_OF_RESOURCE;
@@ -3209,8 +3265,7 @@ process:
     /* if new daemons are being launched, mark that this job
      * caused it to happen */
     if (0 < map->num_new_daemons) {
-        rc = prte_set_attribute(&jdata->attributes, PRTE_JOB_LAUNCHED_DAEMONS, true,
-                                NULL, PMIX_BOOL);
+        rc = prte_set_bool_attribute(&jdata->attributes, PRTE_JOB_LAUNCHED_DAEMONS, true, true);
         if (PRTE_SUCCESS != rc) {
             PRTE_ERROR_LOG(rc);
             free(new_vpids);
@@ -3685,6 +3740,71 @@ static void grow_rollback(prte_grow_campaign_t *camp, pmix_rank_t trigger)
     free(kill);
 }
 
+/* did this job ask for the DVM to grow before it launched? */
+static bool job_asked_to_grow(prte_job_t *jdata)
+{
+    prte_app_context_t *app;
+
+    for (int i = 0; i < jdata->apps->size; i++) {
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i);
+        if (NULL == app) {
+            continue;
+        }
+        if (prte_get_attribute(&app->attributes, PRTE_APP_ADD_HOST, NULL, PMIX_STRING) ||
+            prte_get_attribute(&app->attributes, PRTE_APP_ADD_HOSTFILE, NULL, PMIX_STRING) ||
+            prte_get_attribute(&app->attributes, PRTE_APP_ACTIVATE_HOSTS, NULL, PMIX_STRING)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * The last grow in flight has failed: give back what it was holding.
+ *
+ * An --add-host, --add-hostfile or --activate marks the DVM not-ready and
+ * parks its job in prte_cache, and only the grow's VM_READY re-entry marks it
+ * ready again and drains the cache.  A grow whose daemon never started does
+ * not get there - the campaign is rolled back instead - so the job that asked
+ * waited forever, and so did every job submitted behind it, and so did pterm.
+ *
+ * Answer the jobs that asked for nodes they did not get, and launch the rest,
+ * which were only queued behind the grow.  This is the answer
+ * prte_ras_base_modify gives when a grow request fails before any daemon is
+ * launched, and in the same order: out of the cache first, because draining
+ * it spawns synchronously and would launch a job we are about to fail.
+ */
+static void grow_failed_release_cache(void)
+{
+    pmix_pointer_array_t failed;
+    prte_job_t *jptr;
+    int i;
+
+    PMIX_CONSTRUCT(&failed, pmix_pointer_array_t);
+    pmix_pointer_array_init(&failed, 4, INT_MAX, 4);
+    for (i = 0; i < prte_cache->size; i++) {
+        jptr = (prte_job_t *) pmix_pointer_array_get_item(prte_cache, i);
+        if (NULL != jptr && job_asked_to_grow(jptr)) {
+            /* the cache holds a borrowed pointer - clearing the slot is all
+             * it takes to take the job out of it */
+            pmix_pointer_array_set_item(prte_cache, i, NULL);
+            pmix_pointer_array_add(&failed, jptr);
+        }
+    }
+
+    prte_dvm_ready = true;
+    prte_plm_base_release_cached_jobs();
+
+    for (i = 0; i < failed.size; i++) {
+        jptr = (prte_job_t *) pmix_pointer_array_get_item(&failed, i);
+        if (NULL != jptr) {
+            prte_plm_base_spawn_response(prte_pmix_convert_job_state_to_error(PRTE_JOB_STATE_ALLOC_FAILED),
+                                         jptr);
+        }
+    }
+    PMIX_DESTRUCT(&failed);
+}
+
 bool prte_plm_base_grow_target_failed(pmix_rank_t rank)
 {
     prte_grow_campaign_t *camp;
@@ -3724,6 +3844,10 @@ bool prte_plm_base_grow_target_failed(pmix_rank_t rank)
             PMIX_RELEASE(camp);
             /* any grow failure fails the whole pre-map held-job set */
             prte_plm_base_abort_premap_held();
+            /* and once no grow remains, so do the jobs parked waiting for one */
+            if (pmix_list_is_empty(&prte_grow_campaigns)) {
+                grow_failed_release_cache();
+            }
             return true;
         }
     }

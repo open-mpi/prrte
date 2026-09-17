@@ -89,11 +89,15 @@ typedef struct {
     bool send_ev_active;
     prte_event_t recv_event; /**< registration with event thread for recv events */
     bool recv_ev_active;
-    prte_event_t timer_event; /**< timer for retrying connection failures */
-    bool timer_ev_active;
     pmix_list_t send_queue;        /**< list of messages to send */
     prte_oob_tcp_send_t *send_msg; /**< current send in progress */
     prte_oob_tcp_recv_t *recv_msg; /**< current recv in progress */
+    prte_oob_tcp_handshake_t hshake; /**< the peer's reply to a connection WE opened, as far as it
+                                          has arrived.  Main progress thread only - the handshake
+                                          always runs there - and emptied whenever a new socket is
+                                          made for the peer.  An inbound handshake is read into its
+                                          own conn op instead, since it arrives before we know
+                                          which peer it is. */
 } prte_oob_tcp_peer_t;
 PMIX_CLASS_DECLARATION(prte_oob_tcp_peer_t);
 

@@ -53,9 +53,9 @@ It is **not** a Docker Swarm in the orchestration sense — just ten plain
 | `docker-compose.yml` | The ten nodes `prte-node1`..`prte-node10`, each mounting the shared `prte-build` volume. Every one of those names derives from `$PRTE_SWARM`, so two clones can each run a swarm — see §4. |
 | `elastic.c` | The elastic test client (`elastic` in the install): issues a PMIx allocation request and waits for the phase-two completion event. |
 | *(no file here)* | `build.sh` also compiles [`examples/dynamic.c`](../../examples/dynamic.c) from the main tree as `dynamic` — the only client in this harness that calls `PMIx_Spawn`, and so the only way to get a **parent/child job pair**. See §11. |
-| `dataserver.c` | A bare PMIx client for the publish/lookup service (`dataserver` in the install): publish/lookup/lookupwait/lookup2/unpublish. Drives `src/runtime/data_server`. See §13. |
+| `dataserver.c` | A bare PMIx client for the publish/lookup service (`dataserver` in the install): publish/lookup/lookupwait/lookup2/lookup2wait/pubtimeout/unpublish. Drives `src/runtime/data_server`. See §13. |
 | `jobinfo.c` | A bare PMIx client for the **direct-modex** paths (`jobinfo` in the install): `publish`/`fetch`/`fetchkey`. Drives `src/prted/pmix/pmix_server_fence.c` from a daemon that hosts none of the target job's procs. |
-| `proctable.c` | A bare PMIx client for the **proc-table and server-URI queries** (`proctable` in the install): `procs`/`localprocs`/`serveruri`. Those are the only callers of `prte_pmix_convert_state()`, and the local-vs-global proc-table split has no meaning on one host. Drives `src/pmix`. |
+| `proctable.c` | A bare PMIx client for the **proc-table and server-URI queries** (`proctable` in the install): `procs`/`localprocs`/`departed`/`serveruri`. Those are the only callers of `prte_pmix_convert_state()`, and the local-vs-global proc-table split has no meaning on one host. `departed` lets half the job exit first, which is what tells a table that is *current* from one that is merely the launch message read back. Drives `src/pmix`. |
 | `peerinfo.c` | A bare PMIx client in which every rank asks **every other rank of its own job** where it is (`peerinfo` in the install): rank, app rank, local/node rank, node id, hostname, cpuset, locality string — and device distances, the one key an off-node peer must be *refused*. The only client here that reads a *peer's* reserved keys, and so the only one that reaches the daemon's derive-on-demand path — everything else either reads back what it put itself or asks about the job. Drives `derive_proc_data()` in `src/prted/pmix/pmix_server_fence.c`. See §20. |
 | `groupcon.c` | A bare PMIx client that drives a **group construct/destruct** (`groupcon` in the install): every rank contributes a local cid, asks for a context id, constructs, reads every peer's contribution back, destructs. Drives grpcomm's `grp_release` on daemons that merely *received* the broadcast. See §15. |
 | `groupinv.c` | A bare PMIx client that forms a group by **invitation** and asks for a context id (`groupinv` in the install). The highest rank leads, so mapped by node the leader is never the HNP - which is the point: that method runs no collective, so its leader asks for the id through job control and only the HNP holds the pool, so the request has to be relayed. Drives `PRTE_PMIX_GROUP_CTXID` in `src/prted/pmix`. See §15. |
@@ -334,11 +334,12 @@ in a non-login `docker exec` shell (login shells get it automatically).
 Both `grow` and `shrink` should print
 `PHASE 2 (completion): received event PMIX_DVM_IS_READY` followed by `SUCCESS`.
 
-> **The flag that bites you.** PRRTE gates *all* of the grow/shrink launch-fence
-> and completion-event machinery behind `prte_elastic_mode` (default off).
-> Without `--prtemca prte_elastic_mode 1`, a grow returns phase-1 SUCCESS and
-> even launches daemons, but **never completes** — the client times out after
-> 60s. Always start with the flag.
+> **The flag that bites you.** Only an elastic DVM changes size, and
+> `prte_elastic_mode` is off by default. Without `--prtemca prte_elastic_mode 1`
+> every grow or shrink - `elastic grow`, `--add-host`, `--add-hostfile`,
+> `--activate`, a release that removes a daemon - is refused with
+> "A request to change the size of the DVM was refused". Always start with the
+> flag.
 
 > **Capturing HNP verbose output.** `prte --daemonize` detaches from stdio, so
 > a `>/tmp/prte.out` redirect captures nothing. To trace the HNP, run it in the
@@ -639,6 +640,24 @@ is `proctable`, and it asserts:
 - `PMIX_QUERY_LOCAL_PROC_TABLE` returns *some but not all* of a job's procs.
   On one host "local" and "all" are the same set, so this case cannot exist
   there.
+- a proc that has **departed** is reported as departed. A daemon advances
+  `pid`, `state` and `exit_code` for its own local children and for nothing
+  else — proc states travel *up* to the master and never back down, because
+  no daemon needs a peer's — so the global table answered locally reported
+  every off-node rank with the state the launch message shipped, forever.
+  A rank that had exited seconds ago came back `LAUNCH_UNDERWAY`, and that
+  table is the only signal PRRTE offers for "has this proc gone away".
+  Neither case above catches it: a freshly launched job is one whose stale
+  entries happen to be right.
+
+  The probe is `proctable departed` — ranks 1 and 3 leave, rank 0 asks six
+  seconds later — and it runs **twice**, with the querier once on a
+  non-master node and once on the master. The master's own answer was
+  correct all along, so a case that asks only a non-master cannot tell a
+  fix from a daemon that stopped answering at all; the assertion worth
+  making is that the two placements agree. It also requires the two
+  survivors to still read as alive, since a table that called everything
+  terminated would satisfy the first half.
 - **every daemon serves every node's `PMIX_SERVER_URI`**. The consumer here
   is a **tool**, not a daemon — daemons reach each other over the RML and
   never form PMIx connections to one another; see `examples/tool.c --uri
@@ -1349,6 +1368,8 @@ dataserver publish <key> <value> [session|namespace|local|proc-local|global] [se
 dataserver lookup <key> [secs]           # no wait
 dataserver lookupwait <key> [secs]       # PMIX_WAIT -- parks in the store
 dataserver lookup2 <key1> <key2> [secs]  # the partial-success shape
+dataserver lookup2wait <key1> <key2> [secs]  # PMIX_WAIT for two keys -- one answer, both values
+dataserver pubtimeout <key1> <key2> [secs]   # two publishes carrying PMIX_TIMEOUT; nothing stored under it
 dataserver unpublish <key> [secs]        # publish, confirm, unpublish, confirm gone
 ```
 
