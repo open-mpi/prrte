@@ -16,9 +16,8 @@
 #include "src/include/constants.h"
 #include "src/include/types.h"
 
-#ifdef HAVE_MATH_H
-#    include <math.h>
-#endif
+#include <stdlib.h> /* abs() */
+#include <string.h> /* memcmp() */
 
 #ifndef MIN
 #    define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -94,13 +93,12 @@ static int get_weights(pmix_pif_t *local_if, pmix_pif_t *remote_if)
     int outgoing_interface, ret, weight, has_gateway;
 
     /* pmix_net_get_hostname returns a static buffer.  Great for
-       single address printfs, need to copy in this case */
+       single address printfs, need to copy in this case.  pmix_string_copy
+       guarantees the terminator, so there is nothing to add afterwards. */
     pmix_string_copy(str_local, pmix_net_get_hostname((struct sockaddr *) &local_if->if_addr),
                      sizeof(str_local));
-    str_local[sizeof(str_local) - 1] = '\0';
     pmix_string_copy(str_remote, pmix_net_get_hostname((struct sockaddr *) &remote_if->if_addr),
                      sizeof(str_remote));
-    str_remote[sizeof(str_remote) - 1] = '\0';
 
     /*  initially, assume no connection is possible */
     weight = calculate_weight(0, 0, CQ_NO_CONNECTION);
@@ -149,9 +147,17 @@ static int get_weights(pmix_pif_t *local_if, pmix_pif_t *remote_if)
 
         /* If the ips are identical, assume reachable through loopback. This
            is done artificially due to historical reasons. With this, we can
-           maintain similar behavior to previous implementations. */
-        if (local_ip == remote_ip) {
-            conn_type = "IPv4 SAME NETWORK";
+           maintain similar behavior to previous implementations.
+
+           Compare the addresses, not the pointers holding them: these point
+           into two different pmix_pif_t objects on two different lists, so
+           "local_ip == remote_ip" is never true and this short circuit never
+           fired.  What happened instead is that the pair went to the kernel,
+           which answers a route to one of our own addresses out of `lo` -- a
+           different interface index than the one being scored -- so the pair
+           came back NO CONNECTION where the IPv4 branch says SAME NETWORK. */
+        if (0 == memcmp(local_ip, remote_ip, sizeof(*local_ip))) {
+            conn_type = "IPv6 SAME NETWORK";
             weight = calculate_weight(local_if->if_bandwidth, remote_if->if_bandwidth,
                                       CQ_SAME_NETWORK);
             goto out;
