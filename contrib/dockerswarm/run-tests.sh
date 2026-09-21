@@ -5004,54 +5004,124 @@ test_grpcomm() {
         && ok "...and the DVM still launches an ordinary job afterwards" \
         || bad "the DVM did not run a plain job after the group tests ($n of 3)"
 
-    banner "grpcomm: a requested membership order is applied on every daemon"
-    # PMIX_GROUP_FINAL_MEMBERSHIP_ORDER is one of two construct directives
-    # that hand the DVM an array of procs, and that array belongs to the PMIx
-    # server which delivered the upcall -- PMIx frees it, arrays and all, once
-    # the operation completes.  The daemon has to COPY it into the group
-    # signature, whose destructor frees what it holds; pointing at it instead
-    # is a double free of live heap on every daemon that had a local
-    # participant.  So this case is as much about the DVM being alive
-    # afterwards as it is about the order.
-    #
-    # The order asked for is the ranks reversed, because that is the one
-    # answer the DVM cannot arrive at by accident: with no order given it
-    # sorts the membership itself, so a directive that was dropped on the
-    # floor is indistinguishable from the default unless the order is a
-    # permutation the sort would never produce.
-    out=$(PRUN "--host node1:2,node2:2,node3:2,node4:2 -n 8 --map-by node $GC --order g5" 2>&1)
+    banner "grpcomm: a membership comes back in the order its participants gave"
+    # The membership keeps the order of the procs array the participants
+    # passed. It used to be sorted, and PMIX_GROUP_FINAL_MEMBERSHIP_ORDER
+    # existed only to undo that; both are gone. Every
+    # rank here passes the ranks in reverse, which a sort would undo, and
+    # they are spread one daemon to a node so the order has to survive the
+    # rollup through each of them and the release back down.
+    out=$(PRUN "--host node1:2,node2:2,node3:2,node4:2 -n 8 --map-by node $GC --reverse g6" 2>&1)
     n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
     [ "$n" = 8 ] \
-        && ok "all 8 ranks constructed a group with a final order" \
-        || bad "$n of 8 ranks constructed the ordered group: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        && ok "all 8 ranks constructed a group passing their procs in reverse" \
+        || bad "$n of 8 ranks constructed the reversed group: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
     n=$(echo "$out" | awk '$1=="GRP" && $3=="ORDER" {print $4}' | sort -u | wc -l | tr -d ' ')
     g=$(echo "$out" | awk '$1=="GRP" && $3=="ORDER" {print $4; exit}')
     if [ "$n" != 1 ]; then
         bad "daemons returned $n different membership orders"
     elif [ "$g" = "7,6,5,4,3,2,1,0" ]; then
-        ok "...and every daemon returned the reversed order that was asked for"
+        ok "...and every daemon returned the order the participants passed"
     else
-        bad "the requested order was not applied (got '${g:-nothing}')"
+        bad "the participants' order was not kept (got '${g:-nothing}')"
     fi
     ranks=$(echo "$out" | grep -c 'CID-OK 8')
     [ "$ranks" = 8 ] \
         && ok "...with the whole membership still readable from each rank" \
-        || bad "only $ranks of 8 ranks read back a full set after ordering"
+        || bad "only $ranks of 8 ranks read back a full set in the passed order"
     out=$(PRUN "--host node1:1,node2:1,node3:1 -n 3 --map-by node hostname" 2>&1)
     n=$(echo "$out" | grep -c '^node')
     [ "$n" = 3 ] \
-        && ok "...and every daemon that carried the order is still running" \
-        || bad "the DVM lost a daemon to the ordered construct ($n of 3)"
+        && ok "...and every daemon that carried the construct is still running" \
+        || bad "the DVM lost a daemon to the reversed construct ($n of 3)"
 
     RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     cleanup_swarm
 
     test_grpcomm_invite
     test_grpcomm_ft
+    test_grpcomm_reuse
     test_fence_straggler
     test_fence_early_arrival
     test_low_radix_release
     test_low_radix_release_fault
+}
+
+test_grpcomm_reuse() {
+    local out n first
+
+    banner "grpcomm: a second construct over a reused group ID completes"
+    # A group ID belongs to the application and is legal to reuse once the
+    # operation that used it is over -- MPI_Comm_create_from_group's
+    # stringtag becomes one verbatim, so this is reachable from the top.
+    #
+    # completed_group_ops used to be a boolean "already released" memo,
+    # dropped again by group() on the grounds that a local client starting an
+    # operation proves the previous one of that name is finished.  group()
+    # runs only where a local client starts one, and a group rollup also
+    # passes through daemons that host no member of the group.  On one of
+    # those the entry was never dropped, so grp_recv discarded every
+    # contribution to the SECOND operation of that name and it hung.  It is
+    # now a count of releases per (groupID, op), and the round rides the wire
+    # in the signature.
+    #
+    # Running the job entirely OFF node1 is the whole point of the case.
+    # node1 is the HNP: it relays for a job it hosts no part of, which makes
+    # it exactly the daemon whose memo the old code could never drop.  A run
+    # that puts a rank on node1 passes with the bug present and asserts
+    # nothing, so the placement is checked before the reuse is -- see the
+    # "single-host test wearing a hat" note on the first grpcomm case.
+    cleanup_swarm
+    if ! RUN "test -x $GC"; then
+        skp "groupcon client not installed -- re-run ./build.sh"
+        return
+    fi
+    if ! prted_dvm_start 'node1:1,node2:2,node3:2,node4:2'; then
+        bad "could not start a DVM for the group reuse test"
+        cleanup_swarm
+        return
+    fi
+
+    first=$(PRUN "--host node2:2,node3:2,node4:2 -n 6 --map-by node $GC reusedgrp" 2>&1)
+    n=$(echo "$first" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+    [ "$n" = 6 ] \
+        && ok "the first construct over \"reusedgrp\" completed on all 6 ranks" \
+        || bad "$n of 6 ranks completed the first construct: $(echo "$first" | tr '\n' ' ' | tail -c 300)"
+
+    # If any rank landed on the HNP then group() ran there, the old memo was
+    # dropped, and the reuse below would pass with the bug present.
+    if echo "$first" | awk '$1=="GRP" && $3=="HOST" {print $4}' | sort -u | grep -qx 'node1'; then
+        bad "a rank landed on the HNP -- this case cannot show the bug"
+    else
+        ok "...with the HNP relaying for a job it hosts no part of"
+    fi
+
+    # THE CASE.  Same group ID, same DVM, same HNP with the same stale memo.
+    out=$(PRUN "--host node2:2,node3:2,node4:2 -n 6 --map-by node $GC reusedgrp" 2>&1)
+    n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+    [ "$n" = 6 ] \
+        && ok "...and so did a SECOND construct over the same group ID" \
+        || bad "$n of 6 ranks completed the reused group ID -- a relaying daemon dropped their contributions: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+
+    # ...and it must keep working, not merely survive one extra round.
+    out=$(PRUN "--host node2:2,node3:2,node4:2 -n 6 --map-by node $GC reusedgrp" 2>&1)
+    n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+    [ "$n" = 6 ] \
+        && ok "...and a third, so the count advances rather than just tolerating one reuse" \
+        || bad "$n of 6 ranks completed the third construct over the same group ID"
+
+    # Deliberately not phrased as "the DVM lost a daemon": with the bug
+    # present the collective is still hung when we get here, so what this
+    # reports is that the DVM could not run a follow-on job -- which is true
+    # whether the daemons died or are merely wedged.
+    out=$(PRUN "--host node1:1,node2:1,node3:1 -n 3 --map-by node hostname" 2>&1)
+    n=$(echo "$out" | grep -c '^node')
+    [ "$n" = 3 ] \
+        && ok "...and the DVM still runs a follow-on job afterwards" \
+        || bad "the DVM could not run a follow-on job after the reuse ($n of 3)"
+
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
 }
 
 test_fence_early_arrival() {

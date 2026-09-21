@@ -29,6 +29,8 @@
 #include "prte_config.h"
 #include "constants.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <string.h>
 
 #include "src/hwloc/hwloc-internal.h"
@@ -61,6 +63,33 @@ static int map_colocate(prte_job_t *jdata,
 static void inherit_env_directives(prte_job_t *jdata,
                                    prte_job_t *parent,
                                    pmix_proc_t *proxy);
+
+/* Parse the count half of a ppr pattern ("N:<object>") - the number of procs
+ * to place on each resource. It is multiplied by an object count into an int,
+ * so it has to be a positive integer that fits one. A bare strtoul() did not
+ * check: "-2" came back as a huge unsigned that truncated to -2 and gave the
+ * ppr mapper a NEGATIVE process count, a value past INT_MAX wrapped silently
+ * to whatever the low bits said, and non-numeric text became zero - which the
+ * mapper reads as "this app named no pattern" and quietly maps by the job's.
+ * Returns false for anything else; the caller reports it, because the job and
+ * the app have different things to say about where the bad spelling came
+ * from. */
+static bool ppr_count(const char *str, int *cnt)
+{
+    char *endptr;
+    unsigned long val;
+
+    if (NULL == str || '\0' == str[0]) {
+        return false;
+    }
+    errno = 0;
+    val = strtoul(str, &endptr, 10);
+    if (0 != errno || '\0' != *endptr || 0 == val || (unsigned long) INT_MAX < val) {
+        return false;
+    }
+    *cnt = (int) val;
+    return true;
+}
 
 /* Translate the object half of a ppr pattern ("N:<object>") into the hwloc
  * object type and binding depth the mappers work against. Returns false if
@@ -241,8 +270,6 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
     bool have_map, have_rank, have_bind;
     prte_mapping_policy_t appmap = 0;
 
-    PRTE_HIDE_UNUSED_PARAMS(jdata);
-
     /* 1. PRTE_APP_MAPBY → opts->map plus the object type/depth and span/ordered
      * directives that flow from the mapping policy.  We store the bare policy
      * in opts->map (matching the job-level convention) and capture the full
@@ -312,13 +339,13 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
             NULL != str) {
             char **pk = PMIx_Argv_split(str, ':');
             if (2 != PMIx_Argv_count(pk) ||
+                !ppr_count(pk[0], &opts->pprn) ||
                 !ppr_object(pk[1], &opts->maptype, &opts->mapdepth, &opts->map_device)) {
                 prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-ppr.txt", "invalid-ppr", true, str);
                 PMIx_Argv_free(pk);
                 free(str);
                 return PRTE_ERR_SILENT;
             }
-            opts->pprn = strtoul(pk[0], NULL, 10);
             PMIx_Argv_free(pk);
             free(str);
         }
@@ -381,7 +408,7 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
         opts->limit = u16;
     }
 
-    /* 9. Ranking: an explicit per-app --rank-by wins.  Otherwise, when the app
+    /* 12. Ranking: an explicit per-app --rank-by wins.  Otherwise, when the app
      * supplied its own mapping policy, derive the ranking default from that
      * policy rather than inheriting the job-level ranking (which followed the
      * job map).  When the app changed neither, the job-level ranking stands. */
@@ -392,7 +419,7 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
         opts->rank = prte_rmaps_base_derive_ranking(appmap);
     }
 
-    /* 10. Binding: an explicit per-app --bind-to wins (carrying its overload
+    /* 13. Binding: an explicit per-app --bind-to wins (carrying its overload
      * directive).  Otherwise, when the app supplied its own mapping policy,
      * recompute the default binding from that policy.  We deliberately do not
      * disable binding here just because oversubscription is permitted: like
@@ -617,6 +644,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     prte_attr_state_t astate;
     bool map_succeeded = false;
     prte_mapping_policy_t job_oversub = 0;
+    bool job_nolocal = false;
 
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
@@ -629,15 +657,20 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     options.verbosity = 5;  // usual value for base-level functions
     // set and check convenience vars
     jdata = caddy->jdata;
+    /* the map has to exist before the first "goto cleanup" can run: the
+     * cleanup label walks jdata->map->nodes to reset the flags this map
+     * set, and a job that arrives here without a map - every job that has
+     * not been mapped before - would take the HNP down inside its own
+     * error handler */
+    if (NULL == jdata->map) {
+        jdata->map = PMIX_NEW(prte_job_map_t);
+    }
     schizo = (prte_schizo_base_module_t*)jdata->schizo;
     if (NULL == schizo) {
         prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "missing-personality", true,
                        PRTE_JOBID_PRINT(jdata->nspace));
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
         goto cleanup;
-    }
-    if (NULL == jdata->map) {
-        jdata->map = PMIX_NEW(prte_job_map_t);
     }
     jdata->state = PRTE_JOB_STATE_MAP;
 
@@ -654,6 +687,24 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
         options.limit = u16;
         // reset any prior counters
         prte_hwloc_base_reset_counters();
+    } else {
+        /* an app may carry a limit of its own, and the per-object counters
+         * bind_generic keeps live on the hwloc objects for the life of the
+         * DVM. Only a limit job bumps them, so only a limit job has to clear
+         * them - but the per-app spelling counts just as much as the job-level
+         * one. Without this, a second "--bind-to <obj>:limit=N" app found
+         * every object already standing at its limit from the previous job
+         * and could not be bound at all. */
+        for (n = 0; n < jdata->apps->size; n++) {
+            app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, n);
+            if (NULL == app) {
+                continue;
+            }
+            if (prte_get_attribute(&app->attributes, PRTE_APP_BINDING_LIMIT, NULL, PMIX_UINT16)) {
+                prte_hwloc_base_reset_counters();
+                break;
+            }
+        }
     }
 
     /* an app's mapping spec may carry a qualifier that describes the whole
@@ -662,7 +713,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
      * The oversubscription answer is applied further down, once the job's
      * mapping policy has been resolved (that resolution assigns the whole
      * policy word and would otherwise overwrite it) */
-    rc = prte_rmaps_base_hoist_job_directives(jdata, &job_oversub);
+    rc = prte_rmaps_base_hoist_job_directives(jdata, &job_oversub, &job_nolocal);
     if (PRTE_SUCCESS != rc) {
         // the error message has been printed
         jdata->exit_code = rc;
@@ -679,7 +730,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
      */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DEBUG_DAEMONS_PER_NODE, (void **) &u16ptr, PMIX_UINT16)) {
         procs_per_target = u16;
-        if (procs_per_target == 0) {
+        if (0 == procs_per_target) {
             pmix_output(0, "Error: PRTE_JOB_DEBUG_DAEMONS_PER_NODE value %u == 0\n", procs_per_target);
             jdata->exit_code = PRTE_ERR_BAD_PARAM;
             PRTE_ERROR_LOG(jdata->exit_code);
@@ -699,7 +750,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             goto cleanup;
         }
         procs_per_target = u16;
-        if (procs_per_target == 0) {
+        if (0 == procs_per_target) {
             pmix_output(0, "Error: PRTE_JOB_DEBUG_DAEMONS_PER_PROC value %u == 0\n", procs_per_target);
             jdata->exit_code = PRTE_ERR_BAD_PARAM;
             PRTE_ERROR_LOG(jdata->exit_code);
@@ -717,10 +768,12 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
             goto cleanup;
         }
-        /* store the target as a pmix_data_array_t */
+        /* store the target as a pmix_data_array_t. The attribute handed us
+         * a copy of the proc, so hand it back once it has been transferred */
         PMIX_DATA_ARRAY_CREATE(darray, 1, PMIX_PROC);
         pptr = (pmix_proc_t*)darray->array;
         PMIX_XFER_PROCID(&pptr[0], target_proc);
+        PMIX_PROC_RELEASE(target_proc);
     }
 
     /* asking for the colocation targets is what allocates them, so a job
@@ -748,7 +801,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     }
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_COLOCATE_NPERNODE, (void **) &u16ptr, PMIX_UINT16)) {
         procs_per_target = u16;
-        if (procs_per_target == 0) {
+        if (0 == procs_per_target) {
             pmix_output(0, "Error: PRTE_JOB_COLOCATE_NUM_PROC WITH ZERO PROCS/TARGET\n");
             jdata->exit_code = PRTE_ERR_BAD_PARAM;
             PRTE_ERROR_LOG(jdata->exit_code);
@@ -767,7 +820,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             goto cleanup;
         }
         procs_per_target = u16;
-        if (procs_per_target == 0) {
+        if (0 == procs_per_target) {
             pmix_output(0, "Error: PRTE_JOB_COLOCATE_NUM_PROC WITH ZERO PROCS/TARGET\n");
             jdata->exit_code = PRTE_ERR_BAD_PARAM;
             PRTE_ERROR_LOG(jdata->exit_code);
@@ -1063,6 +1116,11 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
         }
         PRTE_SET_MAPPING_DIRECTIVE(jdata->map->mapping, PRTE_MAPPING_SUBSCRIBE_GIVEN);
     }
+    /* likewise the nolocal answer hoisted off the apps - it too had to wait
+     * for the policy word to be settled before it could be written into it */
+    if (job_nolocal) {
+        PRTE_SET_MAPPING_DIRECTIVE(jdata->map->mapping, PRTE_MAPPING_NO_USE_LOCAL);
+    }
 
     /* we always inherit a parent's oversubscribe flag unless the job assigned it */
     if (NULL != parent &&
@@ -1131,7 +1189,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
         options.use_hwthreads = true;
     }
 
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PROCESSORS, (void*)&tmp, PMIX_STRING)) {
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PROCESSORS, (void **) &tmp, PMIX_STRING)) {
         prte_ras_base_display_cpus(jdata, tmp);
         free(tmp);
     }
@@ -1148,7 +1206,14 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
             goto cleanup;
         }
         /* compute the #procs per resource */
-        options.pprn = strtoul(ck[0], NULL, 10);
+        if (!ppr_count(ck[0], &options.pprn)) {
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-ppr.txt", "invalid-ppr", true, tmp);
+            free(tmp);
+            PMIx_Argv_free(ck);
+            jdata->exit_code = PRTE_ERR_SILENT;
+            PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
+            goto cleanup;
+        }
         if (!ppr_object(ck[1], &options.maptype, &options.mapdepth, &options.map_device)) {
             /* unknown spec */
             prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-ppr.txt", "unrecognized-ppr-option", true,
@@ -1166,7 +1231,7 @@ void prte_rmaps_base_map_job(int fd, short args, void *cbdata)
     /* add up all the expected procs */
     for (n = 0; n < jdata->apps->size; n++) {
         app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, n);
-        if (NULL == app ) {
+        if (NULL == app) {
             continue;
         }
         if (0 < app->num_procs) {
@@ -1555,7 +1620,7 @@ ranking:
 
     if (colocate_daemons || colocate) {
         /* This is a colocation request, so we don't run any mapping modules */
-        if (procs_per_target == 0) {
+        if (0 == procs_per_target) {
             pmix_output(0, "Error: COLOCATION REQUESTED WITH ZERO PROCS/TARGET\n");
             jdata->exit_code = PRTE_ERR_BAD_PARAM;
             PRTE_ERROR_LOG(jdata->exit_code);
@@ -1666,6 +1731,13 @@ ranking:
                     break;
                 }
                 if (PRTE_ERR_RESOURCE_BUSY == rc) {
+                    /* the app was mapped, but nothing could be placed for
+                     * launch - say so, exactly as the whole-job dispatch
+                     * does, rather than failing the job with no explanation
+                     * and no exit code of its own */
+                    prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt",
+                                   "cannot-launch", true);
+                    jdata->exit_code = rc;
                     PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_MAP_FAILED);
                     goto cleanup;
                 }
@@ -1846,7 +1918,7 @@ static int map_colocate(prte_job_t *jdata,
                         uint16_t procs_per_target,
                         prte_rmaps_options_t *options)
 {
-    char *tmp;
+    char *tmp = NULL;
     pmix_status_t rc;
     size_t n, nprocs;
     pmix_proc_t *procs;
@@ -1869,16 +1941,40 @@ static int map_colocate(prte_job_t *jdata,
             pmix_output(0, "%s rmaps: mapping job %s: Colocate with\n  %s",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         PRTE_JOBID_PRINT(jdata->nspace), tmp);
+            /* only a successful print allocated anything - the failure
+             * returns leave the output pointer untouched */
+            free(tmp);
         }
-        free(tmp);
+    }
+    /* The array reaches us straight off a tool's spawn request, so nothing
+     * upstream has established that it holds what we are about to read it
+     * as. Reading a differently-typed array as procs walks off the end of
+     * the caller's allocation. */
+    if (PMIX_PROC != darray->type || NULL == darray->array || 0 == darray->size) {
+        pmix_output(0, "Error: colocation target list is not a list of processes\n");
+        return PRTE_ERR_BAD_PARAM;
     }
     procs = (pmix_proc_t*)darray->array;
     nprocs = darray->size;
     map = jdata->map;
     if (daemons) {
-        /* daemons are never bound and always rank by-slot */
+        /* Daemons are never bound and always rank by-slot.
+         *
+         * This has to be said in "options" as well as on the map. By the
+         * time we are called, prte_rmaps_base_map_job() has already read
+         * jdata->map into options.bind/options.rank, and those copies are
+         * what the placement actually consults - prte_rmaps_base_bind_proc()
+         * dispatches on options->bind and prte_rmaps_base_compute_vpids()
+         * on options->rank. Writing only to the map left both saying
+         * whatever the job derived: the colocated daemons were bound (to a
+         * core, by default), which both takes cpus away from the very
+         * processes they were colocated with and fails the whole colocation
+         * outright on a node with no free cpu to give them. */
         PRTE_SET_BINDING_POLICY(map->binding, PRTE_BIND_TO_NONE);
+        options->bind = PRTE_BIND_TO_NONE;
+        options->hwb = HWLOC_OBJ_MACHINE;
         PRTE_SET_RANKING_POLICY(map->ranking, PRTE_RANK_BY_SLOT);
+        options->rank = PRTE_RANK_BY_SLOT;
     }
     jdata->num_procs = 0;
 
@@ -1894,6 +1990,14 @@ static int map_colocate(prte_job_t *jdata,
                 goto done;
             }
             target_map = target_jdata->map;
+            if (NULL == target_map) {
+                /* the nspace exists but was never mapped - a tool's job
+                 * tracker, or a job that has not reached MAP yet - so it
+                 * has no nodes to colocate against */
+                pmix_output(0, "App job %s has not been mapped\n", procs[n].nspace);
+                ret = PRTE_ERR_BAD_PARAM;
+                goto done;
+            }
             for (i = 0; i < target_map->nodes->size; i++) {
                 node = (prte_node_t*)pmix_pointer_array_get_item(target_map->nodes, i);
                 if (NULL == node) {
@@ -2083,7 +2187,14 @@ static int map_colocate(prte_job_t *jdata,
     ret = prte_rmaps_base_compute_vpids(jdata, options, -1, NULL);
 
 done:
-    // ensure all the nodes are marked as not mapped
+    /* ensure all the nodes are marked as not mapped - the target list has
+     * to be swept as well as the map, because an error exit from the scan
+     * that builds it leaves the flag set on nodes that never reached the
+     * map, and the next colocation reads that flag as "already collected"
+     * and silently leaves those nodes out */
+    PMIX_LIST_FOREACH(nptr, &targets, prte_node_t) {
+        PRTE_FLAG_UNSET(nptr, PRTE_NODE_FLAG_MAPPED);
+    }
     for (i=0; i < map->nodes->size; i++) {
         node = (prte_node_t*)pmix_pointer_array_get_item(map->nodes, i);
         if (NULL != node) {
@@ -2117,7 +2228,7 @@ static void inherit_env_directives(prte_job_t *jdata,
         // do we have a matching attribute in the new job?
         exists = false;
         PMIX_LIST_FOREACH(attr2, &jdata->attributes, prte_attribute_t) {
-            if (PMIX_ENVAR != attr->data.type) {
+            if (PMIX_ENVAR != attr2->data.type) {
                 continue;
             }
             val2 = &attr2->data;
@@ -2170,7 +2281,7 @@ static void inherit_env_directives(prte_job_t *jdata,
 
             exists = false;
             PMIX_LIST_FOREACH(attr2, &app2->attributes, prte_attribute_t) {
-                if (PMIX_ENVAR != attr->data.type) {
+                if (PMIX_ENVAR != attr2->data.type) {
                     continue;
                 }
                 val2 = &attr2->data;
