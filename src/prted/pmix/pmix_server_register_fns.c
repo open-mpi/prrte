@@ -106,8 +106,7 @@ static void _nspace_reg_done(int sd, short args, void *cbdata)
      * have not published yet - so it has to mean "PMIx has our answer",
      * not "we have finished assembling it". */
     if (PMIX_SUCCESS == cd->status && NULL != cd->jdata) {
-        prte_set_attribute(&cd->jdata->attributes, PRTE_JOB_NSPACE_REGISTERED,
-                           PRTE_ATTR_LOCAL, NULL, PMIX_BOOL);
+        prte_set_bool_attribute(&cd->jdata->attributes, PRTE_JOB_NSPACE_REGISTERED, PRTE_ATTR_LOCAL, true);
     }
 
     if (NULL != cd->cbfunc) {
@@ -167,7 +166,8 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
     pmix_topology_t topo;
     prte_job_t *parent = NULL;
     pmix_data_array_t darray, lparray;
-    bool flag, *fptr, newpset;
+    bool flag, newpset;
+    prte_attr_state_t astate;
 
     pmix_output_verbose(2, prte_pmix_server_globals.output,
                         "%s register nspace for %s",
@@ -335,6 +335,15 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
             }
             /* construct the node info array */
             PMIX_INFO_LIST_START(iarray);
+            if (NULL == iarray) {
+                PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+                if (NULL != tmp) {
+                    free(tmp);
+                }
+                PMIX_INFO_LIST_RELEASE(info);
+                rc = PRTE_ERR_OUT_OF_RESOURCE;
+                goto errout;
+            }
             /* start with the hostname */
             PMIX_INFO_LIST_ADD(ret, iarray, PMIX_HOSTNAME, node->name, PMIX_STRING);
             /* add any aliases */
@@ -367,8 +376,21 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
             if (PRTE_FLAG_TEST(node, PRTE_NODE_FLAG_OVERSUBSCRIBED)) {
                 PMIX_INFO_LIST_ADD(ret, iarray, PMIX_NODE_OVERSUBSCRIBED, NULL, PMIX_BOOL);
             }
-            /* add to the overall payload */
+            /* Add to the overall payload.  The conversion is the one place
+             * the adds above are answerable: an info list carries the first
+             * failure any add onto it hit, and reports it here.  Without this
+             * test the whole array goes in empty - not one key missing but
+             * every key of every node - under a registration that reports
+             * success. */
             PMIX_INFO_LIST_CONVERT(ret, iarray, &darray);
+            if (PMIX_SUCCESS != ret) {
+                PMIX_ERROR_LOG(ret);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
+                PMIX_INFO_LIST_RELEASE(iarray);
+                PMIX_INFO_LIST_RELEASE(info);
+                rc = prte_pmix_convert_status(ret);
+                goto errout;
+            }
             PMIX_INFO_LIST_ADD(ret, info, PMIX_NODE_INFO_ARRAY, &darray, PMIX_DATA_ARRAY);
             PMIX_DATA_ARRAY_DESTRUCT(&darray);
             PMIX_INFO_LIST_RELEASE(iarray);
@@ -484,24 +506,38 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
     // job session dir will have been stored in the jdata object
     PMIX_INFO_LIST_ADD(ret, info, PMIX_NSDIR, jdata->session_dir, PMIX_STRING);
 
-    /* check for output directives */
-    fptr = &flag;
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT, (void**)&fptr, PMIX_BOOL)) {
+    /* check for output directives.  Each of these is published with the
+     * value it was given and omitted when nobody has set it - "off" and
+     * "nobody said" are different answers, and only the first is ours to
+     * state on the job's behalf. */
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_TAG_OUTPUT, &flag, PMIX_BOOL);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT_DETAILED, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT_DETAILED);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_TAG_DETAILED_OUTPUT, &flag, PMIX_BOOL);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT_FULLNAME, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_TAG_OUTPUT_FULLNAME);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_TAG_FULLNAME_OUTPUT, &flag, PMIX_BOOL);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_RANK_OUTPUT, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_RANK_OUTPUT);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_RANK_OUTPUT, &flag, PMIX_BOOL);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TIMESTAMP_OUTPUT, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_TIMESTAMP_OUTPUT);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_TIMESTAMP_OUTPUT, &flag, PMIX_BOOL);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_XML_OUTPUT, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_XML_OUTPUT);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_XML_OUTPUT, &flag, PMIX_BOOL);
     }
 #ifdef PMIX_IOF_INHERIT
@@ -514,7 +550,7 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
      *
      * Sent only to say NO: absence means inherit, on both sides of the
      * interface, so a job with no opinion adds nothing to the wire. */
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_NO_IOF_INHERIT, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_NO_IOF_INHERIT)) {
         bool noinherit = false;
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_INHERIT, &noinherit, PMIX_BOOL);
     }
@@ -531,24 +567,34 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
         PMIX_INFO_LIST_ADD(ret, info, PMIX_OUTPUT_TO_DIRECTORY, tmp, PMIX_STRING);
         free(tmp);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_NOCOPY, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_NOCOPY);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_OUTPUT_NOCOPY, &flag, PMIX_BOOL);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_FILE_PATTERN, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_OUTPUT_FILE_PATTERN);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         /* PMIx expands the pattern when it opens the sink, so the flag has to
          * reach the nspace it will read the filename from */
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_FILE_PATTERN, &flag, PMIX_BOOL);
     }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_MERGE_STDERR_STDOUT, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_MERGE_STDERR_STDOUT);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_MERGE_STDERR_STDOUT, &flag, PMIX_BOOL);
     }
 
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_RAW_OUTPUT, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_RAW_OUTPUT);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_IOF_OUTPUT_RAW, &flag, PMIX_BOOL);
     }
 
     // check for GPU directives
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_GPU_SUPPORT, (void**)&fptr, PMIX_BOOL)) {
+    astate = prte_get_bool_attribute(&jdata->attributes, PRTE_JOB_GPU_SUPPORT);
+    if (PRTE_ATTR_NOT_SET != astate) {
+        flag = (PRTE_ATTR_TRUE == astate);
         PMIX_INFO_LIST_ADD(ret, info, PMIX_GPU_SUPPORT, &flag, PMIX_BOOL);
     }
 
@@ -558,6 +604,12 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
             continue;
         }
         PMIX_INFO_LIST_START(iarray);
+        if (NULL == iarray) {
+            PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            PMIX_INFO_LIST_RELEASE(info);
+            rc = PRTE_ERR_OUT_OF_RESOURCE;
+            goto errout;
+        }
         /* start with the app number */
         PMIX_INFO_LIST_ADD(ret, iarray, PMIX_APPNUM, &app->idx, PMIX_UINT32);
         /* add the app size */
@@ -642,8 +694,17 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
             }
             PMIX_LIST_DESTRUCT(&members);
         }
-        /* add to the main payload */
+        /* add to the main payload - see the node array above for why the
+         * conversion is checked */
         PMIX_INFO_LIST_CONVERT(ret, iarray, &darray);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            PMIX_DATA_ARRAY_DESTRUCT(&darray);
+            PMIX_INFO_LIST_RELEASE(iarray);
+            PMIX_INFO_LIST_RELEASE(info);
+            rc = prte_pmix_convert_status(ret);
+            goto errout;
+        }
         PMIX_INFO_LIST_ADD(ret, info, PMIX_APP_INFO_ARRAY, &darray, PMIX_DATA_ARRAY);
         PMIX_DATA_ARRAY_DESTRUCT(&darray);
         PMIX_INFO_LIST_RELEASE(iarray);
@@ -710,6 +771,12 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
             }
             /* setup the proc map object */
             PMIX_INFO_LIST_START(pmap);
+            if (NULL == pmap) {
+                PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+                PMIX_INFO_LIST_RELEASE(info);
+                rc = PRTE_ERR_OUT_OF_RESOURCE;
+                goto errout;
+            }
 
             /* must start with rank */
             PMIX_INFO_LIST_ADD(ret, pmap, PMIX_RANK, &pptr->name.rank, PMIX_PROC_RANK);
@@ -859,7 +926,16 @@ int prte_pmix_server_register_nspace(prte_job_t *jdata,
                 PMIX_INFO_LIST_ADD(ret, pmap, PMIX_DEVICE_ID, devarray, PMIX_DATA_ARRAY);
                 PMIX_DATA_ARRAY_FREE(devarray);
             }
+            /* see the node array above for why the conversion is checked */
             PMIX_INFO_LIST_CONVERT(ret, pmap, &darray);
+            if (PMIX_SUCCESS != ret) {
+                PMIX_ERROR_LOG(ret);
+                PMIX_DATA_ARRAY_DESTRUCT(&darray);
+                PMIX_INFO_LIST_RELEASE(pmap);
+                PMIX_INFO_LIST_RELEASE(info);
+                rc = prte_pmix_convert_status(ret);
+                goto errout;
+            }
             PMIX_INFO_LIST_ADD(ret, info, PMIX_PROC_INFO_ARRAY, &darray, PMIX_DATA_ARRAY);
             PMIX_DATA_ARRAY_DESTRUCT(&darray);
             PMIX_INFO_LIST_RELEASE(pmap);

@@ -239,7 +239,7 @@ static void job_errors(int fd, short args, void *cbdata)
              * daemons fail to start would only bury it. */
             if (PRTE_JOB_STATE_FAILED_TO_START == jdata->state
                 || PRTE_JOB_STATE_FAILED_TO_LAUNCH == jdata->state) {
-                prte_show_help("help-errmgr-base.txt", "failed-daemon-launch",
+                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-errmgr-base.txt", "failed-daemon-launch",
                                true, prte_tool_basename);
             }
             prte_routing_is_enabled = false;
@@ -254,7 +254,7 @@ static void job_errors(int fd, short args, void *cbdata)
          * likely already output an error message */
         if (PRTE_JOB_STATE_ABORTED == jobstate && jdata->num_procs != jdata->num_reported) {
             prte_routing_is_enabled = false;
-            prte_show_help("help-errmgr-base.txt", "failed-daemon", true);
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-errmgr-base.txt", "failed-daemon", true);
         }
         /* there really isn't much else we can do since the problem
          * is in the DVM itself, so best just to terminate */
@@ -520,13 +520,23 @@ static void proc_errors(int fd, short args, void *cbdata)
                      * A daemon we have never placed has no node, and this
                      * message is the last thing that should turn a lost
                      * daemon into a segfault in the HNP */
-                    prte_show_help("help-errmgr-base.txt", "node-died", true,
+                    prte_show_help(PRTE_JOB_NSPACE(jdata), "help-errmgr-base.txt", "node-died", true,
                                    PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), prte_process_info.nodename,
                                    PRTE_NAME_PRINT(proc),
                                    NULL == pptr->node ? "unknown" : pptr->node->name);
                 }
 
-                if (PRTE_SUCCESS == prte_rml_route_lost(proc->rank)) {
+                /* A daemon that never started while the DVM was first forming
+                 * cannot be routed around.  The route repair below succeeds
+                 * for any daemon the HNP loses, and continuing is right for
+                 * one that dies under a running DVM - its node's procs are
+                 * marked gone and their jobs end.  But nothing has been mapped
+                 * yet while the DVM forms: the launch is waiting for this
+                 * daemon to report, it never will, and there are no procs
+                 * whose termination could end that wait.  prterun sat there
+                 * until killed, having already said the daemon had failed. */
+                if ((prte_dvm_started || PRTE_PROC_STATE_FAILED_TO_START != state) &&
+                    PRTE_SUCCESS == prte_rml_route_lost(proc->rank)) {
                     /* Mark all procs on the lost daemon's node as gone.  This
                      * used to be guarded by "am I rank 0", standing in for "am
                      * I the HNP" - which this component always is, so the test
@@ -637,8 +647,8 @@ keep_going:
     }
 
     /* simplify later checks */
-    flag = (prte_get_attribute(&jdata->attributes, PRTE_JOB_RECOVERABLE, NULL, PMIX_BOOL) ||
-            prte_get_attribute(&jdata->attributes, PRTE_JOB_CONTINUOUS, NULL, PMIX_BOOL));
+    flag = (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_RECOVERABLE) ||
+            PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_CONTINUOUS));
 
     /* ensure we record the failed proc properly so we can report
      * the error once we terminate
@@ -835,7 +845,7 @@ keep_going:
         ++i32;
         prte_set_attribute(&jdata->attributes, PRTE_JOB_NUM_NONZERO_EXIT, PRTE_ATTR_LOCAL, i32ptr,
                            PMIX_INT32);
-        if (flag && prte_get_attribute(&jdata->attributes, PRTE_JOB_ERROR_NONZERO_EXIT, NULL, PMIX_BOOL)) {
+        if (flag && PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_ERROR_NONZERO_EXIT)) {
             check_send_notification(jdata, pptr, PMIX_ERR_EXIT_NONZERO_TERM);
             // recover the resources used by this proc
             prte_state_base_recover_resources(jdata, pptr);
@@ -891,7 +901,7 @@ static void check_send_notification(prte_job_t *jdata,
                         PMIx_Error_string(event),
                         PRTE_NAME_PRINT(&proc->name));
 
-    if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_NOTIFY_ERRORS, NULL, PMIX_BOOL) ||
+    if (!PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_NOTIFY_ERRORS) ||
         prte_dvm_abort_ordered) {
         return;
     }

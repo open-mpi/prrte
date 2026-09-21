@@ -214,7 +214,7 @@ static int plm_slurm_init(void)
      * so the mapper has something to work with
      */
     jdata = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         prte_plm_globals.daemon_nodes_assigned_at_launch = true;
     } else {
         /* we do NOT assign daemons to nodes at launch - we will
@@ -295,7 +295,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
      * launch the daemons - the user really wants to just
      * look at the proposed process map
      */
-    if (prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         /* set the state to indicate the daemons reported - this
          * will trigger the daemons_reported event and cause the
          * job to move to the following step
@@ -406,7 +406,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
         PMIx_Argv_append_nosize(&nodelist_argv, node->name);
     }
     if (0 == PMIx_Argv_count(nodelist_argv)) {
-        prte_show_help("help-plm-slurm.txt", "no-hosts-in-list", true);
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-slurm.txt", "no-hosts-in-list", true);
         rc = PRTE_ERR_FAILED_TO_START;
         goto cleanup;
     }
@@ -642,7 +642,7 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
     /* need to check that we are at least version 17.11 */
     slurm = prte_common_slurm_version();
     if (slurm->ancient) {
-        prte_show_help("help-plm-slurm.txt", "ancient-version", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-slurm.txt", "ancient-version", true,
                        slurm->major, slurm->minor);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
         free(job_id);
@@ -689,7 +689,7 @@ static void srun_wait_cb(int sd, short fd, void *cbdata)
         /* an orted must have died unexpectedly - report
          * that the daemon has failed so we exit
          */
-        prte_show_help("help-plm-slurm.txt", "srun-failed", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-slurm.txt", "srun-failed", true,
                        proc->exit_code);
         PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_DAEMONS_TERMINATED);
     } else {
@@ -748,7 +748,7 @@ static int plm_slurm_start_proc(int argc, char **argv,
     PRTE_HIDE_UNUSED_PARAMS(argc);
 
     if (NULL == exec_argv) {
-        prte_show_help("help-plm-slurm.txt", "no-srun", true);
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-slurm.txt", "no-srun", true);
         return PRTE_ERR_SILENT;
     }
 

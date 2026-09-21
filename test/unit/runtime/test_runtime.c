@@ -76,6 +76,7 @@
 #include "src/runtime/prte_worker_pool.h"
 #include "src/runtime/runtime.h"
 #include "src/util/attr.h"
+#include "src/util/nidmap.h"
 #include "src/util/proc_info.h"
 
 #include "src/runtime/data_server/ds.h"
@@ -218,6 +219,65 @@ static int test_job_registry(void)
     j1 = make_job("job.three");
     CHECK("job: the vacated slot is reused", PRTE_SUCCESS == prte_set_job_data_object(j1));
     CHECK("job: reuse lands in the freed slot", saved_index == j1->index);
+
+    reset_globals();
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
+/* the grow catch-up                                                  */
+/* ------------------------------------------------------------------ */
+
+/* A job registered to launch, whose launch message has not gone out yet, is
+ * not caught up to the daemons with a grow's VM_READY message.  It will be
+ * sent to every daemon in its own launch message, and a daemon that already
+ * holds the namespace cannot take that message - so a catch-up copy made
+ * the job launch nowhere but on the master.  The launch fence holds exactly
+ * such jobs across a grow and admits them after the grow's catch-up. */
+static int test_job_catchup_skips_pending_launch(void)
+{
+    int failures = 0;
+    prte_job_t *dvm, *pending, *tool;
+    pmix_data_buffer_t buf;
+    int32_t njobs, cnt;
+    int rc;
+
+    reset_globals();
+
+    /* slot 0 is the DVM's own job, which the catch-up never packs */
+    dvm = make_job("catchup.dvm");
+    CHECK("catchup: register the DVM job", PRTE_SUCCESS == prte_set_job_data_object(dvm));
+    CHECK("catchup: the DVM job holds slot 0", 0 == dvm->index);
+
+    pending = make_job("catchup.pending");
+    PRTE_FLAG_SET(pending, PRTE_JOB_FLAG_LAUNCH_PENDING);
+    CHECK("catchup: register the held job", PRTE_SUCCESS == prte_set_job_data_object(pending));
+
+    tool = make_job("catchup.tool");
+    PRTE_FLAG_SET(tool, PRTE_JOB_FLAG_TOOL);
+    CHECK("catchup: register a tool", PRTE_SUCCESS == prte_set_job_data_object(tool));
+
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    rc = prte_util_pack_job_catchup(&buf, NULL);
+    CHECK("catchup: packing succeeds", PRTE_SUCCESS == rc);
+    cnt = 1;
+    njobs = -1;
+    rc = PMIx_Data_unpack(NULL, &buf, &njobs, &cnt, PMIX_INT32);
+    CHECK("catchup: the count unpacks", PMIX_SUCCESS == rc);
+    CHECK("catchup: a job still to be launched is not caught up", 0 == njobs);
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
+
+    /* once its launch message is out, a daemon joining later does need it -
+     * the count is packed ahead of the jobs themselves, so read only that */
+    PRTE_FLAG_UNSET(pending, PRTE_JOB_FLAG_LAUNCH_PENDING);
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    (void) prte_util_pack_job_catchup(&buf, tool);
+    cnt = 1;
+    njobs = -1;
+    rc = PMIx_Data_unpack(NULL, &buf, &njobs, &cnt, PMIX_INT32);
+    CHECK("catchup: the count unpacks again", PMIX_SUCCESS == rc);
+    CHECK("catchup: a launched job is caught up", 1 == njobs);
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
 
     reset_globals();
     return failures;
@@ -470,6 +530,89 @@ static int test_proc_lookups(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* proc runtime-state authority                                       */
+/* ------------------------------------------------------------------ */
+
+/* A daemon's copy of a job carries a prte_proc_t for every proc, but it
+ * only ever advances pid, state and exit_code for the procs it hosts:
+ * nothing sends a peer daemon's updates back down the tree, because no
+ * daemon needs them.  So the entry for a proc on another node keeps the
+ * launch message's snapshot for the life of the DVM, and reading it
+ * yields a plausible-looking lie - PMIX_QUERY_PROC_TABLE reported a rank
+ * that had exited long ago as one that had not started yet.
+ *
+ * prte_get_proc_runtime_state() is the gate: the master hears about every
+ * proc, a daemon only about its own. */
+static int test_proc_runtime_authority(void)
+{
+    int failures = 0;
+    prte_proc_t *local, *remote;
+    prte_proc_state_t state;
+    prte_exit_code_t code;
+    pid_t pid;
+    prte_proc_type_t saved;
+
+    reset_globals();
+
+    local = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&local->name, "app.job", 0);
+    local->state = PRTE_PROC_STATE_TERMINATED;
+    local->pid = 4242;
+    local->exit_code = 7;
+    PRTE_FLAG_SET(local, PRTE_PROC_FLAG_LOCAL);
+
+    remote = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&remote->name, "app.job", 1);
+    remote->state = PRTE_PROC_STATE_INIT;
+    remote->pid = 0;
+    remote->exit_code = 0;
+
+    /* main() initialized this process as the master */
+    saved = prte_process_info.proc_type;
+    CHECK("runtime: the harness starts out as the master", PRTE_PROC_IS_MASTER);
+
+    state = PRTE_PROC_STATE_UNDEF;
+    pid = -1;
+    code = -1;
+    CHECK("runtime: the master answers for a proc it hosts",
+          PRTE_SUCCESS == prte_get_proc_runtime_state(local, &state, &pid, &code));
+    CHECK("runtime: ...with that proc's state", PRTE_PROC_STATE_TERMINATED == state);
+    CHECK("runtime: ...its pid", 4242 == pid);
+    CHECK("runtime: ...and its exit code", 7 == code);
+
+    CHECK("runtime: the master answers for a proc it does not host",
+          PRTE_SUCCESS == prte_get_proc_runtime_state(remote, &state, &pid, &code));
+
+    /* now stand where a prted stands */
+    prte_process_info.proc_type = PRTE_PROC_DAEMON;
+    CHECK("runtime: a daemon answers for its own child",
+          PRTE_SUCCESS == prte_get_proc_runtime_state(local, &state, &pid, &code));
+    CHECK("runtime: ...with the state it recorded", PRTE_PROC_STATE_TERMINATED == state);
+
+    state = PRTE_PROC_STATE_UNDEF;
+    pid = -1;
+    code = -1;
+    CHECK("runtime: a daemon refuses a proc it does not host",
+          PRTE_ERR_NOT_AUTHORITATIVE
+              == prte_get_proc_runtime_state(remote, &state, &pid, &code));
+    /* a refusal that had written the stale values first would leave the
+     * caller with exactly the plausible lie the gate exists to stop */
+    CHECK("runtime: ...having touched nothing",
+          PRTE_PROC_STATE_UNDEF == state && -1 == pid && -1 == code);
+
+    CHECK("runtime: every out parameter is optional",
+          PRTE_SUCCESS == prte_get_proc_runtime_state(local, NULL, NULL, NULL));
+    CHECK("runtime: a NULL proc is rejected",
+          PRTE_ERR_BAD_PARAM == prte_get_proc_runtime_state(NULL, &state, &pid, &code));
+
+    prte_process_info.proc_type = saved;
+    PMIX_RELEASE(local);
+    PMIX_RELEASE(remote);
+    reset_globals();
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
 /* node matching                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -621,8 +764,7 @@ static int test_app_copy(void)
     PRTE_FLAG_SET(src, PRTE_APP_FLAG_USED_ON_NODE);
     prte_set_attribute(&src->attributes, PRTE_APP_PMIX_PREFIX, PRTE_ATTR_GLOBAL,
                        "/opt/prte", PMIX_STRING);
-    prte_set_attribute(&src->attributes, PRTE_APP_PRELOAD_BIN, PRTE_ATTR_GLOBAL,
-                       NULL, PMIX_BOOL);
+    prte_set_bool_attribute(&src->attributes, PRTE_APP_PRELOAD_BIN, PRTE_ATTR_GLOBAL, true);
 
     CHECK("appcopy: copy succeeds", PRTE_SUCCESS == prte_app_copy(&cpy, src));
     if (NULL == cpy) {
@@ -648,11 +790,11 @@ static int test_app_copy(void)
           prte_get_attribute(&cpy->attributes, PRTE_APP_PMIX_PREFIX, (void **) &ppr, PMIX_STRING));
     CHECK("appcopy: ...with its value intact", NULL != ppr && 0 == strcmp("/opt/prte", ppr));
     free(ppr);
-    bval = prte_get_attribute(&cpy->attributes, PRTE_APP_PRELOAD_BIN, NULL, PMIX_BOOL);
+    bval = PRTE_ATTR_IS_TRUE(&cpy->attributes, PRTE_APP_PRELOAD_BIN);
     CHECK("appcopy: a bool attribute is findable by key", bval);
     /* and nothing invented itself */
     CHECK("appcopy: an unset attribute is still unset",
-          !prte_get_attribute(&cpy->attributes, PRTE_APP_NO_CACHEDIR, NULL, PMIX_BOOL));
+          !PRTE_ATTR_IS_TRUE(&cpy->attributes, PRTE_APP_NO_CACHEDIR));
 
     PMIX_RELEASE(cpy);
     PMIX_RELEASE(src);
@@ -776,7 +918,7 @@ static int test_pack_roundtrip(void)
      * load-bearing (the mapper reads an unpacked copy of the job), so test
      * both dispositions */
     prte_set_attribute(&src->attributes, PRTE_JOB_PPR, PRTE_ATTR_GLOBAL, "2:node", PMIX_STRING);
-    prte_set_attribute(&src->attributes, PRTE_JOB_DO_NOT_LAUNCH, PRTE_ATTR_LOCAL, NULL, PMIX_BOOL);
+    prte_set_bool_attribute(&src->attributes, PRTE_JOB_DO_NOT_LAUNCH, PRTE_ATTR_LOCAL, true);
 
     app = PMIX_NEW(prte_app_context_t);
     app->idx = 0;
@@ -865,7 +1007,7 @@ static int test_pack_roundtrip(void)
         sval = NULL;
         /* a LOCAL attribute deliberately does not */
         CHECK("wire: a LOCAL attribute does not cross",
-              !prte_get_attribute(&dst->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL));
+              !PRTE_ATTR_IS_TRUE(&dst->attributes, PRTE_JOB_DO_NOT_LAUNCH));
 
         CHECK("wire: num_apps round-trips", 1 == dst->num_apps);
         app2 = (prte_app_context_t *) pmix_pointer_array_get_item(dst->apps, 0);
@@ -966,6 +1108,30 @@ static int test_pack_roundtrip(void)
     PMIX_DATA_BUFFER_DESTRUCT(&buf);
     PMIX_RELEASE(saved_map);
 
+    /* A proc the mapper left unranked sits on the node but not in the job's
+     * rank-indexed procs array, so it has no proc record - yet the proc map
+     * is built by walking the NODE.  Rendering its rank with a display
+     * helper made it the word "INVALID", which the decoder's strtoul reads
+     * as zero: rank 0 silently inherited its node, app and local rank.  The
+     * rank travels numerically now, so the sentinel arrives above num_procs
+     * and the decode refuses it. */
+    proc = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&proc->name, "wire.job", PMIX_RANK_INVALID);
+    proc->app_idx = 0;
+    proc->state = PRTE_PROC_STATE_RUNNING;
+    pmix_pointer_array_add(wnode->procs, proc); // deliberately NOT in src->procs
+    dst = NULL;
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    if (PRTE_SUCCESS == prte_job_pack(&buf, src, PRTE_JOB_PACK_ALL)) {
+        rc = prte_job_unpack(&buf, &dst, NULL);
+        CHECK("wire: an unranked proc in the map is refused, not read as rank 0",
+              PRTE_SUCCESS != rc && NULL == dst);
+        if (NULL != dst) {
+            PMIX_RELEASE(dst);
+        }
+    }
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
+
     PMIX_RELEASE(src);
     reset_globals();
     return failures;
@@ -980,7 +1146,9 @@ static int test_node_pack_roundtrip(void)
     int rc;
 
     src = make_node("wire-node");
-    src->num_procs = 6;
+    /* a value that needs BOTH bytes of the prte_node_rank_t: the field used
+     * to be packed as a PMIX_PROC_RANK, which is four bytes wide */
+    src->num_procs = 0xbeef;
     src->state = PRTE_NODE_STATE_UP;
     PRTE_FLAG_SET(src, PRTE_NODE_FLAG_OVERSUBSCRIBED);
     prte_set_attribute(&src->attributes, PRTE_NODE_USERNAME, PRTE_ATTR_GLOBAL,
@@ -999,7 +1167,8 @@ static int test_node_pack_roundtrip(void)
     if (NULL != dst) {
         CHECK("wire: node name round-trips",
               NULL != dst->name && 0 == strcmp("wire-node", dst->name));
-        CHECK("wire: node num_procs round-trips", 6 == dst->num_procs);
+        CHECK("wire: node num_procs round-trips", 0xbeef == dst->num_procs);
+        CHECK("wire: the node's proc array survived the unpack", NULL != dst->procs);
         CHECK("wire: node state round-trips", PRTE_NODE_STATE_UP == dst->state);
         CHECK("wire: the oversubscribed flag round-trips",
               PRTE_FLAG_TEST(dst, PRTE_NODE_FLAG_OVERSUBSCRIBED));
@@ -1249,6 +1418,484 @@ static int test_data_server_objects(void)
     /* the destructor free()s keys - it must not free garbage */
     PMIX_RELEASE(req);
 
+    return failures;
+}
+
+/* prte_ds_collect() is what decides whether a PMIX_WAIT lookup can be
+ * answered, and it has to be able to ask without taking anything.  A parked
+ * request gets one reply - the daemon frees its room on the first - so a
+ * FIRST_READ value consumed by a request that goes on waiting is a value
+ * nobody ever receives.  That is exactly what the lookup path used to do:
+ * take what it could find, drop it, and park for the rest. */
+/* the store is normally built by prte_data_server_init(), which also
+ * registers RML receives these tests have no RML for */
+static void ds_store_open(void)
+{
+    PMIX_CONSTRUCT(&prte_data_store.store, pmix_pointer_array_t);
+    pmix_pointer_array_init(&prte_data_store.store, 1, INT_MAX, 1);
+    PMIX_CONSTRUCT(&prte_data_store.pending, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_data_store.usage, pmix_list_t);
+}
+
+static void ds_store_close(void)
+{
+    PMIX_DESTRUCT(&prte_data_store.store);
+    PMIX_LIST_DESTRUCT(&prte_data_store.pending);
+    PMIX_LIST_DESTRUCT(&prte_data_store.usage);
+}
+
+static prte_data_object_t *ds_store_item(const char *key, const char *val,
+                                         uint32_t uid, pmix_persistence_t persist)
+{
+    prte_data_object_t *data = PMIX_NEW(prte_data_object_t);
+    prte_info_item_t *item = PMIX_NEW(prte_info_item_t);
+
+    PMIX_LOAD_PROCID(&data->owner, "publisher.job", 0);
+    data->uid = uid;
+    data->gid = 20;
+    data->persistence = persist;
+    PMIX_INFO_LOAD(&item->info, key, val, PMIX_STRING);
+    pmix_list_append(&data->info, &item->super);
+    prte_ds_charge(data);
+    data->index = pmix_pointer_array_add(&prte_data_store.store, data);
+    return data;
+}
+
+static int test_data_server_collect(void)
+{
+    int failures = 0;
+    prte_data_object_t *once, *kept, *theirs;
+    prte_data_req_t rq;
+    pmix_list_t answers;
+    prte_ds_info_t *rinfo;
+    bool denied;
+    int k;
+    char *ac[] = {"prte.test.once", "prte.test.absent", NULL};
+    char *ab[] = {"prte.test.once", "prte.test.kept", NULL};
+    char *a[] = {"prte.test.once", NULL};
+    char *theirkey[] = {"prte.test.theirs", NULL};
+
+    ds_store_open();
+
+    once = ds_store_item("prte.test.once", "first-read", 500, PMIX_PERSIST_FIRST_READ);
+    kept = ds_store_item("prte.test.kept", "indefinite", 500, PMIX_PERSIST_INDEF);
+    theirs = ds_store_item("prte.test.theirs", "private", 600, PMIX_PERSIST_INDEF);
+
+    PMIX_CONSTRUCT(&rq, prte_data_req_t);
+    PMIX_LOAD_PROCID(&rq.requestor, "reader.job", 0);
+    rq.uid = 500;
+    rq.gid = 20;
+
+    /* counting: one of two found, and nothing taken */
+    CHECK("collect: counting finds what is there",
+          1 == prte_ds_collect(&rq, ac, NULL, NULL));
+    CHECK("collect: counting leaves a FIRST_READ item in the store",
+          once == pmix_pointer_array_get_item(&prte_data_store.store, once->index));
+    CHECK("collect: counting leaves a FIRST_READ value in its item",
+          1 == pmix_list_get_size(&once->info));
+    CHECK("collect: counting again gives the same answer",
+          2 == prte_ds_collect(&rq, ab, NULL, NULL));
+
+    /* collecting: both values come back, and the FIRST_READ one is gone */
+    PMIX_CONSTRUCT(&answers, pmix_list_t);
+    k = once->index;
+    CHECK("collect: collecting returns every key found",
+          2 == prte_ds_collect(&rq, ab, &answers, NULL));
+    CHECK("collect: one answer per key", 2 == pmix_list_get_size(&answers));
+    rinfo = (prte_ds_info_t *) pmix_list_get_first(&answers);
+    CHECK("collect: the answer carries the value",
+          PMIX_STRING == rinfo->info.value.type &&
+          0 == strcmp("first-read", rinfo->info.value.data.string));
+    CHECK("collect: the answer names the publisher",
+          PMIX_CHECK_NSPACE("publisher.job", rinfo->source.nspace));
+    CHECK("collect: an emptied FIRST_READ item leaves the store",
+          NULL == pmix_pointer_array_get_item(&prte_data_store.store, k));
+    CHECK("collect: an INDEF item stays",
+          kept == pmix_pointer_array_get_item(&prte_data_store.store, kept->index));
+    PMIX_LIST_DESTRUCT(&answers);
+
+    PMIX_CONSTRUCT(&answers, pmix_list_t);
+    CHECK("collect: a consumed FIRST_READ value is not found again",
+          0 == prte_ds_collect(&rq, a, &answers, NULL));
+    PMIX_LIST_DESTRUCT(&answers);
+
+    /* another user's item holding the key is a refusal, not an absence */
+    denied = false;
+    CHECK("collect: another user's private item is not returned",
+          0 == prte_ds_collect(&rq, theirkey, NULL, &denied));
+    CHECK("collect: ...and is reported as denied", denied);
+
+    PMIX_DESTRUCT(&rq);
+    prte_ds_drop(kept);
+    prte_ds_drop(theirs);
+    CHECK("collect: dropping every item uncharges every uid",
+          0 == pmix_list_get_size(&prte_data_store.usage));
+    ds_store_close();
+
+    return failures;
+}
+
+/* A range or a persistence arrives in the client's own directive array,
+ * typed however the client typed it.  Reading the union member regardless
+ * turned an int-typed PMIX_RANGE_NAMESPACE into PMIX_RANGE_UNDEF on a
+ * big-endian host - data meant for one namespace, open to everyone - and a
+ * test on a little-endian one can only show that the conversions are made
+ * and the unreadable ones refused. */
+static int test_data_server_named_uint8(void)
+{
+    int failures = 0;
+    pmix_value_t val;
+    uint8_t u8;
+    pmix_data_range_t range = PMIX_RANGE_NAMESPACE;
+    int ival;
+
+    u8 = 0xff;
+    PMIX_VALUE_LOAD(&val, &range, PMIX_DATA_RANGE);
+    CHECK("named uint8: the named type is read",
+          PMIX_SUCCESS == prte_ds_get_named_uint8(&val, PMIX_DATA_RANGE, &u8) &&
+          PMIX_RANGE_NAMESPACE == u8);
+
+    u8 = 0xff;
+    ival = PMIX_RANGE_LOCAL;
+    PMIX_VALUE_LOAD(&val, &ival, PMIX_INT);
+    CHECK("named uint8: a plain int is converted",
+          PMIX_SUCCESS == prte_ds_get_named_uint8(&val, PMIX_DATA_RANGE, &u8) &&
+          PMIX_RANGE_LOCAL == u8);
+
+    ival = 300;
+    PMIX_VALUE_LOAD(&val, &ival, PMIX_INT);
+    CHECK("named uint8: an int too wide for the type is refused",
+          PMIX_SUCCESS != prte_ds_get_named_uint8(&val, PMIX_DATA_RANGE, &u8));
+
+    PMIX_VALUE_LOAD(&val, "namespace", PMIX_STRING);
+    CHECK("named uint8: a string is refused",
+          PMIX_SUCCESS != prte_ds_get_named_uint8(&val, PMIX_DATA_RANGE, &u8));
+    PMIX_VALUE_DESTRUCT(&val);
+
+    return failures;
+}
+
+/* What counts as a duplicate.  The access check keeps two users'
+ * identically-keyed items apart, but it is the wrong test for a publisher's
+ * own item: a publisher may leave itself off its own accessor list, and
+ * the collision test used to ask whether it could READ its item - so a
+ * second publish of the key was stored beside the first. */
+static int test_data_server_same_range(void)
+{
+    int failures = 0;
+    prte_data_object_t *data;
+    prte_data_req_t *rq;
+
+    data = PMIX_NEW(prte_data_object_t);
+    PMIX_LOAD_PROCID(&data->owner, "publisher.job", 0);
+    data->uid = 500;
+    data->gid = 20;
+    data->range = PMIX_RANGE_SESSION;
+
+    rq = PMIX_NEW(prte_data_req_t);
+    PMIX_LOAD_PROCID(&rq->requestor, "publisher.job", 0);
+    rq->uid = 500;
+    rq->gid = 20;
+    rq->range = PMIX_RANGE_SESSION;
+
+    CHECK("same range: the publisher's own item collides",
+          prte_data_server_same_range(rq, data, PMIX_RANGE_SESSION));
+    CHECK("same range: a different range word does not",
+          !prte_data_server_same_range(rq, data, PMIX_RANGE_GLOBAL));
+
+    /* the publisher named only somebody else as a reader */
+    data->auids = (uint32_t *) malloc(sizeof(uint32_t));
+    data->auids[0] = 501;
+    data->nauids = 1;
+    CHECK("same range: an owned item the owner may not read still collides",
+          prte_data_server_same_range(rq, data, PMIX_RANGE_SESSION));
+
+    /* another user's item: the access check decides */
+    rq->uid = 502;
+    CHECK("same range: another user's item this publisher cannot read does not collide",
+          !prte_data_server_same_range(rq, data, PMIX_RANGE_SESSION));
+    rq->uid = 501;
+    CHECK("same range: another user's item this publisher can read collides",
+          prte_data_server_same_range(rq, data, PMIX_RANGE_SESSION));
+
+    /* a namespace range is a set of processes, not a word */
+    rq->uid = 500;
+    data->range = PMIX_RANGE_NAMESPACE;
+    rq->range = PMIX_RANGE_NAMESPACE;
+    PMIX_LOAD_PROCID(&rq->requestor, "later.job", 0);
+    CHECK("same range: NAMESPACE from another namespace is a different set",
+          !prte_data_server_same_range(rq, data, PMIX_RANGE_NAMESPACE));
+
+    PMIX_RELEASE(rq);
+    PMIX_RELEASE(data);
+    return failures;
+}
+
+/* The per-uid cap.  Two things it has got wrong: evicting the one item a
+ * user holds releases that user's usage record, and prte_ds_make_room() went
+ * on reading the record it had in hand; and every value that was not a
+ * string or a byte object was charged the size of the union, so a
+ * PMIX_DATA_ARRAY of any length cost the price of an integer. */
+static int test_data_server_cap(void)
+{
+    int failures = 0;
+    prte_data_object_t *old, *fresh, *arr;
+    prte_info_item_t *item;
+    pmix_data_array_t *darray;
+    size_t saved = prte_data_store.max_size;
+
+    ds_store_open();
+
+    old = ds_store_item("prte.test.cap.old", "the first of this user's items", 700,
+                        PMIX_PERSIST_INDEF);
+    old->last_access -= 10;
+
+    /* a cap that holds either item but not both */
+    fresh = PMIX_NEW(prte_data_object_t);
+    PMIX_LOAD_PROCID(&fresh->owner, "publisher.job", 0);
+    fresh->uid = 700;
+    fresh->gid = 20;
+    item = PMIX_NEW(prte_info_item_t);
+    PMIX_INFO_LOAD(&item->info, "prte.test.cap.new", "the item that needs the room", PMIX_STRING);
+    pmix_list_append(&fresh->info, &item->super);
+    /* charging is the only way to measure it; then take the charge back
+     * off, since a publish is charged only once there is room for it */
+    prte_ds_charge(fresh);
+    prte_data_store.max_size = old->nbytes + fresh->nbytes - 1;
+    ((prte_ds_usage_t *) pmix_list_get_first(&prte_data_store.usage))->bytes -= fresh->nbytes;
+    fresh->nbytes = 0;
+
+    CHECK("cap: room is made by evicting the user's only item",
+          prte_ds_make_room(fresh));
+    CHECK("cap: ...which has left the store",
+          NULL == pmix_pointer_array_get_item(&prte_data_store.store, 0));
+    CHECK("cap: ...and taken the user's usage record with it",
+          0 == pmix_list_get_size(&prte_data_store.usage));
+    prte_ds_charge(fresh);
+    fresh->index = pmix_pointer_array_add(&prte_data_store.store, fresh);
+    CHECK("cap: the new item is charged afresh",
+          1 == pmix_list_get_size(&prte_data_store.usage) &&
+          fresh->nbytes == ((prte_ds_usage_t *) pmix_list_get_first(&prte_data_store.usage))->bytes);
+    prte_ds_drop(fresh);
+    prte_data_store.max_size = saved;
+
+    /* a data array is charged for what it holds */
+    arr = PMIX_NEW(prte_data_object_t);
+    arr->uid = 701;
+    item = PMIX_NEW(prte_info_item_t);
+    PMIX_DATA_ARRAY_CREATE(darray, 65536, PMIX_UINT8);
+    memset(darray->array, 0xa5, 65536);
+    PMIX_INFO_LOAD(&item->info, "prte.test.cap.array", darray, PMIX_DATA_ARRAY);
+    PMIX_DATA_ARRAY_FREE(darray);
+    pmix_list_append(&arr->info, &item->super);
+    prte_ds_charge(arr);
+    CHECK("cap: a data array is charged for its contents", 65536 < arr->nbytes);
+    prte_ds_drop(arr);
+
+    ds_store_close();
+    return failures;
+}
+
+/* A lookup parked by a process that has ended must go when the process
+ * does - or a later publish hands a FIRST_READ value to nobody.  The state
+ * machine purges by direct call, and only the message form used to drop
+ * parked requests; and the message form accepted a target naming "anybody",
+ * which is what a relayed SESSION purge carried. */
+static prte_data_req_t *ds_park(const char *nspace, pmix_rank_t rank)
+{
+    prte_data_req_t *req = PMIX_NEW(prte_data_req_t);
+
+    PMIX_LOAD_PROCID(&req->requestor, nspace, rank);
+    /* a daemon these tests have no RML for, so the reply is refused */
+    PMIX_LOAD_PROCID(&req->proxy, "prte-daemons", 1);
+    req->room_number = 7;
+    PMIx_Argv_append_nosize(&req->keys, "prte.test.purge.key");
+    pmix_list_append(&prte_data_store.pending, &req->super);
+    return req;
+}
+
+static bool ds_parked(prte_data_req_t *req)
+{
+    prte_data_req_t *r;
+
+    PMIX_LIST_FOREACH(r, &prte_data_store.pending, prte_data_req_t) {
+        if (r == req) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ds_purge_msg(const char *nspace, pmix_rank_t rank,
+                         pmix_info_t *info, size_t ninfo)
+{
+    pmix_data_buffer_t buf, *answer;
+    pmix_proc_t target, sender;
+
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    PMIX_LOAD_PROCID(&target, nspace, rank);
+    PMIx_Data_pack(NULL, &buf, &target, 1, PMIX_PROC);
+    PMIx_Data_pack(NULL, &buf, &ninfo, 1, PMIX_SIZE);
+    if (0 < ninfo) {
+        PMIx_Data_pack(NULL, &buf, info, (int32_t) ninfo, PMIX_INFO);
+    }
+    PMIX_DATA_BUFFER_CREATE(answer);
+    PMIX_LOAD_PROCID(&sender, "prte-daemons", 1);
+    /* disposes of "answer" whatever happens */
+    prte_ds_purge(&sender, &buf, answer);
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
+}
+
+static int test_data_server_purge_parked(void)
+{
+    int failures = 0;
+    prte_data_req_t *a, *b, *c;
+    prte_data_object_t *data;
+    pmix_proc_t t;
+    pmix_info_t info[2];
+    pmix_persistence_t persist;
+    uint32_t sid = 1;
+    int ival;
+
+    ds_store_open();
+    a = ds_park("purge.job1", 3);
+    b = ds_park("purge.job1", 4);
+    c = ds_park("purge.job2", 0);
+
+    prte_data_server_purge_local(&a->requestor, PMIX_PERSIST_PROC, UINT32_MAX);
+    CHECK("purge: PROC drops the ended process's parked lookup", !ds_parked(a));
+    CHECK("purge: PROC leaves its namespace-mate's", ds_parked(b));
+    CHECK("purge: PROC leaves another job's", ds_parked(c));
+
+    /* an application's target is its whole namespace, and a request does
+     * not say which application parked it */
+    PMIX_LOAD_PROCID(&t, "purge.job1", PMIX_RANK_WILDCARD);
+    prte_data_server_purge_local(&t, PMIX_PERSIST_APP, 0);
+    CHECK("purge: APP cancels no lookup", ds_parked(b));
+    PMIX_LOAD_PROCID(&t, NULL, PMIX_RANK_WILDCARD);
+    prte_data_server_purge_local(&t, PMIX_PERSIST_SESSION, 1);
+    CHECK("purge: SESSION cancels no lookup", ds_parked(b) && ds_parked(c));
+    PMIX_LOAD_PROCID(&t, "purge.job1", PMIX_RANK_WILDCARD);
+    prte_data_server_purge_local(&t, PMIX_PERSIST_NSPACE, UINT32_MAX);
+    CHECK("purge: NSPACE drops the namespace's parked lookups", !ds_parked(b));
+    CHECK("purge: NSPACE leaves another job's", ds_parked(c));
+
+    /* the message form: a session purge naming "anybody" is refused, and
+     * takes neither this DVM's session data nor anybody's parked lookup */
+    data = ds_store_item("prte.test.purge.session", "v", 501, PMIX_PERSIST_SESSION);
+    data->session_id = 1;
+    persist = PMIX_PERSIST_SESSION;
+    PMIX_INFO_LOAD(&info[0], PMIX_PERSISTENCE, &persist, PMIX_PERSIST);
+    PMIX_INFO_LOAD(&info[1], PMIX_SESSION_ID, &sid, PMIX_UINT32);
+    ds_purge_msg("", PMIX_RANK_WILDCARD, info, 2);
+    CHECK("purge: a message naming anybody takes no data",
+          data == pmix_pointer_array_get_item(&prte_data_store.store, data->index));
+    CHECK("purge: a message naming anybody cancels no lookup", ds_parked(c));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
+    prte_ds_drop(data);
+
+    /* a horizon that cannot be read is refused rather than guessed at */
+    PMIX_INFO_LOAD(&info[0], PMIX_PERSISTENCE, "proc", PMIX_STRING);
+    ds_purge_msg("purge.job2", 0, info, 1);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    CHECK("purge: an unreadable horizon is refused", ds_parked(c));
+
+    /* ...and one given as a plain integer is read as the lifetime it holds */
+    ival = PMIX_PERSIST_PROC;
+    PMIX_INFO_LOAD(&info[0], PMIX_PERSISTENCE, &ival, PMIX_INT);
+    ds_purge_msg("purge.job2", 0, info, 1);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    CHECK("purge: an int-typed PROC horizon drops the parked lookup", !ds_parked(c));
+
+    ds_store_close();
+    return failures;
+}
+
+/* An unpublish reaches its owner's items - but on a range narrower than a
+ * user, only the owner's items in the requestor's own set.  Two jobs of one
+ * user may each publish a NAMESPACE-range key of the same name, and one of
+ * them unpublishing it used to take both. */
+static prte_data_object_t *ds_unpub_item(const char *nspace, pmix_data_range_t range)
+{
+    prte_data_object_t *data = ds_store_item("prte.test.unpub", "v", 601,
+                                             PMIX_PERSIST_INDEF);
+
+    PMIX_LOAD_PROCID(&data->owner, nspace, 0);
+    PMIX_LOAD_PROCID(&data->proxy, "prte-daemons", 1);
+    data->gid = 20;
+    data->range = range;
+    return data;
+}
+
+static bool ds_stored(prte_data_object_t *data, int index)
+{
+    return (data == pmix_pointer_array_get_item(&prte_data_store.store, index));
+}
+
+static void ds_unpub_msg(const char *nspace, pmix_rank_t rank)
+{
+    pmix_data_buffer_t buf, *answer;
+    pmix_proc_t requestor, sender;
+    pmix_info_t info[2];
+    size_t n = 1;
+    uint32_t uid = 601, gid = 20;
+    char *key = "prte.test.unpub";
+
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    PMIX_LOAD_PROCID(&requestor, nspace, rank);
+    PMIx_Data_pack(NULL, &buf, &requestor, 1, PMIX_PROC);
+    PMIx_Data_pack(NULL, &buf, &n, 1, PMIX_SIZE);
+    PMIx_Data_pack(NULL, &buf, &key, 1, PMIX_STRING);
+    n = 2;
+    PMIx_Data_pack(NULL, &buf, &n, 1, PMIX_SIZE);
+    PMIX_INFO_LOAD(&info[0], PMIX_USERID, &uid, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[1], PMIX_GRPID, &gid, PMIX_UINT32);
+    PMIx_Data_pack(NULL, &buf, info, 2, PMIX_INFO);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_INFO_DESTRUCT(&info[1]);
+    PMIX_DATA_BUFFER_CREATE(answer);
+    PMIX_LOAD_PROCID(&sender, "prte-daemons", 1);
+    /* returns having disposed of "answer": the reply is refused, since
+     * these tests have no RML */
+    (void) prte_ds_unpublish(&sender, &buf, answer);
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
+}
+
+static int test_data_server_unpublish_reach(void)
+{
+    int failures = 0;
+    prte_data_object_t *mine, *theirs, *wide, *rm;
+    int imine, itheirs, iwide, irm;
+
+    ds_store_open();
+    mine = ds_unpub_item("unpub.job2", PMIX_RANGE_NAMESPACE);
+    imine = mine->index;
+    theirs = ds_unpub_item("unpub.job1", PMIX_RANGE_NAMESPACE);
+    itheirs = theirs->index;
+
+    ds_unpub_msg("unpub.job2", 3);
+    CHECK("unpublish: a job takes back its own NAMESPACE-range key", !ds_stored(mine, imine));
+    CHECK("unpublish: ...and not the same key another job of its user holds",
+          ds_stored(theirs, itheirs));
+    if (ds_stored(theirs, itheirs)) {
+        prte_ds_drop(theirs);
+    }
+
+    /* on a range the whole user shares, the owner reaches it from anywhere:
+     * a later job taking back what its predecessor left */
+    wide = ds_unpub_item("unpub.job1", PMIX_RANGE_SESSION);
+    iwide = wide->index;
+    ds_unpub_msg("unpub.job2", 0);
+    CHECK("unpublish: a SESSION-range key is its user's from any job", !ds_stored(wide, iwide));
+
+    /* ...and an RM item, which does not admit its own owner to read it */
+    rm = ds_unpub_item("unpub.job1", PMIX_RANGE_RM);
+    irm = rm->index;
+    ds_unpub_msg("unpub.job2", 0);
+    CHECK("unpublish: an RM-range key is still its owner's to remove", !ds_stored(rm, irm));
+
+    ds_store_close();
     return failures;
 }
 
@@ -1731,6 +2378,95 @@ static int test_data_server_requestor(void)
     return failures;
 }
 
+/* What a relay hands the external server.  Exactly one identity claim goes
+ * out, and it names the process the far end must attribute the operation
+ * to: the requester itself, or - when the requester is a relay too, a tool
+ * of another DVM - the process IT was acting for.  That second case used to
+ * relay the tool, so every item that DVM published through us was the
+ * tool's: visible to all of its jobs on a NAMESPACE range, and taken by the
+ * first of its job-end purges. */
+static const pmix_info_t *relay_find(const pmix_info_t *info, size_t ninfo,
+                                     const char *key, size_t *count)
+{
+    const pmix_info_t *found = NULL;
+    size_t n;
+
+    *count = 0;
+    for (n = 0; n < ninfo; n++) {
+        if (PMIx_Check_key(info[n].key, key)) {
+            found = &info[n];
+            (*count)++;
+        }
+    }
+    return found;
+}
+
+static int test_data_server_relay_directives(void)
+{
+    int failures = 0;
+    prte_job_t *toolj, *appj;
+    pmix_proc_t requestor, behalf;
+    pmix_info_t in[5], *out = NULL;
+    const pmix_info_t *hit;
+    size_t nout = 0, count;
+    uint32_t reluid = 7, relgid = 9, claim = 4242;
+
+    reset_globals();
+    toolj = make_job("relay.tool");
+    PRTE_FLAG_SET(toolj, PRTE_JOB_FLAG_TOOL);
+    CHECK("relay: tool job registered", PRTE_SUCCESS == prte_set_job_data_object(toolj));
+    appj = make_job("some.app");
+    CHECK("relay: app job registered", PRTE_SUCCESS == prte_set_job_data_object(appj));
+    PMIX_LOAD_PROCID(&behalf, "far.away.job", 3);
+
+    /* a tool relaying for a process of its own DVM, with the identity its
+     * own PMIx server appended after the claim */
+    PMIX_INFO_LOAD(&in[0], "prte.test.relay.key", "v", PMIX_STRING);
+    PMIX_INFO_LOAD(&in[1], PMIX_REQUESTOR, &behalf, PMIX_PROC);
+    PMIX_INFO_LOAD(&in[2], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&in[3], PMIX_USERID, &reluid, PMIX_UINT32);
+    PMIX_INFO_LOAD(&in[4], PMIX_GRPID, &relgid, PMIX_UINT32);
+    PMIX_LOAD_PROCID(&requestor, "relay.tool", 0);
+    CHECK("relay: a tool's directives build",
+          PMIX_SUCCESS == prte_ds_relay_directives(in, 5, &requestor, &out, &nout));
+    CHECK("relay: the tool's claim is what is relayed", PMIX_CHECK_PROCID(&requestor, &behalf));
+    hit = relay_find(out, nout, PMIX_REQUESTOR, &count);
+    CHECK("relay: one PMIX_REQUESTOR goes out", 1 == count);
+    CHECK("relay: ...naming the process the tool acted for",
+          NULL != hit && PMIX_PROC == hit->value.type &&
+          PMIX_CHECK_PROCID(hit->value.data.proc, &behalf));
+    hit = relay_find(out, nout, PRTE_PUBLISH_REQ_UID, &count);
+    CHECK("relay: one claimed uid goes out, the tool's claim",
+          1 == count && NULL != hit && claim == hit->value.data.uint32);
+    hit = relay_find(out, nout, PRTE_PUBLISH_REQ_GID, &count);
+    CHECK("relay: absent a claimed gid, the requester's own goes out",
+          1 == count && NULL != hit && relgid == hit->value.data.uint32);
+    hit = relay_find(out, nout, "prte.test.relay.key", &count);
+    CHECK("relay: the published data goes out", 1 == count);
+    PMIX_INFO_FREE(out, nout);
+
+    /* an application process claiming to act for somebody is named as
+     * itself, and its claim does not travel */
+    PMIX_LOAD_PROCID(&requestor, "some.app", 1);
+    CHECK("relay: an application's directives build",
+          PMIX_SUCCESS == prte_ds_relay_directives(in, 5, &requestor, &out, &nout));
+    hit = relay_find(out, nout, PMIX_REQUESTOR, &count);
+    CHECK("relay: an application is relayed as itself",
+          1 == count && NULL != hit && PMIX_PROC == hit->value.type &&
+          PMIX_CHECK_NSPACE(hit->value.data.proc->nspace, "some.app") &&
+          1 == hit->value.data.proc->rank);
+    hit = relay_find(out, nout, PRTE_PUBLISH_REQ_UID, &count);
+    CHECK("relay: ...under the uid its server gave",
+          1 == count && NULL != hit && reluid == hit->value.data.uint32);
+    PMIX_INFO_FREE(out, nout);
+
+    for (count = 0; count < 5; count++) {
+        PMIX_INFO_DESTRUCT(&in[count]);
+    }
+    reset_globals();
+    return failures;
+}
+
 /* ------------------------------------------------------------------ */
 /* progress threads                                                   */
 /* ------------------------------------------------------------------ */
@@ -2015,6 +2751,7 @@ int main(void)
     failures += test_session_ownership();
     failures += test_session_job_backref();
     failures += test_proc_lookups();
+    failures += test_proc_runtime_authority();
     failures += test_node_matching();
     failures += test_node_copy();
     failures += test_app_copy();
@@ -2031,8 +2768,16 @@ int main(void)
     failures += test_data_server_access();
     failures += test_data_server_ownership();
     failures += test_data_server_requestor();
+    failures += test_data_server_relay_directives();
+    failures += test_data_server_collect();
+    failures += test_data_server_cap();
+    failures += test_data_server_purge_parked();
+    failures += test_data_server_unpublish_reach();
+    failures += test_data_server_same_range();
+    failures += test_data_server_named_uint8();
     failures += test_progress_thread_cpus();
     failures += test_progress_thread_lifecycle();
+    failures += test_job_catchup_skips_pending_launch();
     failures += test_worker_pool();
     failures += test_paramfile_ordering();
 

@@ -970,12 +970,12 @@ int prte_launch(int argc, char *argv[])
             targv = PMIx_Argv_split(opt->values[n], ',');
             for (i=0; NULL != targv[i]; i++) {
                 if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_ALLOC)) {
-                    prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC,
-                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                    prte_set_bool_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_ALLOC,
+                                            PRTE_ATTR_GLOBAL, true);
                 } else if (PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSEABLE) ||
                            PMIX_CHECK_CLI_OPTION(targv[i], PRTE_CLI_PARSABLE)) {
-                    prte_set_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
-                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                    prte_set_bool_attribute(&jdata->attributes, PRTE_JOB_DISPLAY_PARSEABLE_OUTPUT,
+                                            PRTE_ATTR_GLOBAL, true);
                 }
             }
             PMIx_Argv_free(targv);

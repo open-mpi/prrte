@@ -126,7 +126,7 @@ int plm_lsf_init(void)
     }
 
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
-    if (prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         /* must assign daemons as won't be launching them */
         prte_plm_globals.daemon_nodes_assigned_at_launch = true;
     } else {
@@ -205,7 +205,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
      * launch the daemons - the user really wants to just
      * look at the proposed process map
      */
-    if (prte_get_attribute(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH, NULL, PMIX_BOOL)) {
+    if (PRTE_ATTR_IS_TRUE(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         /* set the state to indicate the daemons reported - this
          * will trigger the daemons_reported event and cause the
          * job to move to the following step
@@ -265,7 +265,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
         /* every node in the map already has a daemon - there is nothing
          * for lsb_launch to do, and handing it an empty host list is not
          * something we should ask of it */
-        prte_show_help("help-plm-lsf.txt", "no-hosts-in-list", true);
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-lsf.txt", "no-hosts-in-list", true);
         rc = PRTE_ERR_FAILED_TO_START;
         goto cleanup;
     }
@@ -401,7 +401,7 @@ static void launch_daemons(int fd, short args, void *cbdata)
         PRTE_ERROR_LOG(PRTE_ERR_FAILED_TO_START);
         char *flattened_nodelist = NULL;
         flattened_nodelist = PMIx_Argv_join(nodelist_argv, '\n');
-        prte_show_help("help-plm-lsf.txt", "lsb_launch-failed", true, rc, lsberrno, lsb_sysmsg(),
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-lsf.txt", "lsb_launch-failed", true, rc, lsberrno, lsb_sysmsg(),
                        PMIx_Argv_count(nodelist_argv), flattened_nodelist);
         free(flattened_nodelist);
         rc = PRTE_ERR_FAILED_TO_START;

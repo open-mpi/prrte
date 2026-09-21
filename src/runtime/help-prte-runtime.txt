@@ -1,6 +1,6 @@
 # -*- text -*-
 #
-# Copyright (c) 2025      Nanook Consulting  All rights reserved.
+# Copyright (c) 2025-2026 Nanook Consulting  All rights reserved.
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -33,6 +33,45 @@ administrator to have the list of prohibited locations changed.
 Otherwise, please identify a different location to be used (use "-h"
 to see the cmd line option), or simply let the system pick a default
 location.
+#
+[prte:session:dir:owner]
+
+PRRTE found an existing directory at the location it uses for its
+session directory, but that directory belongs to another user:
+
+   Directory: %s
+   Owner uid: %lu
+   Our uid:   %lu
+
+Session directory names are predictable, so a directory with the right
+name and the wrong owner is either left over from another user's job
+or was created to intercept this one. PRRTE will not use it. Remove the
+directory (this may require the system administrator), or point PRRTE
+at a private temporary directory (use "-h" to see the cmd line option).
+#
+[prte:session:dir:writable]
+
+PRRTE found an existing directory at the location it uses for its
+session directory, but other users are allowed to write to it:
+
+   Directory: %s
+   Mode:      %04o
+
+PRRTE never creates its session directories that way, and other users
+may already have placed files in it, so PRRTE will not use it. Remove
+the directory and try again.
+#
+[prte:session:dir:inspect]
+
+PRRTE could not inspect the directory it created for its session
+directory:
+
+   Directory: %s
+   Error:     %s
+
+The directory may have been removed, or replaced with something that is
+not a directory (such as a symbolic link), after it was created. PRRTE
+will not use it.
 #
 [failed-to-uncompress]
 
@@ -212,3 +251,16 @@ directive that caused some group members to be dropped - i.e., the
 provided final order does not cover some of the final group members.
 Please revise your final order directive so that all final group
 members can be included in the returned final membership.
+[uniform-nodes-mismatch]
+A node has reported hardware that differs from this node's:
+
+  Node: %s
+
+"--uniform-nodes" (or the prte_uniform_nodes MCA parameter) asserts that
+every node of the allocation is identical, and PRRTE acts on that rather
+than merely noting it: only one daemon is asked for its hardware, and every
+other node is given what that one reported. The node above disagrees, so the
+assertion does not hold and the other nodes have been described wrongly -
+their processes would be placed and bound against hardware they do not have.
+
+Remove the option and let PRRTE discover each node's hardware for itself.

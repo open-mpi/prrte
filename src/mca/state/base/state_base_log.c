@@ -52,10 +52,10 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
-#ifdef HAVE_FCNTL_H
+#if HAVE_FCNTL_H
 #    include <fcntl.h>
 #endif
-#ifdef HAVE_UNISTD_H
+#if HAVE_UNISTD_H
 #    include <unistd.h>
 #endif
 
@@ -164,14 +164,14 @@ void prte_state_base_log_open(void)
     rc = prte_state_base_log_resolve_dir(prte_state_base.log_path,
                                          prte_process_info.tmpdir_base, &dir);
     if (PRTE_SUCCESS != rc) {
-        prte_show_help("help-state-base.txt", "state-log-no-path", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-state-base.txt", "state-log-no-path", true,
                        prte_process_info.nodename,
                        (NULL == prte_state_base.log_path) ? "(none)" : prte_state_base.log_path);
         goto disable;
     }
     rc = pmix_os_dirpath_create(dir, S_IRWXU);
     if (PMIX_SUCCESS != rc && PMIX_ERR_EXISTS != rc) {
-        prte_show_help("help-state-base.txt", "state-log-open-failed", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-state-base.txt", "state-log-open-failed", true,
                        prte_process_info.nodename, dir, PMIx_Error_string(rc));
         goto disable;
     }
@@ -191,7 +191,7 @@ void prte_state_base_log_open(void)
      * erase the record of the first.  The banner below separates the runs. */
     prte_state_base.log_fp = fopen(prte_state_base.log_file, "a");
     if (NULL == prte_state_base.log_fp) {
-        prte_show_help("help-state-base.txt", "state-log-open-failed", true,
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-state-base.txt", "state-log-open-failed", true,
                        prte_process_info.nodename, prte_state_base.log_file, strerror(errno));
         goto disable;
     }
@@ -199,7 +199,7 @@ void prte_state_base_log_open(void)
      * before the transition it names has been acted on - which is the point
      * of keeping the log at all */
     setvbuf(prte_state_base.log_fp, NULL, _IOLBF, 0);
-#ifdef HAVE_FCNTL_H
+#if HAVE_FCNTL_H
     /* the odls forks application processes; none of them should inherit this */
     (void) fcntl(fileno(prte_state_base.log_fp), F_SETFD, FD_CLOEXEC);
 #endif
@@ -252,8 +252,18 @@ void prte_state_base_log_close(void)
 void prte_state_base_log_job(prte_job_t *jdata, prte_job_state_t state)
 {
     char tsbuf[64];
+    FILE *fp;
 
-    if (NULL == prte_state_base.log_fp) {
+    /* Read the handle ONCE and write through that copy.  Gating on the
+     * global and then naming it again in the fprintf is two reads of a field
+     * another thread is clearing: prte_state_base_log_close() stores NULL
+     * before it closes, precisely so an activation arriving from a worker
+     * thread mid-teardown finds the gate shut - but a record that passed the
+     * gate went on to re-read the global, and could pick up the NULL that
+     * had landed in between and hand it to fprintf().  The window is not
+     * hypothetical; stamp() sits inside it. */
+    fp = prte_state_base.log_fp;
+    if (NULL == fp) {
         return;
     }
     stamp(tsbuf, sizeof(tsbuf));
@@ -261,7 +271,7 @@ void prte_state_base_log_job(prte_job_t *jdata, prte_job_state_t state)
      * nspace, so the field can be empty as well as the job absent.  Both are
      * written as "-": an empty field would leave the state where a reader
      * splitting on whitespace expects the namespace. */
-    fprintf(prte_state_base.log_fp, "%s JOB %s %s\n", tsbuf,
+    fprintf(fp, "%s JOB %s %s\n", tsbuf,
             (NULL == jdata || '\0' == jdata->nspace[0]) ? "-" : jdata->nspace,
             prte_job_state_to_str(state));
 }
@@ -270,18 +280,21 @@ void prte_state_base_log_proc(const pmix_proc_t *proc, prte_proc_state_t state)
 {
     char tsbuf[64];
     char rbuf[24];
+    FILE *fp;
 
-    if (NULL == prte_state_base.log_fp) {
+    /* one read of the handle - see prte_state_base_log_job() */
+    fp = prte_state_base.log_fp;
+    if (NULL == fp) {
         return;
     }
     stamp(tsbuf, sizeof(tsbuf));
     if (NULL == proc) {
-        fprintf(prte_state_base.log_fp, "%s PROC - %s\n", tsbuf,
+        fprintf(fp, "%s PROC - %s\n", tsbuf,
                 prte_proc_state_to_str(state));
         return;
     }
     rankstr(proc->rank, rbuf, sizeof(rbuf));
-    fprintf(prte_state_base.log_fp, "%s PROC %s:%s %s\n", tsbuf,
+    fprintf(fp, "%s PROC %s:%s %s\n", tsbuf,
             ('\0' == proc->nspace[0]) ? "-" : proc->nspace,
             rbuf, prte_proc_state_to_str(state));
 }

@@ -38,7 +38,7 @@ creates the daemon procs:
 | fixed DVM | `PRTE_JOB_FIXED_DVM` | none — returns at once |
 | **grow** | `PRTE_JOB_EXTEND_DVM` | pool nodes marked `PRTE_NODE_STATE_ADDED`, and *only* those |
 | dynamic spawn | the job has an originator | first pass: the whole pool (singleton); later: `ADDED` nodes |
-| no-VM / multi-sim | `PRTE_JOB_NO_VM` or `PRTE_JOB_MULTI_DAEMON_SIM` | pool nodes carrying procs |
+| multi-sim | `PRTE_JOB_MULTI_DAEMON_SIM` | pool nodes carrying procs |
 | initial VM | otherwise | the whole pool, filtered through the app specs |
 
 ### The per-launch reset (read this before adding a branch)
@@ -89,6 +89,18 @@ In elastic mode the function also records a **grow campaign** and raises
 - the requester is found by scanning **all** the targets' session
   backpointers rather than trusting the first — see the framework guide
   for the shrink-then-grow case that motivated it.
+
+When a target fails to start, `prte_plm_base_grow_target_failed()` rolls its
+campaign back (`grow_rollback`), aborts the pre-map held jobs, and - once no
+campaign remains - calls `grow_failed_release_cache()`. That last step is the
+failure half of `VM_READY`'s re-entry: an `--add-host`, `--add-hostfile` or
+`--activate` marks the DVM not-ready and parks its job in `prte_cache`, and
+nothing else would ever mark it ready again. It answers the cached jobs that
+asked to grow with `ALLOC_FAILED` and launches the rest, taking the former
+out of the cache *before* draining it (the drain spawns synchronously). It is
+deliberately **not** called from `prte_plm_base_grow_drain(false)`, whose only
+caller is the DVM shutting down - releasing the cache there would launch jobs
+into a DVM on its way out.
 
 ---
 
@@ -210,6 +222,15 @@ not interchangeable:
 
 `PRTE_JOB_SPAWN_NOTIFIED` makes the whole thing single-shot on both the
 local and the relayed path.
+
+That single-shot matters because a short job can be answered twice over:
+`state/dvm`'s `check_complete` responds when the job ends, and a launch
+report that arrived late still drives `prte_plm_base_post_launch` for a job
+that has already terminated. `post_launch` (and `prte_plm_base_registered`)
+must therefore not write the job's state once it has reached
+`PRTE_JOB_STATE_UNTERMINATED` - see "A job's state must never go backwards"
+in [`../../state/AGENTS.md`](../../state/AGENTS.md). `test_plm`'s
+`test_late_report_keeps_termination` pins it.
 
 ---
 

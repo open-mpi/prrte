@@ -1,6 +1,6 @@
 .. -*- rst -*-
 
-   Copyright (c) 2022-2023 Nanook Consulting.  All rights reserved.
+   Copyright (c) 2022-2026 Nanook Consulting.  All rights reserved.
    Copyright (c) 2023 Jeffrey M. Squyres.  All rights reserved.
 
    $COPYRIGHT$
@@ -19,7 +19,11 @@ the number of slots to assign to that entry:
 
 .. code::
 
-   --host node01:5,node02
+   --add-host node01:5,node02
+
+Only a DVM started in elastic mode (``--prtemca prte_elastic_mode 1``)
+can change its membership.  Any other DVM is fixed for its lifetime,
+and this option is refused.
 
 In the absence of the slot extension, one slot will be assigned to the
 node. Duplicate entries are aggregated and the number of slots
@@ -36,20 +40,20 @@ the new specification, or adjusted as directed:
 
 .. code::
 
-   --host node01:5,node02
+   --add-host node01:5,node02
 
 would direct that node01 be set to 5 slots and node02 will have 1
 slot, while
 
 .. code::
 
-   --host node01:+5,node02
+   --add-host node01:+5,node02
 
 would add 5 slots to the current value for node01, and
 
 .. code::
 
-   --host node01:-5,node02
+   --add-host node01:-5,node02
 
 would subtract 5 slots from the current value.
 

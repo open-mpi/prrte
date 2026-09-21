@@ -37,13 +37,11 @@
 
 #include "src/class/pmix_pointer_array.h"
 #include "src/pmix/pmix-internal.h"
-#include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/rml/rml.h"
 #include "src/runtime/prte_globals.h"
-#include "src/runtime/prte_wait.h"
 #include "src/util/name_fns.h"
 #include "src/util/prte_show_help.h"
 
@@ -268,8 +266,9 @@ void prte_data_server(int status, pmix_proc_t *sender,
             return;
 
         default:
-            PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-            rc = PRTE_ERR_BAD_PARAM;
+            /* rc goes back to a PMIx client, so it is a PMIx status */
+            PMIX_ERROR_LOG(PMIX_ERR_BAD_PARAM);
+            rc = PMIX_ERR_BAD_PARAM;
             break;
     }
 
@@ -388,6 +387,61 @@ bool prte_data_server_owns(uint32_t uid, uint32_t gid, prte_data_object_t *data)
     return (gid == data->gid);
 }
 
+pmix_status_t prte_ds_get_named_uint8(const pmix_value_t *val,
+                                      pmix_data_type_t type, uint8_t *dest)
+{
+    if (type == val->type) {
+        /* both of the types this serves are a uint8 in the union */
+        *dest = val->data.uint8;
+        return PMIX_SUCCESS;
+    }
+    /* a plain integer, converted with its value checked against the width.
+     * The destination is named as a plain PMIX_UINT8 rather than as the
+     * named type, which not every PMIx this can run against converts to. */
+    return PMIx_Value_get_number(val, dest, PMIX_UINT8);
+}
+
+/* Is a stored item on the SAME DATA RANGE as a publication?
+ *
+ * The Standard permits duplicate keys on different ranges and requires
+ * PMIX_ERR_DUPLICATE_KEY for a duplicate on the same one.  A range is a
+ * SET OF PROCESSES, and the pmix_data_range_t is only that set's name as
+ * seen from the publisher: PMIX_RANGE_NAMESPACE published by two processes
+ * of different namespaces names two disjoint sets, not one, and refusing
+ * the second of those would refuse a publish the Standard permits.
+ *
+ * So "same data range" is the range word matching AND the stored item
+ * falling within the publisher's view of that range (the publisher's
+ * range check).  For NAMESPACE, LOCAL and PROC_LOCAL that is exactly set
+ * equality; for SESSION, GLOBAL and RM it is trivially true, which is what
+ * makes those the cases that do collide.
+ *
+ * Between two USERS the access check separates identically-keyed items as
+ * well: neither can see the other's, so neither can shadow it.  But it is
+ * the wrong test for the publisher's OWN items.  A publisher may leave
+ * itself off its own accessor list, and asking whether it could read such
+ * an item answered "no" - so its second publish of the key was stored as
+ * a second item beside the first, the readers it named got whichever sat
+ * in the lower slot, and PRTE_PUBLISH_REPLACE could not take the first
+ * one back.  An item the publisher owns is on its range whether or not it
+ * may read it.
+ *
+ * The req is the PUBLISHER cast as a requestor - the publisher's range is
+ * carried in it too, but only so a CUSTOM publication is asked the right
+ * question; the range word is compared before either check runs. */
+bool prte_data_server_same_range(prte_data_req_t *rq, prte_data_object_t *data,
+                                 pmix_data_range_t range)
+{
+    if (range != data->range) {
+        return false;
+    }
+    if (!prte_data_server_owns(rq->uid, rq->gid, data) &&
+        PMIX_SUCCESS != prte_data_server_check_access(rq, data)) {
+        return false;
+    }
+    return (PMIX_SUCCESS == prte_data_server_check_range(rq, data));
+}
+
 /* One range rule, applied in both directions.
  *
  * The PMIx retrieval rules for published data impose the range test
@@ -399,7 +453,12 @@ bool prte_data_server_owns(uint32_t uid, uint32_t gid, prte_data_object_t *data)
  *
  * This is an ACCESS rule: it says who may read an item.  It is therefore
  * the wrong test for who may REMOVE one, which is a question of
- * ownership - see ds_unpublish.c. */
+ * ownership - see ds_unpublish.c.
+ *
+ * Every comparison is the STRICT form.  PMIX_CHECK_NSPACE and
+ * PMIX_CHECK_PROCID call an empty namespace a wildcard that matches
+ * anything, which is the opposite of what a range means: a process whose
+ * namespace we do not know is in nobody's namespace. */
 static pmix_status_t range_admits(pmix_data_range_t range,
                                   const pmix_proc_t *anchor,
                                   const pmix_proc_t *anchor_proxy,
@@ -417,22 +476,22 @@ static pmix_status_t range_admits(pmix_data_range_t range,
         break;
 
     case PMIX_RANGE_NAMESPACE:
-        match = PMIX_CHECK_NSPACE(anchor->nspace, subject->nspace);
+        match = PMIX_CHECK_NSPACE_STRICT(anchor->nspace, subject->nspace);
         break;
 
     case PMIX_RANGE_LOCAL:
         // the two must sit behind the same daemon
-        match = PMIX_CHECK_PROCID(anchor_proxy, subject_proxy);
+        match = PMIX_CHECK_PROCID_STRICT(anchor_proxy, subject_proxy);
         break;
 
     case PMIX_RANGE_PROC_LOCAL:
-        match = PMIX_CHECK_PROCID(anchor, subject);
+        match = PMIX_CHECK_PROCID_STRICT(anchor, subject);
         break;
 
     case PMIX_RANGE_RM:
         /* the subject must be the host environment - which means its
          * nspace must match that of the host's server, which is my own */
-        match = PMIX_CHECK_NSPACE(subject->nspace, PRTE_PROC_MY_NAME->nspace);
+        match = PMIX_CHECK_NSPACE_STRICT(subject->nspace, PRTE_PROC_MY_NAME->nspace);
         break;
 
     case PMIX_RANGE_CUSTOM:
@@ -575,11 +634,20 @@ static prte_ds_usage_t *usage_for(uint32_t uid, bool create)
  *
  * An accounting figure rather than a malloc total: what matters is that it
  * is monotone in what the publisher stored, so that a publisher cannot
- * evade the cap by choosing a type.  Strings and byte objects are measured
- * because they are the two a publisher can make arbitrarily large;
- * everything else is charged the size of the union that holds it. */
+ * evade the cap by choosing a type.  Strings and byte objects - what nearly
+ * every publisher stores - are measured directly.  Anything else is
+ * measured by what it packs to, which is the one measure that follows a
+ * pointer into whatever the type holds.
+ *
+ * Every other type used to be charged the size of the union, and a
+ * PMIX_DATA_ARRAY is a pointer in that union: a publisher could store an
+ * array of any length for the price of an integer, and the cap bounded
+ * nothing for anybody who noticed. */
 static size_t value_size(const pmix_value_t *val)
 {
+    pmix_data_buffer_t buf;
+    size_t size = sizeof(pmix_value_t);
+
     switch (val->type) {
     case PMIX_STRING:
         return (NULL == val->data.string) ? 0 : strlen(val->data.string) + 1;
@@ -588,7 +656,15 @@ static size_t value_size(const pmix_value_t *val)
     case PMIX_COMPRESSED_BYTE_OBJECT:
         return val->data.bo.size;
     default:
-        return sizeof(pmix_value_t);
+        PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+        /* a value that cannot be packed arrived packed, so this does not
+         * fail in practice - and if it did, the union is the floor */
+        if (PMIX_SUCCESS == PMIx_Data_pack(NULL, &buf, (pmix_value_t *) val, 1, PMIX_VALUE) &&
+            buf.bytes_used > size) {
+            size = buf.bytes_used;
+        }
+        PMIX_DATA_BUFFER_DESTRUCT(&buf);
+        return size;
     }
 }
 
@@ -675,8 +751,18 @@ bool prte_ds_make_room(prte_data_object_t *data)
     if (need > prte_data_store.max_size) {
         return false;
     }
-    u = usage_for(data->uid, true);
-    while ((u->bytes + need) > prte_data_store.max_size) {
+    for (;;) {
+        /* Found again on every pass.  prte_ds_drop() releases a uid's record
+         * with its last byte, so the record from the previous pass may be
+         * gone - and evicting the one item a user holds to make room for a
+         * second is the ordinary way to get there.  Holding the pointer
+         * across the drop read the loop condition, and wrote the warning
+         * flag, through freed memory.  No record means nothing held, and
+         * need is already known to fit in that. */
+        u = usage_for(data->uid, false);
+        if (NULL == u || (u->bytes + need) <= prte_data_store.max_size) {
+            break;
+        }
         victim = oldest_of(data->uid);
         if (NULL == victim) {
             /* nothing of this uid's left to take: the accounting and the
@@ -686,7 +772,7 @@ bool prte_ds_make_room(prte_data_object_t *data)
         }
         if (!u->warned) {
             u->warned = true;
-            prte_show_help("help-prte-data-server.txt", "datastore:evicting", true,
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-data-server.txt", "datastore:evicting", true,
                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), (unsigned long) data->uid,
                            (unsigned long) prte_data_store.max_size);
         }
@@ -764,6 +850,7 @@ static void rqcon(prte_data_req_t *p)
     /* the default range for a lookup or an unpublish is SESSION - the
      * same default the publish side carries */
     p->range = PMIX_RANGE_SESSION;
+    p->nwait = 0;
 }
 static void rqdes(prte_data_req_t *p)
 {
@@ -791,9 +878,6 @@ PMIX_CLASS_INSTANCE(prte_ds_usage_t,
                     pmix_list_item_t,
                     ucon, NULL);
 
-PMIX_CLASS_INSTANCE(prte_data_cleanup_t,
-                    pmix_list_item_t,
-                    NULL, NULL);
 
 
 static void dsicon(prte_ds_info_t *p)

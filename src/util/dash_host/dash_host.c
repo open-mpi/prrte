@@ -301,8 +301,7 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts)
                 node->slots += slots;
                 PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
                 if (add_slots) {
-                    prte_set_attribute(&node->attributes, PRTE_NODE_ADD_SLOTS,
-                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                    prte_set_bool_attribute(&node->attributes, PRTE_NODE_ADD_SLOTS, PRTE_ATTR_GLOBAL, true);
                 }
             } else if (slots < 0) {
                 node->slots = 0;
@@ -332,8 +331,7 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts)
                 node->slots = slots;
                 PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
                 if (add_slots) {
-                    prte_set_attribute(&node->attributes, PRTE_NODE_ADD_SLOTS,
-                                       PRTE_ATTR_GLOBAL, NULL, PMIX_BOOL);
+                    prte_set_bool_attribute(&node->attributes, PRTE_NODE_ADD_SLOTS, PRTE_ATTR_GLOBAL, true);
                 }
             } else if (slots < 0) {
                 node->slots = 0;
@@ -434,7 +432,7 @@ static int parse_dash_host(char ***mapped_nodes, char *hosts)
                         ++cptr;
                         if ('\0' == *cptr) {
                             // missing number of nodes being requested
-                            prte_show_help("help-dash-host.txt",
+                            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt",
                                            "dash-host:invalid-relative-node-syntax", true,
                                            mini_map[k]);
                             rc = PRTE_ERR_SILENT;
@@ -465,7 +463,7 @@ static int parse_dash_host(char ***mapped_nodes, char *hosts)
                         }
                         if (p < nnodes) {
                             // not enough empty nodes
-                            prte_show_help("help-dash-host.txt",
+                            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt",
                                            "dash-host:not-enough-empty", true,
                                            nnodes-p);
                             rc = PRTE_ERR_SILENT;
@@ -482,7 +480,7 @@ static int parse_dash_host(char ***mapped_nodes, char *hosts)
                     nodeidx = strtol(&mini_map[k][2], NULL, 10);
                     if (nodeidx < 0 || nodeidx >= (int) prte_node_pool->size) {
                         /* this is an error */
-                        prte_show_help("help-dash-host.txt",
+                        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt",
                                        "dash-host:relative-node-out-of-bounds", true, nodeidx,
                                        mini_map[k]);
                         rc = PRTE_ERR_SILENT;
@@ -499,7 +497,7 @@ static int parse_dash_host(char ***mapped_nodes, char *hosts)
                     node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, nodeidx);
                     if (NULL == node) {
                         /* this is an error */
-                        prte_show_help("help-dash-host.txt", "dash-host:relative-node-not-found",
+                        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt", "dash-host:relative-node-not-found",
                                        true, nodeidx, mini_map[k]);
                         rc = PRTE_ERR_SILENT;
                         goto cleanup;
@@ -508,7 +506,7 @@ static int parse_dash_host(char ***mapped_nodes, char *hosts)
                     PMIx_Argv_append_nosize(mapped_nodes, node->name);
                 } else {
                     /* invalid relative node syntax */
-                    prte_show_help("help-dash-host.txt", "dash-host:invalid-relative-node-syntax",
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt", "dash-host:invalid-relative-node-syntax",
                                    true, mini_map[k]);
                     rc = PRTE_ERR_SILENT;
                     goto cleanup;
@@ -680,7 +678,7 @@ int prte_util_filter_dash_host_nodes(pmix_list_t *nodes, char *hosts, bool remov
     /* was something specified that was -not- found? */
     for (i = 0; i < len_mapped_node; i++) {
         if (NULL != mapped_nodes[i]) {
-            prte_show_help("help-dash-host.txt", "not-all-mapped-alloc", true, mapped_nodes[i]);
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt", "not-all-mapped-alloc", true, mapped_nodes[i]);
             rc = PRTE_ERR_SILENT;
             goto cleanup;
         }
@@ -704,7 +702,7 @@ int prte_util_filter_dash_host_nodes(pmix_list_t *nodes, char *hosts, bool remov
 
     /* did they ask for more than we could provide */
     if (!want_all_empty && 0 < num_empty) {
-        prte_show_help("help-dash-host.txt", "dash-host:not-enough-empty", true, num_empty);
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt", "dash-host:not-enough-empty", true, num_empty);
         rc = PRTE_ERR_SILENT;
         goto cleanup;
     }
