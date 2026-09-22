@@ -480,7 +480,9 @@ test_ras_alloc() {
     # The same authority, reached from the command line instead of a PMIx
     # directive.  This used to insert the node and then kill the DVM trying to
     # launch a daemon on it.
-    out=$(SA 'timeout 60 prterun --add-host node9:2 -n 2 hostname 2>&1 | tr -d "\0"')
+    # Elastic mode, or the refusal under test is unreachable: the same
+    # function refuses a non-elastic --add-host first.
+    out=$(SA 'timeout 60 prterun --prtemca prte_elastic_mode 1 --add-host node9:2 -n 2 hostname 2>&1 | tr -d "\0"')
     echo "$out" | grep -q "is owned by a resource manager" \
         && ok "add-host is refused, and says why" \
         || bad "add-host was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
@@ -527,7 +529,7 @@ test_ras_alloc() {
     # four nodes, two in the DVM: node3 for the named form and node4 for the
     # hostfile form, so neither is already in the DVM when its case runs
     ALLOC new --tag dvm --nodes 5 --tasks-per-node 2 >/dev/null 2>&1
-    if dvm_start --host node1:2,node2:2; then
+    if dvm_start --prtemca prte_elastic_mode 1 --host node1:2,node2:2; then
         [ "$(prted_count 3 4 5)" = 0 ] \
             && ok "node3, node4 and node5 are allocated but not in the DVM" \
             || bad "they already have daemons - the test premise is gone"
@@ -577,16 +579,12 @@ test_ras_alloc() {
         # prte_ras_base_modify, where ras/slurm owns the allocation and would
         # have to refuse anything that needed the scheduler's consent - so it
         # being served here is a property of its own, and this is the only
-        # harness that can show it.  No elastic mode on this DVM, so no
-        # campaign is recorded and the grant is the whole answer.
-        out=$(SA 'timeout 90 elastic activate node5 --no-wait 2>&1 | tr -d "\0"')
-        echo "$out" | grep -q 'PHASE 1 (acceptance): allocation request returned PMIX_SUCCESS' \
-            && ok "PMIX_ALLOC_ACTIVATE was granted under SLURM" \
-            || bad "the activation request was not granted: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
-        # Run the job before counting daemons rather than sleeping for one:
-        # granting the request marks the DVM not-ready, so this prun is parked
-        # until the grow reaches VM_READY - which makes its completion the
-        # signal that the daemon is up, and its output the proof.
+        # harness that can show it.
+        out=$(SA 'timeout 90 elastic activate node5 2>&1 | tr -d "\0"')
+        echo "$out" | grep -q PMIX_DVM_IS_READY \
+            && ok "PMIX_ALLOC_ACTIVATE was granted under SLURM, and completed" \
+            || bad "no completion event for the activation: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        # ...and the point of the exercise: the node is now usable
         out=$(SA 'timeout 90 prun --host node5:2 -n 2 --map-by node hostname 2>&1 | tr -d "\0"')
         c=$(echo "$out" | grep -c '^node5$')
         [ "$c" = 2 ] \
@@ -1015,6 +1013,7 @@ test_elastic() {
     # up a DVM of its own.
     elastic_argv_group
     elastic_fault_group
+    elastic_oversize_group
 }
 
 # The first extend, and everything that can only be asserted about a grant
@@ -1664,6 +1663,86 @@ elastic_argv_group() {
 # and those paths exist precisely for it doing so.  The shim arms exactly one
 # fault at a time and passes everything else through, so the rest of the
 # conversation is still with the real scheduler.
+# A record far larger than anything PRRTE holds in memory.  The reader streams
+# it, so the two halves are asserted apart: a member it does not read costs
+# nothing however large, and the node array it does read must come back whole.
+elastic_oversize_group() {
+    local out seg before after nodes
+
+    banner "ras/slurm: a huge job record is read without being held"
+    cleanup_cluster
+    if ! ON 1 "test -x $SHIM_BIN/slurm-shim"; then
+        skp "the recording shim is not in the volume -- rerun ./build.sh"
+        return
+    fi
+    SHIM reset >/dev/null 2>&1
+    ALLOC new --tag dvm --nodes 2 --tasks-per-node 2 >/dev/null 2>&1
+    DVM_SHIM=1
+    if ! dvm_start --prtemca prte_elastic_mode 1; then
+        DVM_SHIM=0
+        bad "no DVM came up under the recording shim"
+        skp "the oversize-record cases need a DVM"
+        cleanup_cluster
+        return
+    fi
+
+    before=$(SA "awk '/VmHWM/ {print \$2}' /proc/\$(pgrep -x prte)/status")
+
+    # Eight megabytes in a member PRRTE never reads.  It is measured and
+    # discarded as it arrives, so the extend has to behave as if it were not
+    # there.
+    SHIM set fat_json 8388608 >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    SHIM set fat_json 0 >/dev/null 2>&1
+    echo "$out" | grep -q 'ALLOC_ID' \
+        && ok "an extend succeeded on a record with an 8MB member in it" \
+        || bad "a large but irrelevant member broke the extend: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    drop_extra_jobs "$(ALLOC jobid --tag dvm | tr -d ' \r')"
+
+    # The same again with the bulk in the array PRRTE does read, so every one
+    # of those nodes is parsed, one at a time.
+    SHIM set fat_nodes 4000 >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    SHIM set fat_nodes 0 >/dev/null 2>&1
+    echo "$out" | grep -q 'ALLOC_ID\|REJECTED' \
+        && ok "a 4000-node allocation array was read to the end" \
+        || bad "a large allocation array broke the extend: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    drop_extra_jobs "$(ALLOC jobid --tag dvm | tr -d ' \r')"
+
+    # Peak RSS is what the whole branch is for: reading a record many times
+    # the size of the window must not move it.
+    after=$(SA "awk '/VmHWM/ {print \$2}' /proc/\$(pgrep -x prte)/status")
+    if [ -n "$before" ] && [ -n "$after" ]; then
+        [ "$((after - before))" -lt 65536 ] \
+            && ok "the HNP's peak memory held across both records (${before}kB to ${after}kB)" \
+            || bad "reading the records cost the HNP $((after - before))kB of peak memory"
+    else
+        skp "could not read the HNP's peak memory"
+    fi
+
+    # A member PRRTE reads has to be held whole, so one past the window cannot
+    # be read at all.  fat_field pads current_working_directory, which the
+    # extend propagates, rather than the member fat_json adds -- that one is
+    # skipped at any size, which is what the case above already showed.  The
+    # refusal has to name the member rather than report a size with no cause.
+    SA 'cp /tmp/prte.out /tmp/prte.out.preoversize' >/dev/null 2>&1
+    SHIM set fat_field 4194304 >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    SHIM set fat_field 0 >/dev/null 2>&1
+    seg=$(SA "diff /tmp/prte.out.preoversize /tmp/prte.out | sed -n 's/^> //p'")
+    if echo "$seg" | grep -q 'current_working_directory in the record does not fit'; then
+        ok "the refusal named the member that did not fit"
+    else
+        bad "a 4MB member PRRTE reads was not refused by name: $(echo "$seg" | tr '\n' ' ' | tail -c 300)"
+    fi
+    SA 'pgrep -x prte >/dev/null' && ok "HNP survived the oversized records" \
+                                  || bad "HNP died reading an oversized record"
+
+    dvm_stop
+    DVM_SHIM=0
+    cleanup_cluster
+}
+
 elastic_fault_group() {
     local out ajid seg
 

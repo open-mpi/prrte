@@ -85,6 +85,7 @@
 #include "src/util/pmix_context_fns.h"
 #include "src/util/name_fns.h"
 #include "src/util/nidmap.h"
+#include "src/util/prte_cmd_line.h"
 #include "src/util/proc_info.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
@@ -1569,7 +1570,6 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
     prte_proc_t *child = cd->child;
     int rc = PRTE_SUCCESS;
     int i;
-    bool found;
     prte_proc_state_t state;
     pmix_proc_t pproc;
     pmix_status_t ret;
@@ -1605,44 +1605,16 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
         goto errorout;
     }
 
-    /* did the user request we display output in xterms? */
-    if (NULL != prte_xterm) {
-        pmix_list_item_t *nmitem;
-        prte_namelist_t *nm;
-        /* see if this rank is one of those requested */
-        found = false;
-        for (nmitem = pmix_list_get_first(&prte_odls_globals.xterm_ranks);
-             nmitem != pmix_list_get_end(&prte_odls_globals.xterm_ranks);
-             nmitem = pmix_list_get_next(nmitem)) {
-            nm = (prte_namelist_t *) nmitem;
-            if (PMIX_RANK_WILDCARD == nm->name.rank || child->name.rank == nm->name.rank) {
-                /* we want this one - modify the app's command to include
-                 * the prte xterm cmd that starts with the xtermcmd */
-                cd->argv = PMIx_Argv_copy(prte_odls_globals.xtermcmd);
-                /* insert the rank into the correct place as a window title */
-                free(cd->argv[2]);
-                pmix_asprintf(&cd->argv[2], "Rank %s", PRTE_VPID_PRINT(child->name.rank));
-                /* add in the argv from the app */
-                for (i = 0; NULL != app->argv[i]; i++) {
-                    PMIx_Argv_append_nosize(&cd->argv, app->argv[i]);
-                }
-                /* use the xterm cmd as the app string */
-                cd->cmd = strdup(prte_odls_globals.xtermcmd[0]);
-                found = true;
-                break;
-            } else if (jobdat->num_procs <= nm->name.rank) { /* check for bozo case */
-                /* can't be done! */
-                prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt", "prte-odls-base:xterm-rank-out-of-bounds",
-                               true, prte_process_info.nodename, nm->name.rank, jobdat->num_procs);
-                rc = PRTE_ERR_BAD_PARAM;
-                state = PRTE_PROC_STATE_FAILED_TO_LAUNCH;
-                goto errorout;
-            }
+    /* did the user ask for this proc's output in an xterm? The command
+     * was settled on the progress thread (see xterm_select) */
+    if (NULL != cd->xterm_argv) {
+        cd->argv = PMIx_Argv_copy(cd->xterm_argv);
+        /* add in the argv from the app */
+        for (i = 0; NULL != app->argv[i]; i++) {
+            PMIx_Argv_append_nosize(&cd->argv, app->argv[i]);
         }
-        if (!found) {
-            cd->cmd = strdup(app->app);
-            cd->argv = PMIx_Argv_copy(app->argv);
-        }
+        /* use the xterm cmd as the app string */
+        cd->cmd = strdup(cd->xterm_argv[0]);
     } else if (NULL != cd->exec_agent) {
         /* we were given a fork agent - use it */
         ptr = cd->exec_agent;
@@ -1961,6 +1933,84 @@ static void spawn_caddy_resolve(prte_odls_spawn_caddy_t *cd, prte_job_t *jobdat)
                            PMIX_STRING)) {
         cd->exec_agent = agent;
     }
+    if (NULL != cd->xterm_spec) {
+        free(cd->xterm_spec);
+        cd->xterm_spec = NULL;
+    }
+    agent = NULL;
+    if (prte_get_attribute(&jobdat->attributes, PRTE_JOB_XTERM, (void **) &agent,
+                           PMIX_STRING)) {
+        cd->xterm_spec = agent;
+    }
+}
+
+/* Decide whether this child is to be run inside an xterm and, if so,
+ * build the command to do it.  "--xterm" is a directive of the job, not of
+ * the DVM: a persistent DVM's daemons were started long before the job that
+ * asks for it, so it arrives as a job attribute and is settled per child.
+ * Progress thread only.
+ *
+ * The ranks were checked for syntax where the user typed them; what cannot
+ * be checked there is whether they exist, since the job's size is only
+ * known once it has been mapped. */
+static int xterm_select(prte_odls_spawn_caddy_t *cd, prte_job_t *jobdat, prte_proc_t *child)
+{
+    prte_rank_range_t *ranges = NULL;
+    size_t nranges, n;
+    bool all, hold;
+    long badrank = 0;
+    char *path;
+    int rc;
+
+    if (NULL != cd->xterm_argv) {
+        PMIx_Argv_free(cd->xterm_argv);
+        cd->xterm_argv = NULL;
+    }
+    if (NULL == cd->xterm_spec) {
+        return PRTE_SUCCESS;
+    }
+    rc = prte_parse_xterm_option(cd->xterm_spec, &ranges, &nranges, &all, &hold, &badrank);
+    if (PRTE_ERR_VALUE_OUT_OF_BOUNDS == rc) {
+        prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt",
+                       "prte-odls-base:xterm-neg-rank", true, (int) badrank);
+        return PRTE_ERR_BAD_PARAM;
+    } else if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        return rc;
+    }
+    for (n = 0; n < nranges; n++) {
+        if (jobdat->num_procs <= ranges[n].hi) {
+            prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt",
+                           "prte-odls-base:xterm-rank-out-of-bounds", true,
+                           prte_process_info.nodename, (int) ranges[n].hi,
+                           (int) jobdat->num_procs);
+            free(ranges);
+            return PRTE_ERR_BAD_PARAM;
+        }
+    }
+    if (!prte_xterm_names_rank(ranges, nranges, all, child->name.rank)) {
+        free(ranges);
+        return PRTE_SUCCESS;
+    }
+    free(ranges);
+
+    path = pmix_find_absolute_path("xterm");
+    if (NULL == path) {
+        prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt",
+                       "prte-odls-base:xterm-not-found", true, prte_process_info.nodename);
+        return PRTE_ERR_NOT_FOUND;
+    }
+    PMIx_Argv_append_nosize(&cd->xterm_argv, path);
+    free(path);
+    PMIx_Argv_append_nosize(&cd->xterm_argv, "-T");
+    pmix_asprintf(&path, "Rank %s", PRTE_VPID_PRINT(child->name.rank));
+    PMIx_Argv_append_nosize(&cd->xterm_argv, path);
+    free(path);
+    if (hold) {
+        PMIx_Argv_append_nosize(&cd->xterm_argv, "-hold");
+    }
+    PMIx_Argv_append_nosize(&cd->xterm_argv, "-e");
+    return PRTE_SUCCESS;
 }
 
 static void spawn_caddy_copy(prte_odls_spawn_caddy_t *dst, prte_odls_spawn_caddy_t *src)
@@ -1972,6 +2022,9 @@ static void spawn_caddy_copy(prte_odls_spawn_caddy_t *dst, prte_odls_spawn_caddy
     dst->report_physical_cpus = src->report_physical_cpus;
     if (NULL != src->exec_agent) {
         dst->exec_agent = strdup(src->exec_agent);
+    }
+    if (NULL != src->xterm_spec) {
+        dst->xterm_spec = strdup(src->xterm_spec);
     }
 }
 
@@ -2322,6 +2375,16 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
             cd->fork_local = fork_local;
             cd->index_argv = index_argv;
             spawn_caddy_copy(cd, &proto);
+            if (PRTE_SUCCESS != (rc = xterm_select(cd, jobdat, child))) {
+                child->exit_code = rc;
+                PMIX_RELEASE(cd);
+                /* see the note on the prefork failure below */
+                PRTE_FLAG_UNSET(child, PRTE_PROC_FLAG_ALIVE);
+                prte_wait_cb_cancel(child);
+                PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
+                PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);
+                goto GETOUT;
+            }
             /* setup any IOF */
             cd->opts.usepty = PRTE_ENABLE_PTY_SUPPORT;
 
@@ -2514,9 +2577,6 @@ void prte_odls_base_default_wait_local_proc(int fd, short sd, void *cbdata)
         }
         goto MOVEON;
     }
-
-    /* mark that the waitpid fired */
-    PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_WAITPID);
 
     /* if the proc called "abort", then we just need to flag that it
      * came thru here */
@@ -2740,7 +2800,30 @@ void prte_odls_base_default_wait_local_proc(int fd, short sd, void *cbdata)
 MOVEON:
     /* cancel the wait as this proc has already terminated */
     prte_wait_cb_cancel(proc);
-    PRTE_ACTIVATE_PROC_STATE(&proc->name, state);
+
+    /* Report what we learned, and then report that the waitpid fired.  Two
+     * separate activations, in that order, because they say two different
+     * things: the first is this proc's diagnosis and is the error manager's
+     * to act on, while the second is half of the join that retires the proc
+     * and belongs to the state machine.  Conflating them is what this used
+     * to do - a single activation of the diagnosis, on the assumption that
+     * whoever handled it would also complete the join - and the error
+     * manager's branches did not all carry that half, so a proc taking one
+     * of those was never retired.
+     *
+     * The order matters and is kept only by the dispatcher: activation is
+     * asynchronous, but prte_state_base_activate_proc_state() thread-shifts
+     * every activation onto prte_event_base at the same priority, so two
+     * activations from here are processed in the order they were made.
+     * Nothing enforces that priority, so if it ever changes, a diagnosis
+     * could be handled after the proc it describes has already been
+     * retired.
+     */
+    if (PRTE_PROC_STATE_WAITPID_FIRED != state) {
+        PRTE_ACTIVATE_PROC_STATE(&proc->name, state);
+    }
+    PRTE_ACTIVATE_PROC_STATE(&proc->name, PRTE_PROC_STATE_WAITPID_FIRED);
+
     /* cleanup the tracker */
     PMIX_RELEASE(t2);
 }
@@ -2873,10 +2956,6 @@ int prte_odls_base_default_kill_local_procs(pmix_pointer_array_t *procs,
                      * at least have a value that will let us eventually wakeup
                      */
                     child->state = PRTE_PROC_STATE_TERMINATED;
-                    /* ensure we realize that the waitpid will never come, if
-                     * it already hasn't
-                     */
-                    PRTE_FLAG_SET(child, PRTE_PROC_FLAG_WAITPID);
                     child->pid = 0;
                     goto CLEANUP;
                 } else {
@@ -2912,12 +2991,12 @@ int prte_odls_base_default_kill_local_procs(pmix_pointer_array_t *procs,
             continue;
 
         CLEANUP:
-            /* check for everything complete - this will remove
-             * the child object from our local list
+            /* the waitpid will never come for a proc that never started, so
+             * report it as having fired - that completes the join, and the
+             * state machine removes the child from our local list
              */
-            if (!prte_finalizing && PRTE_FLAG_TEST(child, PRTE_PROC_FLAG_IOF_COMPLETE) &&
-                PRTE_FLAG_TEST(child, PRTE_PROC_FLAG_WAITPID)) {
-                PRTE_ACTIVATE_PROC_STATE(&child->name, child->state);
+            if (!prte_finalizing) {
+                PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_WAITPID_FIRED);
             }
         }
     }
@@ -2957,10 +3036,6 @@ int prte_odls_base_default_kill_local_procs(pmix_pointer_array_t *procs,
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                                  PRTE_NAME_PRINT(&cd->child->name)));
             kill_local(cd->child->pid, SIGKILL);
-            /* indicate the waitpid fired as this is effectively what
-             * has happened
-             */
-            PRTE_FLAG_SET(cd->child, PRTE_PROC_FLAG_WAITPID);
 
             /* Since we are not going to wait for this process, make sure
              * we mark it as not-alive so that we don't wait for it
@@ -2969,19 +3044,31 @@ int prte_odls_base_default_kill_local_procs(pmix_pointer_array_t *procs,
             PRTE_FLAG_UNSET(cd->child, PRTE_PROC_FLAG_ALIVE);
             cd->child->pid = 0;
 
-            /* mark the child as "killed" */
-            if (cd->child->state < PRTE_PROC_STATE_TERMINATED) {
-                cd->child->state = PRTE_PROC_STATE_KILLED_BY_CMD; /* we ordered it to die */
+            if (prte_finalizing) {
+                continue;
             }
 
-            /* check for everything complete - this will remove
-             * the child object from our local list
+            /* Report that we ordered this proc to die, but only if that is
+             * actually what happened to it: a proc that already had a
+             * diagnosis of its own - it called abort, it exited non-zero -
+             * keeps it, and that diagnosis has already been reported by
+             * whoever made it.  Re-reporting it from here is what this used
+             * to do, and it delivered somebody else's diagnosis to the error
+             * manager a second time as though it were news, on a path whose
+             * only actual business was to say that the waitpid would never
+             * come.
              */
-            if (!prte_finalizing &&
-                PRTE_FLAG_TEST(cd->child, PRTE_PROC_FLAG_IOF_COMPLETE) &&
-                PRTE_FLAG_TEST(cd->child, PRTE_PROC_FLAG_WAITPID)) {
-                PRTE_ACTIVATE_PROC_STATE(&cd->child->name, cd->child->state);
+            if (cd->child->state < PRTE_PROC_STATE_TERMINATED) {
+                cd->child->state = PRTE_PROC_STATE_KILLED_BY_CMD; /* we ordered it to die */
+                PRTE_ACTIVATE_PROC_STATE(&cd->child->name, PRTE_PROC_STATE_KILLED_BY_CMD);
             }
+
+            /* we cancelled the waitpid above, so it will never fire - report
+             * it as having fired, since that is effectively what happened.
+             * This completes the join, and the state machine removes the
+             * child from our local list.
+             */
+            PRTE_ACTIVATE_PROC_STATE(&cd->child->name, PRTE_PROC_STATE_WAITPID_FIRED);
         }
     }
     PMIX_LIST_DESTRUCT(&procs_killed);
@@ -3059,6 +3146,12 @@ int prte_odls_base_default_restart_proc(prte_proc_t *child,
     cd->child = child;
     cd->fork_local = fork_local;
     spawn_caddy_resolve(cd, jobdat);
+    if (PRTE_SUCCESS != (rc = xterm_select(cd, jobdat, child))) {
+        child->exit_code = rc;
+        PMIX_RELEASE(cd);
+        PRTE_ACTIVATE_PROC_STATE(&child->name, PRTE_PROC_STATE_FAILED_TO_LAUNCH);
+        goto CLEANUP;
+    }
     /* setup any IOF */
     cd->opts.usepty = PRTE_ENABLE_PTY_SUPPORT;
 

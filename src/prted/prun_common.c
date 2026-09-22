@@ -71,6 +71,7 @@
 #include "src/util/pmix_basename.h"
 #include "src/util/prte_cmd_line.h"
 #include "src/util/pmix_fd.h"
+#include "src/util/pmix_os_dirpath.h"
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_path.h"
@@ -79,6 +80,7 @@
 #include "src/util/pmix_getcwd.h"
 #include "src/util/pmix_show_help.h"
 #include "src/util/prte_show_help.h"
+#include "src/util/session_dir.h"
 
 #include "src/class/pmix_pointer_array.h"
 #include "src/runtime/prte_progress_threads.h"
@@ -516,7 +518,7 @@ int prun_common(pmix_cli_result_t *results,
                 int pargc, char **pargv)
 {
     int rc = 1;
-    char *param, *ptr;
+    char *param;
     prte_pmix_lock_t lock, rellock;
     pmix_list_t apps, jobdata;
     prte_info_item_t *iprteinfo;
@@ -528,6 +530,8 @@ int prun_common(pmix_cli_result_t *results,
     bool flag;
     size_t n, ninfo;
     pmix_app_t *papps = NULL;
+    char *sessdir = NULL;
+    bool sessdir_created = false;
     size_t napps = 0;
     mylock_t mylock;
     uint32_t ui32;
@@ -577,6 +581,7 @@ int prun_common(pmix_cli_result_t *results,
         param = NULL;
     }
     if (PMIX_SUCCESS != (rc = prte_ess_base_setup_signals(param))) {
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
         return rc;
     }
     PMIX_LIST_FOREACH(sig, &prte_ess_base_signals, prte_ess_base_signal_t)
@@ -593,6 +598,7 @@ int prun_common(pmix_cli_result_t *results,
         PRTE_ERROR_LOG(ret);
         /* NOT rc: it holds the SUCCESS the signal setup just returned, so
          * returning it told our caller the tool had done its job */
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
         return ret;
     }
 
@@ -634,6 +640,7 @@ int prun_common(pmix_cli_result_t *results,
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true, prte_tool_basename,
                            "--" PRTE_CLI_WAIT_TO_CONNECT, opt->values[0], "a number of seconds");
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         }
         ui32 = (uint32_t) ulval;
@@ -646,6 +653,7 @@ int prun_common(pmix_cli_result_t *results,
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true, prte_tool_basename,
                            "--" PRTE_CLI_NUM_CONNECT_RETRIES, opt->values[0], "a number of retries");
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         }
         ui32 = (uint32_t) ulval;
@@ -663,18 +671,21 @@ int prun_common(pmix_cli_result_t *results,
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "file-open-error", true, prte_tool_basename,
                            "--" PRTE_CLI_PID, opt->values[0], param);
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         case PRTE_ERR_FILE_READ_FAILURE:
             /* we could not obtain the single conversion we require */
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-file", true, prte_tool_basename,
                            "--" PRTE_CLI_PID, opt->values[0], param);
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         default: /* neither an integer nor a usable 'file:' spec */
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true,
                            prte_tool_basename, "--" PRTE_CLI_PID,
                            opt->values[0], "file:path");
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         }
     }
@@ -686,10 +697,19 @@ int prun_common(pmix_cli_result_t *results,
     /* set our session directory to something hopefully unique so
      * our rendezvous files don't conflict with other prun/prte
      * instances */
-    pmix_asprintf(&ptr, "%s/%s.session.%s.%lu.%lu", pmix_tmp_directory(), prte_tool_basename,
+    pmix_asprintf(&sessdir, "%s/%s.session.%s.%lu.%lu", pmix_tmp_directory(), prte_tool_basename,
                   prte_process_info.nodename, (unsigned long) geteuid(), (unsigned long) getpid());
-    PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_SERVER_TMPDIR, ptr, PMIX_STRING);
-    free(ptr);
+    /* PMIx trusts the directory it is given, so this name - which anyone
+     * could predict - has to be seen to be ours before it is handed over.
+     * We then own its removal: PMIx only removes a directory it made */
+    if (NULL == sessdir ||
+        PRTE_SUCCESS != prte_session_dir_create(sessdir, &sessdir_created)) {
+        free(sessdir);
+        PMIX_INFO_LIST_RELEASE(tinfo);
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+        return 1;
+    }
+    PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_SERVER_TMPDIR, sessdir, PMIX_STRING);
 
     /* we are also a launcher, so pass that down so PMIx knows
      * to setup rendezvous points */
@@ -724,6 +744,10 @@ int prun_common(pmix_cli_result_t *results,
          * whoever reached this function.  There is nothing to finalize:
          * PMIx never came up. */
         (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+        if (sessdir_created) {
+            (void) pmix_os_dirpath_destroy(sessdir, true, NULL);
+        }
+        free(sessdir);
         /* 1, not a PRTE code: our return IS the tool's exit status, and
          * this is the commonest failure a script driving us will see */
         return 1;
@@ -1117,6 +1141,12 @@ DONE:
         // a warning here, if prte logging is on.
         pmix_output(0, "PMIx_tool_finalize() failed. Status = %d", ret);
     }
+    /* PMIx has removed its rendezvous files; the directory is ours */
+    if (sessdir_created) {
+        (void) pmix_os_dirpath_destroy(sessdir, true, NULL);
+    }
+    free(sessdir);
+    sessdir = NULL;
 
     /* Only NOW is the release lock finished with.  It is on our stack, and
      * the default event handler holds a pointer to it that is never
@@ -1254,6 +1284,34 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_EXEC_AGENT);
     if (NULL != opt) {
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_EXEC_AGENT, opt->values[0], PMIX_STRING);
+    }
+
+    /* check for ranks to be displayed in xterm windows.  Refuse a value
+     * we cannot read here, on the user's terminal: the daemons are the
+     * ones who act on it, and by then all they can do is fail the launch */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_XTERM);
+    if (NULL != opt) {
+        prte_rank_range_t *xranges = NULL;
+        size_t nxranges;
+        bool xall, xhold;
+        long badrank = 0;
+
+        ret = prte_parse_xterm_option(opt->values[0], &xranges, &nxranges,
+                                      &xall, &xhold, &badrank);
+        free(xranges);
+        if (PRTE_ERR_VALUE_OUT_OF_BOUNDS == ret) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-odls-base.txt",
+                           "prte-odls-base:xterm-neg-rank", true, (int) badrank);
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        } else if (PRTE_SUCCESS != ret) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true,
+                           prte_tool_basename, "--" PRTE_CLI_XTERM, opt->values[0],
+                           "\"all\" or a comma-delimited list of ranks and rank ranges");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        PMIX_INFO_LIST_ADD(ret, jinfo, PRTE_XTERM_RANKS, opt->values[0], PMIX_STRING);
     }
 
     /* mark if recovery was enabled on the cmd line */

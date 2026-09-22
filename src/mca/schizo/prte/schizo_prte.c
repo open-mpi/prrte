@@ -495,7 +495,7 @@ static struct option pinfooptions[] = {
     PMIX_OPTION_DEFINE(PMIX_CLI_INFO_PARAM, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PMIX_CLI_INFO_PARAMS, PMIX_ARG_REQD),
     PMIX_OPTION_DEFINE(PMIX_CLI_INFO_PATH, PMIX_ARG_REQD),
-    PMIX_OPTION_DEFINE(PMIX_CLI_INFO_VERSION, PMIX_ARG_REQD),
+    PMIX_OPTION_DEFINE(PMIX_CLI_INFO_VERSION, PMIX_ARG_OPTIONAL),
     PMIX_OPTION_DEFINE(PMIX_CLI_PRETTY_PRINT, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PMIX_CLI_PARSABLE, PMIX_ARG_NONE),
     PMIX_OPTION_DEFINE(PMIX_CLI_PARSEABLE, PMIX_ARG_NONE),
@@ -597,6 +597,16 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
         return rc;
     }
 
+    /* the tool's pre-scan has already applied the --tune files - it had
+     * to, before the MCA params were registered - but it could not know
+     * the files were ours, so it passed over anything it did not
+     * understand. Under this personality they can hold nothing but
+     * PRRTE and PMIx params, so say so now. */
+    rc = prte_schizo_base_check_tune(results);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+
     // handle relevant MCA params
     PMIX_LIST_FOREACH(opt, &results->instances, pmix_cli_item_t) {
         if (0 == strcmp(opt->key, PRTE_CLI_PRTEMCA)) {
@@ -670,10 +680,12 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                                                 PRTE_CLI_MAPBY, PRTE_CLI_HWTCPUS,
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
-            if (NULL != prte_set_slots) {
-                free(prte_set_slots);
-            }
-            prte_set_slots = strdup("hwthreads");
+            /* the qualifier alone is enough: the mapper counts a node's
+             * hwthreads as its slots for a job that asks for them, and only
+             * for that job. This used to set prte_set_slots as well, which
+             * resized every node for the life of whatever DVM this process
+             * started (so prterun's spawned children inherited it) and did
+             * nothing at all in prun, whose DVM was already sized. */
         }
 
         /* --cpu-set and --cpu-list -> --map-by pe-list:X
@@ -734,12 +746,16 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
 
-        /* -N ->   map-by ppr:N:node */
+        /* -N ->   map-by ppr:N:node
+         *
+         * -N is a current, documented option - it is merely implemented as
+         * a mapping directive - so it converts without the deprecation
+         * warning, exactly like "--n" -> "--np" above */
         else if (0 == strcmp(option, "N")) {
             pmix_asprintf(&p2, "ppr:%s:node", opt->values[0]);
             rc = prte_schizo_base_add_directive(results, option,
                                                 PRTE_CLI_MAPBY, p2,
-                                                warn);
+                                                false);
             free(p2);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
@@ -793,9 +809,13 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
 
-        /* --rankfile X -> map-by rankfile:file=X */
+        /* --rankfile X -> map-by rankfile:file=X
+         *
+         * The directive has to be named: "file=X" on its own is a
+         * qualifier with nothing to qualify, and the sanity checker
+         * refuses it as an unrecognized mapping directive */
         else if (0 == strcmp(option, "rankfile")) {
-            pmix_asprintf(&p2, "%s%s", PRTE_CLI_QFILE, opt->values[0]);
+            pmix_asprintf(&p2, "%s:%s%s", PRTE_CLI_RANKFILE, PRTE_CLI_QFILE, opt->values[0]);
             rc = prte_schizo_base_add_directive(results, option,
                                                 PRTE_CLI_MAPBY, p2,
                                                 warn);
@@ -939,10 +959,17 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
 
-        /* --display-topo  ->  --display topo */
+        /* --display-topo  ->  --display topo
+         *
+         * The bare directive, not PRTE_CLI_TOPO: that constant is the
+         * prefix "topo=" the parser matches a node list against, and
+         * handed over as a value it is an empty list, which
+         * parse_display rightly refuses.  The deprecated option takes no
+         * argument and always meant every node in the allocation, which
+         * is what "topo" without a list says. */
         else if (0 == strcmp(option, "display-topo")) {
             rc = prte_schizo_base_add_directive(results, option,
-                                                PRTE_CLI_DISPLAY, PRTE_CLI_TOPO,
+                                                PRTE_CLI_DISPLAY, "topo",
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }

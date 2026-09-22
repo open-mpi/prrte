@@ -89,6 +89,8 @@
 #include "src/util/error_strings.h"
 #include "src/util/hostfile/hostfile.h"
 #include "src/util/name_fns.h"
+#include "src/util/prte_json_scan.h"
+#include "src/util/prte_json_window.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/proc_info.h"
 #include "src/util/sys_limits.h"
@@ -1304,6 +1306,584 @@ static int test_sys_limits(void)
 
 /* ------------------------------------------------------------------ */
 
+/* The scanner measures one JSON value in bytes and does not parse it.  A
+ * caller supplies the bytes in parts, so the scanner must keep its position
+ * between the parts and must stop at the exact end of the value. */
+
+/* Measure a value in one buffer.  A number, and each of the words true, false
+ * and null, that continues to the end of the buffer is complete only after
+ * the caller reports the end of the document.  prte_json_scan_finish() does
+ * that. */
+static prte_json_scan_status_t scan_value(const char *buf, size_t len, size_t *extent)
+{
+    prte_json_scan_t scan;
+    prte_json_scan_status_t status;
+    size_t used;
+
+    prte_json_scan_init(&scan);
+    status = prte_json_scan_feed(&scan, buf, len, &used);
+
+    if (PRTE_JSON_SCAN_NEED_MORE == status) {
+        status = prte_json_scan_finish(&scan);
+    }
+
+    *extent = scan.extent;
+    return status;
+}
+
+/* The same, fed in fixed-size pieces instead of all at once. */
+static prte_json_scan_status_t scan_value_in_pieces(const char *buf, size_t len, size_t piece,
+                                                    size_t *extent)
+{
+    prte_json_scan_t scan;
+    prte_json_scan_status_t status = PRTE_JSON_SCAN_NEED_MORE;
+    size_t offset = 0;
+    size_t used;
+
+    prte_json_scan_init(&scan);
+
+    while (offset < len) {
+        size_t take = (len - offset < piece) ? (len - offset) : piece;
+
+        status = prte_json_scan_feed(&scan, buf + offset, take, &used);
+        offset += used;
+
+        if (PRTE_JSON_SCAN_DONE == status || PRTE_JSON_SCAN_MALFORMED == status) {
+            break;
+        }
+    }
+
+    if (PRTE_JSON_SCAN_NEED_MORE == status) {
+        status = prte_json_scan_finish(&scan);
+    }
+
+    *extent = scan.extent;
+    return status;
+}
+
+/*
+ * What the scanner counts as one value.
+ *
+ * Each case gives a buffer and, spelled out rather than counted, the piece of
+ * it the scanner should measure.  Whatever follows that piece belongs to the
+ * caller, not to this value.
+ */
+static int test_json_scan_extent(void)
+{
+    static const struct {
+        const char *buffer;
+        const char *value;
+    } cases[] = {
+        /* an object ends at its closing brace, whatever comes after it */
+        {"{\"a\":1},\"next\"",     "{\"a\":1}"},
+        {"[1,2,3] trailing",       "[1,2,3]"},
+
+        /* a quote closes a string only when it is not escaped */
+        {"\"a\\\"b\" rest",        "\"a\\\"b\""},
+        {"\"a\\\\\" rest",         "\"a\\\\\""},
+
+        /* brackets inside a string are text, not structure */
+        {"{\"k\":\"v}\"} rest",    "{\"k\":\"v}\"}"},
+
+        /* whitespace before the value is part of it */
+        {"   {\"a\":1}",           "   {\"a\":1}"},
+
+        /* a number or literal ends AT its delimiter without consuming it */
+        {"-1.5e-3,next",           "-1.5e-3"},
+        {"true}",                  "true"},
+        {"null ",                  "null"},
+
+        /* ...or at the end of the stream, where there is no delimiter */
+        {"42",                     "42"},
+    };
+
+    int failures = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t extent = 0;
+        prte_json_scan_status_t status = scan_value(cases[i].buffer, strlen(cases[i].buffer),
+                                                    &extent);
+
+        if (PRTE_JSON_SCAN_DONE != status) {
+            fprintf(stderr, "FAIL [scan %s]: not measured, status %d\n",
+                    cases[i].buffer, (int) status);
+            failures++;
+            continue;
+        }
+
+        if (extent != strlen(cases[i].value)) {
+            fprintf(stderr, "FAIL [scan %s]: measured %.*s, expected %s\n",
+                    cases[i].buffer, (int) extent, cases[i].buffer, cases[i].value);
+            failures++;
+        }
+    }
+
+    return failures;
+}
+
+/*
+ * What the scanner refuses.
+ *
+ * The scanner finds the end of a value.  It does not check that the JSON in
+ * the value is valid.  These documents have no end for it to find.
+ */
+static int test_json_scan_refuses(void)
+{
+    static const struct {
+        const char *buffer;
+        const char *why;
+    } cases[] = {
+        {"{\"a\":[}", "a brace closed by a bracket"},
+        {"[}",        "a bracket closed by a brace"},
+        {"\"abc",     "a string with no closing quote"},
+        {"\"a\\",     "a string ending inside an escape"},
+        {"{\"a\":",   "an object that stops mid-member"},
+        {"   ",       "whitespace where a value should start"},
+        {",1",        "a delimiter where a value should start"},
+        {"}",         "a close with nothing open"},
+    };
+
+    char too_deep[PRTE_JSON_SCAN_MAX_DEPTH + 1];
+    int failures = 0;
+    size_t extent = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        prte_json_scan_status_t status = scan_value(cases[i].buffer, strlen(cases[i].buffer),
+                                                    &extent);
+
+        if (PRTE_JSON_SCAN_MALFORMED != status) {
+            fprintf(stderr, "FAIL [scan]: accepted %s (%s)\n", cases[i].buffer, cases[i].why);
+            failures++;
+        }
+    }
+
+    /* The scanner limits the depth, so a malformed document cannot increase
+     * it with no end.  The scanner refuses one bracket more than the limit.
+     * The limit itself must still work. */
+    memset(too_deep, '[', sizeof(too_deep));
+    CHECK("scan: one level past the depth bound is refused",
+          PRTE_JSON_SCAN_MALFORMED == scan_value(too_deep, sizeof(too_deep), &extent));
+
+    {
+        char at_bound[2 * PRTE_JSON_SCAN_MAX_DEPTH];
+
+        memset(at_bound, '[', PRTE_JSON_SCAN_MAX_DEPTH);
+        memset(at_bound + PRTE_JSON_SCAN_MAX_DEPTH, ']', PRTE_JSON_SCAN_MAX_DEPTH);
+        CHECK("scan: the depth bound itself is usable",
+              PRTE_JSON_SCAN_DONE == scan_value(at_bound, sizeof(at_bound), &extent));
+        CHECK("scan: a value at the depth bound measures whole",
+              sizeof(at_bound) == extent);
+    }
+
+    return failures;
+}
+
+/* Measure one buffer in one part, then in parts of each size.  Report any
+ * difference. */
+static int one_value_survives_splitting(const char *buffer, size_t len)
+{
+    size_t whole_extent = 0;
+    prte_json_scan_status_t whole = scan_value(buffer, len, &whole_extent);
+    size_t piece;
+
+    for (piece = 1; piece <= len && piece < 64; piece++) {
+        size_t extent = 0;
+        prte_json_scan_status_t status = scan_value_in_pieces(buffer, len, piece, &extent);
+
+        if (status != whole || extent != whole_extent) {
+            fprintf(stderr, "FAIL [scan]: in %zu-byte pieces gave status %d extent %zu,"
+                            " whole gave status %d extent %zu, for: %.*s\n",
+                    piece, (int) status, extent, (int) whole, whole_extent, (int) len, buffer);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int test_json_scan_resumes(void)
+{
+    static const char *const cases[] = {
+        "{\"a\":1},\"next\"",       /* splits at the closing brace          */
+        "\"a\\\"b\"",               /* splits between a backslash and quote */
+        "-1.5e-3,",                 /* splits before a number's delimiter   */
+        "true",                     /* splits before the end of the stream  */
+        "{\"k\":\"v}\"}",           /* splits inside a quoted bracket       */
+        "   {\"a\":[1,[2],{}]}",    /* splits anywhere in a nested value    */
+        "{\"a\":[}",                /* a refusal must also be reproducible  */
+    };
+
+    int failures = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        failures += one_value_survives_splitting(cases[i], strlen(cases[i]));
+    }
+
+    /* Ask the scanner the same question two times and compare the two
+     * answers.  Make every short string from the characters that can confuse
+     * a scanner.  For each string ask where the value ends.  Ask first with
+     * all of the bytes in one part, then with the bytes in many parts.  The
+     * two answers must be the same.
+     *
+     * A real reader gets its bytes from a pipe, so a value can arrive in
+     * parts that divide it at any byte.  A scanner that loses its position
+     * between two parts reports the wrong end for the value.  The reader then
+     * reads a member name from the middle of a value. */
+    {
+        static const char symbols[] = "{}[]\"\\1,";
+        const size_t nsymbols = sizeof(symbols) - 1;
+        char buffer[5];
+        size_t len;
+
+        for (len = 1; len <= sizeof(buffer) && failures < 5; len++) {
+            size_t combinations = 1;
+            size_t n;
+
+            for (n = 0; n < len; n++) {
+                combinations *= nsymbols;
+            }
+
+            /* Count from 0 to combinations-1 in base nsymbols.  Each digit
+             * selects one symbol, so each string of this length occurs one
+             * time. */
+            for (n = 0; n < combinations && failures < 5; n++) {
+                size_t remaining = n;
+                size_t digit;
+
+                for (digit = 0; digit < len; digit++) {
+                    buffer[digit] = symbols[remaining % nsymbols];
+                    remaining /= nsymbols;
+                }
+
+                failures += one_value_survives_splitting(buffer, len);
+            }
+        }
+    }
+
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
+
+/* The window reads a document that arrives in parts.  It holds no more of the
+ * document than the one value that a caller asks for.  These tests supply the
+ * document from memory, so they can make the buffer small. */
+
+typedef struct {
+    const char *doc;
+    size_t len;
+    size_t pos;
+    size_t chunk;       /* bytes handed over per read, as a pipe would */
+} window_source_t;
+
+static size_t window_source_read(char *dest, size_t len, void *cbdata)
+{
+    window_source_t *src = (window_source_t *) cbdata;
+    size_t take = src->len - src->pos;
+
+    if (take > len) {
+        take = len;
+    }
+
+    if (take > src->chunk) {
+        take = src->chunk;
+    }
+
+    memcpy(dest, src->doc + src->pos, take);
+    src->pos += take;
+    return take;
+}
+
+/* A walk makes a text record of itself, so a test compares one string. */
+typedef struct {
+    char text[512];
+    size_t used;
+} window_trace_t;
+
+static void window_trace_put(window_trace_t *trace, const char *text, size_t len)
+{
+    if (trace->used + len < sizeof(trace->text)) {
+        memcpy(trace->text + trace->used, text, len);
+        trace->used += len;
+    }
+
+    trace->text[trace->used] = '\0';
+}
+
+/* This function writes the name of the member, then '=', then the bytes of
+ * the value as the document writes them, then a separator.  It writes the
+ * name before it takes the value, because the call that takes the value lets
+ * the window use the space of the name again. */
+static int window_trace_member(prte_json_window_t *win, const char *key, void *cbdata)
+{
+    window_trace_t *trace = (window_trace_t *) cbdata;
+    const char *bytes = NULL;
+    size_t len = 0;
+    int err;
+
+    window_trace_put(trace, key, strlen(key));
+    window_trace_put(trace, "=", 1);
+    err = prte_json_window_take(win, &bytes, &len);
+
+    if (PRTE_SUCCESS != err) {
+        return err;
+    }
+
+    window_trace_put(trace, bytes, len);
+    window_trace_put(trace, ";", 1);
+    return PRTE_SUCCESS;
+}
+
+static int window_nest_member(prte_json_window_t *win, const char *key, void *cbdata);
+
+static int window_nest_element(prte_json_window_t *win, size_t index, void *cbdata)
+{
+    window_trace_t *trace = (window_trace_t *) cbdata;
+    const char *bytes = NULL;
+    size_t len = 0;
+    char label[24];
+    int err = prte_json_window_take(win, &bytes, &len);
+
+    if (PRTE_SUCCESS != err) {
+        return err;
+    }
+
+    snprintf(label, sizeof(label), "[%zu]=", index);
+    window_trace_put(trace, label, strlen(label));
+    window_trace_put(trace, bytes, len);
+    window_trace_put(trace, ";", 1);
+    return PRTE_SUCCESS;
+}
+
+/* This function reads the first element and refuses a second one.  A reader
+ * that expects one job in an array does the same. */
+static int window_only_element(prte_json_window_t *win, size_t index, void *cbdata)
+{
+    if (0 != index) {
+        return PRTE_ERR_JSON_PARSE_FAILURE;
+    }
+
+    return prte_json_window_walk_object(win, window_nest_member, cbdata);
+}
+
+/* This function reads into a member with the name obj.  It reads an array in
+ * a member with the name arr.  It expects one object in a member with the
+ * name one.  It discards a member with the name skip.  It records every other
+ * member complete. */
+static int window_nest_member(prte_json_window_t *win, const char *key, void *cbdata)
+{
+    if (0 == strcmp(key, "skip")) {
+        return prte_json_window_skip(win);
+    }
+
+    if (0 == strcmp(key, "obj")) {
+        return prte_json_window_walk_object(win, window_nest_member, cbdata);
+    }
+
+    if (0 == strcmp(key, "arr")) {
+        return prte_json_window_walk_array(win, window_nest_element, cbdata);
+    }
+
+    if (0 == strcmp(key, "one")) {
+        return prte_json_window_walk_array(win, window_only_element, cbdata);
+    }
+
+    return window_trace_member(win, key, cbdata);
+}
+
+static int window_walk(const char *document, size_t cap, size_t chunk, window_trace_t *trace)
+{
+    window_source_t src;
+    prte_json_window_t win;
+    char buf[256];
+
+    src.doc = document;
+    src.len = strlen(document);
+    src.pos = 0;
+    src.chunk = chunk;
+
+    trace->used = 0;
+    trace->text[0] = '\0';
+
+    prte_json_window_init(&win, window_source_read, &src, buf,
+                          (cap < sizeof(buf)) ? cap : sizeof(buf));
+    return prte_json_window_walk_object(&win, window_nest_member, trace);
+}
+
+/*
+ * What a walk reports.
+ *
+ * Each case gives a document and a text record of the walk.  The record has
+ * one entry for each member.  The walk reads into the members with the names
+ * obj, arr and one, so the record holds their contents in place of them.
+ */
+static int test_json_window_reports(void)
+{
+    static const struct {
+        const char *document;
+        const char *trace;
+    } cases[] = {
+        /* values come back exactly as the document spells them */
+        {"{\"a\":1,\"b\":\"two\",\"c\":null}",   "a=1;b=\"two\";c=null;"},
+        /* whitespace around the punctuation belongs to nobody */
+        {"{ \"a\" : 1 , \"b\" : 2 }",            "a=1;b=2;"},
+        /* a member's value can be an object, taken whole */
+        {"{\"a\":{\"in\":[1,2]}}",               "a={\"in\":[1,2]};"},
+        /* braces and quotes inside a string are not punctuation */
+        {"{\"a\":\"}{\\\"\",\"b\":2}",           "a=\"}{\\\"\";b=2;"},
+        /* an empty object and an empty array end where they start */
+        {"{\"a\":{},\"b\":[]}",                  "a={};b=[];"},
+        /* descending reaches members of a nested object */
+        {"{\"obj\":{\"a\":1},\"b\":2}",          "a=1;b=2;"},
+        /* an array reports its elements in order, by position */
+        {"{\"arr\":[1,\"x\",{\"k\":0}]}",        "[0]=1;[1]=\"x\";[2]={\"k\":0};"},
+        /* an empty array leaves nothing behind */
+        {"{\"arr\":[]}",                         ""},
+        /* the shape the Slurm reader walks: one object inside one array */
+        {"{\"one\":[{\"a\":1}],\"b\":2}",        "a=1;b=2;"},
+    };
+
+    int failures = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        window_trace_t trace;
+        int err = window_walk(cases[i].document, 128, 128, &trace);
+
+        if (PRTE_SUCCESS != err || 0 != strcmp(trace.text, cases[i].trace)) {
+            fprintf(stderr, "FAIL [window]: %s gave rc %d and \"%s\", expected \"%s\"\n",
+                    cases[i].document, err, trace.text, cases[i].trace);
+            failures++;
+        }
+    }
+
+    return failures;
+}
+
+/* What a walk refuses, and why. */
+static int test_json_window_refuses(void)
+{
+    static const struct {
+        const char *document;
+        const char *why;
+    } cases[] = {
+        {"[1,2]",                   "the document is not an object"},
+        {"{\"a\" 1}",               "a member without its colon"},
+        {"{\"a\":1 \"b\":2}",       "two members without a comma"},
+        {"{\"a\":1",                "the document ends inside the object"},
+        {"{\"arr\":[1 2]}",         "two elements without a comma"},
+        {"{\"one\":[{},{}]}",       "a second element where one was expected"},
+        {"{1:2}",                   "a member name that is not a string"},
+        {"{\"a\":1,}",              "a trailing comma in an object"},
+        {"{\"arr\":[1,]}",          "a trailing comma in an array"},
+    };
+
+    int failures = 0;
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        window_trace_t trace;
+        int err = window_walk(cases[i].document, 128, 128, &trace);
+
+        if (PRTE_SUCCESS == err) {
+            fprintf(stderr, "FAIL [window]: %s was accepted; %s\n",
+                    cases[i].document, cases[i].why);
+            failures++;
+        }
+    }
+
+    return failures;
+}
+
+/*
+ * A buffer that is smaller than the value that the caller wants.
+ *
+ * The document can be of any length, and the cost to read it is the size of
+ * the buffer.  A value that the window gives to a caller must fit in the
+ * buffer complete.
+ */
+static int test_json_window_bounds(void)
+{
+    static const char skipped[] = "{\"skip\":\"0123456789012345678901234567890123456789\","
+                                  "\"a\":1}";
+    static const char taken[] = "{\"pad\":\"0123456789012345678901234567890123456789\"}";
+
+    window_trace_t trace;
+    int failures = 0;
+
+    CHECK("window: a value far longer than the window is walked past",
+          PRTE_SUCCESS == window_walk(skipped, 16, 4, &trace));
+    CHECK("window: and the members after it are still reported",
+          0 == strcmp(trace.text, "a=1;"));
+    CHECK("window: a value the caller wants and cannot fit is refused",
+          PRTE_ERR_MEM_LIMIT_EXCEEDED == window_walk(taken, 16, 4, &trace));
+
+    /* A member name must also be in the buffer complete, and the window
+     * holds it there while a handler reads the value.  Thus the buffer can
+     * become full because of the name and not because of the value.  Read the
+     * same document with each buffer size near the length of its name.  Each
+     * walk must report the name or refuse for lack of space.  No walk can
+     * read the document incorrectly, and no walk can fail to return. */
+    {
+        static const char named[] = "{\"0123456789abcdef0123456789\":1}";
+        size_t cap;
+
+        for (cap = 8; cap <= 40; cap++) {
+            int err = window_walk(named, cap, 3, &trace);
+
+            CHECK("window: a long member name is reported or refused, never misread",
+                  (PRTE_SUCCESS == err
+                   && 0 == strcmp(trace.text, "0123456789abcdef0123456789=1;"))
+                      || PRTE_ERR_MEM_LIMIT_EXCEEDED == err);
+        }
+    }
+
+    return failures;
+}
+
+/*
+ * The same document with a different buffer.
+ *
+ * Read one document with each buffer size and each read size, and compare the
+ * reports.  All of them must be the same.  The window discards the bytes that
+ * it no longer needs, so both sizes change where those discards occur.  A
+ * window that loses its position between two reads reports the wrong end for
+ * a value.  The walk then reads a member name from the middle of a value.
+ */
+static int test_json_window_resizes(void)
+{
+    static const char document[] = "{\"obj\":{\"s\":\"a}b\\\"c\",\"n\":-1.5e-3},"
+                                   "\"arr\":[{},[1,[2]],true],\"one\":[{\"z\":null}]}";
+    static const char expected[] = "s=\"a}b\\\"c\";n=-1.5e-3;[0]={};[1]=[1,[2]];[2]=true;"
+                                   "z=null;";
+
+    int failures = 0;
+    size_t cap;
+
+    /* The longest value a caller takes here is 10 bytes, so a window under
+     * that cannot hold one and has nothing to say about agreement. */
+    for (cap = 12; cap <= 64 && 5 > failures; cap++) {
+        size_t chunk;
+
+        for (chunk = 1; chunk <= 16 && 5 > failures; chunk++) {
+            window_trace_t trace;
+            int err = window_walk(document, cap, chunk, &trace);
+
+            if (PRTE_SUCCESS != err || 0 != strcmp(trace.text, expected)) {
+                fprintf(stderr, "FAIL [window]: a %zu-byte window read %zu bytes at a time"
+                                " gave rc %d and \"%s\"\n",
+                        cap, chunk, err, trace.text);
+                failures++;
+            }
+        }
+    }
+
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -1319,6 +1899,13 @@ int main(void)
     prte_node_pool = PMIX_NEW(pmix_pointer_array_t);
     pmix_pointer_array_init(prte_node_pool, 8, INT_MAX, 8);
 
+    failures += test_json_scan_extent();
+    failures += test_json_scan_refuses();
+    failures += test_json_scan_resumes();
+    failures += test_json_window_reports();
+    failures += test_json_window_refuses();
+    failures += test_json_window_bounds();
+    failures += test_json_window_resizes();
     failures += test_compare_name_fields();
     failures += test_name_printing();
     failures += test_error_strings();

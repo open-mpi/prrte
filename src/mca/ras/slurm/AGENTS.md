@@ -25,7 +25,10 @@ Files:
 | `ras_slurm_modify_release.c` | `PMIX_ALLOC_RELEASE`: `scontrol update job` to shrink; remove nodes by count. |
 | `ras_slurm_modify_cancel.c` | `PMIX_ALLOC_REQ_CANCEL`: track and cancel pending extend requests. |
 | `ras_slurm_modify_common.c` | Shared helpers: `kill_job`, control-char checks, command-output draining. |
-| `ras_slurm_jansson.c` | JSON path: `scontrol show job <id> --json`, extract job fields, add/detach modified resources. |
+| `ras_slurm_jansson.c` | JSON path: reads a record through a fixed window; knows nothing of its shape past `jobs[0]`. |
+| `ras_slurm_jansson_nodes.c` | Walks `job_resources.nodes.allocation`, with the two readers that consume it. |
+| `ras_slurm_jansson_fields.c` | Reads the top-level fields, the job state and the job's times. |
+| `ras_slurm_jansson.h` | What those three share. |
 | `ras_slurm_jansson_stub.c` | No-Jansson stubs so the component builds without the JSON parser. |
 | `ras_slurm.h` | Component struct, constants, field enums, the session-stack item type. |
 
@@ -226,7 +229,7 @@ the in-flight extend registries; `finalize` tears them down. A successful
 atomic modify returns `PMIX_OPERATION_SUCCEEDED` so the base completes the
 request.
 
-The JSON helpers (`ras_slurm_jansson.c`) are compiled only when the
+The JSON helpers (the three `ras_slurm_jansson*.c` files) are compiled only when the
 **extensions** are built — jansson available *and* a new enough SLURM, see
 the build gate below; otherwise `ras_slurm_jansson_stub.c` provides
 `prte_ras_slurm_have_jansson()==false` and no-op stubs. All three `modify`
@@ -270,12 +273,45 @@ coverage follows that seam.
 | Half | Covered by |
 |------|------------|
 | `query` + `allocate` (nodelist expansion, taint refusal, `PRTE_EXISTS` on re-discovery) | `test/unit/ras/test_ras.c` — no scheduler needed, since both read only the environment |
-| `modify` (extend/release/cancel, the JSON parser, `validate_hostname`, `drain_cmd_output`) | [`contrib/dockerswarm`](../../../../contrib/dockerswarm/) — it shells out and is inherently multi-node, and it is one of the two automated builds that configure `--with-jansson`, so `ras_slurm_jansson.c` is compiled nowhere else |
+| `modify` (extend/release/cancel, the JSON parser, `validate_hostname`, `drain_cmd_output`) | [`contrib/dockerswarm`](../../../../contrib/dockerswarm/) — it shells out and is inherently multi-node, and it is one of the two automated builds that configure `--with-jansson`, so the `ras_slurm_jansson*.c` files are compiled nowhere else |
 | the same surface against a scheduler that can refuse it | [`contrib/slurmswarm`](../../../../contrib/slurmswarm/) — ten containers running a real SLURM, so `salloc` really allocates, `scontrol update ... ReqNodeList=` really has to be a resize SLURM accepts on a RUNNING job, and the JSON is SLURM's own |
+
+### A job record is streamed, never held
+
+Slurm prints every socket and every core of every allocated node, so a
+record grows with the total core count of the job's nodes: on a 10k-node DVM
+it is hundreds of megabytes, and several times that again as a jansson DOM.
+
+`prte_ras_slurm_json_run` therefore walks the record with
+`src/util/prte_json_window.c` through a fixed 1MB window
+(`PRTE_SLURM_JSON_WINDOW_SIZE`). The walker knows nothing about JSON beyond
+the punctuation between values: it hands this file the bytes of a member it
+asks for, and measures and discards every other member as it arrives. Jansson
+only ever sees the bytes of a member this file wants. Two entry points sit on
+it:
+
+- `prte_ras_slurm_read_job_fields` returns an object holding just the named
+  members, so the helpers that used to read a whole record work unchanged.
+- `prte_ras_slurm_walk_alloc_nodes` reports `job_resources.nodes.allocation`
+  one element at a time, releasing each before the next is read.
+
+The members to keep are listed by name and everything else goes, whatever it
+holds. `gres_detail` carries one string per node and arrives *before*
+`job_resources`, so discarding only the member known to be large would have
+left that one in memory.
+
+Two consequences worth knowing. The record is always drained, so `scontrol`
+exits on its own terms and its status means what it says. And
+`threads_per_core` is a member of the job that Slurm prints *after* the node
+array, which is why `add_modified_resources` settles slot counts once the
+walk returns rather than inside it.
+
+The only size that can still be refused is a single member larger than the
+window, which is reported by name and maps to `PMIX_ERR_OUT_OF_RESOURCE`.
 
 ### The extensions are a separate build gate: SLURM 24.05 or newer
 
-`prte_ras_slurm_get_jobinfo_json` reads
+`ras_slurm_jansson_nodes.c` reads
 `job_resources.nodes.{count,list,allocation}`, which is the shape SLURM
 adopted in data parser **v0.0.41**. Through 23.11 the same query answers with
 `job_resources.nodes` as a plain *string* alongside a flat `allocated_nodes`
@@ -293,7 +329,7 @@ builds SLURM from source rather than taking the distribution package.
 |----------|-----|
 | `PRTE_HAVE_SLURM_EXTENSIONS` (0/1) | the C gate — test with `#if`, never `#ifdef` |
 | `PRTE_SLURM_VERSION_STRING`, `PRTE_SLURM_MIN_EXT_VERSION` | what the run-time diagnostic names |
-| `PRTE_WANT_SLURM_EXTENSIONS` (automake) | the **build** gate: `Makefile.am` compiles `ras_slurm_jansson.c` or `ras_slurm_jansson_stub.c`, and configure drops the jansson flags entirely when off |
+| `PRTE_WANT_SLURM_EXTENSIONS` (automake) | the **build** gate: `Makefile.am` compiles the three `ras_slurm_jansson*.c` files or `ras_slurm_jansson_stub.c`, and configure drops the jansson flags entirely when off |
 | `--enable`/`--disable-slurm-extensions` | the override, in both directions. A feature switch, not a package location: the component links no SLURM library, so there is nothing to point a `--with-` at |
 
 Three things about that decision are deliberate:

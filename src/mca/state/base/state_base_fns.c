@@ -671,6 +671,23 @@ void prte_state_base_orphaned_proc(pmix_proc_t *proc, prte_proc_state_t state)
     prte_plm.terminate_orteds();
 }
 
+void prte_state_base_join(prte_proc_t *pdata, pmix_proc_t *proc, prte_proc_flags_t half)
+{
+    PRTE_FLAG_SET(pdata, half);
+
+    /* the RECORDED test is what makes the activation happen once per proc.
+     * Without it a proc that gets a duplicate report of either half - which
+     * the master does get, see the long comment in the TERMINATED arm - is
+     * counted twice, num_terminated reaches num_procs while a survivor is
+     * still running, and the DVM is torn down under it.
+     */
+    if (PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_IOF_COMPLETE)
+        && PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_WAITPID)
+        && !PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_RECORDED)) {
+        PRTE_ACTIVATE_PROC_STATE(proc, PRTE_PROC_STATE_TERMINATED);
+    }
+}
+
 void prte_state_base_track_procs(int fd, short argc, void *cbdata)
 {
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
@@ -759,19 +776,13 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
         if (NULL != prte_iof.close) {
             prte_iof.close(proc, PRTE_IOF_STDALL);
         }
-        PRTE_FLAG_SET(pdata, PRTE_PROC_FLAG_IOF_COMPLETE);
-        if (PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_WAITPID)) {
-            PRTE_ACTIVATE_PROC_STATE(proc, PRTE_PROC_STATE_TERMINATED);
-        }
+        prte_state_base_join(pdata, proc, PRTE_PROC_FLAG_IOF_COMPLETE);
     } else if (PRTE_PROC_STATE_WAITPID_FIRED == state) {
         /* update the proc state */
         if (pdata->state < PRTE_PROC_STATE_TERMINATED) {
             pdata->state = state;
         }
-        PRTE_FLAG_SET(pdata, PRTE_PROC_FLAG_WAITPID);
-        if (PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_IOF_COMPLETE)) {
-            PRTE_ACTIVATE_PROC_STATE(proc, PRTE_PROC_STATE_TERMINATED);
-        }
+        prte_state_base_join(pdata, proc, PRTE_PROC_FLAG_WAITPID);
     } else if (PRTE_PROC_STATE_TERMINATED == state) {
         /* Have we already counted this proc?  Ask the flag, not the state
          * word.  Testing "pdata->state == state" looks equivalent and is not,
@@ -991,6 +1002,40 @@ void prte_state_base_check_fds(prte_job_t *jdata)
     free(r2);
 }
 
+void prte_state_base_cpu_release_policy(prte_job_t *jdata, prte_app_context_t *app,
+                                        hwloc_obj_type_t *type, bool *takeall)
+{
+    bool hwt;
+    uint16_t mapping, *mptr = &mapping;
+
+    hwt = PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_HWT_CPUS);
+    *takeall = prte_get_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, NULL, PMIX_UINT16);
+    mapping = (NULL == jdata->map) ? 0 : PRTE_GET_MAPPING_POLICY(jdata->map->mapping);
+
+    if (NULL != app) {
+        /* an app that counts its cpus differently from the job was bound in
+         * its own terms - a hwthread each, or a core each - and has to be
+         * released in them, or the release looks for an object that is not
+         * inside the binding and gives nothing back */
+        if (PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_HWT_CPUS)) {
+            hwt = true;
+        } else if (PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_CORE_CPUS)) {
+            hwt = false;
+        }
+        if (prte_get_attribute(&app->attributes, PRTE_APP_PES_PER_PROC, NULL, PMIX_UINT16)) {
+            *takeall = true;
+        }
+        if (prte_get_attribute(&app->attributes, PRTE_APP_RESOLVED_MAPBY,
+                               (void **) &mptr, PMIX_UINT16)) {
+            mapping = PRTE_GET_MAPPING_POLICY(mapping);
+        }
+    }
+    if (PRTE_MAPPING_BYUSER == mapping || PRTE_MAPPING_SEQ == mapping) {
+        *takeall = true;
+    }
+    *type = hwt ? HWLOC_OBJ_PU : HWLOC_OBJ_CORE;
+}
+
 void prte_state_base_recover_resources(prte_job_t *jdata, prte_proc_t *pptr)
 {
     prte_node_t *node, *nptr;
@@ -1065,18 +1110,11 @@ void prte_state_base_recover_resources(prte_job_t *jdata, prte_proc_t *pptr)
         }
     }
 
-    // determine how cpus were handled
-    takeall = false;
-    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_HWT_CPUS)) {
-        type = HWLOC_OBJ_PU;
-    } else {
-        type = HWLOC_OBJ_CORE;
-    }
-    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, NULL, PMIX_UINT16) ||
-        PRTE_MAPPING_BYUSER == PRTE_GET_MAPPING_POLICY(map->mapping) ||
-        PRTE_MAPPING_SEQ == PRTE_GET_MAPPING_POLICY(map->mapping)) {
-        takeall = true;
-    }
+    // determine how cpus were handled - in this proc's app's terms
+    prte_state_base_cpu_release_policy(jdata,
+                                       (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps,
+                                                                                          pptr->app_idx),
+                                       &type, &takeall);
 
     boundcpus = hwloc_bitmap_alloc();
     /* release the resources held by the proc - only the first

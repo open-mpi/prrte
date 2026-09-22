@@ -54,6 +54,8 @@ headers = \
         name_fns.h \
         nidmap.h \
         prte_bootstrap.h \
+        prte_json_scan.h \
+        prte_json_window.h \
         proc_info.h \
         prte_show_help.h \
         session_dir.h \
@@ -72,6 +74,8 @@ sources = \
         nidmap.c \
         prte_bootstrap.c \
         prte_cmd_line.c \
+        prte_json_scan.c \
+        prte_json_window.c \
         proc_info.c \
         prte_show_help.c \
         session_dir.c \

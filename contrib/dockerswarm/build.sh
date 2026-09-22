@@ -301,6 +301,10 @@ prep_srcdir() {
         [ "$root/configure.ac" -nt "$root/configure" ] && return 0
         [ -n "$(find "$root/config" -name '*.m4' -newer "$root/configure" \
                      -print -quit 2>/dev/null)" ] && return 0
+        # A Makefile.am too: the container's source mount is read-only, so
+        # maintainer mode cannot regenerate its Makefile.in there.
+        [ -n "$(find "$root" -name 'Makefile.am' -newer "$root/configure" \
+                     -print -quit 2>/dev/null)" ] && return 0
         return 1
     }
 
@@ -564,7 +568,15 @@ build_linux() {
             # and this is the harness that gets built on every change, so a
             # break in those lines surfaces here rather than in the slower
             # sibling.  libjansson-dev is baked into the image.
-            prte_args="--prefix=/opt/prte/prte --with-pmix=$PMIX_PREFIX --with-jansson --enable-debug"
+            # --enable-prte-prefix-by-default is how PRRTE is always built for
+            # containers. A daemon on a remote node is started by a
+            # non-interactive ssh shell, which never sources env.sh, and the
+            # tests invoke a bare prterun off PATH, which passes no prefix of
+            # its own. Without the flag the remote shell finds prted only
+            # through the /usr/local/bin links the node entrypoint makes when
+            # the container STARTS - so a swarm brought up before the volume
+            # held an install finds none, and every remote launch exits 127.
+            prte_args="--prefix=/opt/prte/prte --with-pmix=$PMIX_PREFIX --with-jansson --enable-debug --enable-prte-prefix-by-default"
             # Every component as a loadable DSO instead of inside libprrte.
             # It goes in the argument string, so switching the knob is a
             # configure-argument change and reconfigure_needed catches it --

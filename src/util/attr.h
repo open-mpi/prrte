@@ -112,6 +112,9 @@ typedef uint8_t prte_node_flags_t;
 #define PRTE_NODE_FLAG_MAPPED           0x08 // whether we have been added to the current map
 #define PRTE_NODE_FLAG_SLOTS_GIVEN      0x10 // the number of slots was specified - used only in non-managed environments
 #define PRTE_NODE_NON_USABLE            0x20 // the node is hosting a tool and is NOT to be used for jobs
+#define PRTE_NODE_FLAG_SLOTS_FROM_CORES 0x40 // the slot count was derived by counting the node's cores (the
+                                             // default prte_set_default_slots policy), so a job that asks for
+                                             // hwthreads as its cpus may count the node's hwthreads instead
 
 /*** NODE ATTRIBUTE KEYS - never sent anywhere ***/
 #define PRTE_NODE_START_KEY PRTE_APP_MAX_KEY
@@ -312,6 +315,11 @@ typedef uint16_t prte_job_flags_t;
                                                                        // this job later becomes a parent itself, so reusing it would make
                                                                        // a non-inheriting child silently refuse to pass mapping,
                                                                        // ranking and binding on to a grandchild
+
+#define PRTE_JOB_XTERM                      (PRTE_JOB_START_KEY + 135) // char* - "--xterm" value: the ranks whose output is to be shown
+                                                                       // in their own xterm window, in prte_parse_xterm_option() syntax.
+                                                                       // A job attribute - not a DVM-wide setting - because a persistent
+                                                                       // DVM's daemons were started long before the job that asks for it
 
 #define PRTE_JOB_MAX_KEY (PRTE_JOB_START_KEY + 200)
 
