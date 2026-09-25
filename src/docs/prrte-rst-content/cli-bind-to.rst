@@ -42,7 +42,9 @@ line option.
 Note that directives and qualifiers are case-insensitive
 and can be shortened to the minimum number of characters
 to uniquely identify them. Thus, ``L1CACHE`` can be given
-as ``l1cache`` or simply as ``L1``.
+as ``l1cache`` or simply as ``L1``. A shortening that fits
+more than one of them is refused rather than guessed at
+|mdash| ``N`` could be ``NONE`` or ``NUMA``.
 
 Supported binding directives include:
 
@@ -75,7 +77,9 @@ Supported binding directives include:
 
 Any directive can include qualifiers by adding a colon (:) and any
 combination of one or more of the following to the ``--bindto``
-option:
+option, each separated from the next by a colon as well - never a
+comma. For example, ``--bindto core:overload-allowed:report`` or
+``--bindto numa:limit=2``:
 
 * ``OVERLOAD`` indicates that objects can have more
   processes bound to them than CPUs within them

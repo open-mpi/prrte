@@ -415,16 +415,25 @@ int test_policy_parse(void)
     CHECK("mapby numa:shared: refused", PRTE_SUCCESS != rc);
     PMIX_RELEASE(app);
 
-    /* The same prefix hazard as interleave, against a different neighbour:
-     * "shared" and "span" both begin with 's', and ":s" has meant SPAN for
-     * as long as there has been one.  The shared arm sits after it. */
+    /* "shared" and "span" both begin with 's'.  One comparison at a time,
+     * ":s" meant whichever arm of the chain was tested first - SPAN, by
+     * construction, so that adding "shared" did not silently change a
+     * working command line.  Matched against the whole vocabulary it is
+     * what it always was, ambiguous, and it is refused with both named;
+     * nothing changes silently either way. */
     app = PMIX_NEW(prte_app_context_t);
+    fprintf(stderr, "--- expected error output follows (ambiguous ':s') ---\n");
     rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:s");
-    CHECK("mapby ':s' : rc", PRTE_SUCCESS == rc);
-    CHECK("mapby ':s' still means SPAN, not shared",
+    CHECK("mapby ':s' is ambiguous - span or shared", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:sp");
+    CHECK("mapby ':sp' : rc", PRTE_SUCCESS == rc);
+    CHECK("mapby ':sp' is SPAN, not shared",
           !PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_MAP_SHARED));
     u16 = get_u16(&app->attributes, PRTE_APP_MAPBY);
-    CHECK("mapby ':s' set the SPAN directive",
+    CHECK("mapby ':sp' set the SPAN directive",
           0 != (PRTE_MAPPING_SPAN & PRTE_GET_MAPPING_DIRECTIVE(u16)));
     PMIX_RELEASE(app);
 
@@ -463,24 +472,29 @@ int test_policy_parse(void)
     CHECK("mapby numa:ndev: refused", PRTE_SUCCESS != rc);
     PMIX_RELEASE(app);
 
-    /* THE regression that matters: "interleave" and "inherit" share a first
-     * letter, and the option matcher has no view of the other options - the
-     * first arm of the chain that prefix-matches wins. ":i" has meant
-     * INHERIT for as long as there has been one, so an interleave arm tested
-     * before the inherit arm would silently change what a working command
-     * line does. No error, no warning, a different mapping. */
+    /* "interleave" and "inherit" share their first letters.  Tested one
+     * option at a time, ":i" and ":in" were INHERIT only because that arm
+     * came first; they fit both, and are refused as such rather than
+     * resolved by the order code happens to be written in. */
+    fprintf(stderr, "--- expected error output follows (ambiguous ':i', ':in') ---\n");
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:i");
-    CHECK("mapby device=gpu:i : rc", PRTE_SUCCESS == rc);
-    CHECK("mapby ':i' still means INHERIT, not interleave",
+    CHECK("mapby ':i' is ambiguous - inherit or interleave", PRTE_SUCCESS != rc);
+    CHECK("mapby ':i' recorded no interleave",
           !prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, NULL, PMIX_STRING));
     PMIX_RELEASE(app);
 
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:in");
-    CHECK("mapby device=gpu:in : rc", PRTE_SUCCESS == rc);
-    CHECK("mapby ':in' still means INHERIT",
-          !prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, NULL, PMIX_STRING));
+    CHECK("mapby ':in' is ambiguous", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* ":inh" is unambiguously inherit... */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu:inh");
+    CHECK("mapby ':inh' is inherit",
+          PRTE_SUCCESS == rc
+          && !prte_get_attribute(&app->attributes, PRTE_APP_MAP_INTERLEAVE, NULL, PMIX_STRING));
     PMIX_RELEASE(app);
 
     /* ...while ":int" is unambiguously interleave */
@@ -497,6 +511,18 @@ int test_policy_parse(void)
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_mapping_policy(app, "gpu");
     CHECK("mapby bare gpu: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* the reporter's spelling: a comma where the qualifier's ':' belongs */
+    fprintf(stderr, "--- expected error output follows (device with a comma) ---\n");
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "device=gpu,ndev=2");
+    CHECK("mapby device=gpu,ndev=2: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_mapping_policy(app, "ppr:1:device=gpu,ndev=2");
+    CHECK("mapby ppr:1:device=gpu,ndev=2: refused", PRTE_SUCCESS != rc);
     PMIX_RELEASE(app);
 
     /* the value is validated here, not left for the mapper to trip over */
@@ -635,6 +661,36 @@ int test_policy_parse(void)
     app = PMIX_NEW(prte_app_context_t);
     rc = prte_rmaps_base_set_app_binding_policy(app, "core:limit=0");
     CHECK("bindto limit zero is refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(app);
+
+    /* --- binding policy: an empty qualifier list.  PMIx_Argv_split() hands
+     * back NULL for it rather than an empty array, and the qualifier loop
+     * indexed that NULL - a segfault in whatever process was parsing,
+     * which on the spawn path is the DVM's controller --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_binding_policy(app, "core:");
+    CHECK("bindto core: (trailing colon): rc", PRTE_SUCCESS == rc);
+    u16 = get_u16(&app->attributes, PRTE_APP_BINDTO);
+    CHECK("bindto core: (trailing colon): policy", PRTE_BIND_TO_CORE == PRTE_GET_BINDING_POLICY(u16));
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_binding_policy(app, ":");
+    CHECK("bindto \":\": rc", PRTE_SUCCESS == rc);
+    PMIX_RELEASE(app);
+
+    /* --- binding policy: qualifiers with no policy word.  The empty word
+     * used to match "none", so ":overload-allowed" quietly unbound the app;
+     * like the job-level parser, it names no policy and leaves the policy
+     * bits clear for the resolver to fill in --- */
+    app = PMIX_NEW(prte_app_context_t);
+    rc = prte_rmaps_base_set_app_binding_policy(app, ":overload-allowed");
+    CHECK("bindto :overload-allowed: rc", PRTE_SUCCESS == rc);
+    CHECK("bindto :overload-allowed: recorded",
+          prte_get_attribute(&app->attributes, PRTE_APP_BINDTO, NULL, PMIX_UINT16));
+    u16 = get_u16(&app->attributes, PRTE_APP_BINDTO);
+    CHECK("bindto :overload-allowed: no policy", !PRTE_BINDING_POLICY_IS_SET(u16));
+    CHECK("bindto :overload-allowed: overload", 0 != PRTE_BIND_OVERLOAD_ALLOWED(u16));
     PMIX_RELEASE(app);
 
     return failures;

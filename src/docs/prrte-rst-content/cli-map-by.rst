@@ -172,7 +172,18 @@ applied at the job level:
 
 Any directive can include qualifiers by adding a colon (``:``) and any
 combination of one or more of the following (delimited by colons) to
-the ``--mapby`` option (except where noted):
+the ``--mapby`` option (except where noted). A comma does not separate
+qualifiers: ``--mapby device=gpu:ndev=2`` gives each process two GPUs,
+while ``--mapby device=gpu,ndev=2`` names a device called
+``gpu,ndev=2`` and is refused. For example:
+
+.. code::
+
+   --mapby package:span                  load balance across the nodes
+   --mapby core:pe=2:hwtcpus             two hwthreads per process
+   --mapby device=gpu:ndev=2:interleave  two GPUs each, one per package
+   --mapby ppr:2:numa:pe=4               two processes per NUMA domain
+
 
 * ``PE=n`` bind n CPUs to each process (can not be used in combination
   with rankfile or pe-list directives)
@@ -243,14 +254,21 @@ the ``--mapby`` option (except where noted):
   understanding. A process holding two GPUs attached to different NUMA
   domains is local to neither of them alone --- it is local to whatever
   contains them both. So the locality of a process becomes the **common
-  ancestor** of its devices' localities, and binding descends from there. On
-  a node with two GPUs per socket, ``ndev=2`` therefore makes each process
-  package-local, which means ``--bindto package`` is legitimate in that case
-  and remains an error without ``ndev``.
+  ancestor** of its devices' localities, and that decides how coarse a
+  binding may be. On a node with two GPUs per socket, ``ndev=2`` therefore
+  makes each process package-local, which means ``--bindto package`` is
+  legitimate in that case and remains an error without ``ndev``.
+
+  A *finer* binding is chosen from the devices' own localities, not from
+  anywhere in that ancestor: ``--bindto numa`` binds to the NUMA domain of
+  one of the process's GPUs, and ``--bindto core`` to a core in one of them
+  --- never to a part of the package that is local to neither.
 
   Devices are handed out in groups taken in order from the device list, so a
   group is a contiguous run of that order and the ``INTERLEAVE`` qualifier
-  composes with this one.
+  composes with this one. On a node with two GPUs per socket, interleaving
+  across packages and then taking ``ndev=2`` gives each process one GPU from
+  each socket.
 
 * ``ORDERED`` only applies to the ``PE-LIST`` option to indicate that
   procs are to be bound to each of the specified CPUs in the order in
@@ -261,7 +279,11 @@ the ``--mapby`` option (except where noted):
 .. note:: Directives and qualifiers are case-insensitive and can be
           shortened to the minimum number of characters to uniquely
           identify them. Thus, ``L1CACHE`` can be given as ``l1cache`` or
-          simply as ``L1``.
+          simply as ``L1``. A shortening that fits more than one of them
+          is refused rather than guessed at |mdash| ``N`` could be
+          ``NUMA`` or ``NODE``, and ``:S`` could be ``SPAN`` or
+          ``SHARED`` |mdash| as is a value given to one that takes none:
+          ``SPAN=false`` is an error, not ``SPAN``.
 
 The type of CPU (core vs hwthread) used in the mapping algorithm
 is determined as follows:

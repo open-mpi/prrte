@@ -345,7 +345,7 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     size_t napps;
     mylock_t mylock;
     char **pargv, **split;
-    int pargc;
+    int pargc, tag;
     prte_job_t *jdata;
     prte_app_context_t *dapp;
     bool proxyrun = false;
@@ -593,58 +593,8 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     /* decide if we are to use a persistent DVM, or act alone */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_DVM);
     if (proxyrun && (NULL != opt || NULL != getenv("PRTEPROXY_USE_DVM"))) {
-        /* use a persistent DVM - act like prun */
-        if (NULL != opt && NULL != opt->values && NULL != opt->values[0]) {
-            /* they provided a directive on how to find the DVM */
-            if (0 == strncasecmp(opt->values[0], "file:", 5)) {
-                /* change the key to match what prun expects */
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_DVM_URI);
-            } else if (0 == strncasecmp(opt->values[0], "uri:", 4)) {
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_DVM_URI);
-                /* must remove the "uri:" prefix */
-                cptr = strdup(&opt->values[0][4]);
-                free(opt->values[0]);
-                opt->values[0] = cptr;
-            } else if (0 == strncasecmp(opt->values[0], "pid:", 4)) {
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_PID);
-                /* must remove the "pid:" prefix */
-                cptr = strdup(&opt->values[0][4]);
-                free(opt->values[0]);
-                opt->values[0] = cptr;
-            } else if (0 == strncasecmp(opt->values[0], "ns:", 3)) {
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_NAMESPACE);
-                /* must remove the "ns:" prefix */
-                cptr = strdup(&opt->values[0][3]);
-                free(opt->values[0]);
-                opt->values[0] = cptr;
-            } else if (0 == strcasecmp(opt->values[0], "system-first")) {
-                /* direct to search for a system server first, and then
-                 * take the first available DVM */
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_SYS_SERVER_FIRST);
-            } else if (0 == strcasecmp(opt->values[0], "system")) {
-                /* direct to search for a system server */
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_SYS_SERVER_ONLY);
-            } else if (0 != strcasecmp(opt->values[0], "search")) {
-                /* "search" would mean to look for first available DVM,
-                 * so we wouldn't have to adjust anything as the opt
-                 * key is already set to PRTE_CLI_DVM, which will be
-                 * ignored so that the PMIx_tool_init in prun_common
-                 * will conduct its standard server search.
-                 * However, if this is not "search", then this is an
-                 * unknown option and must be reported to the user as
-                 * an error */
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-dvm-option", true,
-                               opt->values[0], prte_tool_basename);
-                return 1;
-            }
-        }
-
+        /* use a persistent DVM - act like prun.  prun_common() works out
+         * which one from the --dvm directive, as it does for prun */
         // open the ess framework so it can init the signal forwarding
         // list - we don't actually need the components.  prun_common()
         // closes it, because it has to be closed before PMIx_tool_finalize
@@ -656,7 +606,13 @@ PRTE_EXPORT int prte(int argc, char *argv[])
             (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             exit(rc);
         }
-        rc = prun_common(&results, schizo, argc, argv);
+        /* pargv, not argv: it is the copy the MCA pre-scan, the spelling
+         * normalizer and the --app expansion all worked on, and that
+         * "results" was parsed from.  Handing over the raw argv made the
+         * app parse see "--map-by" where every option table spells it
+         * "--mapby", so "mpirun --dvm ... --map-by X" was refused as an
+         * unrecognized option, and an --app file's contents were lost. */
+        rc = prun_common(&results, schizo, pargc, pargv);
 
         exit(rc);
     }
@@ -828,8 +784,12 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     if (NULL != opt) {
         for (i = 0; NULL != opt->values[i]; i++) {
             split = PMIx_Argv_split(opt->values[i], ',');
-            for (n = 0; NULL != split[n]; n++) {
-                if (PMIX_CHECK_CLI_OPTION(split[n], PRTE_CLI_XML)) {
+            for (n = 0; NULL != split && NULL != split[n]; n++) {
+                /* an abbreviation that fits more than "xml", or a malformed
+                 * value, is reported where the directive is parsed - all
+                 * this needs is to not act on it */
+                if (PMIX_CLI_MATCH_FOUND == pmix_cli_match(split[n], prte_cli_output_directives, &tag) &&
+                    PRTE_OUTPUT_XML == tag) {
                     if (PRTE_SUCCESS != prte_cli_bool_value(PMIX_CLI_QUALIFIER_VALUE(split[n]),
                                                             &prte_xml_output)) {
                         /* the value is reported where the directive is
@@ -1429,6 +1389,17 @@ PRTE_EXPORT int prte(int argc, char *argv[])
      * the spawn request */
     while (prte_event_base_active && lock.active) {
         prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
+    }
+    if (lock.active) {
+        /* We are shutting down before the spawn answered, so there is no
+         * job to report or to push stdin to - and lock.status and lock.msg
+         * are still their constructed defaults, which read as a successful
+         * spawn of a job with no name. The callback still holds this lock,
+         * so leave it alone: destructing it, or constructing it again for
+         * the stdin push below, would hand that late wakeup a lock that no
+         * longer means the spawn. This frame never returns (DONE exits), so
+         * the storage stays valid for it. */
+        goto DONE;
     }
     PMIX_ACQUIRE_OBJECT(&lock.lock);
     if (PMIX_SUCCESS != lock.status) {

@@ -207,6 +207,10 @@ relative to `prte_init()`.
    options (`--daemonize`, `--report-uri`, `--singleton`, `--prefix`,
    `--report-pid`, `--keepalive`, …).
 4. **Proxy hand-off.** `--dvm` + proxy ⇒ `prun_common()` and `exit()`.
+   It must be handed `pargc`/`pargv` - the copy the MCA pre-scan, the
+   spelling normalizer and the `--app` expansion worked on - never the raw
+   `argv`: that made the app parse see `--map-by` where the tables spell
+   `--mapby`, so `mpirun --dvm ... --map-by X` was refused outright.
 5. **`prte_init(PRTE_PROC_MASTER)`.** After this the daemon job object,
    the node pool, and the PMIx server all exist. **Anything that must
    reject bad user input before PMIx sees it has to happen above this
@@ -240,9 +244,12 @@ relative to `prte_init()`.
   inside the event loop.
 - **`prte_event_reinit()` after `--daemonize`.** The event base is opened
   before the fork and some backends (kqueue on macOS) do not survive it.
-- **The `--dvm <keyword>` values are keywords, not prefixes.** The block
-  that rewrites the `--dvm` option's key into the one `prun_common()`
-  expects tests `file:`, `uri:`, `pid:` and `ns:` as prefixes, which they
+- **The `--dvm <keyword>` values are keywords, not prefixes.** The
+  translation of `--dvm` into the key that names a DVM now lives in
+  `prun_common()` (`translate_dvm_option()`), so `prun` under the ompi
+  personality - whose option table offers `--dvm` and none of prun's own
+  `--dvm-uri`/`--pid`/`--namespace` - gets it too; it used to be done only
+  here, before the proxy hand-off. It tests `file:`, `uri:`, `pid:` and `ns:` as prefixes, which they
   are, and then `system`, `system-first` and `search`, which are not.
   Testing those three with `strncasecmp(..., 6)` made `system-first`
   unreachable — it matches `system` in its first six characters, so the
@@ -417,6 +424,19 @@ report the job's exit status. Signal forwarding is done with
 `PMIx_Job_control(PMIX_JOB_CTRL_SIGNAL)` against the spawned nspace,
 which is what eventually arrives at `prted_comm.c`'s
 `SIGNAL_LOCAL_PROCS`.
+
+**prun's own name is the static `myproc`, never `prte_process_info.myproc`.**
+`PMIx_tool_init()` fills in `myproc`; nothing sets
+`prte_process_info.myproc` in a tool, so it holds an empty namespace. The
+environment harvest (`PMIx_server_setup_application`) was asked in that
+empty name, PMIx refused it, and `setupcbfunc()` threw the status away — so
+for as long as that lasted, nothing from the submitting shell (`PMIX_MCA_*`,
+`OMPI_MCA_*` under the ompi personality, the MCA param files) reached any
+job, while prun still told the DVM the harvest was done so no daemon did it
+either. `-x` kept working because it does not go through the harvest. A
+failed harvest now fails the launch. The IOF-failure kill in `defhandler()`
+had the same fault; it targets `spawnednspace`. The job prun *launched* is
+`spawnednspace`, prun itself is `myproc`, and there is no third name.
 
 **Its return value IS the tool's exit status**, and `rc` holds
 `PRTE_SUCCESS` for most of the function's length — it is left there by the
