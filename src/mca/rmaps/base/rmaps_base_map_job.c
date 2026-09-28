@@ -49,6 +49,7 @@
 #include "src/runtime/prte_globals.h"
 #include "src/threads/pmix_threads.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/prte_cmd_line.h"
 #include "src/util/prte_show_help.h"
 
 #include "src/mca/rmaps/base/base.h"
@@ -93,68 +94,71 @@ static bool ppr_count(const char *str, int *cnt)
 
 /* Translate the object half of a ppr pattern ("N:<object>") into the hwloc
  * object type and binding depth the mappers work against. Returns false if
- * the name is not one we map by; the caller reports it, because the job and
- * the app have different things to say about where the bad spelling came
- * from. Names may be abbreviated, which is why each comparison is against
- * the length of what the user actually wrote. */
+ * the name is not one we map by - which includes an abbreviation that fits
+ * two of them; the caller reports it, because the job and the app have
+ * different things to say about where the bad spelling came from. The
+ * vocabulary is the one the command-line checker holds a pattern to, so
+ * the two cannot disagree about what a ppr object may be called. */
 static bool ppr_object(const char *obj,
                        hwloc_obj_type_t *maptype,
                        prte_binding_policy_t *mapdepth,
                        char **device)
 {
-    size_t len = strlen(obj);
+    int tag;
 
-    if (0 == len) {
+    if (PMIX_CLI_MATCH_FOUND != pmix_cli_match(obj, prte_cli_ppr_objects, &tag)) {
         return false;
     }
-    /* "device=<class>" names the devices rather than an hwloc level, so the
-     * pattern reads "N procs per device of this class".  It is spelled the
-     * same way as the --map-by directive deliberately: it is the same
-     * resource, asked about a different way round. */
-    if (0 == strncasecmp(obj, "device=", 7)) {
-        if ('\0' == obj[7]) {
-            return false;
-        }
-        if (NULL != device) {
-            if (NULL != *device) {
-                free(*device);
+    switch (tag) {
+        case PRTE_PPROBJ_DEVICE:
+            /* "device=<class>" names the devices rather than an hwloc level,
+             * so the pattern reads "N procs per device of this class".  It
+             * is spelled the same way as the --map-by directive
+             * deliberately: it is the same resource, asked about a
+             * different way round. */
+            if (NULL != device) {
+                if (NULL != *device) {
+                    free(*device);
+                }
+                *device = strdup(pmix_cli_qualifier_value((char *) obj));
             }
-            *device = strdup(&obj[7]);
-        }
-        *maptype = HWLOC_OBJ_OS_DEVICE;
-        *mapdepth = PRTE_BIND_TO_NONE;
-        return true;
-    }
-    if (0 == strncasecmp(obj, "node", len)) {
-        *maptype = HWLOC_OBJ_MACHINE;
-        *mapdepth = PRTE_BIND_TO_NONE;
-    } else if (0 == strncasecmp(obj, "hwthread", len) ||
-               0 == strncasecmp(obj, "thread", len)) {
-        *maptype = HWLOC_OBJ_PU;
-        *mapdepth = PRTE_BIND_TO_HWTHREAD;
-    } else if (0 == strncasecmp(obj, "core", len)) {
-        *maptype = HWLOC_OBJ_CORE;
-        *mapdepth = PRTE_BIND_TO_CORE;
-    } else if (0 == strncasecmp(obj, "package", len) ||
-               0 == strncasecmp(obj, "skt", len) ||
-               0 == strncasecmp(obj, "socket", len)) {
-        *maptype = HWLOC_OBJ_PACKAGE;
-        *mapdepth = PRTE_BIND_TO_PACKAGE;
-    } else if (0 == strncasecmp(obj, "numa", len) ||
-               0 == strncasecmp(obj, "nm", len)) {
-        *maptype = HWLOC_OBJ_NUMANODE;
-        *mapdepth = PRTE_BIND_TO_NUMA;
-    } else if (0 == strncasecmp(obj, "l1cache", len)) {
-        *maptype = HWLOC_OBJ_L1CACHE;
-        *mapdepth = PRTE_BIND_TO_L1CACHE;
-    } else if (0 == strncasecmp(obj, "l2cache", len)) {
-        *maptype = HWLOC_OBJ_L2CACHE;
-        *mapdepth = PRTE_BIND_TO_L2CACHE;
-    } else if (0 == strncasecmp(obj, "l3cache", len)) {
-        *maptype = HWLOC_OBJ_L3CACHE;
-        *mapdepth = PRTE_BIND_TO_L3CACHE;
-    } else {
-        return false;
+            *maptype = HWLOC_OBJ_OS_DEVICE;
+            *mapdepth = PRTE_BIND_TO_NONE;
+            break;
+        case PRTE_PPROBJ_NODE:
+            *maptype = HWLOC_OBJ_MACHINE;
+            *mapdepth = PRTE_BIND_TO_NONE;
+            break;
+        case PRTE_PPROBJ_HWT:
+            *maptype = HWLOC_OBJ_PU;
+            *mapdepth = PRTE_BIND_TO_HWTHREAD;
+            break;
+        case PRTE_PPROBJ_CORE:
+            *maptype = HWLOC_OBJ_CORE;
+            *mapdepth = PRTE_BIND_TO_CORE;
+            break;
+        case PRTE_PPROBJ_PACKAGE:
+            *maptype = HWLOC_OBJ_PACKAGE;
+            *mapdepth = PRTE_BIND_TO_PACKAGE;
+            break;
+        case PRTE_PPROBJ_NUMA:
+            *maptype = HWLOC_OBJ_NUMANODE;
+            *mapdepth = PRTE_BIND_TO_NUMA;
+            break;
+        case PRTE_PPROBJ_L1CACHE:
+            *maptype = HWLOC_OBJ_L1CACHE;
+            *mapdepth = PRTE_BIND_TO_L1CACHE;
+            break;
+        case PRTE_PPROBJ_L2CACHE:
+            *maptype = HWLOC_OBJ_L2CACHE;
+            *mapdepth = PRTE_BIND_TO_L2CACHE;
+            break;
+        case PRTE_PPROBJ_L3CACHE:
+            *maptype = HWLOC_OBJ_L3CACHE;
+            *mapdepth = PRTE_BIND_TO_L3CACHE;
+            break;
+        default:
+            return false;
     }
     return true;
 }
@@ -431,14 +435,22 @@ int prte_rmaps_base_resolve_app_options(prte_job_t *jdata,
      * When the app changed neither, the job-level binding stands. */
     have_bind = prte_get_attribute(&app->attributes, PRTE_APP_BINDTO, (void **)&u16ptr, PMIX_UINT16);
     opts->appbind = 0;
-    if (have_bind) {
+    if (have_bind && PRTE_BINDING_POLICY_IS_SET(u16)) {
         opts->bind = PRTE_GET_BINDING_POLICY(u16);
-        opts->overload = (0 != PRTE_BIND_OVERLOAD_ALLOWED(u16));
-        /* keep the whole word: the app asked for this binding, so its own
-         * directives - IF-SUPPORTED above all - describe it, not the job's */
-        opts->appbind = u16;
     } else if (have_map) {
         opts->bind = prte_rmaps_base_derive_binding(opts);
+    }
+    if (have_bind) {
+        opts->overload = (0 != PRTE_BIND_OVERLOAD_ALLOWED(u16));
+        /* keep the whole word: the app asked for this binding, so its own
+         * directives - IF-SUPPORTED above all - describe it, not the job's.
+         * A word that carried qualifiers but no policy ("--bind-to
+         * :overload-allowed") asked for the default binding, and a default
+         * is only ever a preference - as it is for the job */
+        opts->appbind = u16;
+        if (!PRTE_BINDING_POLICY_IS_SET(u16)) {
+            opts->appbind |= PRTE_BIND_IF_SUPPORTED;
+        }
     }
 
     /* keep the hwloc binding object in sync with the (possibly changed)
@@ -457,6 +469,10 @@ static void free_target(prte_rmaps_options_t *opts)
     if (NULL != opts->target) {
         hwloc_bitmap_free(opts->target);
         opts->target = NULL;
+    }
+    if (NULL != opts->devcpus) {
+        hwloc_bitmap_free(opts->devcpus);
+        opts->devcpus = NULL;
     }
 }
 
@@ -1713,6 +1729,7 @@ ranking:
              * the mappers compute their own per node */
             app_options.job_cpuset = NULL;
             app_options.target = NULL;
+            app_options.devcpus = NULL;
             /* nor of the job-level string: a pe-list mapper frees and
              * rewrites "cpuset" as it places procs, so each app needs its
              * own copy rather than a second pointer to the job's */

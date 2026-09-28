@@ -216,6 +216,22 @@ int test_job_policy(void)
     free(sval);
     PMIX_RELEASE(jdata);
 
+    /* a qualifier written after the device with ',' instead of ':' is
+     * refused.  It used to reach the mapper as the class "gpu" with the
+     * rest dropped - one GPU per process where two were asked for */
+    fprintf(stderr, "--- expected error output follows (device with a comma) ---\n");
+    jdata = newjob();
+    rc = prte_rmaps_base_set_mapping_policy(jdata, "device=gpu,ndev=2");
+    CHECK("job device=gpu,ndev=2: refused", PRTE_SUCCESS != rc);
+    CHECK("job device=gpu,ndev=2: no device recorded",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_MAP_DEVICE, NULL, PMIX_STRING));
+    PMIX_RELEASE(jdata);
+
+    jdata = newjob();
+    rc = prte_rmaps_base_set_mapping_policy(jdata, "ppr:2:device=gpu,ndev=2");
+    CHECK("job ppr:2:device=gpu,ndev=2: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(jdata);
+
     /* abbreviated, and the value read after the "=" rather than at a fixed
      * offset past the full spelling */
     jdata = newjob();
@@ -275,6 +291,36 @@ int test_job_policy(void)
     CHECK("job rankfile:FILE: path", NULL != sval && 0 == strcmp(sval, "/tmp/rf"));
     free(sval);
     PMIX_RELEASE(jdata);
+
+    /* === a job that names rankfile mapping without a FILE= uses the
+     * DVM's default rankfile, as a per-app spec always has.  It was refused
+     * instead: the "no file" check ran before the fallback that was meant
+     * to supply one === */
+    {
+        char *saved = prte_rmaps_base.file;
+
+        prte_rmaps_base.file = strdup("/tmp/dvm-default-rf");
+        jdata = newjob();
+        rc = prte_rmaps_base_set_mapping_policy(jdata, "rankfile");
+        CHECK("job rankfile, DVM default: rc", PRTE_SUCCESS == rc);
+        sval = get_str(&jdata->attributes, PRTE_JOB_FILE);
+        CHECK("job rankfile, DVM default: path",
+              NULL != sval && 0 == strcmp(sval, "/tmp/dvm-default-rf"));
+        free(sval);
+        PMIX_RELEASE(jdata);
+
+        /* ...and a FILE= of its own still wins */
+        jdata = newjob();
+        rc = prte_rmaps_base_set_mapping_policy(jdata, "rankfile:FILE=/tmp/rf");
+        sval = get_str(&jdata->attributes, PRTE_JOB_FILE);
+        CHECK("job rankfile:FILE over the DVM default",
+              PRTE_SUCCESS == rc && NULL != sval && 0 == strcmp(sval, "/tmp/rf"));
+        free(sval);
+        PMIX_RELEASE(jdata);
+
+        free(prte_rmaps_base.file);
+        prte_rmaps_base.file = saved;
+    }
 
     /* === garbage is refused, not guessed at === */
     jdata = newjob();
@@ -352,6 +398,22 @@ int test_job_policy(void)
     jdata = newjob();
     rc = prte_hwloc_base_set_binding_policy(jdata, "core:LIMIT=two");
     CHECK("bindto core:LIMIT=two: refused", PRTE_SUCCESS != rc);
+    PMIX_RELEASE(jdata);
+
+    /* an empty qualifier list splits to NULL, not to an empty array, and
+     * the qualifier loop indexed it: "--bind-to core:" killed prterun, and
+     * on the spawn path a persistent DVM's controller */
+    jdata = newjob();
+    rc = prte_hwloc_base_set_binding_policy(jdata, "core:");
+    CHECK("bindto core: (trailing colon): rc", PRTE_SUCCESS == rc);
+    CHECK("bindto core: (trailing colon): policy",
+          PRTE_BIND_TO_CORE == PRTE_GET_BINDING_POLICY(jdata->map->binding));
+    PMIX_RELEASE(jdata);
+
+    jdata = newjob();
+    rc = prte_hwloc_base_set_binding_policy(jdata, ":");
+    CHECK("bindto \":\": rc", PRTE_SUCCESS == rc);
+    CHECK("bindto \":\": no policy", !PRTE_BINDING_POLICY_IS_SET(jdata->map->binding));
     PMIX_RELEASE(jdata);
 
     /* === the printer.  Every qualifier at once is the longest string it
