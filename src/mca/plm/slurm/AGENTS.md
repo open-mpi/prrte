@@ -13,9 +13,9 @@ referenced throughout.
 starts one daemon per node across the allocation. Priority **75**,
 selected when running inside a SLURM allocation. Unlike `ssh` it does
 **one** launcher invocation for the whole DVM — `srun` fans out to the
-nodes itself — and it lets SLURM decide proc→node placement, so PRRTE
-learns each daemon's node only when the daemon phones home
-(`daemon_nodes_assigned_at_launch = false`).
+nodes itself. It lists the nodes in vpid order and has `srun` start the
+daemons in that order, so each daemon's node is known at launch
+(`daemon_nodes_assigned_at_launch = true`).
 
 Built only when SLURM is detected at configure time (`PRTE_CHECK_SLURM`);
 PRRTE does **not** link against any SLURM library — it just execs `srun`.
@@ -27,7 +27,7 @@ Files:
 | `plm_slurm_component.c` | Registration (`plm_slurm_args`), `query` (SLURM detection + version check via [`common/slurm`](../../common/slurm/AGENTS.md) → priority 75). |
 | `plm_slurm_module.c` | `plm_slurm_init`, `plm_slurm_launch_job` (spawn), `launch_daemons` (build & exec srun), `plm_slurm_start_proc` (fork/exec), `srun_wait_cb`, terminate/signal/finalize. |
 | `plm_slurm.h` | `prte_mca_plm_slurm_component_t` (`custom_args` — the version state lives in `common/slurm`, not here). |
-| `help-plm-slurm.txt` | Error text (no-srun, srun-failed, ancient-version, no-hosts-in-list). |
+| `help-plm-slurm.txt` | Error text (no-srun, srun-failed, ancient-version). |
 
 ---
 
@@ -67,19 +67,31 @@ If no Slurm command can be run, or the version cannot be parsed
    - `--mpi=none` (daemons aren't MPI tasks), `--cpu-bind=none` (don't
      let TaskAffinity pin the prted to one core).
    - any `plm_slurm_args`.
-   - a **nodelist**: the map's new-daemon nodes (skipping ones that
-     already have a daemon); errors `no-hosts-in-list` if empty.
-   - `--jobid=<id>` — taken from the first node's `PRTE_NODE_ALLOC_ID`
-     attribute and the matching session; lets PRRTE launch into another
-     allocation than the one it's in. Errors if no job id / session.
-   - `--nodes=N --nodelist=...` (only when not using the whole
-     allocation) and `--ntasks=N` where `N = num_new_daemons`.
+   - a **nodelist**: the nodes of this launch's daemons, in vpid order,
+     the vpids `daemon_vpid_start` to `daemon_vpid_start + num_new_daemons - 1`.
+     Not a walk of the daemon map, which also holds an earlier launch's
+     nodes until their daemons report: under two overlapping grows that
+     walk gave the second srun the first grow's node and job id.
+   - `--jobid=<id>` — taken from the first of those nodes'
+     `PRTE_NODE_ALLOC_ID` attribute and the matching session; lets PRRTE
+     launch into another allocation than the one it's in. Errors if no
+     job id / session.
+   - `--distribution=arbitrary --nodelist=<node file>` and `--ntasks=N`,
+     where `N = num_new_daemons`, on every launch. See "The node file"
+     below. The arbitrary distribution numbers the tasks in file order,
+     which is vpid order. Slurm's own node order need not be: a node
+     granted again after a release keeps its old place in the pool, which
+     is the order `setup_vm` hands out vpids in. `srun` takes the node
+     count from the file and refuses `--nodes` alongside this
+     distribution.
 3. **Build the `prted` argv** appended after srun's:
    `prte_plm_base_setup_prted_cmd`, then
    `prte_plm_base_prted_append_basic_args(..., "slurm", &proc_vpid_index)`.
    Substitute `map->daemon_vpid_start` into the vpid slot — SLURM starts
-   the tasks and each daemon offsets from this base to compute its own
-   vpid. That base is recomputed by `setup_virtual_machine` on **every**
+   the tasks and each daemon offsets from this base by its task index
+   (`SLURM_PROCID`, see [`ess/slurm`](../../ess/slurm/AGENTS.md)) to
+   compute its own vpid. That base is recomputed by
+   `setup_virtual_machine` on **every**
    launch, and this component is one of the three reasons it must be: a
    stale base (left over from DVM formation) tells the daemons of a later
    `--add-host` launch to claim ranks that live daemons already own. `ssh`
@@ -90,11 +102,41 @@ If no Slurm command can be run, or the version cannot be parsed
    `plm_slurm_start_proc`. Set state `DAEMONS_LAUNCHED`. On any error jump
    to `cleanup:` and activate `FAILED_TO_LAUNCH`.
 
+### The node file
+
+srun gets the node list in a file, never inline: as one `--nodelist`
+argument the list hits the kernel's per-argument limit (`MAX_ARG_STRLEN`,
+128 KiB, around 13k nodes). srun reads a `--nodelist` value containing
+`/` as a file (`slurm_read_hostfile`), on the HNP's host, so no shared
+file system is needed. An explicit `--nodelist` also overrides an
+inherited `SLURM_HOSTFILE`.
+
+- **Where:** `<daemon job session_dir>/srun-nodes.<daemon_vpid_start>`,
+  one name per line. `session_dir.c` refuses a session directory the
+  user does not own or that group or others can write.
+- **How:** `O_CREAT|O_EXCL`, mode 0600, so anything already at the path
+  fails the launch. A failed write fails it too, with a plain error.
+- **Names:** `slurm_read_hostfile` ends a name at a newline, splits it at
+  a comma, reads `*N` as N copies, and reads `#` as a comment unless
+  written `\#`. `#` is escaped; a name with a newline, a comma, or a `*`
+  followed by a number fails the launch. Nothing else is restricted. A
+  name Slurm does not know is no error to srun, from a file or inline: it
+  starts the task on another node of the job.
+- **Lifetime:** the srun's tracker owns the path once `start_proc`
+  succeeds, and `srun_release` unlinks it when srun exits. If the launch
+  fails before that, `launch_daemons` unlinks it. Session-dir teardown
+  removes anything left.
+- **Logging:** the srun command line shows only the path, so the node
+  list is logged at the verbosity the command line is (`plm_base_verbose`
+  1 and up).
+
 ### `plm_slurm_start_proc` — fork/exec srun
 
 `fork()`s; the parent records the srun pid (the first one becomes the
 `primary_srun_pid`) and registers a `prte_wait_cb` (`srun_wait_cb`) on a
-dummy proc so it notices srun's exit. The child:
+dummy proc so it notices srun's exit. The wait callback's data is a
+`plm_slurm_srun_t` (the Slurm job id and the node file), freed by
+`srun_release` on every path. The child:
 
 - **Purges `PMIX_*`/`PRTE_*` from the environment** — SLURM forwards the
   whole environment to the daemons, which we must not do (it could carry
@@ -152,10 +194,11 @@ not srun).
 
 ## Things to watch when editing
 
-- **One srun, RM-driven placement.** There is no per-node launch loop
-  like ssh — srun places the daemons. Hence
-  `daemon_nodes_assigned_at_launch = false`; don't assume a node↔daemon
-  binding before the callback.
+- **One srun, placement in list order.** There is no per-node launch
+  loop like ssh — srun places the daemons, in the order the node file
+  gives. That order is what binds each vpid to its node: keep the file in
+  vpid order and the distribution arbitrary, or daemons claim each
+  other's vpids and `prted_report_launch` renames their nodes to match.
 - **Version gates are load-bearing.** `--external-launcher` (23.11+) and
   the `ancient`/`early` flags come straight from the version
   [`common/slurm`](../../common/slurm/AGENTS.md) parsed out of

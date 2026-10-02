@@ -370,6 +370,28 @@ static void _client_abort(int sd, short args, void *cbdata)
         goto release;
     }
 
+    /* Aborting another job's processes is acting on that job. The abort
+     * up-call names no requester identity, so the requester is the owner
+     * of the calling process's job - the user its clients are registered
+     * as, which PMIx checks when they connect. A process may always abort
+     * its own job. Checked for every target before any is touched */
+    jdata = prte_get_job_data_object(cd->proc.nspace);
+    for (n = 0; n < cd->nprocs; n++) {
+        if (PMIX_CHECK_NSPACE_STRICT(cd->procs[n].nspace, cd->proc.nspace)) {
+            continue;
+        }
+        if (NULL == jdata ||
+            !prte_pmix_server_job_permitted(prte_pmix_server_job_owner(jdata),
+                                            prte_get_job_data_object(cd->procs[n].nspace))) {
+            pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                "%s abort refused: %s may not abort %s",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&cd->proc),
+                                PRTE_NAME_PRINT(&cd->procs[n]));
+            rc = PMIX_ERR_NO_PERMISSIONS;
+            goto release;
+        }
+    }
+
     // otherwise, we need to abort the specified procs
     for (n=0; n < cd->nprocs; n++) {
         if (PMIX_RANK_WILDCARD == cd->procs[n].rank) {
@@ -634,6 +656,9 @@ static void _toolconn(int sd, short args, void *cbdata)
         PMIX_RELEASE(cd);
         return;
     }
+
+    /* the tool's user is a user we now know - see pmix_server_access.c */
+    prte_pmix_server_access_user(cd->uid);
 
     pmix_output_verbose(2, prte_pmix_server_globals.output,
                         "%s %s CONNECTION FROM UID %d GID %d NSPACE %s PID %d",
@@ -1130,6 +1155,24 @@ static void record_interest(const pmix_proc_t *proc)
     }
 }
 
+/* May the process that asked for this pull receive the output of these
+ * sources? The PMIx server gives us the requester's uid in the directives,
+ * and the requester must be allowed every source job - its owner, a user
+ * or group its access list names, root, or the user this DVM runs as. */
+static bool iof_pull_permitted(const pmix_info_t *dirs, size_t ndirs,
+                               const pmix_proc_t *procs, size_t nprocs)
+{
+    size_t n;
+
+    for (n = 0; n < nprocs; n++) {
+        if (!prte_pmix_server_request_permitted(NULL, dirs, ndirs,
+                                                prte_get_job_data_object(procs[n].nspace))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void _iof_pull(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
@@ -1138,6 +1181,19 @@ static void _iof_pull(int sd, short args, void *cbdata)
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
 
     PMIX_ACQUIRE_OBJECT(cd);
+
+    /* a request to start forwarding needs the requester to be allowed the
+     * output - a request to stop is always honored */
+    if (!cd->flag && !iof_pull_permitted(cd->directives, cd->ndirs, cd->procs, cd->nprocs)) {
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s IOF pull refused: requester may not receive this output",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
+        if (NULL != cd->cbfunc) {
+            cd->cbfunc(PMIX_ERR_NO_PERMISSIONS, cd->cbdata);
+        }
+        PMIX_RELEASE(cd);
+        return;
+    }
 
     /* Set up I/O forwarding sinks and handlers for stdout and stderr for each proc
      * requesting I/O forwarding */
@@ -1200,6 +1256,9 @@ pmix_status_t pmix_server_iof_pull_fn(const pmix_proc_t procs[], size_t nprocs,
     cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
     cd->procs = (pmix_proc_t *) procs;
     cd->nprocs = nprocs;
+    /* borrowed like the procs - PMIx keeps them valid until the callback */
+    cd->directives = (pmix_info_t *) directives;
+    cd->ndirs = ndirs;
     cd->channels = channels;
     cd->flag = stop;
     cd->cbfunc = cbfunc;
@@ -1243,6 +1302,21 @@ static void pmix_server_stdin_push(int sd, short args, void *cbdata)
         cd->cbfunc(PMIX_ERR_NOT_SUPPORTED, cd->cbdata);
         PMIX_RELEASE(cd);
         return;
+    }
+
+    /* the requester must be allowed every job it is feeding - checked
+     * before any of the data goes anywhere */
+    for (n = 0; n < cd->nprocs; n++) {
+        if (!prte_pmix_server_request_permitted(&cd->proc, cd->directives, cd->ndirs,
+                                                prte_get_job_data_object(cd->procs[n].nspace))) {
+            pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                "%s stdin refused: requester may not access %s",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                PRTE_NAME_PRINT(&cd->procs[n]));
+            cd->cbfunc(PMIX_ERR_NO_PERMISSIONS, cd->cbdata);
+            PMIX_RELEASE(cd);
+            return;
+        }
     }
 
     for (n = 0; n < cd->nprocs; n++) {
@@ -1293,10 +1367,27 @@ pmix_status_t pmix_server_stdin_fn(const pmix_proc_t *source, const pmix_proc_t 
                                    const pmix_byte_object_t *bo, pmix_op_cbfunc_t cbfunc,
                                    void *cbdata)
 {
-    PRTE_HIDE_UNUSED_PARAMS(source, directives, ndirs);
+    prte_pmix_server_op_caddy_t *cd;
 
-    // Note: We are ignoring the directives / ndirs at the moment
-    PRTE_IO_OP(targets, ntargets, bo, pmix_server_stdin_push, cbfunc, cbdata);
+    cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
+    if (NULL == cd) {
+        return PMIX_ERR_NOMEM;
+    }
+    if (NULL != source) {
+        PMIX_LOAD_PROCID(&cd->proc, source->nspace, source->rank);
+    }
+    cd->procs = (pmix_proc_t *) targets;
+    cd->nprocs = ntargets;
+    cd->server_object = (void *) bo;
+    /* borrowed, like the rest - PMIx keeps them until we call back. They
+     * name the requester, whom the push checks */
+    cd->directives = (pmix_info_t *) directives;
+    cd->ndirs = ndirs;
+    cd->cbfunc = cbfunc;
+    cd->cbdata = cbdata;
+    prte_event_set(prte_event_base, &(cd->ev), -1, PRTE_EV_WRITE, pmix_server_stdin_push, cd);
+    PMIX_POST_OBJECT(cd);
+    prte_event_active(&(cd->ev), PRTE_EV_WRITE, 1);
 
     // Do not send PMIX_OPERATION_SUCCEEDED since the op hasn't completed yet.
     // We will send it back when we are done by calling the cbfunc.

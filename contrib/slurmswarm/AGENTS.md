@@ -227,7 +227,12 @@ any kind over there, so every DVM it builds goes out over ssh no matter what
 the ras was told. The cases assert that `plm/slurm` won
 selection, that the command really is `srun`, that it carried
 `--jobid=<the allocation>` (a launcher that omitted it would work on an idle
-cluster and queue a second job on a busy one), that PRRTE read the srun exit
+cluster and queue a second job on a busy one), that the nodes went to `srun`
+in a node file (`--nodelist=<session dir>/srun-nodes.<vpid>`, mode 0600, one
+name per line, the list itself in the HNP's verbose log) with
+`--distribution=arbitrary` and no `--nodes`, so the daemons are numbered in
+vpid order, that each daemon reported from its assigned node, that PRRTE read
+the srun exit
 as a **hand-off** rather than a failure once `prted` daemonized, that SLURM
 is left with no dangling job step, that `pterm` does not cancel the user's
 allocation, and — the other side of the gate — that with no allocation in the
@@ -315,6 +320,17 @@ phase, so five later groups — none of which depended on it — silently did no
 run, and the only visible symptom was a suite total about fifty checks lower
 than the run before. A group that gives up now says what it gave up on, and
 the caller runs the next one regardless.
+
+One more group runs on a DVM of its own:
+
+- **A node granted again, out of SLURM's order.** vpids follow the node
+  pool, where a regranted node keeps its old place, so a grant can list
+  nodes in a different order from SLURM's. Unless `srun` numbers the tasks
+  in pool order, the daemons swap vpids and the next grant of both nodes
+  gets one daemon. The case forces that order by parking every other node,
+  checks from the HNP's log that each daemon reported from its assigned
+  node, then grants the pair again and checks for a daemon and a job on
+  each. A grant that lands elsewhere is a skip: the order was not forced.
 
 [#2617]: https://github.com/openpmix/prrte/issues/2617
 [#2491]: https://github.com/openpmix/prrte/issues/2491
@@ -674,17 +690,24 @@ answer these two:
   exist for precisely that.
 
 `slurm-shim.py` is installed by `build.sh` as
-`/opt/prte/slurmshim/bin/{salloc,scontrol,scancel}` — dispatching on
+`/opt/prte/slurmshim/bin/{salloc,scontrol,scancel,srun}` — dispatching on
 `argv[0]`, and deliberately **not** into the install `bin/` that the node
 entrypoint puts on every PATH. A case opts in by starting its DVM with that
 directory first (`DVM_SHIM=1` in `run-tests.sh`), so nothing else in the
 suite can be perturbed by it. It is the **HNP** that needs it: the HNP is
 what shells out, the tools never do.
 
+It wraps `srun` for one assertion, that a launch past the kernel's 128 KiB
+per-argument limit still starts it: as one argument such a node list makes
+the exec fail with `E2BIG`. For each `srun` it records the line and byte
+count of the `--nodelist` file, and `elastic_launch_arg_limit_group` checks
+them after an extend onto 10000 invented nodes.
+
 ```sh
 slurm-shim reset                 # clear argv records and faults
 slurm-shim argv                  # argv of the most recent salloc
 slurm-shim audit                 # every wrapped command, in order
+slurm-shim nodefile              # lines and bytes of the last srun's node file
 slurm-shim set bad_json 1        # scontrol --json prints garbage, exits 0
 slurm-shim set scancel_fail 1    # scancel fails, verbosely
 ```
