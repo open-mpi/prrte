@@ -742,6 +742,25 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             jdata->uid = parent->uid;
             jdata->gid = parent->gid;
         }
+        /* a job we launch ourselves - prterun's own - is our user's, and
+         * our daemon job records no identity to inherit */
+        if (PRTE_INVALID_UID == jdata->uid &&
+            PMIX_CHECK_NSPACE(nptr->nspace, PRTE_PROC_MY_NAME->nspace)) {
+            jdata->uid = prte_process_info.euid;
+            jdata->gid = prte_process_info.egid;
+        }
+        /* and every daemon tells its PMIx server who owns the job when it
+         * registers it - PMIx decides who may access a job's data by that */
+        if (PRTE_INVALID_UID != jdata->uid) {
+            uint32_t ownuid = (uint32_t) jdata->uid;
+            prte_set_attribute(&jdata->attributes, PRTE_JOB_OWNER_UID, PRTE_ATTR_GLOBAL,
+                               &ownuid, PMIX_UINT32);
+            if (PRTE_INVALID_GID != jdata->gid) {
+                uint32_t owngid = (uint32_t) jdata->gid;
+                prte_set_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID, PRTE_ATTR_GLOBAL,
+                                   &owngid, PMIX_UINT32);
+            }
+        }
 
         /* A spawn-target list takes precedence and may name multiple sessions
          * (the union of allocations the job may map onto). Resolve it, validate

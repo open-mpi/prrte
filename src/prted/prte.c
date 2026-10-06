@@ -105,6 +105,7 @@
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_wait.h"
 #include "src/runtime/runtime.h"
+#include "src/util/prte_dvm_key.h"
 
 #include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
@@ -515,6 +516,14 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         return 1;
     }
 
+    /* Create the DVM key.  Each daemon we launch is handed it, privately,
+     * and must prove it holds it before any other daemon will talk to it -
+     * see src/util/prte_dvm_key.h.  It is created before we might detach,
+     * so the DVM has one key however it is started. */
+    if (PRTE_SUCCESS != prte_dvm_key_generate()) {
+        return 1;
+    }
+
     /* parse the input argv to get values, including everyone's MCA params */
     PMIX_CONSTRUCT(&results, pmix_cli_result_t);
     // check for special case of executable immediately following tool
@@ -756,7 +765,7 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         if (PRTE_SUCCESS != rc || 0 == pmix_list_get_size(&apps)) {
             if (proxyrun) {
                 prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "prun:executable-not-specified", true,
-                               prte_tool_basename, prte_tool_basename);
+                               prte_tool_basename);
                 PRTE_UPDATE_EXIT_STATUS(rc);
                 goto DONE;
             }
@@ -980,7 +989,7 @@ PRTE_EXPORT int prte(int argc, char *argv[])
             if (0 != strcmp(cptr, param)) {
                 prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-base.txt", "multiple-prrte-prefixes", true,
                                prte_tool_basename, prte_tool_basename,
-                               prte_tool_basename, param, cptr);
+                               prte_tool_basename, prte_tool_basename, param, cptr);
                 free(param);
                 free(cptr);
                 PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
@@ -1053,6 +1062,14 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         rc = prte_state_base_set_runtime_options(jdata, prte_schizo_base.default_runtime_options);
     }
     if (PRTE_SUCCESS != rc) {
+        PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+        goto DONE;
+    }
+    /* the users= and groups= among them say who else may change the DVM -
+     * create a session in it, say */
+    rc = prte_pmix_server_access_record_dvm(jdata);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
         PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
         goto DONE;
     }

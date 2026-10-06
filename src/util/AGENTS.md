@@ -35,6 +35,7 @@ linked into `libprrte`. There are no MCA components here.
 | **Session directories** | `session_dir.[ch]` | Construction and teardown of the `$TMPDIR/<prefix>.<pid>/<jobid>/<rank>` tree. |
 | **Tool option values** | `prte_cmd_line.[ch]` | Value interpreters more than one tool needs (`--pid`, `--app`, the daemon umask), and the vocabularies of the directive-valued options - see "Directive vocabularies" below. See [`src/tools/AGENTS.md`](../tools/AGENTS.md). |
 | **Bootstrap** | `prte_bootstrap.[ch]` | Reading `prte.conf` for a launcher-less DVM. |
+| **DVM key** | `prte_dvm_key.[ch]`, `prte_hmac.[ch]` | The per-DVM key daemons prove they hold before the OOB treats them as daemons, how each launcher delivers it, and the SHA-256/HMAC that proof is made with. See "The DVM key" below. |
 | **Process plumbing** | `daemon_init.c`, `sys_limits.[ch]`, `stacktrace.[ch]`, `ethtool.[ch]` | Daemonizing, `setrlimit`, the crash handler, and the Linux interface-speed ioctl. |
 | **Help delivery** | `prte_show_help.[ch]` | `prte_show_help()` — a drop-in for `pmix_show_help()` that works on a **daemon**. See below. |
 | **Generated** | `prte_show_help_content.c`, `prte-convert-help.py` | Every `help-*.txt` in the tree, compiled in. **Never edit the generated file.** |
@@ -181,7 +182,19 @@ directories. `_check_owner()` therefore refuses any directory PRRTE composes
 (top, job, rank) that is not owned by our euid or is group/other-writable,
 inspecting it through an `O_NOFOLLOW` descriptor. It never examines
 `tmpdir_base`: that was handed to us, and on macOS it is reached through the
-root-owned `/tmp` symlink. A job whose directory is refused must also forget
+root-owned `/tmp` symlink.
+
+**A top-level name that is taken is not a reason to stop.** For the top
+directory, and for `prun`'s own session directory, `prte_session_dir_create()`
+(`_claim_dir()`) uses the name only if it is free or holds a directory of ours
+that passes that check; otherwise it creates `<name>.XXXXXX` with `mkdtemp()`
+and hands that name back in its place. Nothing looks a session directory up
+by name - it is passed to PMIx (`PMIX_SERVER_TMPDIR`, `PMIX_TMPDIR`) and
+everywhere else by value, and PMIx finds rendezvous files by searching
+subdirectories - so the only effect is that startup succeeds. The prefix is
+kept, so cleanup by prefix (`/tmp/prte.*`, as `contrib/dockerswarm` does)
+still catches it. The job and rank directories need none of this: they are
+made inside a directory that is ours and closed to everyone else. A job whose directory is refused must also forget
 the path (`jdata->session_dir = NULL`), because finalize recursively destroys
 whatever that names. Verifying the foreign-owner refusal needs a second uid,
 so it was checked in the dockerswarm image as root planting the name for the
@@ -258,6 +271,37 @@ job and therefore sends no launch message.
 
 ---
 
+## The DVM key
+
+`prte_dvm_key` is a 256-bit value every daemon of one DVM holds and nothing
+else does; the OOB connect handshake (`src/rml/oob/AGENTS.md`) has each end
+prove it holds the key before anything else happens. The whole value of it is
+that **it stays private to the DVM's own processes**:
+
+- never on a command line (`ps` shows every command line on the node) - and
+  so never as a `PRTE_MCA_` environment variable either, because
+  `prte_plm_base_prted_append_basic_args` copies those onto the prted's;
+- never in a file other users can access (`prte_dvm_key_from_file` refuses one
+  that is group/other accessible, not ours, or a symlink);
+- never left in a daemon's environment once read (`prte_dvm_key_scrub_env`
+  wipes the bytes - `/proc/<pid>/environ` shows them, `unsetenv` alone does
+  not remove them - and every prted calls it before it can start anything).
+
+Each launcher has its own channel: `plm/ssh` the ssh's stdin (read by
+`prte_dvm_key_from_fd` before the prted daemonizes, since daemonizing replaces
+stdin), `plm/slurm`/`lsf`/`pals` the launcher's environment
+(`prte_dvm_key_setenv`, scrubbed from an `env` array with
+`prte_dvm_key_scrub_array` before it is freed), and a bootstrapped DVM the
+`DVMKeyFile` named in `prte.conf`. A new launcher must pick a channel of the
+same kind, or its daemons are no longer the only processes that can join.
+
+`prte_hmac.[ch]` - SHA-256 and HMAC-SHA256, checked against the FIPS 180-4
+and RFC 4231 vectors in `test/unit/util` - is generic code, and the rule below
+says generic code belongs in PMIx. It is here for now because PRRTE must not
+wait on a PMIx release to authenticate its own daemons; if PMIx grows the same
+primitives, use them and delete these. Compare a received proof with
+`prte_secure_equal`, never `memcmp`.
+
 ## `prte_process_info`
 
 A single global, filled in by `prte_setup_hostname()` and `prte_proc_info()`.
@@ -290,9 +334,15 @@ the modex match the names found locally.
   `--map-by`/`--rank-by`/`--bind-to` over synthetic topologies. It consumes
   what `dash_host`/`hostfile` produce, so run it after touching either.
 
-Not unit-testable, and deliberately left to the live smoke test: `session_dir`
-(creates directories under the real `$TMPDIR`), `stacktrace` (installs signal
-handlers), `daemon_init` (forks), and `nidmap` (needs a populated DVM).
+Not unit-testable, and deliberately left to the live smoke test: most of
+`session_dir` (it creates directories under the real `$TMPDIR`), `stacktrace`
+(installs signal handlers), `daemon_init` (forks), and `nidmap` (needs a
+populated DVM). The exception is claiming a top-level directory
+(`prte_session_dir_create()`), which takes the path it is given, so
+`test/unit/util/test_session_dir.c` drives it inside a scratch directory:
+a free name, our own directory, and each kind of name it must pass over.
+A directory owned by another user needs a second uid, so that case is in
+`contrib/dockerswarm`'s `test_util` phase, which can make one as root.
 
 `nidmap` in particular needs a DVM that has **changed size**, and a job that
 **spans a daemon which predates the change** — a one-proc job lands on the
@@ -434,6 +484,20 @@ make
 
 This is a top-level golden rule; it is repeated here because three of the
 tree's `help-*.txt` files live under this directory.
+
+`prte-convert-help.py --check-only` (run by `make check`, and by the
+generation rule under `--purge`) checks the calls against the help files:
+
+| Check | Fails on |
+|-------|----------|
+| `purge()` | a topic no call shows |
+| `check_citation_files()` | a call naming one of our help files with the name mangled |
+| `check_citation_topics()` | a call naming a topic its help file does not have - the user would get PMIx's "couldn't find that topic" placeholder |
+| `check_call_arguments()` | a call passing a different number of arguments than the topic has `printf` conversions - the topic is the format string, so the compiler cannot |
+
+Only calls with a literal file and topic are checked, a call citing a help
+file PMIx owns is left to PMIx, and a topic that pulls in other text with
+`#include` is not counted.
 
 ---
 

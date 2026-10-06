@@ -501,6 +501,122 @@ SPECIAL_TOPICS = ["help",
                   "placement-fundamentals",
                   "placement-limits"]
 
+# printf conversions in a help topic; a '*' width or precision takes an
+# argument of its own
+FMT_SPEC = re.compile(r'%(?P<flags>[-+ #0]*)(?P<width>\*|\d+)?(?:\.(?P<prec>\*|\d+))?'
+                      r'(?:hh|h|ll|l|L|z|j|t|q)?(?P<conv>[diouxXeEfFgGaAcspn%])')
+
+
+def count_specs(lines):
+    n = 0
+    for line in lines:
+        for m in FMT_SPEC.finditer(line):
+            if '%' == m.group('conv'):
+                continue
+            n += 1
+            if '*' == m.group('width'):
+                n += 1
+            if '*' == m.group('prec'):
+                n += 1
+    return n
+
+
+def split_call_args(text, start):
+    """Split the argument list of the call whose '(' is at text[start] at its
+    top-level commas.  Returns (args, end) or (None, end) if the call cannot
+    be read to its closing parenthesis."""
+    depth = 0
+    i = start
+    args = []
+    cur = []
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in '"\'':
+            # a string or character literal, escapes and all
+            q = c
+            j = i + 1
+            while j < n and text[j] != q:
+                j += 2 if text[j] == '\\' else 1
+            cur.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if text.startswith('//', i):
+            j = text.find('\n', i)
+            i = n if j < 0 else j
+            continue
+        if c in '([{':
+            depth += 1
+            if depth > 1:
+                cur.append(c)
+        elif c in ')]}':
+            depth -= 1
+            if depth == 0:
+                args.append(''.join(cur).strip())
+                return args, i
+            cur.append(c)
+        elif c == ',' and depth == 1:
+            args.append(''.join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    return None, n
+
+
+def check_call_arguments(parsed_data, source_files, verbose=False):
+    """Every show_help call with a literal file and topic must pass exactly as
+    many arguments as the topic has conversions.  The topic is the format
+    string, so the compiler never sees it: too few arguments reads whatever
+    is in the registers and on the stack, and a %s among them dereferences
+    it.  Returns the number of mismatches found."""
+    topics = {}
+    for path, sections in parsed_data.items():
+        base = os.path.basename(path)
+        for topic, lines in sections.items():
+            # a topic that pulls in another's text cannot be counted here
+            if any(l.startswith('#include') for l in lines):
+                continue
+            topics[(base, topic)] = count_specs(lines)
+
+    # (function name, index of the filename argument)
+    calls = (('prte_show_help', 1), ('pmix_show_help', 0))
+    bad = 0
+    for src in source_files:
+        with open(src) as f:
+            text = f.read()
+        for fn, fidx in calls:
+            for m in re.finditer(r'\b' + fn + r'\s*\(', text):
+                args, _ = split_call_args(text, m.end() - 1)
+                if args is None or len(args) < fidx + 3:
+                    continue
+                fname, topic = args[fidx], args[fidx + 1]
+                if not (fname.startswith('"') and topic.startswith('"')):
+                    continue
+                if any('__VA_ARGS__' in a for a in args):
+                    continue
+                key = (fname.strip('"'), topic.strip('"'))
+                if key not in topics:
+                    continue
+                given = len(args) - (fidx + 3)
+                want = topics[key]
+                if given != want:
+                    line = text.count('\n', 0, m.start()) + 1
+                    sys.stderr.write("ERROR: %s:%d: %s(%s, %s) passes %d argument%s; "
+                                     "the topic has %d conversion%s\n"
+                                     % (src, line, fn, fname, topic, given,
+                                        '' if 1 == given else 's', want,
+                                        '' if 1 == want else 's'))
+                    bad += 1
+    if 0 == bad and verbose:
+        print("Every show_help call passes as many arguments as its topic expects")
+    return bad
+
+
 def check_citation_files(parsed_data, citations, verbose=False):
     # Every file name a show_help call passes must be the name of a help file
     # that actually exists.
@@ -541,6 +657,30 @@ def check_citation_files(parsed_data, citations, verbose=False):
         print("All show_help citations name their PRRTE help file correctly")
     return errorFound
 
+def check_citation_topics(parsed_data, citations, verbose=False):
+    # Every topic a show_help call names in one of our help files must
+    # exist in that file.  Like a misnamed file, a missing topic does not
+    # fail loudly: the lookup finds nothing and the user is handed PMIx's
+    # "Sorry! ... I couldn't find that topic" placeholder in place of the
+    # diagnostic, on exactly the error path nobody exercises.  A citation of
+    # a file we do not own is PMIx's to resolve and is not checked here.
+    topics = {}
+    for path, sections in parsed_data.items():
+        topics.setdefault(os.path.basename(path), set()).update(sections.keys())
+    errorFound = False
+    reported = set()
+    for (fil, topic) in citations:
+        if fil not in topics or topic in topics[fil] or (fil, topic) in reported:
+            continue
+        reported.add((fil, topic))
+        sys.stderr.write("ERROR: show_help names a topic its help file does not have\n")
+        sys.stderr.write("    File:  " + fil + "\n")
+        sys.stderr.write("    Topic: " + topic + "\n")
+        errorFound = True
+    if verbose and not errorFound:
+        print("Every topic a show_help call names exists in its help file")
+    return errorFound
+
 def purge(parsed_data, citations):
     special_topics = SPECIAL_TOPICS
     result_data = {}
@@ -550,25 +690,6 @@ def purge(parsed_data, citations):
         result_sections = {}
         for section in sections:
             content_list = sections[section]
-            # check for duplicate entries
-            content = '\n'.join(content_list)
-            # search all other entries for a matching section
-            for (file2, sec) in parsed_data.items():
-                if file2 == filename:
-                    continue
-                for (sec2, cl) in sec.items():
-                    cnt = '\n'.join(cl)
-                    if sec == section:
-                        if content == cnt:
-                            # these are the same
-                            sys.stderr.write("DUPLICATE FOUND:\n    SECTION: " + section + "\n    FILES: " + \
-                                             filename + "\n           " + file2 + "\n")
-                            errorFound = True
-                        else:
-                            # same topic, different content
-                            sys.stderr.write("DUPLICATE SECTION WITH DIFFERENT CONTENT:\n    SECTION: " + \
-                                             section + "\n    FILES: " + filename + "\n           " + file2 + "\n")
-                            errorFound = True
             # search code files for usage
             # protect special values
             if section in special_topics:
@@ -595,9 +716,8 @@ def purge(parsed_data, citations):
         else:
             sys.stderr.write("File " + filename + " has no used topics - omitting\n")
             errorFound = True
-        if errorFound:
-            exit(1)
 
+    # report every file's unused topics before failing, not just the first's
     if errorFound:
         exit(1)
     return result_data
@@ -721,6 +841,10 @@ def main():
         if check_tool_options(tool_data, tables, norm, citations, args.verbose):
             exit(1)
         if check_citation_files(parsed_data, citations, args.verbose):
+            exit(1)
+        if check_citation_topics(parsed_data, citations, args.verbose):
+            exit(1)
+        if check_call_arguments(parsed_data, source_files + tool_source_files, args.verbose):
             exit(1)
         outdata = purge(parsed_data, citations)
     else:

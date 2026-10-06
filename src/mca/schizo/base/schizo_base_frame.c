@@ -452,6 +452,8 @@ static const char *valued_directives[] = {
     PRTE_CLI_TIMEOUT,
     PRTE_CLI_SPAWN_TIMEOUT,
     PRTE_CLI_OUTPUT_PROCTABLE,
+    PRTE_CLI_ACCESS_USERS,
+    PRTE_CLI_ACCESS_GROUPS,
     NULL
 };
 
@@ -1261,7 +1263,7 @@ int prte_schizo_base_parse_output(pmix_cli_item_t *opt, void *jinfo)
                     if (PRTE_OUTQUAL_NOCOPY == tag || PRTE_OUTQUAL_COPY == tag) {
                         if (copyqualgiven) {
                             // cannot give both copy and nocopy
-                            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-output.txt", "copy-nocopy", true, cptr);
+                            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-output.txt", "copy-nocopy", true);
                             rc = PRTE_ERR_SILENT;
                             goto cleanup;
                         }

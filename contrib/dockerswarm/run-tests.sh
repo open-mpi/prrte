@@ -413,14 +413,22 @@ else
     bootstrap_vol() { docker run --rm -v "$VOLUME":/opt/prte "$IMAGE" sh -c "$1" 2>/dev/null; }
 fi
 
-bootstrap_write_conf() {   # $1 = controller host, $2 = DVMNodes list
+# Every daemon of a bootstrapped DVM proves it belongs with a key it reads from
+# the file DVMKeyFile names - there is no launcher to hand it one - so the
+# configuration carries one, made fresh each time, beside prte.conf (whose
+# location the cluster preflight may change, so it is not fixed here).
+# $3 = "nokey" leaves it out.
+bootstrap_write_conf() {   # $1 = controller host, $2 = DVMNodes list, [$3 = nokey]
+    local keyline="DVMKeyFile=$BOOT_CONF.key\\n"
+    [ "${3:-}" = nokey ] && keyline=""
     bootstrap_vol "[ -f $BOOT_CONF.testsave ] || cp $BOOT_CONF $BOOT_CONF.testsave;
-                   printf 'ClusterName=swarm\nDVMControllerHost=%s\nDVMPort=7817\nDVMNodes=%s\nDVMRadix=64\n' \
+                   (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \\n' > $BOOT_CONF.key);
+                   printf 'ClusterName=swarm\nDVMControllerHost=%s\nDVMPort=7817\nDVMNodes=%s\nDVMRadix=64\n$keyline' \
                        '$1' '$2' > $BOOT_CONF" || return 1
     return 0
 }
 bootstrap_restore_conf() {
-    bootstrap_vol "[ -f $BOOT_CONF.testsave ] && mv $BOOT_CONF.testsave $BOOT_CONF; true"
+    bootstrap_vol "[ -f $BOOT_CONF.testsave ] && mv $BOOT_CONF.testsave $BOOT_CONF; rm -f $BOOT_CONF.key; true"
 }
 # start prted --bootstrap on the given nodes, controller first (it has to be
 # listening before the others try to reach it)
@@ -4029,6 +4037,41 @@ test_session() {
             && ok "a general job was kept off the reserved nodes" \
             || bad "a general job landed on reserved nodes: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
 
+        banner "session: a node another session holds is not given away"
+        # 4242 holds node3 and is running a job there, so a second session
+        # naming node3 has to be refused, and 4242's job left alone.
+        out=$(RUN "timeout 60 $SESSCTL instantiate 4250 --hosts node3:2" 2>&1); rc=$?
+        if [ "$rc" = 124 ]; then
+            bad "instantiating onto a held node hung"
+        elif echo "$out" | grep -q PMIX_SUCCESS; then
+            bad "a second session was given node3, which 4242 holds"
+        else
+            ok "a second session was refused a node 4242 holds"
+        fi
+        ON 3 'pgrep -x sleep >/dev/null' \
+            && ok "the holding session's job on node3 is untouched" \
+            || bad "4242's job on node3 is gone"
+
+        banner "session: a fixed-size DVM is not grown by a session"
+        # node5 is not in this DVM, which was not started elastic and so
+        # cannot change size.  A session naming it has to be refused - not
+        # grow onto it, which a non-elastic DVM cannot complete.
+        out=$(RUN "timeout 60 $SESSCTL instantiate 4251 --hosts node5:2" 2>&1); rc=$?
+        if [ "$rc" = 124 ]; then
+            bad "instantiating onto a node outside a non-elastic DVM hung"
+        elif echo "$out" | grep -q PMIX_SUCCESS; then
+            bad "a session grew a non-elastic DVM onto node5"
+        else
+            ok "a session naming a node outside a non-elastic DVM was refused"
+        fi
+        ON 5 'pgrep -x prted >/dev/null' \
+            && bad "a daemon was started on node5" \
+            || ok "no daemon was started on node5"
+        out=$(PRUN '-n 2 --map-by node hostname' 2>&1)
+        echo "$out" | grep -qE '^node[12]$' \
+            && ok "the DVM still runs jobs afterwards" \
+            || bad "the DVM stopped running jobs: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
         banner "session: a request relayed from a non-master daemon is served"
         # node3 is not the DVM master, so this goes out on PRTE_RML_TAG_SCHED
         # and comes back on ..._SCHED_RESP.  With one daemon that relay never
@@ -4175,6 +4218,171 @@ test_session() {
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
     for n in $(seq 1 "$NNODES"); do kill_stray "$n" sleep; done
+    cleanup_swarm
+}
+
+########################################################################
+# src/prted/pmix -- what a tool of ANOTHER user may ask of the DVM.
+#
+# The DVM judges a request by the user PMIx authenticated for the
+# requester's connection.  Only a second user can show that, so the DVM
+# runs as root with prte_pmix_no_foreign_tools off, and roletool runs as
+# uid 65534 through setpriv, reaching the DVM by its URI (its rendezvous
+# files are root's alone).  That user must be refused:
+#
+#   * a spawn naming a job of root's as its parent - the parent decides
+#     the session, the allocation and the job the new one is connected to
+#   * the scheduler role, which decides every session
+#   * a new session, which takes nodes out of the general pool
+#
+# and root's own scheduler, once it has gone, must not keep the DVM
+# deferring to it.  A DVM started naming that user - --rtos users= and
+# prte_pmix_scheduler_uids - lets it create a session and be the scheduler.
+########################################################################
+ROLETOOL=/opt/prte/prte/bin/roletool
+test_requesters() {
+    local out uri pns rq rc
+
+    banner "requesters: a tool of another user is judged as that user"
+    cleanup_swarm
+    if ! RUN "test -x $ROLETOOL"; then
+        skp "roletool not installed -- re-run ./build.sh"
+        return
+    fi
+    if ! RUN 'test "$(id -u)" = 0 && command -v setpriv >/dev/null'; then
+        skp "running a tool as a second user needs root and setpriv on the head node"
+        return
+    fi
+    if ! prted_dvm_start_mca 'node1:2,node2:2' '--prtemca prte_pmix_no_foreign_tools 0'; then
+        bad "could not start a DVM that accepts other users' tools"
+        return
+    fi
+    # the URI is the file's first line; the rest describe the server
+    uri=$(RUN "head -1 $PRTED_URI" 2>/dev/null | tr -d '\r\n')
+    # HOME too: root's is not readable by the second user
+    rq="setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp $ROLETOOL '$uri'"
+
+    # the control: without it, every refusal below could just as well be a
+    # tool that cannot reach the DVM at all
+    out=$(RUN "timeout 60 $rq spawn" 2>&1)
+    if ! echo "$out" | grep -q "ROLE SPAWN PMIX_SUCCESS"; then
+        bad "a tool of another user could not start a job of its own: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+        cleanup_swarm
+        return
+    fi
+    ok "a tool of another user can start a job of its own"
+
+    banner "requesters: another user may not name root's job as a parent"
+    ON 1 'printf "#!/bin/sh\necho NS=\$PMIX_NAMESPACE\nexec sleep 60\n" > /tmp/rqparent.sh && chmod +x /tmp/rqparent.sh'
+    PRUN_BG /tmp/rqparent.out '--host node1:1 -n 1 /tmp/rqparent.sh'
+    pns=""
+    for _ in $(seq 1 20); do
+        pns=$(RUN 'cat /tmp/rqparent.out 2>/dev/null' | sed -n 's/^NS=//p' | tr -d '\r' | head -1)
+        [ -n "$pns" ] && break
+        sleep 1
+    done
+    if [ -z "$pns" ]; then
+        bad "the parent job did not report its namespace"
+    else
+        out=$(RUN "timeout 60 $rq parent '$pns' 0" 2>&1)
+        if echo "$out" | grep -q "ROLE SPAWN PMIX_SUCCESS"; then
+            bad "another user's spawn was made a child of root's job $pns"
+        elif echo "$out" | grep -q "ROLE SPAWN PMIX_ERR_NO_PERMISSIONS"; then
+            ok "another user's spawn naming root's job as parent was refused"
+        else
+            bad "naming root's job as parent failed oddly: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        ON 1 'pgrep -f rqparent.sh >/dev/null' \
+            && ok "root's job is still running" \
+            || bad "root's job did not survive the refused spawn"
+    fi
+
+    banner "requesters: another user may not be the scheduler"
+    out=$(RUN "timeout 60 $rq scheduler" 2>&1)
+    if echo "$out" | grep -q "ROLE INIT PMIX_SUCCESS"; then
+        bad "a tool of another user was accepted as the scheduler"
+    else
+        ok "a tool of another user was refused the scheduler role"
+    fi
+
+    banner "requesters: another user may not create a session"
+    out=$(RUN "timeout 60 $rq instantiate 4270 node2:2" 2>&1)
+    if echo "$out" | grep -q "ROLE SESSION PMIX_SUCCESS"; then
+        bad "another user created a session"
+    elif echo "$out" | grep -q "ROLE SESSION PMIX_ERR_NO_PERMISSIONS"; then
+        ok "another user was refused a new session"
+    else
+        bad "creating a session failed oddly: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    # two procs by node: one must land on node2 (root's parent job still
+    # holds a slot on node1, so ask for no more than will fit)
+    out=$(PRUN '-n 2 --map-by node hostname' 2>&1)
+    echo "$out" | grep -q '^node2$' \
+        && ok "node2 is still in the general pool" \
+        || bad "node2 is no longer usable: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+    banner "requesters: a scheduler that has gone is forgotten"
+    # root's own scheduler is accepted - and once it leaves, the DVM must
+    # stop deferring to it, or no tool could start a job again
+    out=$(RUN "timeout 60 $ROLETOOL '$uri' scheduler" 2>&1)
+    echo "$out" | grep -q "ROLE INIT PMIX_SUCCESS" \
+        && ok "root's tool was accepted as the scheduler" \
+        || bad "root's tool was refused the scheduler role: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    sleep 2
+    out=$(PRUN '-n 2 --map-by node hostname' 2>&1)
+    echo "$out" | grep -qE '^node[12]$' \
+        && ok "tools start jobs again once the scheduler has gone" \
+        || bad "a tool could not start a job after the scheduler left: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    ON 1 'rm -f /tmp/rqparent.sh /tmp/rqparent.out'
+    for n in 1 2; do kill_stray "$n" sleep; done
+    cleanup_swarm
+
+    banner "requesters: the users a DVM is started with may change it"
+    # the same second user, now named twice when the DVM starts: by
+    # --rtos users= (who else may change the DVM) and by
+    # prte_pmix_scheduler_uids (who else may be its scheduler)
+    if ! prted_dvm_start_mca 'node1:2,node2:2' \
+            '--prtemca prte_pmix_no_foreign_tools 0 --prtemca prte_pmix_scheduler_uids 65534 --rtos users=65534'; then
+        bad "could not start a DVM naming a second user"
+    else
+        uri=$(RUN "head -1 $PRTED_URI" 2>/dev/null | tr -d '\r\n')
+        rq="setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp $ROLETOOL '$uri'"
+        out=$(RUN "timeout 60 $rq instantiate 4271 node2:2" 2>&1)
+        echo "$out" | grep -q "ROLE SESSION PMIX_SUCCESS" \
+            && ok "a user named by --rtos users= created a session" \
+            || bad "a user named by --rtos users= could not create a session: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(RUN "timeout 60 $SESSCTL terminate 4271" 2>&1)
+        echo "$out" | grep -q PMIX_SUCCESS \
+            || bad "could not terminate session 4271: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        banner "requesters: a scheduler may run as a user the DVM names"
+        out=$(RUN "timeout 60 $rq scheduler" 2>&1)
+        echo "$out" | grep -q "ROLE INIT PMIX_SUCCESS" \
+            && ok "a scheduler running as a user prte_pmix_scheduler_uids names was accepted" \
+            || bad "a scheduler running as a listed user was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 2
+        out=$(PRUN '-n 2 --map-by node hostname' 2>&1)
+        echo "$out" | grep -qE '^node[12]$' \
+            && ok "tools start jobs again once that scheduler has gone" \
+            || bad "a tool could not start a job after the scheduler left: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "requesters: a scheduler user nobody has stops the DVM starting"
+    out=$(RUN "timeout -k 5 60 prte --prtemca prte_pmix_scheduler_uids prte-no-such-user --host node1:1" 2>&1); rc=$?
+    if [ "$rc" = 124 ]; then
+        bad "the DVM started with a scheduler user nobody has"
+    elif [ "$rc" = 0 ]; then
+        bad "prte exited 0 with a scheduler user nobody has"
+    else
+        echo "$out" | grep -q "does not know" \
+            && ok "a scheduler user nobody has is reported and stops the DVM" \
+            || bad "prte failed without naming the unknown user: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
     cleanup_swarm
 }
 
@@ -4568,21 +4776,24 @@ test_util() {
                  || bad "a valid system limit broke the launch: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
     cleanup_swarm
 
-    banner "util: a session directory owned by another user is refused"
-    # The top session directory has a predictable name, <tmpdir>/prtrn.<pid>
-    # for prterun, and one already there used to be adopted whoever owned it.
-    # exec keeps the pid, so the shell can make the directory prterun will
-    # look for before prterun exists. It must be ours.
+    banner "util: a session directory owned by another user is not used"
+    # The top session directory is <tmpdir>/prtrn.<pid> for prterun, and one
+    # already there used to be adopted whoever owned it.  It must be ours to
+    # be used; when it is not, prterun makes one of its own beside it
+    # (prtrn.<pid>.XXXXXX) and runs as usual.  exec keeps the pid, so the
+    # shell can make the directory prterun will look for before prterun
+    # exists.
     cleanup_swarm
     if bounded 90 RUN 'd=/tmp/prtrn.$$; mkdir $d && chmod 777 $d && chown 65534 $d &&
-                       exec prterun -n 1 hostname'; then
-        bad "prterun used a session directory owned by uid 65534"
-    elif grep -q 'belongs to another user' "$BOUT"; then
-        ok "prterun refused a session directory owned by another user"
+                       exec prterun -n 1 hostname' && grep -q '^node1$' "$BOUT"; then
+        ok "prterun ran with its session directory name held by another user"
     else
-        bad "prterun failed, but not over the directory's owner: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
+        bad "prterun did not run past another user's session directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
     fi
     rm -f "$BOUT"
+    RUN 'find /tmp -maxdepth 1 -name "prtrn.*" -uid 65534 | grep -q .' \
+        && ok "the other user's directory is still theirs" \
+        || bad "the other user's session directory was removed or taken over"
     RUN 'find /tmp -maxdepth 1 -name "prtrn.*" -uid 65534 -exec sh -c "ls -A {} | grep -q ." \; -print' \
         | grep -q . \
         && bad "something was written into the other user's session directory" \
@@ -4598,11 +4809,12 @@ test_util() {
     rm -f "$BOUT"
     cleanup_swarm
 
-    banner "util: prun refuses a session directory owned by another user"
+    banner "util: prun does not use a session directory owned by another user"
     # prun hands PMIx <tmpdir>/prun.session.<node>.<euid>.<pid> as its server
     # tmpdir, and PMIx trusts a directory it is given - so prun has to create
-    # it, and refuse one already there that is not ours, before handing it
-    # over. A DVM on node1 alone is enough: the directory is prun's own.
+    # it, and use one already there only if it is ours, before handing it
+    # over; otherwise it makes one of its own beside it. A DVM on node1 alone
+    # is enough: the directory is prun's own.
     cleanup_swarm
     RUN 'nohup prte --daemonize --report-uri /tmp/sessdir-dvm.uri >/tmp/prte.out 2>&1 & sleep 5' >/dev/null
     if ! RUN 'pgrep -x prte >/dev/null'; then
@@ -4610,14 +4822,19 @@ test_util() {
     else
         if bounded 90 RUN 'd=/tmp/prun.session.$(hostname).$(id -u).$$
                            mkdir $d && chmod 777 $d && chown 65534 $d &&
-                           exec prun --dvm-uri file:/tmp/sessdir-dvm.uri -n 1 hostname'; then
-            bad "prun used a session directory owned by uid 65534"
-        elif grep -q 'belongs to another user' "$BOUT"; then
-            ok "prun refused a session directory owned by another user"
+                           exec prun --dvm-uri file:/tmp/sessdir-dvm.uri -n 1 hostname' &&
+           grep -q '^node1$' "$BOUT"; then
+            ok "prun ran with its session directory name held by another user"
         else
-            bad "prun failed, but not over the directory's owner: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
+            bad "prun did not run past another user's session directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
         fi
         rm -f "$BOUT"
+        RUN 'find /tmp -maxdepth 1 -name "prun.session.*" -uid 65534 | grep -q .' \
+            && ok "the other user's directory is still theirs" \
+            || bad "the other user's session directory was removed or taken over"
+        RUN 'find /tmp -maxdepth 1 -name "prun.session.*" ! -uid 65534 | grep -q .' \
+            && bad "prun left the session directory it made instead behind" \
+            || ok "prun removed the session directory it made instead"
         RUN 'rm -rf /tmp/prun.session.*' >/dev/null 2>&1
         if bounded 90 RUN 'mkdir /tmp/prun.session.$(hostname).$(id -u).$$ &&
                            exec prun --dvm-uri file:/tmp/sessdir-dvm.uri -n 1 hostname' &&
@@ -6438,8 +6655,14 @@ test_ess() {
     # stderr goes nowhere and the message -- which the code does emit --
     # cannot be read from here. The flag changes nothing about the path
     # under test, only whether we can see what it wrote.
+    #
+    # A daemon also needs its DVM key before it gets as far as its identity,
+    # and here no launcher is handing it one, so the case hands it a key the
+    # way plm/slurm does - in PRTE_DVM_KEY.  Any well-formed key will do: the
+    # daemon is refused long before it could try one on a peer.
     cleanup_swarm
-    out=$(ONT 2 'timeout -k 5 20 prted --leave-session-attached \
+    out=$(ONT 2 'PRTE_DVM_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n") \
+                 timeout -k 5 20 prted --leave-session-attached \
                      --prtemca ess_base_nspace bogus-dvm \
                      --prtemca ess_base_vpid not-a-number \
                      --prtemca prte_hnp_uri "bogus-dvm.0;tcp://127.0.0.1:1" 2>&1' 2>&1)
@@ -7732,6 +7955,146 @@ test_rml() {
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
     cleanup_swarm
+
+    test_rml_auth
+}
+
+# The DVM's OOB port answers whatever connects to it, and a connected daemon
+# is trusted with launch commands.  It used to be enough to name the DVM's
+# namespace - which, with the HNP's contact URI, is on every prted's command
+# line.  Each daemon now proves it holds a per-DVM key before another will
+# treat it as a daemon, and the listener no longer gives way under
+# connections that never get that far.
+#
+# The foreign connection here is oobpoke.py, run from a node that is not in
+# the DVM and given exactly what `ps` shows on one that is.
+OOBPOKE=/tmp/oobpoke.py
+# the HNP's OOB contact, read off a running prted's command line on node $1
+hnp_uri_from_ps() {
+    ON "$1" 'p=$(pgrep -x prted | head -1); [ -n "$p" ] && tr "\0" "\n" < /proc/$p/cmdline | grep -A1 "^prte_hnp_uri\$" | tail -1' 2>/dev/null | tr -d '\r'
+}
+# wait for a foreground prte writing to $1 to say it is ready
+wait_dvm_ready() {
+    local n=0
+    while [ "$n" -lt 30 ]; do
+        RUN "grep -q 'DVM ready' $1" >/dev/null 2>&1 && return 0
+        sleep 1; n=$((n+1))
+    done
+    return 1
+}
+test_rml_auth() {
+    local out uri n fds ver
+
+    banner "rml/oob: a connection that cannot prove it holds the DVM key is refused"
+    if ! ON 5 'command -v python3' >/dev/null 2>&1; then
+        skp "oob authentication cases (no python3 on node5 to run the test client)"
+        return
+    fi
+    COPY_IN "$PRTE_ROOT/contrib/dockerswarm/oobpoke.py" 5 "$OOBPOKE" >/dev/null 2>&1
+    cleanup_swarm
+    RUN 'rm -f /tmp/oobauth.out /tmp/oobauth.uri' >/dev/null 2>&1
+    RUN_BG /tmp/oobauth.out 'prte --host node1:1,node2:1,node3:1 --report-uri /tmp/oobauth.uri --prtemca prte_elastic_mode 1'
+    if ! wait_dvm_ready /tmp/oobauth.out; then
+        bad "no DVM came up for the oob authentication cases: $(RUN 'tail -3 /tmp/oobauth.out' 2>&1 | tr '\n' ' ' | tail -c 200)"
+        cleanup_swarm
+        return
+    fi
+    uri=$(hnp_uri_from_ps 2)
+    if [ -z "$uri" ]; then
+        bad "could not read prte_hnp_uri off node2's prted command line"
+    else
+        ok "the HNP's contact is on node2's prted command line, as it always was"
+        # ...and the key is not: not on the command line, not in the
+        # environment, where any user of the node - or a process the daemon
+        # starts - could read it
+        out=$(ON 2 'p=$(pgrep -x prted | head -1); tr "\0" " " < /proc/$p/cmdline; echo; tr "\0" "\n" < /proc/$p/environ | grep -c "^PRTE_DVM_KEY=[0-9a-fA-F]"' 2>/dev/null)
+        echo "$out" | head -1 | grep -qE '[0-9a-fA-F]{64}' \
+            && bad "a 64-digit hex string - a DVM key - is on the prted command line" \
+            || ok "the DVM key is not on the prted command line"
+        [ "$(echo "$out" | tail -1 | tr -d ' \r')" = 0 ] \
+            && ok "...nor in the prted's environment" \
+            || bad "the prted kept PRTE_DVM_KEY in its environment"
+
+        # The version string the handshake used to check is just as
+        # visible: it is what `prte --version` prints.
+        ver=$(RUN 'prte --version 2>&1' 2>/dev/null | grep -m1 'PRRTE' | awk '{print $NF}' | tr -d '\r')
+        ON 5 "echo '$uri' > /tmp/hnp.uri" >/dev/null 2>&1
+        out=$(ON 5 "timeout 30 python3 $OOBPOKE ident /tmp/hnp.uri '$ver'" 2>&1)
+        echo "$out" | grep -q '^REPLY_BYTES=0$' && ! echo "$out" | grep -q '^OPEN$' \
+            && ok "a connection with the namespace, address and version but no key is turned away" \
+            || bad "the HNP took an unauthenticated IDENT ($ver): $(echo "$out" | tr '\n' ' ')"
+        RUN 'grep -q "did not begin by authenticating" /tmp/oobauth.out' \
+            && ok "...and the HNP says why it refused" \
+            || bad "the HNP did not report the refusal: $(RUN 'tail -3 /tmp/oobauth.out' 2>&1 | tr '\n' ' ' | tail -c 200)"
+        out=$(PRUN_URI /tmp/oobauth.uri -n 3 --map-by node hostname 2>&1)
+        [ "$(echo "$out" | grep -cE '^node[1-3]$')" = 3 ] \
+            && ok "the DVM is unaffected" \
+            || bad "the DVM stopped working after the refusal: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+        banner "rml/oob: idle connections cannot keep a new daemon out"
+        # Hold far more idle connections than any one address may have in
+        # their handshake at once, and grow the DVM while they are held: the
+        # new daemon has to get through the same listener.
+        EXEC_SH_BG 5 "python3 $OOBPOKE hold /tmp/hnp.uri 500 40 > /tmp/hold.out 2>&1"
+        sleep 6
+        out=$(ON 5 'cat /tmp/hold.out' 2>/dev/null)
+        echo "$out" | grep -q '^HELD=' \
+            && ok "a client holds $(echo "$out" | sed -n 's/^HELD=//p') idle connections" \
+            || bad "the idle connections were not opened: $out"
+        out=$(RUN "timeout -k 5 60 elastic grow node4:1" 2>&1)
+        echo "$out" | grep -q 'SUCCESS' \
+            && ok "a new daemon joined while they were held" \
+            || bad "the DVM could not grow with the idle connections held: $(echo "$out" | tail -3 | tr '\n' ' ' | tail -c 250)"
+        RUN 'grep -q "part way through their handshake" /tmp/oobauth.out' \
+            && ok "...because the HNP bounded what any one address may hold" \
+            || bad "the HNP did not report bounding the idle connections"
+        out=$(PRUN_URI /tmp/oobauth.uri -n 4 --map-by node hostname 2>&1)
+        [ "$(echo "$out" | grep -cE '^node[1-4]$')" = 4 ] \
+            && ok "a job runs on all four nodes, the new one included" \
+            || bad "job after the idle connections: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        ON 5 'pkill -f oobpoke' >/dev/null 2>&1
+    fi
+    RUN 'timeout -k 5 30 pterm --dvm-uri file:/tmp/oobauth.uri' >/dev/null 2>&1
+    cleanup_swarm
+
+    banner "rml/oob: running out of descriptors pauses the listener, not closes it"
+    # The listener used to close itself for good at EMFILE, and idle
+    # connections were enough to get it there - after which no daemon could
+    # ever join, rejoin or reconnect.  Give the HNP a small descriptor
+    # allowance, lift the handshake limits that would otherwise prevent it,
+    # hold idle connections until accept() fails, and then ask a new daemon
+    # to join once they have gone.
+    RUN 'rm -f /tmp/oobfd.out /tmp/oobfd.uri' >/dev/null 2>&1
+    RUN_BG /tmp/oobfd.out 'ulimit -n 200; prte --host node1:1,node2:1 --report-uri /tmp/oobfd.uri --prtemca prte_elastic_mode 1 --prtemca prte_oob_max_pending 100000 --prtemca prte_oob_max_pending_per_host 0 --prtemca prte_oob_handshake_timeout 0'
+    if ! wait_dvm_ready /tmp/oobfd.out; then
+        bad "no DVM came up for the descriptor case: $(RUN 'tail -3 /tmp/oobfd.out' 2>&1 | tr '\n' ' ' | tail -c 200)"
+    else
+        uri=$(hnp_uri_from_ps 2)
+        ON 5 "echo '$uri' > /tmp/hnp.uri" >/dev/null 2>&1
+        EXEC_SH_BG 5 "python3 $OOBPOKE hold /tmp/hnp.uri 400 15 > /tmp/hold.out 2>&1"
+        sleep 6
+        fds=$(ON 1 'ls /proc/$(pgrep -x prte | head -1)/fd 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r')
+        if [ -n "$fds" ] && [ "$fds" -ge 195 ]; then
+            ok "the idle connections ran the HNP out of descriptors ($fds open)"
+        else
+            skp "the idle connections did not exhaust the HNP's descriptors ($fds open) - EMFILE not reached"
+        fi
+        n=0
+        while [ "$n" -lt 30 ] && ON 5 'pgrep -f "oobpoke.py hold"' >/dev/null 2>&1; do
+            sleep 1; n=$((n+1))
+        done
+        out=$(RUN "timeout -k 5 60 elastic grow node3:1" 2>&1)
+        echo "$out" | grep -q 'SUCCESS' \
+            && ok "a new daemon joined once the descriptors came back" \
+            || bad "the listener did not recover from EMFILE: $(echo "$out" | tail -3 | tr '\n' ' ' | tail -c 250)"
+        out=$(PRUN_URI /tmp/oobfd.uri -n 3 --map-by node hostname 2>&1)
+        [ "$(echo "$out" | grep -cE '^node[1-3]$')" = 3 ] \
+            && ok "a job runs on all three nodes" \
+            || bad "job after the descriptors ran out: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        RUN 'timeout -k 5 30 pterm --dvm-uri file:/tmp/oobfd.uri' >/dev/null 2>&1
+    fi
+    ON 5 "pkill -f oobpoke; rm -f $OOBPOKE /tmp/hnp.uri /tmp/hold.out" >/dev/null 2>&1
+    cleanup_swarm
 }
 
 ########################################################################
@@ -8560,6 +8923,41 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         && ok "a relative subdirectory was recreated in each rank's working directory" \
         || bad "preload-files subdir failed (rc=$rc, hits=$hits): $(echo "$out" | tr '\n' ' ')"
     for n in 1 2 3; do EXEC_SH "$n" 'rm -rf /root/pfsub' >/dev/null 2>&1; done
+
+    fi   # FS_SHARED
+    _fl="filem: a relative subdirectory is placed into only through real directories"
+    if [ "$FS_SHARED" != 0 ]; then skp "${_fl}: $WORKDIR is shared, so staging cannot be proved"; else
+    banner "filem: a relative subdirectory is placed into only through real directories"
+    # The directories a preloaded file's name carries are walked one at a
+    # time below the working directory, never through a symlink, and an
+    # existing one is used only if it is ours or our group's.
+    EXEC_SH 1 'mkdir -p /root/pfsub && echo SUBDIR-DATA-OK > /root/pfsub/pf.dat' >/dev/null 2>&1
+    # a symlink where the subdirectory should be: not followed
+    EXEC_SH 2 'rm -rf /root/pfsub /root/pfelse; mkdir /root/pfelse && ln -s /root/pfelse /root/pfsub' >/dev/null 2>&1
+    out=$(RUN 'cd /root && timeout -k 5 60 prterun --host node2:1 -np 1 \
+                 --preload-files pfsub/pf.dat -- sh -c "cat pfsub/pf.dat"' 2>&1); rc=$?
+    [ "$rc" != 0 ] \
+        && ok "a symlinked subdirectory stops the placement" \
+        || bad "the file was placed through a symlinked subdirectory: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    ON 2 'test -e /root/pfelse/pf.dat' \
+        && bad "the file was written where the symlink pointed" \
+        || ok "...and nothing was written where it pointed"
+    # a directory of another user, in our group: a shared project directory
+    EXEC_SH 2 'rm -rf /root/pfsub /root/pfelse; mkdir /root/pfsub && chown 65534:$(id -g) /root/pfsub && chmod 775 /root/pfsub' >/dev/null 2>&1
+    out=$(RUN 'cd /root && timeout -k 5 60 prterun --host node2:1 -np 1 \
+                 --preload-files pfsub/pf.dat -- sh -c "cat pfsub/pf.dat"' 2>&1); rc=$?
+    [ "$rc" = 0 ] && echo "$out" | grep -q 'SUBDIR-DATA-OK' \
+        && ok "a subdirectory shared through our group is placed into" \
+        || bad "a group-shared subdirectory was refused (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    # ...and one of another user in another group is not
+    EXEC_SH 2 'rm -rf /root/pfsub; mkdir /root/pfsub && chown 65534:65534 /root/pfsub && chmod 777 /root/pfsub' >/dev/null 2>&1
+    out=$(RUN 'cd /root && timeout -k 5 60 prterun --host node2:1 -np 1 \
+                 --preload-files pfsub/pf.dat -- sh -c "cat pfsub/pf.dat"' 2>&1); rc=$?
+    [ "$rc" != 0 ] && ! ON 2 'test -e /root/pfsub/pf.dat' \
+        && ok "a subdirectory of another user and group is not placed into" \
+        || bad "the file was placed into another user's subdirectory (rc=$rc)"
+    for n in 1 2 3; do EXEC_SH "$n" 'rm -rf /root/pfsub /root/pfelse' >/dev/null 2>&1; done
+    cleanup_swarm
 
     fi   # FS_SHARED
     _fl="filem: --preload-files keeps a staged file executable"
@@ -10381,6 +10779,8 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
 
     phase test_session
 
+    phase test_requesters
+
     phase test_tools
 
     phase test_util
@@ -10470,6 +10870,19 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
             [ "$(prted_count 1)" = 0 ] \
                 && ok "the controller refused to start on the bad config" \
                 || bad "controller started anyway on a config that cannot form a DVM"
+        fi
+
+        # Without a key the daemons could not tell each other from anything
+        # else that reaches the DVM port, so a configuration that names none
+        # must be refused - up front, on every node, with the remedy.
+        if bootstrap_write_conf "node1" "node2,node3,node4" nokey; then
+            out=$(RUN 'timeout 40 prted --bootstrap 2>&1' || true)
+            echo "$out" | grep -q "without a DVM key" \
+                && ok "a bootstrap config with no DVMKeyFile is rejected with a diagnostic" \
+                || bad "missing DVMKeyFile not reported: $(echo "$out" | tr '\n' ' ' | head -c 200)"
+            [ "$(prted_count 1)" = 0 ] \
+                && ok "the controller refused to start without a key" \
+                || bad "controller started without a DVM key"
         fi
         bootstrap_restore_conf
         cleanup_swarm

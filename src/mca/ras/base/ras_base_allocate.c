@@ -1273,6 +1273,7 @@ static prte_session_t *create_reservation(const char *nspace, uint8_t inherit,
          * identified by namespace alone becomes unusable - by anyone - the
          * moment the requester exits. See prte_session_is_owned_by. */
         s->owner_uid = ownerjob->uid;
+        s->owner_gid = ownerjob->gid;
     }
     /* seed the owner set with the owning namespace */
     prte_session_add_owner(s, nspace);
@@ -1763,8 +1764,10 @@ static pmix_status_t ras_base_prepare_grow(prte_pmix_server_req_t *req,
         if (NULL == dest && NULL != req_id) {
             dest = prte_get_session_object_from_refid(req_id);
         }
+        /* growing a reservation is an operation on it, decided by who is
+         * asking - see prte_pmix_server_session_permitted */
         if (NULL == dest ||
-            !prte_session_is_owned_by(dest, req->tproc.nspace)) {
+            !prte_pmix_server_session_permitted(dest, &req->tproc, req->info, req->ninfo)) {
             return (NULL == dest) ? PMIX_ERR_NOT_FOUND : PMIX_ERR_NO_PERMISSIONS;
         }
         /* a new inheritance value on EXTEND updates the disposition */
@@ -1801,6 +1804,35 @@ int prte_ras_base_insert_node_string(char *ndstring, prte_session_t *dest)
         PRTE_ERROR_LOG(ret);
         PMIX_LIST_DESTRUCT(&ndlist);
         return ret;
+    }
+
+    /* Judge every node before taking any, so a refusal changes nothing. */
+    PMIX_LIST_FOREACH(snap, &ndlist, prte_node_t) {
+        prte_node_t *gnode = prte_node_match(NULL, snap->name);
+
+        /* a node with no daemon of ours makes the DVM bigger, which only
+         * an elastic DVM can be (ras_base_resize_allowed) */
+        if (NULL == gnode || NULL == gnode->daemon) {
+            char *why = NULL;
+
+            pmix_asprintf(&why, "add node %s", snap->name);
+            if (!ras_base_resize_allowed((NULL == why) ? snap->name : why)) {
+                free(why);
+                PMIX_LIST_DESTRUCT(&ndlist);
+                return PRTE_ERR_SILENT;
+            }
+            free(why);
+        }
+        /* and one a session holds is that session's until it lets it go -
+         * taking it would leave its jobs placed on a node it no longer has */
+        if (NULL != gnode && NULL != gnode->session && gnode->session != dest &&
+            gnode->session != prte_default_session) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
+                           "ras-base:node-in-session", true, snap->name,
+                           (unsigned) gnode->session->session_id);
+            PMIX_LIST_DESTRUCT(&ndlist);
+            return PRTE_ERR_SILENT;
+        }
     }
 
     /* prte_ras_base_node_insert() drains ndlist into the global

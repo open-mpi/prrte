@@ -242,6 +242,43 @@ AC_DEFUN([PRTE_CHECK_PMIX],[
                        [$prte_pmix_have_group_ft],
                        [Whether PMIx supports the group fault-tolerance feature set, including the PMIX_GROUP_CANCEL host operation])
 
+    # Who may act on a job or a session is decided from the requester's
+    # identity, which PMIx names on every up-call, and by PMIx's own access
+    # rule - so both are required. Every PMIx release at or above the
+    # minimum version has them; a pre-release that passes the version
+    # check may not.
+    AC_MSG_CHECKING([for PMIx requester identity on up-calls])
+    PRTE_CHECK_PMIX_CAP([REQUESTER_ID],
+                        [AC_MSG_RESULT([yes])],
+                        [AC_MSG_RESULT([no])
+                         AC_MSG_ERROR([PRRTE requires a PMIx that names the requester of every up-call (PMIX_CAP_REQUESTER_ID). Please use a PMIx release of at least version $prte_pmix_min_version.])])
+
+    AC_MSG_CHECKING([for PMIx_server_dmodex_request2])
+    PRTE_CHECK_PMIX_CAP([DMODEX_REQUEST2],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_have_dmodex_request2=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_have_dmodex_request2=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_HAVE_DMODEX_REQUEST2],
+                       [$prte_pmix_have_dmodex_request2],
+                       [Whether PMIx provides PMIx_server_dmodex_request2, which checks the requester a direct-modex request is made for])
+
+    AC_MSG_CHECKING([for PMIx access check])
+    PRTE_CHECK_PMIX_CAP([ACCESS_CHECK],
+                        [AC_MSG_RESULT([yes])],
+                        [AC_MSG_RESULT([no])
+                         AC_MSG_ERROR([PRRTE requires a PMIx that provides its access check (PMIX_CAP_ACCESS_CHECK). Please use a PMIx release of at least version $prte_pmix_min_version.])])
+
+    AC_MSG_CHECKING([for PMIx relayed-identity support])
+    PRTE_CHECK_PMIX_CAP([INFO_RELAYED],
+                        [AC_MSG_RESULT([yes])
+                         prte_pmix_have_info_relayed=1],
+                        [AC_MSG_RESULT([no])
+                         prte_pmix_have_info_relayed=0])
+    AC_DEFINE_UNQUOTED([PRTE_PMIX_HAVE_INFO_RELAYED],
+                       [$prte_pmix_have_info_relayed],
+                       [Whether PMIx keeps a PMIX_USERID/PMIX_GRPID a server marks PMIX_INFO_RELAYED, so a relayed request is attributed to the process that made it])
+
     AC_MSG_CHECKING([for PMIx command-line qualifier value support])
     PRTE_CHECK_PMIX_CAP([CLI_QUAL_VALUE],
                         [AC_MSG_RESULT([yes])],

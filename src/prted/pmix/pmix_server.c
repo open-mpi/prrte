@@ -561,6 +561,16 @@ void pmix_server_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.no_foreign_tools);
 
+    /* the users a scheduler may run as, besides root and our own */
+    prte_pmix_server_globals.scheduler_uids = NULL;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "scheduler_uids",
+                                      "Comma-separated list of the users (names or numeric "
+                                      "uids) a tool may run as to be accepted as the DVM's "
+                                      "scheduler, in addition to root and the user the DVM "
+                                      "runs as",
+                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                      &prte_pmix_server_globals.scheduler_uids);
+
     /* whether or not to generate device distances */
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "generate_distances",
                                       "Device types whose distances are to be provided (default=fabric,gpu,network)",
@@ -798,10 +808,14 @@ static void _alloc_timeout_warning(int sd, short args, void *cbdata)
 
     for (n = 0; n < cd->ninfo; n++) {
         if (PMIx_Check_key(cd->info[n].key, PMIX_ALLOC_ID)) {
-            alloc_id = cd->info[n].value.data.string;
+            if (PMIX_STRING == cd->info[n].value.type) {
+                alloc_id = cd->info[n].value.data.string;
+            }
         } else if (PMIx_Check_key(cd->info[n].key, PMIX_TIME_REMAINING)) {
-            time_remaining = cd->info[n].value.data.uint32;
-            have_time = true;
+            if (PMIX_SUCCESS == PMIx_Value_get_number(&cd->info[n].value, &time_remaining,
+                                                      PMIX_UINT32)) {
+                have_time = true;
+            }
         }
     }
     if (NULL == alloc_id) {
@@ -904,6 +918,7 @@ int pmix_server_init(void)
     /* setup the server's state variables */
     PMIX_CONSTRUCT(&prte_pmix_server_globals.psets, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.departed_jobs, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.users, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.groups, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.local_reqs, pmix_pointer_array_t);
@@ -918,6 +933,19 @@ int pmix_server_init(void)
     prte_pmix_server_globals.nscheddirs = 0;
     prte_pmix_server_globals.primary_server = *PRTE_NAME_INVALID;
     prte_pmix_server_globals.primary_server_set = false;
+    prte_pmix_server_globals.sched_uids = NULL;
+    prte_pmix_server_globals.nsched_uids = 0;
+    prte_pmix_server_globals.dvm_access = NULL;
+
+    /* only the master accepts a scheduler. Its users are looked up now -
+     * a name lookup may block, which a connection being accepted on the
+     * progress thread cannot - and one naming nobody stops us here */
+    if (PRTE_PROC_IS_MASTER) {
+        rc = prte_pmix_server_scheduler_uids_resolve();
+        if (PRTE_SUCCESS != rc) {
+            return rc;
+        }
+    }
 
     PMIX_INFO_LIST_START(ilist);
 
@@ -1422,6 +1450,14 @@ void pmix_server_finalize(void)
     /* finalize our local data server */
     prte_data_server_finalize();
 
+    free(prte_pmix_server_globals.sched_uids);
+    prte_pmix_server_globals.sched_uids = NULL;
+    prte_pmix_server_globals.nsched_uids = 0;
+    prte_pmix_server_access_release_dvm();
+
+    /* and the users we judged access for */
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.users);
+
     if (NULL != prte_pmix_server_globals.scheduler_directives) {
         PMIX_INFO_FREE(prte_pmix_server_globals.scheduler_directives,
                        prte_pmix_server_globals.nscheddirs);
@@ -1877,9 +1913,14 @@ static void dmdx_check(int sd, short args, void *cbdata)
         /* we do have it, so fetch payload */
     }
 
-    /* ask our local PMIx server for the data */
+    /* ask our local PMIx server for the data - naming the requester the
+     * requesting server named, so ours can check it may have the data */
     req->inprogress = true;
+#if PRTE_PMIX_HAVE_DMODEX_REQUEST2
+    rc = PMIx_server_dmodex_request2(&req->tproc, req->info, req->ninfo, modex_resp, req);
+#else
     rc = PMIx_server_dmodex_request(&req->tproc, modex_resp, req);
+#endif
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         req->inprogress = false;
@@ -1953,6 +1994,11 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
     if (NULL != info) {
         for (sz = 0; sz < ninfo; sz++) {
             if (PMIX_CHECK_KEY(&info[sz], PMIX_REQUIRED_KEY)) {
+                /* from the requesting client, whose value PMIx does not
+                 * check against the key */
+                if (PMIX_STRING != info[sz].value.type || NULL == info[sz].value.data.string) {
+                    continue;
+                }
                 if (NULL != key) {
                     free(key);
                 }
@@ -2188,8 +2234,15 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
     }
 
     /* ask our local PMIx server for the data */
+    /* naming the requester the requesting server named, so our PMIx
+     * server can check it may have the data. The info lives on the
+     * request until modex_resp */
     req->inprogress = true;
+#if PRTE_PMIX_HAVE_DMODEX_REQUEST2
+    prc = PMIx_server_dmodex_request2(&pproc, req->info, req->ninfo, modex_resp, req);
+#else
     prc = PMIx_server_dmodex_request(&pproc, modex_resp, req);
+#endif
     if (PMIX_SUCCESS != prc) {
         PMIX_ERROR_LOG(prc);
         if (req->event_active) {

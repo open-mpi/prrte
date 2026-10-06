@@ -136,6 +136,12 @@ PMIX_CLASS_INSTANCE(prte_grow_campaign_t, pmix_list_item_t,
  * false so that a daemon which somehow learns nothing sizes itself for the
  * job in front of it rather than for the largest case. */
 bool prte_persistent = false;
+/* Whether daemons of this DVM must prove they hold the DVM key before
+ * another daemon will talk to them (src/util/prte_dvm_key.h).  On unless an
+ * operator turns it off, and the HNP tells each daemon when it has been. */
+bool prte_oob_authenticate = true;
+/* A daemon's cue that plm/ssh is writing its DVM key down its stdin */
+bool prte_dvm_key_stdin = false;
 bool prte_allow_run_as_root = false;
 bool prte_fwd_environment = false;
 bool prte_show_launch_progress = false;
@@ -840,6 +846,7 @@ static void prte_job_construct(prte_job_t *job)
     PMIX_LOAD_NSPACE(job->launcher, NULL);
     job->uid = PRTE_INVALID_UID;
     job->gid = PRTE_INVALID_GID;
+    job->access = NULL;
     job->target_sessions = NULL;
     job->num_target_sessions = 0;
     job->ntraces = 0;
@@ -859,6 +866,8 @@ static void prte_job_destruct(prte_job_t *job)
         /* probably just a race condition - just return */
         return;
     }
+
+    prte_pmix_server_access_release_job(job);
 
     if (NULL != job->personality) {
         PMIx_Argv_free(job->personality);
@@ -1215,6 +1224,7 @@ static void session_con(prte_session_t *s)
     s->owner_job = NULL;
     PMIX_LOAD_PROCID(&s->requestor, NULL, PMIX_RANK_INVALID);
     s->owner_uid = PRTE_INVALID_UID;
+    s->owner_gid = PRTE_INVALID_GID;
     s->inheritance = PRTE_INHERIT_DEFAULT_VALUE;
     s->acquisition = 0;
 }
