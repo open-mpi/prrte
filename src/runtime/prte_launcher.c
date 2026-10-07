@@ -272,7 +272,7 @@ int prte_launch(int argc, char *argv[])
     int pargc;
     prte_job_t *jdata;
     prte_app_context_t *dapp;
-    bool proxyrun = false, first;
+    bool proxyrun = false, first, failed;
     void *jinfo;
     pmix_proc_t pname;
     pmix_value_t *val;
@@ -492,7 +492,8 @@ int prte_launch(int argc, char *argv[])
             return 1;
         }
         first = true;
-        while (NULL != (param = pmix_getline(fp))) {
+        failed = false;
+        while (NULL != (param = pmix_getline(fp, &failed))) {
             if (!first) {
                 // add a colon delimiter
                 PMIx_Argv_append_nosize(&pargv, ":");
@@ -508,6 +509,10 @@ int prte_launch(int argc, char *argv[])
             first = false;
         }
         fclose(fp);
+        if (failed) {
+            pmix_show_help("help-prun.txt", "appfile-failure", true, opt->values[0]);
+            return 1;
+        }
     }
 
     /* decide if we are to use a persistent DVM, or act alone */
@@ -654,7 +659,7 @@ int prte_launch(int argc, char *argv[])
         if (PMIX_SUCCESS != rc || 0 == pmix_list_get_size(&apps)) {
             if (proxyrun) {
                 pmix_show_help("help-prun.txt", "prun:executable-not-specified", true,
-                               prte_tool_basename, prte_tool_basename);
+                               prte_tool_basename);
                 PRTE_UPDATE_EXIT_STATUS(rc);
                 goto DONE;
             }
@@ -865,7 +870,7 @@ int prte_launch(int argc, char *argv[])
             if (0 != strcmp(cptr, param)) {
                 pmix_show_help("help-plm-base.txt", "multiple-prrte-prefixes", true,
                                prte_tool_basename, prte_tool_basename,
-                               prte_tool_basename, param, cptr);
+                               prte_tool_basename, prte_tool_basename, param, cptr);
                 free(param);
                 free(cptr);
                 PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);

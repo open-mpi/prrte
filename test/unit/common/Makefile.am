@@ -22,9 +22,9 @@ test_common_slurm_SOURCES = \
 if MCA_BUILD_prte_common_slurm_DSO
 test_common_slurm_LDADD = \
     $(top_builddir)/src/mca/common/slurm/libmca_common_slurm.la \
-    $(top_builddir)/src/libprrte.la
+    $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 else
-test_common_slurm_LDADD = $(top_builddir)/src/libprrte.la
+test_common_slurm_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 endif
 
 TESTS = test_common_slurm

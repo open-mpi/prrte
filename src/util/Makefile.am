@@ -105,18 +105,6 @@ if PRTE_PICKY_COMPILERS
 	$(PRTE_V_GEN) $(PYTHON) $(abs_srcdir)/prte-convert-help.py \
 		--root $(abs_top_srcdir) \
 		--out prte_show_help_content.c \
-		--purge
-else
-	$(PRTE_V_GEN) $(PYTHON) $(abs_srcdir)/prte-convert-help.py \
-		--root $(abs_top_srcdir) \
-		--out prte_show_help_content.c
-endif
-
-prte_show_help_content.c: prte-convert-help.py
-if PRTE_PICKY_COMPILERS
-	$(PRTE_V_GEN) $(PYTHON) $(abs_srcdir)/prte-convert-help.py \
-		--root $(abs_top_srcdir) \
-		--out prte_show_help_content.c \
 		--cppflags="$(CPPFLAGS)" \
 		--purge
 else

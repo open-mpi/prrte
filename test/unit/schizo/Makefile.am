@@ -27,7 +27,7 @@ test_schizo_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 # Its own program: it must reach the argv pre-scan with nothing initialized,
 # as a tool does, and test_schizo initializes PRRTE before its first case.
 test_mca_prefixes_SOURCES = test_mca_prefixes.c
-test_mca_prefixes_LDADD = $(top_builddir)/src/libprrte.la
+test_mca_prefixes_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 
 TESTS = test_schizo test_mca_prefixes
 
