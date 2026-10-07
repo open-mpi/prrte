@@ -260,6 +260,13 @@ error_sent:
     return rc;
 }
 
+/* May the requester of this query access jdata? PMIx names the requester
+ * in each query's qualifiers */
+static bool query_permitted(prte_pmix_server_op_caddy_t *cd, pmix_query_t *q, prte_job_t *jdata)
+{
+    return prte_pmix_server_request_permitted(&cd->proct, q->qualifiers, q->nqual, jdata);
+}
+
 static void _query(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
@@ -393,11 +400,14 @@ static void _query(int sd, short args, void *cbdata)
                                             "%s qualifier key \"%s\" : value \"%s\" is an unknown namespace",
                                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), q->qualifiers[n].key,
                                             nsq);
-                        /* A launch message goes only to the daemons that host
-                         * part of a job, so off the master "I have never heard
-                         * of this namespace" is a statement about this daemon,
-                         * not about the DVM - the same reason the proc-table
-                         * arm below defers rather than answering NOT_FOUND.
+                        /* Off the master "I have never heard of this namespace"
+                         * is a statement about this daemon, not about the DVM:
+                         * the launch message reaches every daemon, but a tool's
+                         * job lives only on the master and the daemon the tool
+                         * attached to, and a daemon may not have processed a
+                         * launch yet, or joined the DVM after it - the same
+                         * reason the proc-table arm below defers rather than
+                         * answering NOT_FOUND.
                          * Rejecting it here as a client error made the answer
                          * to one query depend on which node the client landed
                          * on, and did it before any key could reach the
@@ -496,6 +506,20 @@ static void _query(int sd, short args, void *cbdata)
 
             }
         }
+        /* A query about another job needs its requester to be allowed that
+         * job. A job this daemon does not know goes to the master, which
+         * does, and checks it there; a group name in place of a job names
+         * no job at all */
+        if (!defer_query && !PMIX_NSPACE_INVALID(jobid) &&
+            !PMIX_CHECK_NSPACE(jobid, cd->proct.nspace) &&
+            NULL != (jdata = prte_get_job_data_object(jobid)) &&
+            !query_permitted(cd, q, jdata)) {
+            pmix_output_verbose(2, prte_pmix_server_globals.output,
+                                "%s query refused: requester may not access %s",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), jobid);
+            ret = PMIX_ERR_NO_PERMISSIONS;
+            goto done;
+        }
         /* The walk below runs to the array's NULL terminator, so a query
          * carrying no keys at all is a NULL dereference - and the counting
          * pass above already screens for it.  PMIx screens it too, in
@@ -524,8 +548,10 @@ static void _query(int sd, short args, void *cbdata)
                     if (NULL == jdata) {
                         continue;
                     }
-                    /* don't show the DVM's own daemon job */
-                    if (!PMIX_CHECK_NSPACE(PRTE_PROC_MY_NAME->nspace, jdata->nspace)) {
+                    /* don't show the DVM's own daemon job, nor a job the
+                     * requester may not access */
+                    if (!PMIX_CHECK_NSPACE(PRTE_PROC_MY_NAME->nspace, jdata->nspace) &&
+                        query_permitted(cd, q, jdata)) {
                         PMIx_Argv_append_nosize(&nspaces, jdata->nspace);
                     }
                 }
@@ -553,6 +579,10 @@ static void _query(int sd, short args, void *cbdata)
                     // belongs to no session the caller can have named
                     if (UINT32_MAX != sessionid &&
                         (NULL == jdata->session || jdata->session->session_id != sessionid)) {
+                        continue;
+                    }
+                    /* nor jobs the requester may not access */
+                    if (!query_permitted(cd, q, jdata)) {
                         continue;
                     }
                     PMIX_INFO_LIST_START(stack);
@@ -832,10 +862,11 @@ static void _query(int sd, short args, void *cbdata)
                  * entries for each proc in the indicated job */
                 jdata = prte_get_job_data_object(jobid);
                 if (NULL == jdata || 0 == jdata->num_procs) {
-                    /* a job's launch message goes only to the daemons that
-                     * host some of it, so "I have never heard of this job"
-                     * is a statement about this daemon, not about the DVM.
-                     * The master has heard of all of them. */
+                    /* "I have never heard of this job" is a statement about
+                     * this daemon, not about the DVM: a tool's job lives only
+                     * on the master and the daemon it attached to, and a
+                     * daemon may not have processed a launch yet, or joined
+                     * after it. The master has heard of all of them. */
                     if (!PRTE_PROC_IS_MASTER) {
                         goto defer;
                     }
@@ -1463,6 +1494,10 @@ static void _query(int sd, short args, void *cbdata)
                         !PMIX_CHECK_NSPACE(jobid, jdata->nspace)) {
                         continue;
                     }
+                    /* asked about every job: those the requester may access */
+                    if (PMIX_NSPACE_INVALID(jobid) && !query_permitted(cd, q, jdata)) {
+                        continue;
+                    }
                     // see if this job has any procs on the indicated node
                     for (j=0; j < jdata->map->nodes->size; j++) {
                         node = (prte_node_t *) pmix_pointer_array_get_item(jdata->map->nodes, j);
@@ -1534,6 +1569,10 @@ static void _query(int sd, short args, void *cbdata)
                     }
                     if (!PMIX_NSPACE_INVALID(jobid) &&
                         !PMIX_CHECK_NSPACE(jobid, jdata->nspace)) {
+                        continue;
+                    }
+                    /* asked about every job: those the requester may access */
+                    if (PMIX_NSPACE_INVALID(jobid) && !query_permitted(cd, q, jdata)) {
                         continue;
                     }
                     // assemble the nodes

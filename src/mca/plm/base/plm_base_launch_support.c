@@ -40,7 +40,9 @@
 #    include <sys/time.h>
 #endif /* HAVE_SYS_TIME_H */
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
+#include <string.h>
 
 #include "src/class/pmix_pointer_array.h"
 #include "src/hwloc/hwloc-internal.h"
@@ -80,18 +82,35 @@
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
 #include "src/util/prte_show_help.h"
+#include "src/util/prte_output_file.h"
 
 #include "src/mca/plm/base/base.h"
 #include "src/mca/plm/base/plm_private.h"
 
 void prte_plm_base_set_slots(prte_node_t *node)
 {
+    /* Say whether the count below comes from counting cores. It is the only
+     * basis a job may re-count: a job asking for hwthreads as its cpus is
+     * owed the node's hwthreads for its own map (see
+     * prte_rmaps_base_get_target_nodes), whereas a count of packages or
+     * NUMA domains, or a plain number, is a policy the DVM was told to
+     * apply and no job may second-guess it. */
+    PRTE_FLAG_UNSET(node, PRTE_NODE_FLAG_SLOTS_FROM_CORES);
     if (0 == strncmp(prte_set_slots, "cores", strlen(prte_set_slots))) {
         if (NULL != node->topology && NULL != node->topology->topo) {
             node->slots = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
                                                    HWLOC_OBJ_CORE);
+            PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_FROM_CORES);
         }
-    } else if (0 == strncmp(prte_set_slots, "sockets", strlen(prte_set_slots))) {
+        /* "packages" is hwloc's own name for the object, and the name
+         * prte_set_default_slots is documented as taking; "sockets" is what
+         * this code has always called it.  Both have to work - a user who
+         * follows the parameter's own help and writes "packages" used to
+         * match no keyword at all and fall through to the numeric arm below,
+         * where strtol read it as ZERO and left every node that lacked slot
+         * information with no slots to map onto. */
+    } else if (0 == strncmp(prte_set_slots, "packages", strlen(prte_set_slots)) ||
+               0 == strncmp(prte_set_slots, "sockets", strlen(prte_set_slots))) {
         if (NULL != node->topology && NULL != node->topology->topo) {
             node->slots = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
                                                    HWLOC_OBJ_SOCKET);
@@ -113,8 +132,37 @@ void prte_plm_base_set_slots(prte_node_t *node)
                                                    HWLOC_OBJ_PU);
         }
     } else {
-        /* must be a number */
-        node->slots = strtol(prte_set_slots, NULL, 10);
+        /* must be a number.  strtol yields a long and slots is an int32_t, so
+         * clamp rather than let a silly value wrap into a negative slot count
+         * that every later comparison reads as "no room here".
+         *
+         * And check that it WAS a number: strtol answers zero for anything it
+         * cannot read, so a misspelled keyword used to give the node zero
+         * slots silently - a DVM that refuses every launch for no stated
+         * reason.  Say so once and fall back to the documented default. */
+        char *endp = NULL;
+        long sl = strtol(prte_set_slots, &endp, 10);
+
+        if (NULL == endp || endp == prte_set_slots || '\0' != *endp) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-base.txt",
+                               "bad-set-slots", true, prte_set_slots);
+            }
+            if (NULL != node->topology && NULL != node->topology->topo) {
+                node->slots = prte_hwloc_base_get_nbobjs_by_type(node->topology->topo,
+                                                                 HWLOC_OBJ_CORE);
+                PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_FROM_CORES);
+            }
+        } else {
+            if (0 > sl) {
+                sl = 0;
+            } else if (INT32_MAX < sl) {
+                sl = INT32_MAX;
+            }
+            node->slots = (int32_t) sl;
+        }
     }
     /* mark the node as having its slots "given" */
     PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
@@ -413,6 +461,14 @@ void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
         return;
     }
     free(nspace);
+    /* replies are counted only while a request (get_traces) is
+     * outstanding - completing the count delivers the traces and ends
+     * the job, which is what the request asked for and nothing else does */
+    if (!jdata->traces_requested) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        PMIX_DATA_BUFFER_DESTRUCT(&blob);
+        return;
+    }
 
     while (PMIX_SUCCESS == (rc = PMIx_Data_unpack(NULL, buffer, &pbo, &cnt, PMIX_BYTE_OBJECT))) {
         rc = PMIx_Data_load(&blob, &pbo);
@@ -438,6 +494,7 @@ void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
         rc = PMIx_Data_unpack(NULL, &blob, &pid, &cnt, PMIX_PID);
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
+            free(hostname);
             PMIX_DATA_BUFFER_DESTRUCT(&blob);
             goto DONE;
         }
@@ -450,7 +507,8 @@ void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
         /* unpack the stack_trace until complete */
         cnt = 1;
         while (PRTE_SUCCESS == (rc = PMIx_Data_unpack(NULL, &blob, &st, &cnt, PMIX_STRING))) {
-            pmix_asprintf(&st2, "\t%s", st); // has its own newline
+            /* one line of a trace, sent without its newline */
+            pmix_asprintf(&st2, "\t%s\n", st);
             PMIx_Argv_append_nosize(&jdata->traces, st2);
             free(st);
             free(st2);
@@ -469,6 +527,7 @@ void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
 DONE:
     jdata->ntraces++;
     if (prte_process_info.num_daemons == jdata->ntraces) {
+        jdata->traces_requested = false;
         timer = NULL;
         if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TRACE_TIMEOUT_EVENT,
                                (void **) &timer, PMIX_POINTER) &&
@@ -480,9 +539,16 @@ DONE:
         }
         /* output the results - note that the output might need to go to a
          * tool instead of just to stderr, so we use the PMIx IOF deliver
-         * function to ensure it gets where it needs to go */
+         * function to ensure it gets where it needs to go.
+         *
+         * Every daemon answers this request, including one that found no
+         * live local proc of the job to trace - it packs the nspace and
+         * nothing else (see PRTE_DAEMON_GET_STACK_TRACES in prted_comm.c).
+         * So the array can still be empty here, and a job whose procs all
+         * exited while the request was in flight leaves it NULL outright:
+         * PMIx_Argv_append_nosize is what creates it. */
         PMIX_LOAD_PROCID(&name, jdata->nspace, PMIX_RANK_WILDCARD);
-        for (cnt=0; NULL != jdata->traces[cnt]; cnt++) {
+        for (cnt=0; NULL != jdata->traces && NULL != jdata->traces[cnt]; cnt++) {
             bo.bytes = jdata->traces[cnt];
             bo.size = strlen(jdata->traces[cnt]);
             PMIx_server_IOF_deliver(&name, PMIX_FWD_STDERR_CHANNEL, &bo, NULL, 0, NULL, NULL);
@@ -592,7 +658,7 @@ static int get_traces(prte_job_t *jdata)
     pmix_data_buffer_t buffer;
     pmix_byte_object_t bo;
     pmix_proc_t pc;
-    pmix_status_t rc;
+    int rc;
 
     PMIX_LOAD_PROCID(&pc, jdata->nspace, PMIX_RANK_WILDCARD);
     bo.bytes = "Waiting for stack traces (this may take a few moments)...\n";
@@ -616,10 +682,15 @@ static int get_traces(prte_job_t *jdata)
         PMIX_DATA_BUFFER_DESTRUCT(&buffer);
         return PRTE_ERROR;
     }
+    /* the replies are counted against the daemons, so start the count
+     * before any of them can arrive */
+    jdata->ntraces = 0;
+    jdata->traces_requested = true;
     /* goes to all daemons */
     if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &buffer))) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_DESTRUCT(&buffer);
+        jdata->traces_requested = false;
         return PRTE_ERROR;
     }
     PMIX_DATA_BUFFER_DESTRUCT(&buffer);
@@ -993,6 +1064,8 @@ void prte_plm_base_send_launch_msg(int fd, short args, void *cbdata)
     prte_job_t *jdata;
     int rc;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
+
+    PMIX_ACQUIRE_OBJECT(caddy);
 
     /* convenience */
     jdata = caddy->jdata;
@@ -1375,6 +1448,11 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
             ninfo = 0;
         } else if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
+            /* every caller reads this function's return as a PRRTE code -
+             * it logs it with PRTE_ERROR_LOG - and the exit status is a
+             * PRRTE code too, so convert rather than handing PMIx's
+             * numbering across the boundary */
+            rc = prte_pmix_convert_status(rc);
             PRTE_UPDATE_EXIT_STATUS(rc);
             PMIX_INFO_LIST_RELEASE(tinfo);
             /* NOTE: nptr was already released when it was added to the
@@ -1390,10 +1468,27 @@ int prte_plm_base_spawn_response(int32_t status, prte_job_t *jdata)
         PMIX_INFO_FREE(iptr, ninfo);
     }
 
+    /* The room number is the address of the request that is waiting for this
+     * answer: it is recorded when the spawn is entered into the local request
+     * array, and it travels in the job's attributes to whichever daemon ends
+     * up reporting on the job.  A job carrying none is therefore a job no
+     * request is waiting on - a spawn refused before it was ever entered,
+     * whose requestor was answered directly by the server upcall that refused
+     * it, and which is only in the state machine at all so the one-shot DVM
+     * tears itself down.
+     *
+     * That is the same "nobody is waiting" case as the two tests at the top
+     * of this function, and it gets the same answer.  Reported as an error it
+     * put two spurious "Not found" logs in front of the real message on every
+     * mistyped launch directive: one from here, and one from the errmgr
+     * logging what this returned. */
     rmptr = &room;
     if (!prte_get_attribute(&jdata->attributes, PRTE_JOB_ROOM_NUM, (void **) &rmptr, PMIX_INT)) {
-        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-        return PRTE_ERR_NOT_FOUND;
+        PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                             "%s spawn response: job %s has no waiting request",
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                             PRTE_JOBID_PRINT(jdata->nspace)));
+        return PRTE_SUCCESS;
     }
 
     /* if the originator is me, then just do the notification */
@@ -1467,7 +1562,9 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
     jdata = caddy->jdata;
 
     /* if a timer was defined, cancel it */
-    if (prte_get_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT_EVENT, (void **) &timer, PMIX_POINTER)) {
+    timer = NULL;
+    if (prte_get_attribute(&jdata->attributes, PRTE_SPAWN_TIMEOUT_EVENT, (void **) &timer, PMIX_POINTER) &&
+        NULL != timer) {
         prte_event_evtimer_del(timer->ev);
         PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                              "%s plm:base:launch deleting spawn timeout for job %s",
@@ -1508,9 +1605,10 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
             fp = stderr;
         } else {
             /* attempt to open the specified file */
-            fp = fopen(file, "w");
+            fp = prte_output_file_open(file, 0666, NULL);
             if (NULL == fp) {
-                pmix_output(0, "Unable to open file %s for output of proctable", file);
+                pmix_output(0, "Unable to open file %s for output of proctable: %s", file,
+                            strerror(errno));
                 goto next;
             }
         }
@@ -1524,8 +1622,11 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
                 // should never happen
                 continue;
             }
-            fprintf(fp, "(rank, host, exe, pid) = (%u, %s, %s, %d)\n",
-                    proc->name.rank, proc->node->name, app->app, proc->pid);
+            /* pid_t is a signed integer type of unspecified width, so widen
+             * it rather than assuming %d matches - the same thing dump_job()
+             * and the stack-trace report do */
+            fprintf(fp, "(rank, host, exe, pid) = (%u, %s, %s, %ld)\n",
+                    proc->name.rank, proc->node->name, app->app, (long) proc->pid);
         }
         if (stdout != fp && stderr != fp) {
             fclose(fp);
@@ -1533,14 +1634,23 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
     }
 
 next:
+    /* prte_get_attribute() hands back its OWN copy of a string attribute, so
+     * the proctable filename is ours to free - on every path, including the
+     * one that could not open it */
+    if (NULL != file) {
+        free(file);
+        file = NULL;
+    }
+
     /* The job is running, so an allocation obtained for it is now the job's
      * to hold: drop the note that says we still owe it a release.  From here
      * its disposition is the ordinary one for a reservation - the inheritance
      * rules applied when the owning namespace ends. */
     prte_remove_attribute(&jdata->attributes, PRTE_JOB_SPAWN_ALLOC_ID);
 
-    /* notify the spawn requestor */
-    rc = prte_plm_base_spawn_response(PRTE_SUCCESS, jdata);
+    /* notify the spawn requestor - the status is a PMIx one, as every
+     * other caller of this function passes */
+    rc = prte_plm_base_spawn_response(PMIX_SUCCESS, jdata);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
     }
@@ -1719,8 +1829,14 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
 
     PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
 
-    /* get the daemon job */
+    /* get the daemon job - there is nothing to record a report against
+     * without it, and prte_plm_base_daemon_failed() below guards the same
+     * lookup for the same reason */
     jdatorted = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == jdatorted) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        return;
+    }
     show_progress = PRTE_ATTR_IS_TRUE(&jdatorted->attributes, PRTE_JOB_SHOW_PROGRESS);
 
     /* multiple daemons could be in this buffer, so unpack until we exhaust the data */
@@ -2069,7 +2185,18 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
                 }
                 PMIX_RETAIN(t);
                 daemon->node->topology = t;
+                /* a daemon can report in more than once (bootstrap unheal),
+                 * so drop what the node was holding from its last report -
+                 * the same reason the matched branch above does. The node's
+                 * topology IS this one now, so there is nothing to diff */
+                if (NULL != daemon->node->available) {
+                    hwloc_bitmap_free(daemon->node->available);
+                }
                 daemon->node->available = prte_hwloc_base_filter_cpus(t->topo);
+                if (NULL != daemon->node->topodiff) {
+                    hwloc_topology_diff_destroy(daemon->node->topodiff);
+                    daemon->node->topodiff = NULL;
+                }
                 prte_hwloc_base_setup_summary(t->topo);
             }
         }
@@ -2137,8 +2264,8 @@ void prte_plm_base_daemon_callback(int status, pmix_proc_t *sender, pmix_data_bu
 void prte_plm_base_daemon_failed(int st, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
                                  prte_rml_tag_t tag, void *cbdata)
 {
-    int status, rc;
-    int32_t n;
+    int rc;
+    int32_t status, n;
     pmix_rank_t vpid;
     prte_proc_t *daemon = NULL;
     prte_job_t *jdatorted;
@@ -2167,9 +2294,18 @@ void prte_plm_base_daemon_failed(int st, pmix_proc_t *sender, pmix_data_buffer_t
     /* unpack the exit status. This is already a plain status - the senders
      * on this tag report either a decoded exit status (ssh_wait_daemon) or a
      * PRTE error code (remote_spawn), never a raw waitpid() status, so it
-     * must NOT be run through WEXITSTATUS */
+     * must NOT be run through WEXITSTATUS.
+     *
+     * PMIX_INT32 because that is what both senders pack, and because that is
+     * what the value IS - an exit code or a PRRTE code, not a pmix_status_t.
+     * Asking for PMIX_STATUS here read a type the wire never carried: the
+     * two are distinct pmix_data_type_t values, so a fully-described buffer
+     * (the default in a debug build) refused the unpack with
+     * PMIX_ERR_PACK_MISMATCH and the daemon's real exit status was replaced
+     * by the fallback below.  A non-described buffer let it pass only because
+     * both types are four bytes wide. */
     n = 1;
-    rc = PMIx_Data_unpack(NULL, buffer, &status, &n, PMIX_STATUS);
+    rc = PMIx_Data_unpack(NULL, buffer, &status, &n, PMIX_INT32);
     if (PMIX_SUCCESS != rc) {
         PMIX_ERROR_LOG(rc);
         status = PRTE_ERROR_DEFAULT_EXIT_CODE;
@@ -2318,11 +2454,15 @@ int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, in
         pmix_argv_append(argc, argv, "1");
     }
 
-    /* if --xterm was specified, pass that along */
-    if (NULL != prte_xterm) {
+    /* Tell the daemon if connections between daemons are NOT to be
+     * authenticated - it would otherwise wait for a key nobody sends it, and
+     * refuse every peer that does not prove it holds one.  The key itself
+     * never goes here: a command line is visible to anything on the node
+     * (see src/util/prte_dvm_key.h for how it does travel). */
+    if (!prte_oob_authenticate) {
         pmix_argv_append(argc, argv, "--prtemca");
-        pmix_argv_append(argc, argv, "prte_xterm");
-        pmix_argv_append(argc, argv, prte_xterm);
+        pmix_argv_append(argc, argv, "prte_oob_authenticate");
+        pmix_argv_append(argc, argv, "0");
     }
 
     /* look for any envars that relate to us and pass
@@ -2410,7 +2550,7 @@ int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, in
         for (j=0; NULL != skips[j]; j++) {
             if (0 == strncmp(prted_cmd_line[i + 1], skips[j], strlen(skips[j])) ||
                 0 == strcmp(prted_cmd_line[i + 1], "plm")) {
-                ignore = true;;
+                ignore = true;
                 break;
             }
         }
@@ -2783,7 +2923,7 @@ static int setup_virtual_machine(prte_job_t *jdata)
             PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                                  "%s plm:base:setup_vm no new daemons required",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            PMIX_DESTRUCT(&nodes);
+            PMIX_LIST_DESTRUCT(&nodes);
             /* mark that the daemons have reported so we can proceed */
             daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
             PRTE_FLAG_UNSET(daemons, PRTE_JOB_FLAG_UPDATED);
@@ -2847,7 +2987,7 @@ static int setup_virtual_machine(prte_job_t *jdata)
             PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                                  "%s plm:base:setup_vm no new daemons required",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            PMIX_DESTRUCT(&nodes);
+            PMIX_LIST_DESTRUCT(&nodes);
             /* mark that the daemons have reported so we can proceed */
             daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
             PRTE_FLAG_UNSET(daemons, PRTE_JOB_FLAG_UPDATED);
@@ -2857,15 +2997,10 @@ static int setup_virtual_machine(prte_job_t *jdata)
         goto process;
     }
 
-    /* if we are not working with a virtual machine, then we
-     * look across all jobs and ensure that the "VM" contains
-     * all nodes with application procs on them
-     */
+    /* simulating multiple daemons: put one on every usable node in the
+     * pool other than our own, whether or not it has procs mapped to it */
     multi_sim = PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_MULTI_DAEMON_SIM);
     if (multi_sim) {
-        /* loop across all nodes and include those that have
-         * num_procs > 0 && no daemon already on them
-         */
         for (i = 1; i < prte_node_pool->size; i++) {
             if (NULL == (node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, i))) {
                 continue;
@@ -2889,42 +3024,11 @@ static int setup_virtual_machine(prte_job_t *jdata)
                 /* not to be used */
                 continue;
             }
-            if (0 < node->num_procs || multi_sim) {
-                /* retain a copy for our use in case the item gets
-                 * destructed along the way
-                 */
-                PMIX_RETAIN(node);
-                pmix_list_append(&nodes, &node->super);
-            }
-        }
-        if (multi_sim) {
-            goto process;
-        }
-        /* see if anybody had procs */
-        if (0 == pmix_list_get_size(&nodes)) {
-            /* if the HNP has some procs, then we are still good */
-            node = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
-            if (NULL == node) {
-                PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
-                PMIX_LIST_DESTRUCT(&nodes);
-                return PRTE_ERR_NOT_FOUND;
-            }
-            if (0 < node->num_procs) {
-                PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
-                                     "%s plm:base:setup_vm only HNP in use",
-                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-                PMIX_DESTRUCT(&nodes);
-                map->num_nodes = 1;
-                /* mark that the daemons have reported so we can proceed */
-                daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
-                return PRTE_SUCCESS;
-            }
-            /* well, if the HNP doesn't have any procs, and neither did
-             * anyone else...then we have a big problem
+            /* retain a copy for our use in case the item gets
+             * destructed along the way
              */
-            PRTE_ACTIVATE_JOB_STATE(NULL, PRTE_JOB_STATE_FORCED_EXIT);
-            PMIX_LIST_DESTRUCT(&nodes);
-            return PRTE_ERR_FATAL;
+            PMIX_RETAIN(node);
+            pmix_list_append(&nodes, &node->super);
         }
         goto process;
     }
@@ -3011,7 +3115,7 @@ static int setup_virtual_machine(prte_job_t *jdata)
                              "%s plm:base:setup_vm only HNP in allocation",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
         /* cleanup */
-        PMIX_DESTRUCT(&nodes);
+        PMIX_LIST_DESTRUCT(&nodes);
         /* mark that the daemons have reported so we can proceed */
         daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
         PRTE_FLAG_UNSET(daemons, PRTE_JOB_FLAG_UPDATED);
@@ -3092,7 +3196,7 @@ static int setup_virtual_machine(prte_job_t *jdata)
         PMIX_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
                              "%s plm:base:setup_vm only HNP left",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-        PMIX_DESTRUCT(&nodes);
+        PMIX_LIST_DESTRUCT(&nodes);
         /* mark that the daemons have reported so we can proceed */
         daemons->state = PRTE_JOB_STATE_DAEMONS_REPORTED;
         PRTE_FLAG_UNSET(daemons, PRTE_JOB_FLAG_UPDATED);
@@ -3142,6 +3246,7 @@ process:
         proc = PMIX_NEW(prte_proc_t);
         if (NULL == proc) {
             PRTE_ERROR_LOG(PRTE_ERR_OUT_OF_RESOURCE);
+            free(new_vpids);
             PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
@@ -3168,6 +3273,7 @@ process:
             /* no more daemons available */
             prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "out-of-vpids", true);
             PMIX_RELEASE(proc);
+            free(new_vpids);
             PMIX_LIST_DESTRUCT(&nodes);
             return PRTE_ERR_OUT_OF_RESOURCE;
         }
@@ -3180,6 +3286,7 @@ process:
             > (rc = pmix_pointer_array_set_item(daemons->procs, proc->name.rank, (void *) proc))) {
             PRTE_ERROR_LOG(rc);
             PMIX_RELEASE(proc);
+            free(new_vpids);
             PMIX_LIST_DESTRUCT(&nodes);
             return rc;
         }

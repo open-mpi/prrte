@@ -8,10 +8,10 @@
 # $HEADER$
 #
 # A recording, optionally misbehaving, wrapper around the real salloc,
-# scontrol and scancel.  Dispatches on argv[0], the way the tools it wraps are
-# reached: build.sh installs it as
+# scontrol, scancel and srun.  Dispatches on argv[0], the way the tools it
+# wraps are reached: build.sh installs it as
 #
-#     /opt/prte/slurmshim/bin/{salloc,scontrol,scancel}
+#     /opt/prte/slurmshim/bin/{salloc,scontrol,scancel,srun}
 #
 # deliberately NOT into the install bin/ that every node has on its PATH -- a
 # case has to opt in by putting that directory first, so nothing else in the
@@ -38,18 +38,32 @@
 #   slurm-shim reset                 # clear the state (argv records, faults)
 #   slurm-shim argv                  # the argv of the most recent salloc
 #   slurm-shim audit                 # every wrapped command, in order
+#   slurm-shim nodefile              # "<lines> <bytes>" of the node file the
+#                                    # most recent srun was given
 #   slurm-shim set <key> <value>     # arm/disarm a fault
 #
 # Faults:
 #   bad_json 1     `scontrol show job ... --json` prints garbage, exits 0
 #   scancel_fail 1 `scancel` fails with far more output than PRRTE's capture
 #                  buffer holds, so the truncation path is taken
+#   fat_json <n>   the real record, with a member PRRTE does not read added
+#                  to the job and padded to n bytes.  It is skipped whatever
+#                  its size, so it costs nothing however far past the window
+#                  it goes
+#   fat_field <n>  the real record, with a member PRRTE DOES read padded to n
+#                  bytes.  That one has to be held whole, so past the window
+#                  it is refused by name
+#   fat_nodes <n>  the real record, with its allocation array replicated to n
+#                  nodes.  The job stays one Slurm can act on; only the part
+#                  PRRTE streams grows
 
+import json
 import os
+import subprocess
 import sys
 
 STATE = os.environ.get("SLURM_SHIM_STATE", "/tmp/slurm-shim")
-WRAPPED = ("salloc", "scontrol", "scancel")
+WRAPPED = ("salloc", "scontrol", "scancel", "srun")
 
 
 def state_path(*parts):
@@ -84,6 +98,27 @@ def record(name, argv):
     if "salloc" == name:
         with open(state_path("argv.last"), "w") as f:
             f.write("\n".join(argv) + "\n")
+
+
+def record_nodefile(argv):
+    """Count the lines and bytes of the node file srun was given.
+
+    That srun ran at all is the point: as one argument a node list past the
+    kernel's 128 KiB per-argument limit makes the exec fail with E2BIG, so a
+    large list reaches this record only in a file.
+    """
+    for arg in argv:
+        if arg.startswith("--nodelist=") and "/" in arg:
+            path = arg[len("--nodelist="):]
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                return
+            ensure_state()
+            with open(state_path("nodefile.last"), "w") as f:
+                f.write("%d %d\n" % (data.count(b"\n"), len(data)))
+            return
 
 
 def real_command(name):
@@ -126,12 +161,70 @@ def main():
         return control(argv)
 
     record(name, [name] + argv)
+    if "srun" == name:
+        record_nodefile(argv)
 
     if "scontrol" == name and "--json" in argv and "1" == flag("bad_json"):
         # Exit 0 with unparsable output on purpose: a non-zero status would be
         # caught by the caller's status check and never reach the parser,
         # which is the code under test.
         sys.stdout.write("{ this is not json, and never was\n")
+        return 0
+
+    if "scontrol" == name and "--json" in argv and (
+            flag("fat_json") not in (None, "", "0")
+            or flag("fat_field") not in (None, "", "0")
+            or flag("fat_nodes") not in (None, "", "0")):
+        # Forks where the other faults exec, because the scheduler's own
+        # record has to come back here to be grown.  Safe for scontrol, which
+        # PRRTE reads through popen and does not track by pid.
+        real = real_command(name)
+        if real is None:
+            sys.stderr.write("slurm-shim: no real %s on PATH\n" % name)
+            return 127
+        out = subprocess.run([real] + argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, universal_newlines=True)
+        if 0 != out.returncode:
+            sys.stdout.write(out.stdout)
+            sys.stderr.write(out.stderr)
+            return out.returncode
+        try:
+            doc = json.loads(out.stdout)
+        except ValueError:
+            sys.stdout.write(out.stdout)
+            return 0
+
+        job = doc["jobs"][0]
+
+        pad = int(flag("fat_json") or 0)
+        if pad > 0:
+            # Inside the job, where PRRTE is reading, rather than beside it in
+            # the envelope, which it skips whatever we put there.  A NEW key:
+            # PRRTE rejects duplicates, so padding an existing one would be
+            # refused as malformed and prove nothing about size.
+            job["prte_shim_padding"] = "x" * pad
+
+        wide = int(flag("fat_field") or 0)
+        if wide > 0:
+            # Replacing the value of a member PRRTE keeps, which is the only
+            # way to make it hold something too large.  A replacement, not a
+            # second copy: PRRTE refuses a duplicate member, which would end
+            # the read before its size ever mattered.
+            job["current_working_directory"] = "/" + "x" * wide
+
+        nodes = int(flag("fat_nodes") or 0)
+        if nodes > 0:
+            alloc = job["job_resources"]["nodes"]["allocation"]
+            grown = []
+            for i in range(nodes):
+                entry = json.loads(json.dumps(alloc[i % len(alloc)]))
+                entry["index"] = i
+                entry["name"] = "%s-shim%06d" % (entry["name"], i)
+                grown.append(entry)
+            job["job_resources"]["nodes"]["allocation"] = grown
+            job["job_resources"]["nodes"]["count"] = nodes
+
+        sys.stdout.write(json.dumps(doc))
         return 0
 
     if "scancel" == name and "1" == flag("scancel_fail"):
@@ -148,7 +241,7 @@ def main():
 
 def control(argv):
     if not argv:
-        sys.stderr.write(__doc__ or "usage: slurm-shim <reset|argv|audit|set>\n")
+        sys.stderr.write(__doc__ or "usage: slurm-shim <reset|argv|audit|nodefile|set>\n")
         return 2
     cmd = argv[0]
     if "reset" == cmd:
@@ -159,6 +252,13 @@ def control(argv):
     if "argv" == cmd:
         try:
             with open(state_path("argv.last")) as f:
+                sys.stdout.write(f.read())
+        except OSError:
+            return 1
+        return 0
+    if "nodefile" == cmd:
+        try:
+            with open(state_path("nodefile.last")) as f:
                 sys.stdout.write(f.read())
         except OSError:
             return 1

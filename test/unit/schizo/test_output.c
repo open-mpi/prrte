@@ -151,6 +151,10 @@ static int test_hoist(void)
     char *files[] = {"file=/tmp/a", "file=/tmp/b", NULL};
     char *samefile[] = {"file=/tmp/a", "file=/tmp/a", NULL};
     char *timeouts[] = {"timeout=60", "timeout=30", NULL};
+    /* the same hours, different minutes: split at ':' these both read as
+     * "timeout=1" and passed as agreeing */
+    char *hhmmss[] = {"timeout=1:30:00", "timeout=1:45:00", NULL};
+    char *hhmmss_same[] = {"timeout=1:30:00", "timeout=1:30:00", NULL};
     char *empty[] = {NULL};
 
     /* the ordinary MPMD case: the option was written in one segment, and
@@ -198,6 +202,20 @@ static int test_hoist(void)
     fprintf(stderr, "--- expected error output follows (hoist: two timeouts) ---\n");
     rc = run_hoist(PRTE_CLI_RTOS, timeouts, NULL, &merged);
     CHECK("hoist:two-timeouts", PRTE_SUCCESS != rc);
+    free(merged);
+    merged = NULL;
+
+    fprintf(stderr, "--- expected error output follows (hoist: two hh:mm:ss timeouts) ---\n");
+    rc = run_hoist(PRTE_CLI_RTOS, hhmmss, NULL, &merged);
+    CHECK("hoist:two-timeouts-with-colons", PRTE_SUCCESS != rc);
+    free(merged);
+    merged = NULL;
+
+    rc = run_hoist(PRTE_CLI_RTOS, hhmmss_same, NULL, &merged);
+    CHECK("hoist:same-timeout-with-colons", PRTE_SUCCESS == rc);
+    CHECK("hoist:same-timeout-with-colons-value",
+          NULL != merged && 0 == strcmp(merged, "timeout=1:30:00,timeout=1:30:00"));
+    free(merged);
 
     /* no segment wrote the option: whatever the global parse holds is the
      * whole of it, and must not be disturbed */
@@ -231,6 +249,10 @@ int test_output(void)
     char *dvals2[] = {"map", "bind", NULL};
     char *dvals3[] = {"map:parseable", NULL};
     char *dvals4[] = {"topo=node1;node2", NULL};
+    /* the documented replacement for --report-bindings */
+    char *dbindings[] = {"bindings", NULL};
+    char *dvals4b[] = {"topo", NULL};
+    char *dvals4c[] = {"topo=", NULL};
     char *dvals5[] = {"map:bogus", NULL};
     char *evals1[] = {"bogus", NULL};
     char *evals2[] = {"bogus", NULL};
@@ -325,6 +347,15 @@ int test_output(void)
     CHECK("display:multi-bind", has_key(iptr, ninfo, PMIX_REPORT_BINDINGS));
     PMIX_INFO_FREE(iptr, ninfo);
 
+    /*** "--display bindings" is what the deprecated --report-bindings is
+     * documented to become.  It only ever worked because the matcher took
+     * any word that BEGAN with "bind"; it is a spelling of its own now ***/
+    rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dbindings,
+                    &iptr, &ninfo);
+    CHECK("display:bindings-rc", PRTE_SUCCESS == rc);
+    CHECK("display:bindings", has_key(iptr, ninfo, PMIX_REPORT_BINDINGS));
+    PMIX_INFO_FREE(iptr, ninfo);
+
     /*** display qualifiers ***/
     rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dvals3,
                     &iptr, &ninfo);
@@ -343,6 +374,22 @@ int test_output(void)
           0 == strcmp(key_string(iptr, ninfo, PMIX_DISPLAY_TOPOLOGY),
                       "node1;node2"));
     PMIX_INFO_FREE(iptr, ninfo);
+
+    /*** bare "topo" means every node - what the deprecated
+     * --display-topo converts to.  It must be accepted and must still
+     * request the display, with no node list attached ***/
+    rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dvals4b,
+                    &iptr, &ninfo);
+    CHECK("display:topo-bare-rc", PRTE_SUCCESS == rc);
+    CHECK("display:topo-bare-key", has_key(iptr, ninfo, PMIX_DISPLAY_TOPOLOGY));
+    CHECK("display:topo-bare-all", NULL == key_string(iptr, ninfo, PMIX_DISPLAY_TOPOLOGY));
+    PMIX_INFO_FREE(iptr, ninfo);
+
+    /*** ...whereas "topo=" names an empty list, which is refused ***/
+    fprintf(stderr, "--- expected error output follows (empty topo list) ---\n");
+    rc = run_parser(prte_schizo_base_parse_display, PRTE_CLI_DISPLAY, dvals4c,
+                    &iptr, &ninfo);
+    CHECK("display:topo-empty", PRTE_SUCCESS != rc);
 
     /*** an unknown display qualifier is an error ***/
     fprintf(stderr, "--- expected error output follows (bad display qualifier) ---\n");

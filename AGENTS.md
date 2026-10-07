@@ -439,6 +439,21 @@ python3 src/util/prte-convert-help.py --root . --check-only \
     --cppflags="$(pkg-config --cflags-only-I pmix)"
 ```
 
+The same run checks the calls against the help files, in both directions:
+every topic in a help file must be shown by some call, and every topic a
+call names in one of PRRTE's help files must exist there - a missing one
+does not fail, it prints PMIx's "couldn't find that topic" placeholder in
+place of the diagnostic. So adding a call means adding its topic, and
+removing the last call to a topic means removing the topic.
+
+The check also counts arguments: every `prte_show_help()` or
+`pmix_show_help()` call whose file and topic are string literals must pass
+exactly as many arguments as the topic has `printf` conversions. The topic
+text *is* the format string, so the compiler never sees it, and a call that
+passes too few reads whatever happens to be on the stack - with a `%s`
+among them, it dereferences it. When you change a topic's conversions,
+change every call that shows it.
+
 ### Mixed-version DVMs are strictly forbidden
 
 Every process in a DVM comes from the same build. There is no version
@@ -709,6 +724,28 @@ prun -n 4 hostname                  # basic launch smoke test
 pterm                               # shut down DVM
 ```
 
+**Multi-node testing on a real cluster.**  The multi-node suite is not a
+container thing that happens to run in containers — it is a runtime test
+suite, and `contrib/dockerswarm/run-tests.sh cluster` runs the *same*
+cases on real nodes over `ssh`.  The cases speak in logical node names
+(`node1`..`node10`) and reach them through a transport layer; only that
+layer knows the difference.  Prepare a cluster with
+[`contrib/dockerswarm/cluster-setup.sh`](contrib/dockerswarm/cluster-setup.sh)
+and see [`docs/testing/cluster.rst`](docs/testing/cluster.rst):
+
+```sh
+cd contrib/dockerswarm
+./cluster-setup.sh --prefix /shared/prrte     # helper clients + node checks
+PRTE_CLUSTER_PREFIX=/shared/prrte \
+PRTE_CLUSTER_NODES=cn01,cn02,cn03,cn04 ./run-tests.sh cluster
+```
+
+Anything your laptop cannot have — your interconnect, your file system,
+your resource manager, your NUMA and GPUs, your scale — is only covered
+here.  **A case added to that suite must go through the transport**
+(`RUN`, `ON`, `ONT`, `EXEC_SH`, `EXEC_TOOL`, `COPY_IN`, `kill_stray`) and
+never call `docker` directly, or it silently becomes container-only.
+
 **Multi-node testing without a cluster.**  Use the container harness in
 [`contrib/dockerswarm/`](contrib/dockerswarm/) — its
 [`AGENTS.md`](contrib/dockerswarm/AGENTS.md) is the authoritative guide.
@@ -762,9 +799,15 @@ that apply to what you touched:
 5. **Docs build.**  For user-visible changes, update the RST under
    [`docs/`](docs/) and build the docs (`make` in `docs/` produces the
    Sphinx HTML) to confirm they render warning-free.
-6. **Broaden when feasible.**  Where you can, repeat across environments
+6. **Multi-node suite** (`contrib/dockerswarm/run-tests.sh linux`) for
+   anything that only exists between daemons — launch, IOF, file staging,
+   collectives, elastic resize, routing.
+7. **Broaden when feasible.**  Where you can, repeat across environments
    and resource managers — PRRTE's whole reason for existing is
-   portability across systems you may not have in front of you.
+   portability across systems you may not have in front of you.  If you
+   have real nodes, `run-tests.sh cluster` runs the same suite on them
+   (`docs/testing/cluster.rst`); that is the only layer that can speak for
+   your interconnect, file system and resource manager.
 
 ---
 
@@ -964,6 +1007,18 @@ As a narrow exception, creating a **new branch** when you need to park
 work in progress (for example, instead of `git stash`) is fine.  Just be
 careful not to collide with branches that other agents or people may be
 using in the same clone — pick a clearly-scoped, unlikely-to-clash name.
+
+**Start from upstream, not from the clone's `master`.**  A shared clone's
+local `master` is whatever someone last pulled, and can be weeks behind.
+Before creating a topic branch or worktree, `git fetch origin` and branch
+from `origin/master` (for a worktree:
+`git worktree add -b topic/<name> <path> origin/master`).  PMIx
+is the other half of the same code base, so when a change or a test spans
+both, do the same there — and when testing across them, whether in a
+container, the dockerswarm harness or by hand, build each from its current
+master head and state the commits you built.  A stale local `master`, an old
+install or a previously built image quietly tests against, or duplicates,
+code upstream has already replaced.
 
 ---
 

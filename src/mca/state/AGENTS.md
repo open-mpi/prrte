@@ -255,12 +255,25 @@ These live in `state_base_fns.c` and are wired into components' tables
 
 | Handler | Role |
 |---------|------|
-| `prte_state_base_track_procs` | The proc-state workhorse. Advances `pdata->state`, counts `num_launched`/`num_reported`/`num_terminated`, and rolls those counts up into job-state activations: first `RUNNING` → `STARTED`, all running → `RUNNING`; all registered → `REGISTERED`; `IOF_COMPLETE` + `WAITPID_FIRED` together → `TERMINATED`; all terminated → job `TERMINATED` (and, if the daemon job and routes are gone, `DAEMONS_TERMINATED`). Also gates `READY_FOR_DEBUG`. |
+| `prte_state_base_track_procs` | The proc-state workhorse. Advances `pdata->state`, counts `num_launched`/`num_reported`/`num_terminated`, and rolls those counts up into job-state activations: first `RUNNING` → `STARTED`, all running → `RUNNING`; all registered → `REGISTERED`; `IOF_COMPLETE` + `WAITPID_FIRED` together → `TERMINATED` (through `prte_state_base_join`); all terminated → job `TERMINATED` (and, if the daemon job and routes are gone, `DAEMONS_TERMINATED`). Also gates `READY_FOR_DEBUG`. |
+| `prte_state_base_join` | **The one place a local proc is retired.** Records the half of the termination that fired (`PRTE_PROC_FLAG_IOF_COMPLETE` or `PRTE_PROC_FLAG_WAITPID`) and, when both have fired and the proc is not already `PRTE_PROC_FLAG_RECORDED`, activates `PRTE_PROC_STATE_TERMINATED`. Both arms of both proc machines call it, and nothing else may make that decision — see below. |
 | `prte_state_base_local_launch_complete` | Optionally kicks `REPORT_PROGRESS` every 100 daemons when `PRTE_JOB_SHOW_PROGRESS` is set. |
 | `prte_state_base_report_progress` | Prints the "App launch reported: N daemons / M procs" line. |
 | `prte_state_base_check_fds` | Debug leak check: enumerates open fds after a job completes (enabled by `state_base_check_fds`). |
 | `prte_state_base_purge_proc` / `_purge_app` / `_purge_nspace` / `_purge_session` | Tell the data store a lifetime ended, so it drops the published data that was not to outlive it. Each purges **this process's own** store with a direct call — no message, and nothing at all when nothing was ever published, which is what makes the per-process one affordable. The master additionally relays to an *external* data server where one is configured, since that store lives in another DVM behind a PMIx tool connection only the master holds. Which one a caller reaches for is which lifetime it can observe: a daemon sees its own child exit and is told when a namespace is over; it does **not** see an application end DVM-wide, and its own share of a job finishing is not a lifetime at all. Sending the DVM-wide purge from there used to let the first node to finish purge the whole namespace out of the master's store mid-job. |
 | `prte_state_base_recover_resources` | Idempotently returns one proc's slot/cpu resources to its node and drops the node from the map when empty — used on daemon-loss / partial-failure recovery paths. Written to tolerate being called twice for the same proc, **and to tolerate having neither a node nor a map to work on** (see below). |
+
+### A proc's cpus go back in its own app's terms
+
+Both release paths — `prte_state_base_recover_resources()` and state/dvm's
+job cleanup — give back "the first object of the binding's type" from each
+proc's cpuset, and `prte_state_base_cpu_release_policy()` decides that type
+(and whether the whole binding is returned) **per proc, from its app**, the
+app's directives winning over the job's. Both used to read the job alone, so
+in a job whose apps counted cpus differently a hwthread-bound proc was
+released as a core: no core lies inside one hwthread, the lookup printed
+"COULD NOT GET BOUND CPU FOR RESOURCE RELEASE", and the cpu was never
+returned — the DVM shrank until later jobs could not bind.
 
 ### A proc outlives its node, and a job outlives its map
 
@@ -574,6 +587,25 @@ contention — the process's role decides which machine it runs.
   it was found through hwloc's `memory not bound` warning, which adds a pipe
   record and a `show_help` render to `do_parent` before the `RUNNING`
   activation.
+- **Retiring a local proc happens in exactly one place, and producers
+  report halves rather than decide.** A local proc is finished only when
+  both of two independent asynchronous things have happened — its output
+  has drained (`PRTE_PROC_FLAG_IOF_COMPLETE`) and the child has been reaped
+  (`PRTE_PROC_FLAG_WAITPID`) — and either can be last, so whichever arrives
+  second has to activate `PRTE_PROC_STATE_TERMINATED`. That means the same
+  test sits on both arms, and the two must agree. `prte_state_base_join()`
+  is that test, and it is also the only thing that sets either flag: call
+  it with the half that fired and let it decide. Do not set a flag by hand
+  and then call it, and do not write your own copy of the gate anywhere
+  else — the test had drifted into four disagreeing copies, two of them in
+  `errmgr/prted` (where one branch had no copy at all, so a proc taking it
+  was never retired, its daemon's batched `UPDATE_PROC_STATE` never went
+  out, and `prterun` hung with every daemon alive). The producer side is
+  correspondingly narrow: whatever knows a proc's waitpid will never come
+  again — `odls`' reaper, both arms of its kill path — activates its
+  *diagnosis* first, if it owns one, and then **always** activates
+  `PRTE_PROC_STATE_WAITPID_FIRED`. Re-activating a diagnosis to mean "and
+  the waitpid is done" conflates two different statements and is what broke.
 - **A job's state must never go backwards either.** The job-level `RUNNING`
   and `REGISTERED` are counted up from per-proc reports, so they inherit the
   same disorder: a proc can exit, and the job reach `TERMINATED`, while its

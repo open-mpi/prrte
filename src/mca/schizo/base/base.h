@@ -22,6 +22,8 @@
 #include "prte_config.h"
 #include "types.h"
 
+#include <stdio.h>
+
 #include "src/class/pmix_list.h"
 #include "src/mca/base/pmix_mca_base_framework.h"
 #include "src/mca/mca.h"
@@ -92,17 +94,34 @@ PRTE_EXPORT prte_schizo_base_module_t *prte_schizo_base_detect_proxy(char *cmdpa
 PRTE_EXPORT char *prte_schizo_base_normalize_argv(char **argv);
 
 PRTE_EXPORT void prte_schizo_base_root_error_msg(void);
-PRTE_EXPORT char *prte_schizo_base_getline(FILE *fp);
 PRTE_EXPORT char *prte_schizo_base_strip_quotes(char *p);
 PRTE_EXPORT int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target);
 PRTE_EXPORT int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target);
+PRTE_EXPORT bool prte_schizo_base_is_if_param(const char *name);
+/* Open a --tune file as named, or - for a relative name not found in the
+ * cwd - in the directory of parameter sets installed with PRRTE. Reports
+ * the failure itself and returns NULL if neither exists. */
+PRTE_EXPORT FILE *prte_schizo_base_open_tune_file(const char *name);
+/* Pre-scan an argv for --tune files and push their "param = value"
+ * entries into the environment as generic MCA params - the same
+ * treatment "--mca param value" gets. Must run before the MCA params
+ * are registered, alongside prte_schizo_base_parse_prte/_pmix. */
+PRTE_EXPORT int prte_schizo_base_parse_tune(int argc, int start, char **argv);
+/* Validate the --tune files of a parsed command line strictly: every
+ * entry must be "param = value" naming a PRRTE or PMIx parameter */
+PRTE_EXPORT int prte_schizo_base_check_tune(pmix_cli_result_t *results);
 PRTE_EXPORT int prte_schizo_base_sanity(pmix_cli_result_t *cmd_line);
-PRTE_EXPORT bool prte_schizo_base_check_directives(char *directive,
-                                                   char **valid,
-                                                   char **quals,
+/* Check one directive of an option - "package:span:pe=2" - against the
+ * option's vocabulary of directives and of qualifiers (see
+ * src/util/prte_cmd_line.h), explaining any refusal.  A NULL "quals" means
+ * the option has no qualifiers, and its values are not split at ':' - the
+ * value of "--rtos timeout=1:30:00" contains them. */
+PRTE_EXPORT bool prte_schizo_base_check_directives(const char *directive,
+                                                   const pmix_cli_choice_t *valid,
+                                                   const pmix_cli_choice_t *quals,
                                                    char *dir);
-PRTE_EXPORT bool prte_schizo_base_check_qualifiers(char *directive,
-                                                   char **valid,
+PRTE_EXPORT bool prte_schizo_base_check_qualifiers(const char *directive,
+                                                   const pmix_cli_choice_t *valid,
                                                    char *qual);
 PRTE_EXPORT void prte_schizo_base_expose(char *param, char *prefix);
 PRTE_EXPORT int prte_schizo_base_add_directive(pmix_cli_result_t *results,

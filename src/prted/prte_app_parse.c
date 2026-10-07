@@ -209,7 +209,13 @@ static int add_envar_directives(prte_pmix_app_t *app,
                     for (i=0; NULL != environ[i]; i++) {
                         if (0 == strncmp(environ[i], param, strlen(param))) {
                             // this is a var to fwd
-                            // extract the name and value
+                            // extract the name and value. Nothing obliges an
+                            // environ entry to hold an '=' - anything that
+                            // writes environ directly can leave one without -
+                            // and such an entry has no value to forward
+                            if (NULL == strchr(environ[i], '=')) {
+                                continue;
+                            }
                             PMIX_ENVAR_CONSTRUCT(&envt);
                             ptr = strdup(environ[i]);
                             value = strchr(ptr, '=');
@@ -315,7 +321,7 @@ done:
  * There used to be a "char ***app_env" parameter here, described as the
  * base environment to carry across the recursive create_app() calls that an
  * appfile produced.  There is no recursion any more - an appfile is read
- * into the command line up front, by prte_parse_appfile() in prte.c, before
+ * into the command line up front, by prte_load_appfile(), before
  * any of this runs - and this function had long since stopped writing
  * through the parameter, so the caller's variable was always NULL and
  * everything it was plumbed through was a no-op.  It is gone rather than
@@ -495,7 +501,8 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
          * and its cwd is not ours */
         atokens = PMIx_Argv_split(tval, ',');
         free(tval);
-        for (a = 0; NULL != atokens[a]; a++) {
+        /* an empty value names nothing to bring in */
+        for (a = 0; NULL != atokens && NULL != atokens[a]; a++) {
             if (0 != strncmp(atokens[a], "file=", 5) ||
                 '\0' == atokens[a][5] ||
                 pmix_path_is_absolute(&atokens[a][5])) {
@@ -509,10 +516,12 @@ static int create_app(prte_schizo_base_module_t *schizo, char **argv,
             pmix_asprintf(&atokens[a], "file=%s", value);
             free(value);
         }
-        tval = PMIx_Argv_join(atokens, ',');
-        PMIx_Argv_free(atokens);
-        PMIX_INFO_LIST_ADD(rc, app->info, PRTE_ACTIVATE_HOSTS, tval, PMIX_STRING);
-        free(tval);
+        if (NULL != atokens) {
+            tval = PMIx_Argv_join(atokens, ',');
+            PMIx_Argv_free(atokens);
+            PMIX_INFO_LIST_ADD(rc, app->info, PRTE_ACTIVATE_HOSTS, tval, PMIX_STRING);
+            free(tval);
+        }
         // these name nodes the allocation already holds, so they are
         // likewise no part of an initial DVM
     }

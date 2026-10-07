@@ -53,6 +53,7 @@
 #include "src/runtime/pmix_init_util.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/pmix_string_copy.h"
 #include "src/util/prte_show_help.h"
 
 #include "src/mca/base/pmix_mca_base_vari.h"
@@ -328,8 +329,14 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
                 pmix_asprintf(&pargv[n], "-%s", p2);
                 free(p2);
             }
-            // now skip the next two positions
-            n += 2;
+            // now skip the next two positions - as many of them as there
+            // are, so an option missing its values stops at the end
+            if (NULL != pargv[n + 1]) {
+                ++n;
+                if (NULL != pargv[n + 1]) {
+                    ++n;
+                }
+            }
             continue;
         }
         /* check for single-dash errors */
@@ -549,10 +556,12 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
                                                 PRTE_CLI_MAPBY, PRTE_CLI_HWTCPUS,
                                                 warn);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
-            if (NULL != prte_set_slots) {
-                free(prte_set_slots);
-            }
-            prte_set_slots = strdup("hwthreads");
+            /* the qualifier alone is enough: the mapper counts a node's
+             * hwthreads as its slots for a job that asks for them, and only
+             * for that job. This used to set prte_set_slots as well, which
+             * resized every node for the life of whatever DVM this process
+             * started (so prterun's spawned children inherited it) and did
+             * nothing at all in prun, whose DVM was already sized. */
         }
         /* --do-not-launch -> --runtime-options do-not-launch */
         else if(0 == strcmp(option, "do-not-launch")) {
@@ -630,12 +639,16 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
             free(p2);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
-        /* -N ->   map-by ppr:N:node */
+        /* -N ->   map-by ppr:N:node
+         *
+         * -N is a current mpirun option, not a deprecated one - it is
+         * merely implemented as a mapping directive - so it converts
+         * without the deprecation warning */
         else if (0 == strcmp(option, "N")) {
             pmix_asprintf(&p2, "ppr:%s:node", opt->values[0]);
             rc = prte_schizo_base_add_directive(results, option,
                                                 PRTE_CLI_MAPBY, p2,
-                                                warn);
+                                                false);
             free(p2);
             PMIX_CLI_REMOVE_DEPRECATED(results, opt);
         }
@@ -664,7 +677,7 @@ static int convert_deprecated_cli(pmix_cli_result_t *results,
         else if (0 == strcmp(option, "ppr")) {
             /* if they didn't specify a complete pattern, then this is an error */
             if (NULL == strchr(opt->values[0], ':')) {
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "bad-ppr", true, opt->values[0], true);
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "bad-ppr", true, opt->values[0]);
                 return PRTE_ERR_SILENT;
             }
             pmix_asprintf(&p2, "ppr:%s", opt->values[0]);
@@ -1092,7 +1105,7 @@ static int process_envar(const char *p, char ***cache, char ***cachevals)
         rc = check_cache(cache, cachevals, p1, value);
     } else {
         /* check for a '*' wildcard at the end of the value */
-        if ('*' == p1[strlen(p1) - 1]) {
+        if ('\0' != p1[0] && '*' == p1[strlen(p1) - 1]) {
             /* search the local environment for all params
              * that start with the string up to the '*' */
             p1[strlen(p1) - 1] = '\0';
@@ -1207,6 +1220,7 @@ static int process_tune_files(char *filename, char ***dstenv, char sep)
     int i, n, rc = PRTE_SUCCESS;
     char **cache = NULL, **cachevals = NULL;
     char **xparams = NULL, **xvals = NULL;
+    bool failed = false;
 
     tmp = PMIx_Argv_split(filename, sep);
     if (NULL == tmp) {
@@ -1217,34 +1231,18 @@ static int process_tune_files(char *filename, char ***dstenv, char sep)
      * a given param appears more than once with different values */
 
     for (i = 0; NULL != tmp[i]; i++) {
-        fp = fopen(tmp[i], "r");
+        /* the base finds the file - in the cwd or among the installed
+         * parameter sets - and reports it if it can't */
+        fp = prte_schizo_base_open_tune_file(tmp[i]);
         if (NULL == fp) {
-            /* if the file given wasn't absolute, check in the default location */
-            if (!pmix_path_is_absolute(tmp[i])) {
-                p1 = pmix_os_path(false, DEFAULT_PARAM_FILE_PATH, tmp[i], NULL);
-                fp = fopen(p1, "r");
-                if (NULL == fp) {
-                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "missing-param-file-def", true, tmp[i], p1);;
-                    PMIx_Argv_free(tmp);
-                    PMIx_Argv_free(cache);
-                    PMIx_Argv_free(cachevals);
-                    PMIx_Argv_free(xparams);
-                    PMIx_Argv_free(xvals);
-                    free(p1);
-                    return PRTE_ERR_NOT_FOUND;
-                }
-                free(p1);
-            } else {
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "missing-param-file", true, tmp[i]);;
-                PMIx_Argv_free(tmp);
-                PMIx_Argv_free(cache);
-                PMIx_Argv_free(cachevals);
-                PMIx_Argv_free(xparams);
-                PMIx_Argv_free(xvals);
-                return PRTE_ERR_NOT_FOUND;
-            }
+            PMIx_Argv_free(tmp);
+            PMIx_Argv_free(cache);
+            PMIx_Argv_free(cachevals);
+            PMIx_Argv_free(xparams);
+            PMIx_Argv_free(xvals);
+            return PRTE_ERR_NOT_FOUND;
         }
-        while (NULL != (line = prte_schizo_base_getline(fp))) {
+        while (NULL != (line = pmix_getline(fp, &failed))) {
             if ('\0' == line[0]) {
                 free(line);
                 continue; /* skip empty lines */
@@ -1407,6 +1405,16 @@ static int process_tune_files(char *filename, char ***dstenv, char sep)
             free(line);
         }
         fclose(fp);
+        if (failed) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-util.txt", "file-read-failed", true,
+                           tmp[i]);
+            PMIx_Argv_free(tmp);
+            PMIx_Argv_free(cache);
+            PMIx_Argv_free(cachevals);
+            PMIx_Argv_free(xparams);
+            PMIx_Argv_free(xvals);
+            return PRTE_ERR_SILENT;
+        }
     }
 
     PMIx_Argv_free(tmp);
@@ -1820,14 +1828,6 @@ static bool check_prte_overlap(char *var, char *value)
         return true;
     } else if (0 == strncmp(var, "hwloc_", 6)) {
         pmix_asprintf(&tmp, "PRTE_MCA_%s", var);
-        // set it, but don't overwrite if they already
-        // have a value in our environment
-        setenv(tmp, value, false);
-        free(tmp);
-        return true;
-    } else if (0 == strncmp(var, "if_", 3)) {
-        // need to convert if to prteif
-        pmix_asprintf(&tmp, "PRTE_MCA_prteif_%s", &var[3]);
         // set it, but don't overwrite if they already
         // have a value in our environment
         setenv(tmp, value, false);

@@ -85,9 +85,11 @@ test/unit/rml/test_rml
 test/unit/rml/test_rml_routing
 test/unit/rml/test_relm
 test/unit/ras/Makefile
+test/unit/common/test_common_slurm
 test/unit/ras/test_ras
 test/unit/schizo/Makefile
 test/unit/schizo/test_schizo
+test/unit/schizo/test_mca_prefixes
 test/unit/state/Makefile
 test/unit/state/test_state
 test/unit/tools/Makefile
@@ -263,6 +265,7 @@ docs/_templates
 
 # Generated RST files
 docs/code-of-conduct.rst
+docs/security.rst
 src/docs/_build
 src/docs/mca/mca.rst
 src/docs/mca/help*rst

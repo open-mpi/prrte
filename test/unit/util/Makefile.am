@@ -13,7 +13,10 @@ test_util_SOURCES = \
     test_util.c \
     test_hostfile_corpus.c \
     test_rankfile_corpus.c \
-    test_textfile.c
+    test_textfile.c \
+    test_dvm_key.c \
+    test_session_dir.c \
+    test_output_file.c
 
 test_util_LDADD = $(top_builddir)/src/lib@PRTE_BINARY_PREFIX@prrte.la
 

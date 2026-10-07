@@ -28,13 +28,15 @@ linked into `libprrte`. There are no MCA components here.
 | **Names** | `name_fns.[ch]` | Rendering and parsing of `pmix_proc_t`/`pmix_nspace_t`, and `prte_util_compare_name_fields()`. |
 | **Node specifications** | [`hostfile/`](hostfile/AGENTS.md), [`dash_host/`](dash_host/AGENTS.md) | The two ways a user names machines. Each has its own AGENTS.md. |
 | **Rankfile** | [`rankfile/`](rankfile/AGENTS.md) | Reading the per-rank placement file. Here rather than in `rmaps/rank_file` because parsing a file the user wrote is not a mapping policy. |
-| **Line-oriented files** | `textfile.[ch]` | One logical line at a time, comments stripped and fields split, for the two parsers above. What replaced PRRTE's flex scanners. |
+| **Line-oriented files** | `textfile.[ch]` | One logical line at a time, comments stripped and fields split, for the two parsers above. What replaced PRRTE's flex scanners. Lines are read with `pmix_getline()`, as is every other line-oriented file in PRRTE: it returns a line of any length, and its `failed` flag tells a read error or a NUL byte from the end of the file. Do not use a fixed `fgets()` buffer, which hands a long line back in pieces, the next piece read as a line of its own. |
 | **Nidmap** | `nidmap.[ch]` | The compressed node-name/daemon-vpid map the HNP ships to every daemon. |
 | **Errors and states** | `error.[ch]`, `error_strings.[ch]` | `prte_strerror()`, `PRTE_ERROR_LOG()`, and the four state→name renderers. |
 | **Process info** | `proc_info.[ch]` | The `prte_process_info` global: hostname and its aliases, uid/gid, session-dir paths, proc type. |
+| **Output files** | `prte_output_file.[ch]` | A file a tool writes at a path the user gave (`--report-pid`, the proctable): written afresh only if it is a regular file of the user's own with one link, never through a symlink at the name, and removed only if it is still the file written. The stack-trace file applies the same rule inline, because it is opened in a signal handler. |
 | **Session directories** | `session_dir.[ch]` | Construction and teardown of the `$TMPDIR/<prefix>.<pid>/<jobid>/<rank>` tree. |
-| **Tool option values** | `prte_cmd_line.[ch]` | Value interpreters more than one tool needs (`--pid`, `--app`, the daemon umask). See [`src/tools/AGENTS.md`](../tools/AGENTS.md). |
+| **Tool option values** | `prte_cmd_line.[ch]` | Value interpreters more than one tool needs (`--pid`, `--app`, the daemon umask), and the vocabularies of the directive-valued options - see "Directive vocabularies" below. See [`src/tools/AGENTS.md`](../tools/AGENTS.md). |
 | **Bootstrap** | `prte_bootstrap.[ch]` | Reading `prte.conf` for a launcher-less DVM. |
+| **DVM key** | `prte_dvm_key.[ch]`, `prte_hmac.[ch]` | The per-DVM key daemons prove they hold before the OOB treats them as daemons, how each launcher delivers it, and the SHA-256/HMAC that proof is made with. See "The DVM key" below. |
 | **Process plumbing** | `daemon_init.c`, `sys_limits.[ch]`, `stacktrace.[ch]`, `ethtool.[ch]` | Daemonizing, `setrlimit`, the crash handler, and the Linux interface-speed ioctl. |
 | **Help delivery** | `prte_show_help.[ch]` | `prte_show_help()` — a drop-in for `pmix_show_help()` that works on a **daemon**. See below. |
 | **Generated** | `prte_show_help_content.c`, `prte-convert-help.py` | Every `help-*.txt` in the tree, compiled in. **Never edit the generated file.** |
@@ -181,7 +183,19 @@ directories. `_check_owner()` therefore refuses any directory PRRTE composes
 (top, job, rank) that is not owned by our euid or is group/other-writable,
 inspecting it through an `O_NOFOLLOW` descriptor. It never examines
 `tmpdir_base`: that was handed to us, and on macOS it is reached through the
-root-owned `/tmp` symlink. A job whose directory is refused must also forget
+root-owned `/tmp` symlink.
+
+**A top-level name that is taken is not a reason to stop.** For the top
+directory, and for `prun`'s own session directory, `prte_session_dir_create()`
+(`_claim_dir()`) uses the name only if it is free or holds a directory of ours
+that passes that check; otherwise it creates `<name>.XXXXXX` with `mkdtemp()`
+and hands that name back in its place. Nothing looks a session directory up
+by name - it is passed to PMIx (`PMIX_SERVER_TMPDIR`, `PMIX_TMPDIR`) and
+everywhere else by value, and PMIx finds rendezvous files by searching
+subdirectories - so the only effect is that startup succeeds. The prefix is
+kept, so cleanup by prefix (`/tmp/prte.*`, as `contrib/dockerswarm` does)
+still catches it. The job and rank directories need none of this: they are
+made inside a directory that is ours and closed to everyone else. A job whose directory is refused must also forget
 the path (`jdata->session_dir = NULL`), because finalize recursively destroys
 whatever that names. Verifying the foreign-owner refusal needs a second uid,
 so it was checked in the dockerswarm image as root planting the name for the
@@ -258,6 +272,37 @@ job and therefore sends no launch message.
 
 ---
 
+## The DVM key
+
+`prte_dvm_key` is a 256-bit value every daemon of one DVM holds and nothing
+else does; the OOB connect handshake (`src/rml/oob/AGENTS.md`) has each end
+prove it holds the key before anything else happens. The whole value of it is
+that **it stays private to the DVM's own processes**:
+
+- never on a command line (`ps` shows every command line on the node) - and
+  so never as a `PRTE_MCA_` environment variable either, because
+  `prte_plm_base_prted_append_basic_args` copies those onto the prted's;
+- never in a file other users can access (`prte_dvm_key_from_file` refuses one
+  that is group/other accessible, not ours, or a symlink);
+- never left in a daemon's environment once read (`prte_dvm_key_scrub_env`
+  wipes the bytes - `/proc/<pid>/environ` shows them, `unsetenv` alone does
+  not remove them - and every prted calls it before it can start anything).
+
+Each launcher has its own channel: `plm/ssh` the ssh's stdin (read by
+`prte_dvm_key_from_fd` before the prted daemonizes, since daemonizing replaces
+stdin), `plm/slurm`/`lsf`/`pals` the launcher's environment
+(`prte_dvm_key_setenv`, scrubbed from an `env` array with
+`prte_dvm_key_scrub_array` before it is freed), and a bootstrapped DVM the
+`DVMKeyFile` named in `prte.conf`. A new launcher must pick a channel of the
+same kind, or its daemons are no longer the only processes that can join.
+
+`prte_hmac.[ch]` - SHA-256 and HMAC-SHA256, checked against the FIPS 180-4
+and RFC 4231 vectors in `test/unit/util` - is generic code, and the rule below
+says generic code belongs in PMIx. It is here for now because PRRTE must not
+wait on a PMIx release to authenticate its own daemons; if PMIx grows the same
+primitives, use them and delete these. Compare a received proof with
+`prte_secure_equal`, never `memcmp`.
+
 ## `prte_process_info`
 
 A single global, filled in by `prte_setup_hostname()` and `prte_proc_info()`.
@@ -290,9 +335,15 @@ the modex match the names found locally.
   `--map-by`/`--rank-by`/`--bind-to` over synthetic topologies. It consumes
   what `dash_host`/`hostfile` produce, so run it after touching either.
 
-Not unit-testable, and deliberately left to the live smoke test: `session_dir`
-(creates directories under the real `$TMPDIR`), `stacktrace` (installs signal
-handlers), `daemon_init` (forks), and `nidmap` (needs a populated DVM).
+Not unit-testable, and deliberately left to the live smoke test: most of
+`session_dir` (it creates directories under the real `$TMPDIR`), `stacktrace`
+(installs signal handlers), `daemon_init` (forks), and `nidmap` (needs a
+populated DVM). The exception is claiming a top-level directory
+(`prte_session_dir_create()`), which takes the path it is given, so
+`test/unit/util/test_session_dir.c` drives it inside a scratch directory:
+a free name, our own directory, and each kind of name it must pass over.
+A directory owned by another user needs a second uid, so that case is in
+`contrib/dockerswarm`'s `test_util` phase, which can make one as root.
 
 `nidmap` in particular needs a DVM that has **changed size**, and a job that
 **spans a daemon which predates the change** — a one-proc job lands on the
@@ -300,6 +351,32 @@ master, whose copy of the map is authoritative and never decoded. That is the
 elastic grow/shrink/grow case in `contrib/dockerswarm/run-tests.sh`.
 
 ---
+
+## Directive vocabularies
+
+`--map-by`, `--rank-by`, `--bind-to`, `--output`, `--display` and `--rtos`
+take values that are a small language of their own -
+`package:span:pe=2`, `tag,file=out:nocopy` - and each set of words a user
+chooses from is one `pmix_cli_choice_t` table in `prte_cmd_line.c`, with an
+enum of tags beside it in `prte_cmd_line.h`. Two rules:
+
+- **One table per vocabulary, and every reader uses it.** The schizo sanity
+  checker, which refuses a bad command line, and the parser that acts on a
+  good one used to keep a list apiece, and the lists drifted. Adding a word
+  means adding a table entry and a `case` for its tag in the parser; the
+  checker then knows it without being told.
+- **Match with the whole table, never one word at a time.**
+  `prte_cli_match()` wraps PMIx's `pmix_cli_match()`: a word given in full
+  is that word, an abbreviation must fit exactly one entry, entries sharing
+  a tag are spellings of one thing (`parseable`/`parsable`), and each entry
+  says whether it takes a value. It reports an ambiguous word, or a value
+  that is wrong for its word, with the generic `cli-*` topics in
+  `help-prte-util.txt`; a word that matches nothing comes back
+  `PRTE_ERR_NOT_FOUND` *unreported*, because each option has its own
+  message listing what it does accept. A chain of
+  `PMIX_CHECK_CLI_OPTION()` tests cannot see ambiguity at all - it answers
+  for one option at a time - which is why `--bind-to n` quietly meant
+  `none` while `numa` fits as well.
 
 ## `prte_show_help()` — because `pmix_show_help()` does not work on a daemon
 
@@ -327,6 +404,23 @@ tool connection (and under `prterun` it *is* the tool).
   its packer and unpacker change together or not at all.
 - falls back to local delivery if there is no HNP to send to yet (early
   startup, or teardown), so a message is never simply lost.
+
+**Local delivery sometimes has to write `stderr` itself, and that write is
+not suppressed.** `pmix_show_help_norender()` is not a local write on a
+daemon: PMIx routes a *server* peer's log through IOF, and IOF honors
+`PMIX_IOF_LOCAL_OUTPUT`, which PRRTE sets false for a persistent DVM's HNP
+and for every `prted`. So where PRRTE has concluded the message is its to
+show and nobody else's — a `prted` with no HNP to relay to, and a
+persistent DVM that has not started yet — `deliver_locally()` writes it
+out directly. PMIx's duplicate suppression lives *downstream* of that, in
+`plog` (`pmix_help_check_dups`), so the direct write bypasses it: while a
+persistent DVM is starting, one message relayed by N daemons prints N
+times rather than once with a count. Do not reach for
+`pmix_help_check_dups()` to close that — its list is process-global,
+carries no lock, and must be called on the **PMIx** progress thread, which
+is not the thread `deliver_locally()` runs on. The missing piece is a PMIx
+entry point meaning "write this to my own stderr, with suppression", and it
+belongs beside `pmix_show_help_norender()` in PMIx.
 
 ### The first argument names the job the message is about
 
@@ -391,6 +485,20 @@ make
 
 This is a top-level golden rule; it is repeated here because three of the
 tree's `help-*.txt` files live under this directory.
+
+`prte-convert-help.py --check-only` (run by `make check`, and by the
+generation rule under `--purge`) checks the calls against the help files:
+
+| Check | Fails on |
+|-------|----------|
+| `purge()` | a topic no call shows |
+| `check_citation_files()` | a call naming one of our help files with the name mangled |
+| `check_citation_topics()` | a call naming a topic its help file does not have - the user would get PMIx's "couldn't find that topic" placeholder |
+| `check_call_arguments()` | a call passing a different number of arguments than the topic has `printf` conversions - the topic is the format string, so the compiler cannot |
+
+Only calls with a literal file and topic are checked, a call citing a help
+file PMIx owns is left to PMIx, and a topic that pulls in other text with
+`#include` is not counted.
 
 ---
 

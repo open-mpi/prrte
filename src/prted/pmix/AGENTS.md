@@ -359,7 +359,10 @@ because a directive that is merely useless rather than fatal still gets
 broadcast to the whole DVM and answered with success. A pset with no members
 is the case: `PMIx_Proc_create(0)` returns NULL and PMIx refuses a set with
 no name or no members, so every daemon logged an error and the requestor was
-told it had worked.
+told it had worked. Its members are also held to the rule `KILL` and
+`SIGNAL` already follow: every job a set names must be one the requester may
+act on (`targets_permitted()`), or the request is refused with
+`PMIX_ERR_NO_PERMISSIONS`.
 
 **A query's qualifiers are the same array under another name.** `_query()`
 (`pmix_server_queries.c`) reads six of them - `PMIX_NSPACE`, `PMIX_GROUP_ID`,
@@ -938,10 +941,12 @@ flagged `PRTE_PROC_FLAG_LOCAL` — which is exactly the condition under
 which the accessor succeeds. It must not defer: relaying it would answer
 about the *master's* local procs.
 
-That arm also defers when it has never heard of the job at all. A launch
-message goes only to the daemons that host part of the job, so "no such
-job" from a prted is a statement about that daemon, not about the DVM —
-the master has heard of all of them. The local arm keeps answering
+That arm also defers when it has never heard of the job at all. The launch
+message reaches every daemon, and each keeps the job until the DVM says it
+is over - but a tool's job lives only on the master and the daemon the tool
+attached to, and a daemon may not have processed a launch yet, or joined
+after it. So "no such job" from a prted is a statement about that daemon,
+not about the DVM — the master has heard of all of them. The local arm keeps answering
 `PMIX_ERR_NOT_FOUND` there, because for it that is the truth.
 
 **The decision is made by the read, never by a list of keys.** Which keys
@@ -1065,6 +1070,32 @@ onto PRRTE job and app attributes. Notes for extending them:
   spaces live in separate variables there now.
 
 ---
+
+### A directive's value has the type its key implies only once it is checked
+
+PMIx carries a `pmix_value_t` with whatever type the caller gave it and
+does not check that type against the key. A branch that reads
+`value.data.string`, `.proc`, `.envar` or `.darray` out of a value of some
+other type takes an integer as an address. So `prte_pmix_xfer_job_info()`
+and `prte_pmix_xfer_app()` check each directive against
+`job_directive_types[]` / `app_directive_types[]` before any branch runs
+(`directive_check()`), refusing the spawn with `spawn-directive-type` when the
+type is wrong - and, for an array, its element type.
+
+- **A branch that reads a pointer member belongs in the table.** Numbers
+  read through `PMIx_Value_get_number()` and flags read through
+  `PMIX_INFO_TRUE()` check the type themselves and need no entry; a branch
+  that accepts more than one type (`PMIX_SPAWN_TARGET`, `PMIX_SPAWN_ALLOC`,
+  the timeouts) checks it in the branch, and must not be listed.
+- **An empty value is the branch's to judge.** The table checks the type,
+  not presence: a NULL string or proc is what a value loaded with nothing
+  arrives as, and a branch that only hands the value onward
+  (`PMIX_ALLOC_ID`) accepts it, while one that reads it refuses it itself.
+- The same rule applies everywhere a client's or tool's value is read:
+  `PMIX_PERSONALITY` in `interim()`, `PMIX_NSPACE`/`PMIX_HOSTNAME`/
+  `PMIX_CMD_LINE` at tool connection, `PMIX_REQUIRED_KEY` in the direct
+  modex, and the allocation-timeout event's keys all check the type before
+  reading.
 
 ## Connected assemblages (`pmix_server_connect.c`)
 
@@ -1351,6 +1382,131 @@ here that can fail once and be skipped forever needs the same treatment.
 
 ---
 
+## Who may act on a job, or a session
+
+A job belongs to its owner, who may allow further users and groups; root and
+the user this DVM runs as may act on any job. That rule is PMIx's
+(`docs/security-plan.rst` in PMIx), and PRRTE applies exactly it: PMIx's
+`pmix_server_access_check(user, access)` touches nothing but its arguments,
+so `pmix_server_access.c` calls it on our own progress thread with **our own
+copies** of what it needs. PMIx keeps its own, on its own thread - no lock,
+no thread-shift, and no pointer from one side into the other.
+
+- **Both PMIx capabilities are required.** `configure` refuses a PMIx
+  without `PMIX_CAP_REQUESTER_ID` or `PMIX_CAP_ACCESS_CHECK`, so everything
+  below always has the requester's identity and PMIx's rule to work with.
+  Every PMIx release at the minimum version has both.
+- **A job's rule** is `jdata->access` (a `pmix_access_t`, held as `void *`
+  in the job object), loaded with
+  `pmix_server_access_load()` from exactly the info
+  `prte_pmix_server_register_nspace` hands PMIx. Every daemon registers
+  every job - the launch message is xcast to all - so every daemon has it.
+  Until the job is registered here, only its owner is known.
+- **A user** is a `pmix_user_t` on `prte_pmix_server_globals.users`, made
+  when we first meet it - a job it owns is registered, a tool of its
+  connects, or it makes a request - with its groups looked up then, and
+  registered with PMIx at the same moment (`PMIx_server_register_resources`
+  with `PMIX_USERID`). The check looks the groups up again whenever it would
+  otherwise refuse - there is no timeout. Root and our own user never get a
+  record: they pass before anything is looked up, which keeps a DVM of one
+  user, and prterun, exactly as before.
+  The groups go to PMIx with the uid (`PMIX_GRPID` as an array), so PMIx
+  looks nothing up itself.
+- **Letting a user go.** Where a job ends (the three
+  `PMIx_server_deregister_nspace` sites), `prte_pmix_server_access_job_done()`
+  drops our record of its owner if no other job or tool of theirs is left,
+  and deregisters the uid from PMIx (`PMIx_server_deregister_resources`
+  with `PMIX_USERID`) so both copies stay in step.
+- **Who is asking.** PMIx puts the requester's `PMIX_USERID` in the info of
+  every up-call a client or tool makes (`PMIX_CAP_REQUESTER_ID`), replacing
+  any it supplied. A request naming none is one we made of our own PMIx
+  server - prterun forwarding its stdin or a signal - and is allowed when its
+  requesting process is our own name. Never use the up-call's `PMIX_GRPID`
+  (the group the requester chose to charge the work to, unverified), nor a
+  `PMIX_REQUESTOR` the request carries (PMIx passes a client's own through)
+  as an identity.
+- **The access list** comes from `--rtos users=a:b,groups=c:d` (names
+  resolved on the HNP, into a `PMIX_ACCESS_PERMISSIONS` in the job's info
+  cache) and from a spawn's `PMIX_ACCESS_PERMISSIONS`, which is cached as it
+  is. Both reach every daemon with the job. A spawn's own `PMIX_USERID` /
+  `PMIX_GRPID` are the requester's identity and are dropped, not cached -
+  cached, they reached the registration after the owner's. A job prterun
+  launches itself is our user's (`plm_base_receive.c`).
+- **Where it is applied:** IOF pull (a stop is always honored), stdin,
+  job control (a halt of the DVM is for root and our user alone; SIGNAL and
+  KILL with no targets reach only the jobs the requester may access; named
+  targets it may not access refuse the request), abort (by the owner of the
+  calling process's job - the up-call names no identity - and always allowed
+  within its own job), and queries (naming another job is checked; job
+  listings and resolve leave out jobs the requester may not access).
+  Monitoring needs nothing here: the relayed directives carry the
+  requester's `PMIX_USERID`, and each node's PMIx applies the rule to it.
+- **Session operations** - grow, shrink, release, terminate
+  (`pmix_server_session.c`, and extending a reservation in
+  `ras_base_allocate.c`) - are decided by who is asking and nothing else
+  (`prte_pmix_server_session_permitted`): the scheduler (which identified
+  itself when it connected - matched against the requester PMIx names,
+  `req->tproc`, never a `PMIX_REQUESTOR` in the request's info), root, our
+  own user, the session's owner, or a member of the owner's group (`session->owner_gid`, from the requester job's recorded
+  gid). Which jobs use a session's *resources* - spawning onto it - is a
+  separate question, still answered by `prte_session_is_owned_by`.
+- **Creating a session** (`PMIX_SESSION_INSTANTIATE`) is a different kind of
+  request: there is no session yet to be the owner of, and the new one takes
+  nodes - out of the pool, or new ones the DVM grows onto - so it changes
+  what the DVM consists of. That is for the scheduler, ourselves, root, our
+  own user, and the users and groups the DVM was started with
+  (`prte --rtos users=a:b,groups=c:d`) - `prte_pmix_server_dvm_permitted`.
+  Those come from the DVM job's info cache, where `--rtos` leaves them, via
+  `prte_pmix_server_access_record_dvm()` into a rule of their own
+  (`prte_pmix_server_globals.dvm_access`). That rule is deliberately **not**
+  the DVM job's `jdata->access`: job control judges its targets by their
+  job's rule, so a user who may change the DVM would otherwise also be one
+  who may signal or kill its daemons. With a scheduler attached, anyone
+  else's request goes up to the scheduler and never reaches this check; the
+  scheduler's answer comes back down as its own request.
+- **A spawn's `PMIX_PARENT_ID`** makes the new job the parent's: it decides
+  the session the job lands in, whose allocation it draws on, and the job it
+  is connected to. Naming a parent is therefore acting for the parent's job,
+  and `interim()` accepts a parent outside the requester's own job only
+  from a requester permitted on the parent's job
+  (`prte_pmix_server_parent_permitted`). A parent whose job this daemon does
+  not know - a tool's job lives only on the HNP - is accepted only from root,
+  our own user and ourselves.
+- **The scheduler role** is claimed at tool connection
+  (`PMIX_SERVER_SCHEDULER`), and is accepted only from root, our own user, or
+  a user the `prte_pmix_scheduler_uids` MCA parameter names
+  (`prte_pmix_server_scheduler_permitted`) - judged by the uid PMIx
+  authenticated for the connection. Schedulers commonly run as a dedicated
+  service user rather than root, which is what the list is for. It is a
+  comma-separated list of names or numbers, looked up once when the master's
+  server starts (a lookup can block, which accepting a connection on the
+  progress thread must not), and a name nobody has stops the DVM starting
+  (`scheduler-uid-unknown`). The caddy's `uid` defaults to 0, so the check
+  also requires that PMIx supplied one. A scheduler that departs is forgotten
+  (`prte_pmix_server_tool_departed`), so the DVM stops deferring session
+  requests to it and tools may spawn into the default session again.
+
+## Who may have a job's data
+
+PMIx decides that itself, by the job's owner and access list, and for data
+held on another node the PMIx server holding it decides (PMIx's
+`docs/security-plan.rst`). PRRTE's part is to tell it who is involved:
+
+- **The owner, at registration.** `plm_base_receive.c` puts a launched job's
+  `jdata->uid`/`gid` (inherited from the tool that started it) into the
+  global attributes `PRTE_JOB_OWNER_UID`/`_GID`, so every daemon has them,
+  and `prte_pmix_server_register_nspace` passes them as `PMIX_USERID` and
+  `PMIX_GRPID`. A job with no recorded owner registers without them, and
+  PMIx falls back to the user its local clients were registered with -
+  which, for a DVM run as a service account, is not the job's user.
+- **The requester, on a direct modex.** PMIx names it in the `direct_modex`
+  up-call's info; `dmodex_req` already relays that info to the hosting
+  daemon, which passes it to `PMIx_server_dmodex_request2`
+  (`PRTE_PMIX_HAVE_DMODEX_REQUEST2`) so its PMIx server can refuse a
+  requester the owner has not allowed. The refusal travels back through
+  `modex_resp` like any other status. Keep the info alive on the request
+  until `modex_resp` fires - PMIx holds the pointer.
+
 ## A tool's departure
 
 `_client_finalized()` is the **only** notice a daemon gets that a tool has
@@ -1433,6 +1589,11 @@ the array — the wildcard trap that runs through this whole directory, here
 in a place where the wildcard arrived from outside rather than from an
 uninitialized field. A proc leaves a group one at a time; insist on being
 told which one.
+
+And it leaves only for itself. A departure that names a proc other than
+the event's source is ignored - the rule the PMIx server applies before it
+hands the event to us, applied here as well, because every daemon acts on
+the broadcast copy.
 
 The helper is not static only so that `test_group_left` can pin all of that
 without a DVM.

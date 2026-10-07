@@ -82,6 +82,7 @@
 #include "src/util/pmix_show_help.h"
 #include "src/util/prte_show_help.h"
 #include "src/util/pmix_string_copy.h"
+#include "src/util/prte_output_file.h"
 
 #include "src/class/pmix_pointer_array.h"
 #include "src/runtime/prte_progress_threads.h"
@@ -109,13 +110,18 @@ int prun(int argc, char *argv[])
     pmix_cli_item_t *opt;
     FILE *fp;
     char *mypidfile = NULL;
+    struct stat mypidstat;
     char *param;
 
     /* init the globals */
     prte_tool_basename = pmix_basename(argv[0]);
     prte_tool_actual = "prun";
     pargc = argc;
-    pargv = pmix_argv_copy_strip(argv);  // strip any quoted arguments
+    /* a plain copy: stripping quotes here reached the application's own
+     * arguments too - 'echo "a b"' arrived as 'echo "a b' - and the shell
+     * that ran us has already removed every quote the user did not mean.
+     * prte and prterun stopped stripping for the same reason. */
+    pargv = PMIx_Argv_copy(argv);
     gethostname(hostname, sizeof(hostname));
 
     /* every failure from here to the end of setup exits with 1: a PRRTE
@@ -130,7 +136,14 @@ int prun(int argc, char *argv[])
      * prte_register_params() runs, and an MCA variable evaluates its
      * environment only on its first registration - so a "--prtemca" value
      * pushed into the environment after it has run is simply never seen.
-     * prte and prted order it this way for the same reason. */
+     * prte and prted order it this way for the same reason.
+     *
+     * The --tune files go first, so a param given explicitly on the
+     * cmd line overrides the one in a file. */
+    rc = prte_schizo_base_parse_tune(pargc, 0, pargv);
+    if (PRTE_SUCCESS != rc) {
+        return 1;
+    }
     rc = prte_schizo_base_parse_prte(pargc, 0, pargv, NULL);
     if (PRTE_SUCCESS != rc) {
         return 1;
@@ -247,10 +260,15 @@ int prun(int argc, char *argv[])
         } else {
             char *leftover;
             int outpipe;
-            /* see if it is an integer pipe */
+            /* See if it is an integer pipe.  It has to start with a digit
+             * to be one: strtol accepts leading whitespace and a sign and
+             * returns 0 for a string with no digits at all, so an empty
+             * --report-pid value would write our pid onto file descriptor
+             * 0 and then close our own stdin. */
             leftover = NULL;
             outpipe = strtol(opt->values[0], &leftover, 10);
-            if (NULL == leftover || 0 == strlen(leftover)) {
+            if (isdigit((unsigned char) opt->values[0][0]) &&
+                (NULL == leftover || 0 == strlen(leftover))) {
                 /* stitch together the var names and URI */
                 pmix_asprintf(&leftover, "%lu", (unsigned long) getpid());
                 /* output to the pipe */
@@ -259,9 +277,10 @@ int prun(int argc, char *argv[])
                 close(outpipe);
             } else {
                 /* must be a file */
-                fp = fopen(opt->values[0], "w");
+                fp = prte_output_file_open(opt->values[0], 0666, &mypidstat);
                 if (NULL == fp) {
-                    pmix_output(0, "Impossible to open the file %s in write mode\n", opt->values[0]);
+                    pmix_output(0, "Impossible to open the file %s in write mode: %s\n",
+                                opt->values[0], strerror(errno));
                     PRTE_UPDATE_EXIT_STATUS(1);
                     goto DONE;
                 }
@@ -282,6 +301,15 @@ int prun(int argc, char *argv[])
     // check for an appfile
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_APPFILE);
     if (NULL != opt) {
+        // the file supplies every app - refuse one named here as well
+        if (PRTE_SUCCESS != prte_check_appfile_tail(results.tail)) {
+            char *app = PMIx_Argv_join(results.tail, ' ');
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "appfile-with-app", true,
+                           opt->values[0], (NULL == app) ? "" : app);
+            free(app);
+            PRTE_UPDATE_EXIT_STATUS(1);
+            goto DONE;
+        }
         // parse the file and add its context to the argv array
         rc = prte_load_appfile(opt->values[0], &pargv);
         if (PRTE_SUCCESS != rc) {
@@ -313,7 +341,8 @@ DONE:
     // reached prun_common() has had it closed there, and every other path to
     // this label either never opened it or is the open's own failure.
     if (NULL != mypidfile) {
-        unlink(mypidfile);
+        /* only if it is still the file we wrote */
+        prte_output_file_remove(mypidfile, &mypidstat);
     }
 
     exit(prte_exit_status);

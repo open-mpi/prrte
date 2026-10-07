@@ -70,6 +70,7 @@
 
 #include "src/mca/odls/odls.h"
 #include "src/mca/odls/odls_types.h"
+#include "src/mca/state/state.h"
 #include "src/mca/odls/base/base.h"
 #include "src/mca/odls/pdefault/odls_pdefault.h"
 
@@ -418,8 +419,10 @@ static int test_process_envars(void)
 
     jdata = PMIX_NEW(prte_job_t);
     app = PMIX_NEW(prte_app_context_t);
+    /* PFX_NOVALUE is not an assignment: a prefix UNSET that matches it
+     * has nothing to remove, and must move on rather than match it again */
     app->env = PMIx_Argv_split("PATH=/bin PATHEXT=.EXE KEEP=orig SET_ME=old"
-                               " PFX_A=1 PFX_B=2 OTHER=3",
+                               " PFX_A=1 PFX_NOVALUE PFX_B=2 OTHER=3 AB*X=4",
                                ' ');
 
     /* SET overwrites; ADD must NOT - attr.h defines it as "add envar, do
@@ -442,6 +445,10 @@ static int test_process_envars(void)
                           (void *) "OTHER", PMIX_STRING);
     prte_append_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR, PRTE_ATTR_GLOBAL,
                           (void *) "PFX_*", PMIX_STRING);
+    /* a '*' anywhere but the end is part of the name: "AB*C" names one
+     * variable, and must not be read as the prefix "AB*" */
+    prte_append_attribute(&jdata->attributes, PRTE_JOB_UNSET_ENVAR, PRTE_ATTR_GLOBAL,
+                          (void *) "AB*C", PMIX_STRING);
 
     /* the app's directives are applied after the job's, so they win */
     add_envar(&app->attributes, PRTE_APP_SET_ENVAR, "SET_ME", "app");
@@ -470,6 +477,18 @@ static int test_process_envars(void)
     CHECK("UNSET removed the named variable", NULL == envget(app->env, "OTHER"));
     CHECK("UNSET prefix removed PFX_A", NULL == envget(app->env, "PFX_A"));
     CHECK("UNSET prefix removed PFX_B", NULL == envget(app->env, "PFX_B"));
+    {
+        bool kept = false;
+        int n;
+
+        for (n = 0; NULL != app->env[n]; n++) {
+            kept = kept || (0 == strcmp(app->env[n], "PFX_NOVALUE"));
+        }
+        CHECK("UNSET prefix passed over a non-assignment", kept);
+    }
+    v = envget(app->env, "AB*X");
+    CHECK("UNSET of a name with an inner '*' is not a prefix",
+          NULL != v && 0 == strcmp(v, "4"));
 
     PMIX_RELEASE(app);
     PMIX_RELEASE(jdata);
@@ -814,6 +833,39 @@ static int test_mempolicy(void)
 }
 
 /*
+ * A recording stub for the state machine.  The kill path reports what it
+ * learned about a child as a state activation, and there is no state
+ * component open here to receive it, so capture the reports instead: what
+ * the kill says about each child is what this test is about.
+ */
+static pmix_proc_t reported_procs[8];
+static prte_proc_state_t reported_states[8];
+static int nreported = 0;
+
+static void recording_activate(pmix_proc_t *proc, prte_proc_state_t state)
+{
+    if (nreported < (int) (sizeof(reported_states) / sizeof(reported_states[0]))) {
+        PMIX_XFER_PROCID(&reported_procs[nreported], proc);
+        reported_states[nreported] = state;
+        nreported++;
+    }
+}
+
+/* did the kill report this state for this proc? */
+static bool was_reported(pmix_proc_t *proc, prte_proc_state_t state)
+{
+    int i;
+
+    for (i = 0; i < nreported; i++) {
+        if (PMIX_CHECK_PROCID(&reported_procs[i], proc) &&
+            state == reported_states[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * A kill that arrives while a child is still being forked.
  *
  * launch_local flags a child ALIVE and hands it to a worker thread, and the
@@ -830,6 +882,7 @@ static int test_kill_during_launch(void)
     prte_proc_t *launching, *never;
     pmix_pointer_array_t procs;
     prte_proc_t *req;
+    prte_state_base_module_activate_proc_state_fn_t save;
     int i;
 
     launching = PMIX_NEW(prte_proc_t);
@@ -853,7 +906,11 @@ static int test_kill_during_launch(void)
     pmix_pointer_array_add(&procs, req);
 
     nsignalled = 0;
+    nreported = 0;
+    save = prte_state.activate_proc_state;
+    prte_state.activate_proc_state = recording_activate;
     prte_odls_base_default_kill_local_procs(&procs, recording_signal);
+    prte_state.activate_proc_state = save;
 
     CHECK("nothing is signaled without a pid", 0 == nsignalled);
     CHECK("a child still launching is marked for its launch to kill",
@@ -861,12 +918,17 @@ static int test_kill_during_launch(void)
     CHECK("...and is not written off as terminated",
           PRTE_PROC_STATE_INIT == launching->state &&
           !PRTE_FLAG_TEST(launching, PRTE_PROC_FLAG_WAITPID));
+    CHECK("...and its waitpid is not reported as fired",
+          !was_reported(&launching->name, PRTE_PROC_STATE_WAITPID_FIRED));
     CHECK("...and is still alive", PRTE_FLAG_TEST(launching, PRTE_PROC_FLAG_ALIVE));
     CHECK("a child never dispatched is not marked",
           !PRTE_FLAG_TEST(never, PRTE_PROC_FLAG_KILL_PENDING));
     CHECK("...it is simply recorded as over",
-          PRTE_PROC_STATE_TERMINATED == never->state &&
-          PRTE_FLAG_TEST(never, PRTE_PROC_FLAG_WAITPID));
+          PRTE_PROC_STATE_TERMINATED == never->state);
+    /* the waitpid it will never get is reported as fired so that the join
+     * completes - the kill does not set the flag itself */
+    CHECK("...and the waitpid it will never get is reported as fired",
+          was_reported(&never->name, PRTE_PROC_STATE_WAITPID_FIRED));
 
     PMIX_RELEASE(req);
     PMIX_DESTRUCT(&procs);
@@ -901,6 +963,7 @@ static int test_slice_discard(void)
     int failures = 0;
     pmix_data_buffer_t *buf;
     pmix_nspace_t ns, other, bogus;
+    pmix_proc_t peer;
     int32_t nprocs = 0;
     pmix_status_t rc;
 
@@ -911,13 +974,26 @@ static int test_slice_discard(void)
     CHECK("no slices parked to begin with",
           0 == pmix_list_get_size(&prte_odls_globals.pending_slices));
 
+    /* only the master computes bindings, so a slice from anyone else is
+     * not one - and is not parked */
+    PMIX_LOAD_PROCID(&peer, PRTE_PROC_MY_HNP->nspace, PRTE_PROC_MY_HNP->rank + 1);
+    PMIX_DATA_BUFFER_CREATE(buf);
+    rc = PMIx_Data_pack(NULL, buf, &ns, 1, PMIX_PROC_NSPACE);
+    CHECK("pack slice nspace", PMIX_SUCCESS == rc);
+    rc = PMIx_Data_pack(NULL, buf, &nprocs, 1, PMIX_INT32);
+    CHECK("pack slice count", PMIX_SUCCESS == rc);
+    prte_odls_base_recv_cpuset_slice(PRTE_SUCCESS, &peer, buf, 0, NULL);
+    PMIX_DATA_BUFFER_RELEASE(buf);
+    CHECK("a slice from a daemon other than the master is not parked",
+          0 == pmix_list_get_size(&prte_odls_globals.pending_slices));
+
     /* a slice that beats its launch message here */
     PMIX_DATA_BUFFER_CREATE(buf);
     rc = PMIx_Data_pack(NULL, buf, &ns, 1, PMIX_PROC_NSPACE);
     CHECK("pack slice nspace", PMIX_SUCCESS == rc);
     rc = PMIx_Data_pack(NULL, buf, &nprocs, 1, PMIX_INT32);
     CHECK("pack slice count", PMIX_SUCCESS == rc);
-    prte_odls_base_recv_cpuset_slice(PRTE_SUCCESS, NULL, buf, 0, NULL);
+    prte_odls_base_recv_cpuset_slice(PRTE_SUCCESS, PRTE_PROC_MY_HNP, buf, 0, NULL);
     PMIX_DATA_BUFFER_RELEASE(buf);
     CHECK("an early slice is parked",
           1 == pmix_list_get_size(&prte_odls_globals.pending_slices));
