@@ -656,6 +656,15 @@ static void *listen_thread(pmix_object_t *obj)
                 addrlen = sizeof(pending_connection->addr);
                 pending_connection->fd = accept(sd, (struct sockaddr *) &(pending_connection->addr),
                                                 &addrlen);
+                /* the progress thread may fork a launcher before it gets to
+                 * this connection, so it has to be close-on-exec from the
+                 * start rather than once it is taken up there */
+                if (0 <= pending_connection->fd
+                    && PMIX_SUCCESS != pmix_fd_set_cloexec(pending_connection->fd)) {
+                    CLOSE_THE_SOCKET(pending_connection->fd);
+                    PMIX_RELEASE(pending_connection);
+                    continue;
+                }
 
                 /* check for < 0 as indicating an error upon accept */
                 if (pending_connection->fd < 0) {
@@ -698,10 +707,10 @@ static void *listen_thread(pmix_object_t *obj)
                 /* if we are on a privileged port, we only accept connections
                  * from other privileged sockets. A privileged port is one
                  * whose port is less than 1024 on Linux, so we'll check for that. */
-                if (1024 >= listener->port) {
+                if (1024 > listener->port) {
                     uint16_t inport;
                     inport = pmix_net_get_port((struct sockaddr *) &pending_connection->addr);
-                    if (1024 < inport) {
+                    if (1024 <= inport) {
                         /* someone tried to cross-connect privileges,
                          * say something */
                         prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-oob-tcp.txt", "privilege failure", true,

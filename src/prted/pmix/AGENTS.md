@@ -359,7 +359,10 @@ because a directive that is merely useless rather than fatal still gets
 broadcast to the whole DVM and answered with success. A pset with no members
 is the case: `PMIx_Proc_create(0)` returns NULL and PMIx refuses a set with
 no name or no members, so every daemon logged an error and the requestor was
-told it had worked.
+told it had worked. Its members are also held to the rule `KILL` and
+`SIGNAL` already follow: every job a set names must be one the requester may
+act on (`targets_permitted()`), or the request is refused with
+`PMIX_ERR_NO_PERMISSIONS`.
 
 **A query's qualifiers are the same array under another name.** `_query()`
 (`pmix_server_queries.c`) reads six of them - `PMIX_NSPACE`, `PMIX_GROUP_ID`,
@@ -1586,6 +1589,11 @@ the array — the wildcard trap that runs through this whole directory, here
 in a place where the wildcard arrived from outside rather than from an
 uninitialized field. A proc leaves a group one at a time; insist on being
 told which one.
+
+And it leaves only for itself. A departure that names a proc other than
+the event's source is ignored - the rule the PMIx server applies before it
+hands the event to us, applied here as well, because every daemon acts on
+the broadcast copy.
 
 The helper is not static only so that `test_group_left` can pin all of that
 without a DVM.

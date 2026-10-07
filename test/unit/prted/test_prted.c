@@ -667,6 +667,35 @@ static int test_xfer_app(void)
     PMIX_APP_DESTRUCT(&papp);
     PMIX_RELEASE(jdata);
 
+    /* every environment entry has to be a NAME=value assignment */
+    {
+        const char *bad[] = {"NOT_AN_ASSIGNMENT", "=value"};
+        size_t b;
+
+        for (b = 0; b < sizeof(bad) / sizeof(bad[0]); b++) {
+            jdata = fresh_job();
+            PMIX_APP_CONSTRUCT(&papp);
+            papp.cmd = strdup("hostname");
+            papp.maxprocs = 1;
+            PMIx_Argv_append_nosize(&papp.env, "GOOD=1");
+            PMIx_Argv_append_nosize(&papp.env, bad[b]);
+            CHECK("app/env-not-assignment", PRTE_SUCCESS != prte_pmix_xfer_app(jdata, &papp));
+            PMIX_APP_DESTRUCT(&papp);
+            PMIX_RELEASE(jdata);
+        }
+        jdata = fresh_job();
+        PMIX_APP_CONSTRUCT(&papp);
+        papp.cmd = strdup("hostname");
+        papp.maxprocs = 1;
+        PMIx_Argv_append_nosize(&papp.env, "GOOD=1");
+        PMIx_Argv_append_nosize(&papp.env, "EMPTY=");
+        CHECK("app/env-assignments", PRTE_SUCCESS == prte_pmix_xfer_app(jdata, &papp));
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
+        CHECK("app/env-copied", NULL != app && 2 == PMIx_Argv_count(app->env));
+        PMIX_APP_DESTRUCT(&papp);
+        PMIX_RELEASE(jdata);
+    }
+
     /* an app-level directive of the wrong type is refused too */
     {
         int32_t i32 = 7;
@@ -2063,16 +2092,27 @@ static int test_group_left(void)
     PMIX_INFO_DESTRUCT(&info[1]);
 
     /* a departure that names no concrete identity must not stand for the
-     * first member it is compared against */
+     * first member it is compared against - whether it is named or is the
+     * event's source */
     PMIX_LOAD_PROCID(&affected, NULL, PMIX_RANK_WILDCARD);
     PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
     prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
     CHECK("a wildcard departure drops nobody", 3 == grp->num_members);
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &affected, info, 1);
+    CHECK("a wildcard source drops nobody", 3 == grp->num_members);
     PMIX_INFO_DESTRUCT(&info[1]);
 
-    /* an event that is not a departure leaves the registry alone */
+    /* a process leaves a group only for itself: a departure naming a
+     * member other than the event's source is not one */
     PMIX_LOAD_PROCID(&affected, "unit-test-grp@1", 1);
     PMIX_INFO_LOAD(&info[1], PMIX_EVENT_AFFECTED_PROC, &affected, PMIX_PROC);
+    prte_pmix_server_group_member_left(PMIX_GROUP_LEFT, &source, info, 2);
+    CHECK("a departure for another proc is ignored", 3 == grp->num_members);
+
+    /* from here on the departing member is the source itself */
+    PMIX_XFER_PROCID(&source, &affected);
+
+    /* an event that is not a departure leaves the registry alone */
     prte_pmix_server_group_member_left(PMIX_ERR_LOST_CONNECTION, &source, info, 2);
     CHECK("only PMIX_GROUP_LEFT is acted on", 3 == grp->num_members);
 

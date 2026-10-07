@@ -83,12 +83,13 @@ deviation* and the framework guide.
 `modify` dispatches on `req->allocdir`:
 
 - **`PMIX_ALLOC_EXTEND`** → `serve_extend_req`: propagates the original
-  job's SLURM attributes (account, partition, qos, cwd, mem-per-cpu,
-  mem-per-node, time, threads-per-core — each gated by a `propagate_*`
-  MCA param, all default true), builds `salloc` args, launches an
-  **expander job**, waits for its `salloc` to exit, trims its time limit to
-  the parent's end, then adds the modified resources. Answers in two
-  phases — see below.
+  job's SLURM attributes (account, partition, qos, cwd, time,
+  threads-per-core, per-node GRES, reservation, node features, excluded
+  nodes, and the memory and per-GPU options read as described below — each
+  gated by a `propagate_*` MCA param, all default true), builds `salloc`
+  args, launches an **expander job**, waits for its `salloc` to exit, trims
+  its time limit to the parent's end, then adds the modified resources.
+  Answers in two phases — see below.
 - **`PMIX_ALLOC_NEW`** → the same request; see below.
 - **`PMIX_ALLOC_RELEASE`** → `serve_release_req`: shrinks the SLURM job
   with `scontrol update job`, removing nodes by count or by name while
@@ -110,6 +111,81 @@ and queues until it can — including for a node the DVM already holds, which
 is submitted: no per-node slot counts, since Slurm sizes the node. A grow
 naming neither selector is refused, not passed on — inside a Slurm allocation
 no other module could legitimately serve it.
+
+A name the parent excluded is refused by Slurm at submit ("Invalid node name
+specified"), since the parent's `--exclude` goes to the expander too.
+
+### The expander continues the parent
+
+An extend makes the new nodes a continuation of the parent allocation. The
+request picks how many nodes or which; everything else the expander is,
+it takes from the parent through the `propagate_*` parameters, and a request
+cannot override them.
+
+### Memory and per-GPU options come from the environment, not the record
+
+`--mem-per-cpu`, `--mem`, `--mem-per-gpu` and `--cpus-per-gpu` are taken from
+`SLURM_MEM_PER_CPU`, `SLURM_MEM_PER_NODE`, `SLURM_MEM_PER_GPU` and
+`SLURM_CPUS_PER_GPU`. The first two hold the memory Slurm settled on for the
+job; the per-GPU two are exported only for options the job was given. An
+unset variable sends nothing, so the expander gets the same default as the
+parent. The two per-GPU options are sent only with a `--gres`, since Slurm
+refuses them on a job that asks for no GPU — the expander of a `--gpus` or
+`--gpus-per-task` parent.
+
+The memory Slurm settled on includes a default: a batch job exports the
+partition's `DefMemPerCPU` or `DefMemPerNode`, else the cluster's, as though
+asked for (salloc exports nothing), so its expander asks for the default
+explicitly.
+
+The record cannot be read for this. Once a job has GPUs and the partition a
+`DefMemPerGPU`, Slurm keeps the per-GPU default in the job's one memory
+slot, and `scontrol show job --json` prints it as `memory_per_node`: a job
+given `--mem-per-cpu=30` reads `memory_per_node: 100`, and one with two GPUs
+reads 100 for an allocation of 200. `DefCpuPerGPU` and `DefMemPerGPU` are
+also printed into `cpus_per_tres` and `memory_per_tres` as if requested.
+
+GRES itself is read from the record: `tres_per_node` holds `--gres` and
+`--gpus-per-node` alike (`gres/gpu:2`), and goes back verbatim as `--gres=`.
+`--gpus` and `--gpus-per-task` land in `tres_per_job` and `tres_per_task`,
+which are not propagated: one counts GPUs for the whole job, the other per
+task, and the expander has neither the parent's size nor tasks. `--exclusive`
+already hands the expander every GPU on its nodes; the request is what makes
+Slurm choose nodes that have them.
+
+### Node features: a satisfied preference becomes a requirement
+
+`features` goes back as `--constraint`, expressions (`a&b`, `a|b`) included.
+`prefer` is not propagated: Slurm empties it when the job starts, moving a
+preference the nodes met into `features` and dropping one they did not. The
+parent is always running when it grows, so `prefer` is always empty there,
+and a `--prefer` its nodes satisfied reaches the expander as a hard
+`--constraint` — the expander gets the node type the parent got.
+
+### Fields a site names: `ras_slurm_propagate_extra`
+
+Further members of the record, as comma-separated `json_key:--option` pairs
+(`comment:--comment`). Each sends `--option=<the parent's value>`; the value
+always comes from the parent, never from the parameter, so an extend stays a
+continuation.
+
+- **Checked once, in `modify_extend_init`**, so only where extends can run.
+  A bad entry is reported with `propagate-extra-bad-entry`, naming it, and
+  every extend is then refused with `propagate-extra-refused`; the DVM still
+  comes up, since a failed `init()` would only hand the allocation to the
+  next component. Keys are top-level member names (`[a-z_]+`); options are
+  long ones (`--[a-z][a-z0-9-]*`); neither may repeat; and an option may not
+  be, or abbreviate, one PRRTE sets (`initial_args`, `owned_formats`) —
+  getopt_long takes abbreviations, so `--exc` would reach `--exclusive`.
+- **Read with the built-ins**, in the same pass over the record. A string
+  goes as is; a `{set, infinite, number}` object holding a whole number goes
+  as that number, and is omitted when unset or infinite; empty and null are
+  omitted. A member the record lacks, or of any other type, fails the extend
+  with `propagate-extra-bad-member`. PRRTE's own entries in that table
+  (`record_job_data_fields`) carry a `:`, so no member can overwrite them.
+- **No transforms.** The value is sent as Slurm printed it, so only members
+  that round-trip verbatim work. Some do not; for example, Slurm prints a
+  default `wckey` with a leading `*`.
 
 ### The expander job ends with the parent allocation
 
@@ -145,9 +221,8 @@ reports `PMIX_OPERATION_IN_PROGRESS` with the allocation id and
   one campaign can cover several.
 - **Without a requester a failed grow is silent.** `grow_target_failed` notifies
   only a campaign that has one.
-- **Outside `prte_elastic_mode` phase one stays terminal.** No campaign is
-  recorded, so no event can come. Unlike `serve_release_req` the extend does not
-  refuse there — it has already done what was asked of Slurm.
+- **An extend never runs outside `prte_elastic_mode`.** The ras base refuses
+  it before any module sees it (`ras_base_allocate.c`).
 - **Both phase-one statuses are `#if PRTE_HAVE_DVM_MOD_EVENTS`.**
   `prte_plm_base_dvm_mod_notify` compiles away without the event codes.
 

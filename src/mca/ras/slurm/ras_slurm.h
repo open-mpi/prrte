@@ -113,6 +113,11 @@ typedef struct {
     bool propagate_mem_per_node;
     bool propagate_time;
     bool propagate_threads_per_core;
+    bool propagate_gres;
+    bool propagate_reservation;
+    bool propagate_features;
+    bool propagate_exclude;
+    char *propagate_extra;
 } prte_mca_ras_slurm_component_t;
 PRTE_EXPORT extern prte_mca_ras_slurm_component_t prte_mca_ras_slurm_component;
 
@@ -126,6 +131,10 @@ enum slurm_str_field {
     STR_PARTITION,
     STR_QOS,
     STR_CWD,
+    STR_TRES_PER_NODE,
+    STR_RESV_NAME,
+    STR_FEATURES,
+    STR_EXCLUDED_NODES,
     STR_FIELD_COUNT
 };
 
@@ -135,8 +144,6 @@ extern const char *const str_fields[STR_FIELD_COUNT];
    add corresponding entries in ras_slurm_modify_utils.c */
 
 enum slurm_num_obj_field {
-    NUM_OBJ_MEMORY_PER_CPU,
-    NUM_OBJ_MEMORY_PER_NODE,
     NUM_OBJ_TIME_LIMIT,
     NUM_OBJ_THREADS_PER_CORE,
     NUM_OBJ_FIELD_COUNT
@@ -164,6 +171,17 @@ enum record_job_data_field {
     PRTE_JOB_DATA_JOB_ID,
     PRTE_JOB_DATA_COUNT
 };
+
+/* A job record member ras_slurm_propagate_extra copies into the expander,
+   and the salloc argument format it is passed with, such as "--comment=%s" */
+
+typedef struct {
+    char *key;
+    char *format;
+} prte_ras_slurm_extra_field_t;
+
+extern prte_ras_slurm_extra_field_t *prte_ras_slurm_extra_fields;
+extern size_t prte_ras_slurm_num_extra_fields;
 
 /* Stack item type for our session stack */
 
