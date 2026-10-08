@@ -461,6 +461,14 @@ void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
         return;
     }
     free(nspace);
+    /* replies are counted only while a request (get_traces) is
+     * outstanding - completing the count delivers the traces and ends
+     * the job, which is what the request asked for and nothing else does */
+    if (!jdata->traces_requested) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        PMIX_DATA_BUFFER_DESTRUCT(&blob);
+        return;
+    }
 
     while (PMIX_SUCCESS == (rc = PMIx_Data_unpack(NULL, buffer, &pbo, &cnt, PMIX_BYTE_OBJECT))) {
         rc = PMIx_Data_load(&blob, &pbo);
@@ -499,7 +507,8 @@ void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
         /* unpack the stack_trace until complete */
         cnt = 1;
         while (PRTE_SUCCESS == (rc = PMIx_Data_unpack(NULL, &blob, &st, &cnt, PMIX_STRING))) {
-            pmix_asprintf(&st2, "\t%s", st); // has its own newline
+            /* one line of a trace, sent without its newline */
+            pmix_asprintf(&st2, "\t%s\n", st);
             PMIx_Argv_append_nosize(&jdata->traces, st2);
             free(st);
             free(st2);
@@ -518,6 +527,7 @@ void prte_plm_base_stack_trace_recv(int status, pmix_proc_t *sender,
 DONE:
     jdata->ntraces++;
     if (prte_process_info.num_daemons == jdata->ntraces) {
+        jdata->traces_requested = false;
         timer = NULL;
         if (prte_get_attribute(&jdata->attributes, PRTE_JOB_TRACE_TIMEOUT_EVENT,
                                (void **) &timer, PMIX_POINTER) &&
@@ -672,10 +682,15 @@ static int get_traces(prte_job_t *jdata)
         PMIX_DATA_BUFFER_DESTRUCT(&buffer);
         return PRTE_ERROR;
     }
+    /* the replies are counted against the daemons, so start the count
+     * before any of them can arrive */
+    jdata->ntraces = 0;
+    jdata->traces_requested = true;
     /* goes to all daemons */
     if (PRTE_SUCCESS != (rc = prte_grpcomm_xcast(PRTE_RML_TAG_DAEMON, &buffer))) {
         PRTE_ERROR_LOG(rc);
         PMIX_DATA_BUFFER_DESTRUCT(&buffer);
+        jdata->traces_requested = false;
         return PRTE_ERROR;
     }
     PMIX_DATA_BUFFER_DESTRUCT(&buffer);
