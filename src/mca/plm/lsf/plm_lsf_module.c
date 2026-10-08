@@ -71,6 +71,7 @@ int lsberrno;
 #include "src/util/pmix_basename.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_environ.h"
+#include "src/util/prte_dvm_key.h"
 #include "src/util/pmix_printf.h"
 
 #include "src/mca/errmgr/errmgr.h"
@@ -123,9 +124,14 @@ int plm_lsf_init(void)
 
     if (PRTE_SUCCESS != (rc = prte_plm_base_comm_start())) {
         PRTE_ERROR_LOG(rc);
+        return rc;
     }
 
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        return PRTE_ERR_NOT_FOUND;
+    }
     if (PRTE_ATTR_IS_TRUE(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         /* must assign daemons as won't be launching them */
         prte_plm_globals.daemon_nodes_assigned_at_launch = true;
@@ -196,6 +202,11 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
     /* start by setting up the virtual machine */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        rc = PRTE_ERR_NOT_FOUND;
+        goto cleanup;
+    }
     if (PRTE_SUCCESS != (rc = prte_plm_base_setup_virtual_machine(jdata))) {
         PRTE_ERROR_LOG(rc);
         goto cleanup;
@@ -384,6 +395,12 @@ static void launch_daemons(int fd, short args, void *cbdata)
         free(lib_base);
     }
 
+    /* The DVM key rides in the daemons' environment, the one channel to
+     * them that is private to the DVM's user - unlike the command line above. */
+    if (prte_oob_authenticate) {
+        prte_dvm_key_setenv(&env);
+    }
+
     /* lsb_launch tampers with SIGCHLD.
      * After the call to lsb_launch, the signal handler for SIGCHLD is NULL.
      * So, we disable the SIGCHLD handler of libevent for the duration of
@@ -422,6 +439,7 @@ cleanup:
         PMIx_Argv_free(argv);
     }
     if (NULL != env) {
+        prte_dvm_key_scrub_array(env);
         PMIx_Argv_free(env);
     }
     if (NULL != nodelist_argv) {

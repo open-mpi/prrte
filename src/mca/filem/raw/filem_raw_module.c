@@ -46,6 +46,7 @@
 #include "src/util/pmix_path.h"
 #include "src/util/pmix_environ.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/pmix_string_copy.h"
 #include "src/util/prte_show_help.h"
 
 #include "src/mca/errmgr/errmgr.h"
@@ -953,7 +954,7 @@ static int write_bytes(int fd, char *buf, size_t len)
  * asked us to stage sitting in the directory they launched from. It answers
  * no for anything else, which is then somebody else's data.
  */
-static bool same_contents(char *src, char *dest)
+static bool same_contents(char *src, int dfd, const char *leaf)
 {
     int fsrc, fdest;
     struct stat sbuf, dbuf;
@@ -971,7 +972,7 @@ static bool same_contents(char *src, char *dest)
      * somebody opened the other end. The fstat below is what actually
      * decides; anything that is not a plain file is simply "not ours".
      */
-    if (0 > (fdest = open(dest, O_RDONLY | O_NONBLOCK))) {
+    if (0 > (fdest = openat(dfd, leaf, O_RDONLY | O_NONBLOCK | O_CLOEXEC))) {
         close(fsrc);
         return false;
     }
@@ -1015,11 +1016,12 @@ done:
  */
 static int place_file(char *my_dir, char *wdir, char *fname)
 {
-    char *src = NULL, *dest = NULL, *tmpname = NULL, *basedir;
+    char *src = NULL, *dest = NULL, *tmpname = NULL, *subdir = NULL;
+    const char *leaf;
     struct stat sbuf;
     mode_t mode;
     char data[PRTE_FILEM_RAW_COPY_MAX];
-    int fsrc = -1, fdest = -1;
+    int fsrc = -1, fdest = -1, dfd = -1;
     ssize_t nb;
     int rc = PRTE_SUCCESS;
 
@@ -1031,8 +1033,48 @@ static int place_file(char *my_dir, char *wdir, char *fname)
         goto cleanup;
     }
 
-    if (0 == lstat(dest, &sbuf)) {
-        if (same_contents(src, dest)) {
+    /* Split the name into the directories it sits under and the file
+     * itself, and open the directory once. Everything below works through
+     * that descriptor, so every step acts on the directory the name led to
+     * when it was opened - see prte_filem_base_open_dir_under() for the
+     * rule each directory has to pass. The working directory itself is the
+     * user's, and is created as before if it is not there yet - without
+     * touching the mode of one that is. */
+    leaf = strrchr(fname, '/');
+    if (NULL != leaf) {
+        subdir = strndup(fname, (size_t) (leaf - fname));
+        ++leaf;
+        if (NULL == subdir) {
+            rc = PRTE_ERR_OUT_OF_RESOURCE;
+            PRTE_ERROR_LOG(rc);
+            goto cleanup;
+        }
+    } else {
+        leaf = fname;
+    }
+    if (0 != stat(wdir, &sbuf)) {
+        rc = pmix_os_dirpath_create(wdir, S_IRWXU | S_IRWXG | S_IRWXO);
+        if (PMIX_SUCCESS != rc && PMIX_ERR_EXISTS != rc) {
+            PMIX_ERROR_LOG(rc);
+            rc = prte_pmix_convert_status(rc);
+            goto cleanup;
+        }
+        rc = PRTE_SUCCESS;
+    }
+    dfd = prte_filem_base_open_dir_under(wdir, subdir, S_IRWXU | S_IRWXG | S_IRWXO);
+    if (0 > dfd) {
+        pmix_output(0, "%s CANNOT PLACE FILE %s: %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), dest,
+                    (ELOOP == errno || ENOTDIR == errno)
+                        ? "a directory in its path is a symbolic link or not a directory"
+                        : (EACCES == errno)
+                              ? "a directory in its path belongs to a user and group other than ours"
+                              : strerror(errno));
+        rc = PRTE_ERR_FILE_OPEN_FAILURE;
+        goto cleanup;
+    }
+
+    if (0 == fstatat(dfd, leaf, &sbuf, AT_SYMLINK_NOFOLLOW)) {
+        if (same_contents(src, dfd, leaf)) {
             PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                                  "%s filem:raw: %s is already in place at %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fname, dest));
@@ -1047,26 +1089,6 @@ static int place_file(char *my_dir, char *wdir, char *fname)
     PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                          "%s filem:raw: placing %s in %s",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fname, wdir));
-
-    /* create any directories the file is to sit under - but only if they
-     * are not already there. pmix_os_dirpath_create() chmods a path that
-     * already exists to the mode it was given, and the working directory
-     * here belongs to the user: handing it their own cwd would silently
-     * reduce it to 0700. Directories we do create are left to the user's
-     * umask, like any other directory made on their behalf.
-     */
-    basedir = pmix_dirname(dest);
-    if (NULL != basedir && 0 != stat(basedir, &sbuf)) {
-        rc = pmix_os_dirpath_create(basedir, S_IRWXU | S_IRWXG | S_IRWXO);
-        if (PMIX_SUCCESS != rc && PMIX_ERR_EXISTS != rc) {
-            PMIX_ERROR_LOG(rc);
-            rc = prte_pmix_convert_status(rc);
-            free(basedir);
-            goto cleanup;
-        }
-        rc = PRTE_SUCCESS;
-    }
-    free(basedir);
 
     if (0 > (fsrc = open(src, O_RDONLY))) {
         pmix_output(0, "%s CANNOT ACCESS STAGED FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), src);
@@ -1087,25 +1109,14 @@ static int place_file(char *my_dir, char *wdir, char *fname)
     /* write a temporary alongside the target and rename it into place. The
      * rename is atomic, so a proc never sees a half-written file - which
      * matters when the working directory is shared and several daemons are
-     * placing the identical file at the same moment.
+     * placing the identical file at the same moment, each under a name of
+     * its own (prte_filem_base_open_temp_at).
      */
-    pmix_asprintf(&tmpname, "%s.prte-tmp.%lu", dest, (unsigned long) getpid());
-    if (NULL == tmpname) {
-        rc = PRTE_ERR_OUT_OF_RESOURCE;
-        PRTE_ERROR_LOG(rc);
-        goto cleanup;
-    }
-    if (0 > (fdest = open(tmpname, O_WRONLY | O_CREAT | O_TRUNC, mode))) {
-        pmix_output(0, "%s CANNOT CREATE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), tmpname);
+    if (0 > (fdest = prte_filem_base_open_temp_at(dfd, leaf, mode, &tmpname))) {
+        pmix_output(0, "%s CANNOT CREATE A FILE BESIDE %s: %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                    dest, strerror(errno));
         rc = PRTE_ERR_FILE_OPEN_FAILURE;
-        free(tmpname);
-        tmpname = NULL;
         goto cleanup;
-    }
-    if (0 != fchmod(fdest, mode)) {
-        PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
-                             "%s filem:raw: could not set mode on %s",
-                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), tmpname));
     }
     while (0 < (nb = read_bytes(fsrc, data, sizeof(data)))) {
         if (PRTE_SUCCESS != (rc = write_bytes(fdest, data, (size_t) nb))) {
@@ -1120,7 +1131,7 @@ static int place_file(char *my_dir, char *wdir, char *fname)
     }
     close(fdest);
     fdest = -1;
-    if (0 != rename(tmpname, dest)) {
+    if (0 != renameat(dfd, tmpname, dfd, leaf)) {
         pmix_output(0, "%s FAILED TO PLACE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), dest);
         rc = PRTE_ERR_FILE_WRITE_FAILURE;
         goto cleanup;
@@ -1137,9 +1148,13 @@ cleanup:
     }
     if (NULL != tmpname) {
         /* we never got it into place */
-        unlink(tmpname);
+        unlinkat(dfd, tmpname, 0);
         free(tmpname);
     }
+    if (0 <= dfd) {
+        close(dfd);
+    }
+    free(subdir);
     free(src);
     free(dest);
     return rc;
@@ -1564,7 +1579,8 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
     FILE *fp;
     char *cmd, *quoted;
     size_t len;
-    char path[PRTE_PATH_MAX];
+    char *path;
+    bool failed = false;
 
     PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                          "%s filem:raw: identifying links for archive %s",
@@ -1587,20 +1603,16 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
      * directory tree, but link to different files, we
      * have to link to each individual file
      */
-    while (fgets(path, sizeof(path), fp) != NULL) {
+    /* each member on a line of its own, however long */
+    while (NULL != (path = pmix_getline(fp, &failed))) {
         PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                              "%s filem:raw: path %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
-        /* trim the trailing newline, if fgets gave us one - a final line
-         * with no newline keeps every character it has
-         */
         len = strlen(path);
-        if (0 < len && '\n' == path[len - 1]) {
-            path[--len] = '\0';
-        }
         /* protect against an empty result - a bare newline would otherwise
          * send the directory test reading in front of the buffer
          */
         if (0 == len) {
+            free(path);
             continue;
         }
         /* ignore directories */
@@ -1608,6 +1620,7 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
             PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                                  "%s filem:raw: path %s is a directory - ignoring it",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
+            free(path);
             continue;
         }
         /* an archive member that steps above the directory it is unpacked
@@ -1618,6 +1631,7 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
             PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                                  "%s filem:raw: path %s is not relative - ignoring it",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
+            free(path);
             continue;
         }
         /* ignore specific useless directory trees */
@@ -1625,17 +1639,19 @@ static int link_archive(prte_filem_raw_incoming_t *inbnd)
             PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                                  "%s filem:raw: path %s includes .deps - ignoring it",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
+            free(path);
             continue;
         }
         PMIX_OUTPUT_VERBOSE((10, prte_filem_base_framework.framework_output,
                              "%s filem:raw: adding path %s to link points",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), path));
         PMIx_Argv_append_nosize(&inbnd->link_pts, path);
+        free(path);
     }
     /* a listing that failed leaves us with no link points and nothing to
      * place - say so rather than acking a delivery that did not happen
      */
-    if (0 != pclose(fp)) {
+    if (0 != pclose(fp) || failed) {
         PRTE_ERROR_LOG(PRTE_ERR_FILE_READ_FAILURE);
         return PRTE_ERR_FILE_READ_FAILURE;
     }
@@ -1759,9 +1775,15 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                              "%s filem:raw: opening target file %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), incoming->fullpath));
-        /* create the path to the target, if not already existing */
-        tmp = pmix_dirname(incoming->fullpath);
-        rc = pmix_os_dirpath_create(tmp, S_IRWXU);
+        /* create the path to the target, if not already existing. The
+         * session dir is ours; everything under it is composed from the
+         * name we were sent, so walk it without following a symlink */
+        tmp = pmix_dirname(file);
+        if (NULL != tmp && 0 != strcmp(tmp, ".") && 0 != strcmp(tmp, "/")) {
+            rc = pmix_os_dirpath_create_under(session_dir, tmp, S_IRWXU);
+        } else {
+            rc = PMIX_SUCCESS;
+        }
         if (PMIX_SUCCESS != rc && PMIX_ERR_EXISTS != rc) {
             PMIX_ERROR_LOG(rc);
             send_complete(file, PRTE_ERR_FILE_WRITE_FAILURE);
@@ -1775,8 +1797,9 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
             return;
         }
         /* open the file descriptor for writing */
-        incoming->fd = open(incoming->fullpath, O_RDWR | O_CREAT | O_TRUNC,
-                            (mode_t) incoming->mode);
+        incoming->fd = pmix_os_dirpath_open_file_under(session_dir, file,
+                                                       O_RDWR | O_CREAT | O_TRUNC,
+                                                       (mode_t) incoming->mode);
         if (0 > incoming->fd) {
             pmix_output(0, "%s CANNOT CREATE FILE %s", PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         incoming->fullpath);

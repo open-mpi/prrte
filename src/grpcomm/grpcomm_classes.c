@@ -83,9 +83,13 @@ static void sgcon(prte_grpcomm_group_signature_t *p)
     p->follower = false;
     p->addmembers = NULL;
     p->naddmembers = 0;
-    p->final_order = NULL;
-    p->nfinal = 0;
     p->ft_collective = false;
+    /* 0 is a real round, and the right default: a signature built by hand
+     * belongs to the first operation of its name until something says
+     * otherwise. Every signature that goes on the wire has its generation
+     * set explicitly - stamped by the daemon whose client started the
+     * operation, or unpacked from the contribution it arrived in. */
+    p->generation = 0;
 }
 static void sgdes(prte_grpcomm_group_signature_t *p)
 {
@@ -98,9 +102,6 @@ static void sgdes(prte_grpcomm_group_signature_t *p)
     }
     if (NULL != p->addmembers) {
         PMIX_PROC_FREE(p->addmembers, p->naddmembers);
-    }
-    if (NULL != p->final_order) {
-        PMIX_PROC_FREE(p->final_order, p->nfinal);
     }
 }
 PMIX_CLASS_INSTANCE(prte_grpcomm_group_signature_t,
@@ -243,6 +244,7 @@ static void memocon(prte_grpcomm_group_memo_t *p)
 {
     p->groupID = NULL;
     p->op = PMIX_GROUP_NONE;
+    p->next_generation = 0;
 }
 static void memodes(prte_grpcomm_group_memo_t *p)
 {

@@ -12,9 +12,9 @@
 .. The following line is included so that Sphinx won't complain
    about this file not being directly included in some toctree
 
-.. note:: PRRTE accepts both the new "--mapby" and the older
-          deprecated "--map-by" cmd line options. For simplicity, the
-          following description will refer to the new "--mapby" form.
+.. note:: PRRTE accepts both the new ``--mapby`` and the older
+          deprecated ``--map-by`` cmd line options. For simplicity, the
+          following description will refer to the new ``--mapby`` form.
 
 Processes are mapped based on one of the following directives as
 applied at the job level:
@@ -73,12 +73,14 @@ applied at the job level:
   the ORDERED qualifier. The list is comprised of comma-delimited
   ranges of CPUs to use for this job. If the ORDERED qualifier is not
   provided, then each node will be assigned procs up to the number of
-  available slots, capped by the availability of the specified CPUs.
-  If ORDERED is given, then one proc will be assigned to each of the
-  specified CPUs, if available, capped by the number of slots on each
-  node and the total number of specified processes. Providing the
-  OVERLOAD qualifier to the "bind-to" option removes the check on
-  availability of the CPU in both cases.
+  available slots, capped by the total number of specified processes
+  and the availability of the specified CPUs (i.e., the number of procs
+  cannot exceed the number of specified CPUs), with each proc bound to
+  all the specified CPUs. If ORDERED is given, then one proc will be
+  assigned to each of the specified CPUs, if available, capped by the
+  number of slots on each node and the total number of specified
+  processes. Providing the OVERLOAD qualifier to the ``--bindto``
+  option removes the check on availability of the CPU in both cases.
 
 * ``DEVICE=<class|name>`` assigns one proc to each device in the node's
   topology, in PCI bus order, placing it on the CPUs local to that
@@ -131,7 +133,7 @@ applied at the job level:
   NVIDIA, ``ROCR_VISIBLE_DEVICES`` for AMD -- naming them by the vendor's
   own identifier. Only processes actually mapped against a device get
   this, and a variable already set in the environment is replaced, since
-  ``--map-by device=`` is the more specific request. PRRTE never sets the
+  ``--mapby device=`` is the more specific request. PRRTE never sets the
   vendor's device *ordering* variable (``CUDA_DEVICE_ORDER`` and its
   equivalents): the identifiers do not depend on the ordering, which is
   the reason for using them, and changing it would renumber devices for
@@ -170,7 +172,18 @@ applied at the job level:
 
 Any directive can include qualifiers by adding a colon (``:``) and any
 combination of one or more of the following (delimited by colons) to
-the ``--mapby`` option (except where noted):
+the ``--mapby`` option (except where noted). A comma does not separate
+qualifiers: ``--mapby device=gpu:ndev=2`` gives each process two GPUs,
+while ``--mapby device=gpu,ndev=2`` names a device called
+``gpu,ndev=2`` and is refused. For example:
+
+.. code::
+
+   --mapby package:span                  load balance across the nodes
+   --mapby core:pe=2:hwtcpus             two hwthreads per process
+   --mapby device=gpu:ndev=2:interleave  two GPUs each, one per package
+   --mapby ppr:2:numa:pe=4               two processes per NUMA domain
+
 
 * ``PE=n`` bind n CPUs to each process (can not be used in combination
   with rankfile or pe-list directives)
@@ -181,25 +194,37 @@ the ``--mapby`` option (except where noted):
   ``pe-list`` directives). One process is placed on each object in turn,
   cycling across the nodes, so a job that does not fill the allocation
   spreads over all of it instead of filling the first nodes. On three
-  4-slot nodes, ``-n 8 --map-by core:SPAN`` places 3, 3 and 2 processes,
-  where ``--map-by core`` alone places 4 and 4 and leaves the third node
+  4-slot nodes, ``-n 8 --mapby core:SPAN`` places 3, 3 and 2 processes,
+  where ``--mapby core`` alone places 4 and 4 and leaves the third node
   empty.
 
-* ``OVERSUBSCRIBE`` allow more processes on a node than processing elements
+* ``OVERSUBSCRIBE`` allow more processes on a node than processing
+  elements. Note that this describes the whole job. It may be written in
+  a per-app ``--mapby`` string, where it is taken to describe the job
+  (see "Per-app-context mapping" below).
 
-* ``NOOVERSUBSCRIBE`` means ``!OVERSUBSCRIBE``
+* ``NOOVERSUBSCRIBE`` means ``!OVERSUBSCRIBE``. Note that this describes
+  the whole job (see above).
 
-* ``NOLOCAL`` do not launch processes on the same node as ``prun``
+* ``NOLOCAL`` do not launch processes on the same node as ``prun``. This
+  qualifier may be applied per app context in an MPMD job |mdash| see
+  "Per-app-context mapping" below.
 
-* ``HWTCPUS`` use hardware threads as CPU slots
+* ``HWTCPUS`` use hardware threads as CPUs. The processes are bound
+  to hardware threads by default, and a node whose slot count PRRTE
+  determined by counting its cores offers this job one slot per
+  hardware thread instead |mdash| for this job only (see the
+  definition of "slot")
 
 * ``CORECPUS`` use cores as CPU slots (default)
 
 * ``INHERIT`` indicates that a child job (i.e., one spawned from within
   an application) shall inherit the placement policies of the parent job
-  that spawned it.
+  that spawned it. Note that this describes the whole job; written in a
+  per-app ``--mapby`` string it is taken to describe the job.
 
-* ``NOINHERIT`` means ```!INHERIT``
+* ``NOINHERIT`` means ``!INHERIT``. Note that this describes the whole
+  job (see above).
 
 * ``FILE=<path>`` (path to file containing sequential or rankfile entries).
 
@@ -229,14 +254,21 @@ the ``--mapby`` option (except where noted):
   understanding. A process holding two GPUs attached to different NUMA
   domains is local to neither of them alone --- it is local to whatever
   contains them both. So the locality of a process becomes the **common
-  ancestor** of its devices' localities, and binding descends from there. On
-  a node with two GPUs per socket, ``ndev=2`` therefore makes each process
-  package-local, which means ``--bindto package`` is legitimate in that case
-  and remains an error without ``ndev``.
+  ancestor** of its devices' localities, and that decides how coarse a
+  binding may be. On a node with two GPUs per socket, ``ndev=2`` therefore
+  makes each process package-local, which means ``--bindto package`` is
+  legitimate in that case and remains an error without ``ndev``.
+
+  A *finer* binding is chosen from the devices' own localities, not from
+  anywhere in that ancestor: ``--bindto numa`` binds to the NUMA domain of
+  one of the process's GPUs, and ``--bindto core`` to a core in one of them
+  --- never to a part of the package that is local to neither.
 
   Devices are handed out in groups taken in order from the device list, so a
   group is a contiguous run of that order and the ``INTERLEAVE`` qualifier
-  composes with this one.
+  composes with this one. On a node with two GPUs per socket, interleaving
+  across packages and then taking ``ndev=2`` gives each process one GPU from
+  each socket.
 
 * ``ORDERED`` only applies to the ``PE-LIST`` option to indicate that
   procs are to be bound to each of the specified CPUs in the order in
@@ -247,7 +279,11 @@ the ``--mapby`` option (except where noted):
 .. note:: Directives and qualifiers are case-insensitive and can be
           shortened to the minimum number of characters to uniquely
           identify them. Thus, ``L1CACHE`` can be given as ``l1cache`` or
-          simply as ``L1``.
+          simply as ``L1``. A shortening that fits more than one of them
+          is refused rather than guessed at |mdash| ``N`` could be
+          ``NUMA`` or ``NODE``, and ``:S`` could be ``SPAN`` or
+          ``SHARED`` |mdash| as is a value given to one that takes none:
+          ``SPAN=false`` is an error, not ``SPAN``.
 
 The type of CPU (core vs hwthread) used in the mapping algorithm
 is determined as follows:
@@ -255,19 +291,93 @@ is determined as follows:
 * by user directive on the command line via the HWTCPUS qualifier to
   the ``--mapby`` directive
 
-* by setting the ``rmaps_default_mapping_policy`` MCA parameter to
-  include the ``HWTCPUS`` qualifier. This parameter sets the default
-  value for a PRRTE DVM |mdash| qualifiers are carried across to DVM jobs
-  started via ``prun`` unless overridden by the user's command line
+* by setting the ``mapby`` MCA parameter to include the ``HWTCPUS``
+  qualifier (e.g., ``--prtemca mapby :HWTCPUS`` when starting the
+  DVM). This parameter sets the default value for a PRRTE DVM |mdash|
+  qualifiers are carried across to DVM jobs started via ``prun`` unless
+  overridden by the user's command line
 
 * defaults to CORE in topologies where core CPUs are defined, and to
   hwthreads otherwise.
 
 If your application uses threads, then you probably want to ensure that
-you are either not bound at all (by specifying ``--bind-to none``), or
+you are either not bound at all (by specifying ``--bindto none``), or
 bound to multiple cores using an appropriate binding level or specific
 number of processing elements per application process via the ``PE=#``
 qualifier to the ``--mapby`` command line directive.
+
+.. rubric:: Per-app-context mapping (MPMD jobs)
+
+In a multi-program multiple-data (MPMD) job, each application context
+separated by ``:`` on the ``prun`` command line may carry its own
+``--mapby``, ``--rankby``, and ``--bindto`` directives.
+
+Which app such a directive describes follows one rule: the *first* app
+segment is where the command line speaks for the job. A directive
+written there and nowhere else applies to the whole job, however many
+apps follow. A directive written on any later app describes that app
+alone; apps that were given none take the ordinary defaults, since an
+app that says nothing is not agreeing with one that did.
+
+Examples:
+
+.. code::
+
+   prun --mapby core -n 4 app1 : -n 2 app2
+
+Both apps are mapped by core: the only directive is on the first app,
+so it describes the job.
+
+.. code::
+
+   prun --mapby core -n 4 app1 : --mapby node --rankby fill -n 2 app2
+
+Here ``app1`` is mapped by core and ``app2`` is mapped by node with fill
+ranking. No binding directive was given, so both apps take the default
+binding policy.
+
+.. code::
+
+   prun -n 4 app1 : --mapby node -n 2 app2
+
+Only ``app2`` is mapped by node; ``app1`` takes the default mapping.
+
+.. code::
+
+   prun --mapby slot:nolocal -n 8 app1 : --mapby slot -n 1 app2
+
+Here ``app1`` is excluded from the head node while ``app2`` may run
+anywhere, including the head node.
+
+Every mapping policy may be given per app |mdash| ``seq``, ``rankfile``,
+``ppr:N:obj`` and ``pe-list=...`` included, each with the file or
+pattern it needs |mdash| so two apps of one job may be placed by two
+different mapping components. ``--display map-devel`` names the
+component that placed each app.
+
+Qualifiers that describe the whole job:
+
+* ``OVERSUBSCRIBE`` / ``NOOVERSUBSCRIBE`` and ``INHERIT`` /
+  ``NOINHERIT`` describe the job, not an app, so wherever they are
+  written they are applied to the job. Apps that say nothing about them
+  are silent, not dissenting; only apps that answer the same question in
+  *opposite* ways are refused, and that aborts the job with an error.
+
+* ``NOLOCAL`` *may* be applied per app. It prevents that specific app's
+  processes from running on the head node without affecting other apps.
+
+Per-app directives can also be supplied via the ``PMIx_Spawn`` API by
+placing ``PMIX_MAPBY``, ``PMIX_RANKBY``, ``PMIX_BINDTO`` and ``PMIX_PPR``
+keys in the per-app ``info[]`` array on the corresponding ``pmix_app_t``.
+On that path there is no "first app" rule: the array a key was written
+in says what it describes.
+
+Note that ``PMIX_MAPPER`` is *not* supported, per job or per app, and a
+spawn request carrying it is refused. Naming a mapping component says
+nothing that ``PMIX_MAPBY`` has not already said |mdash| the mapping
+policy is what selects the component |mdash| and the two can contradict
+each other. Describe the placement you want with ``PMIX_MAPBY`` and let
+PRRTE choose the component that performs it.
 
 A more detailed description of the mapping, ranking, and binding
 procedure can be obtained via the ``--help placement`` option.

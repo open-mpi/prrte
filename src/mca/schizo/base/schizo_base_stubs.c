@@ -25,11 +25,15 @@
 #include "src/mca/pmdl/base/base.h"
 #include "src/mca/schizo/base/base.h"
 #include "src/runtime/prte_globals.h"
+#include "src/runtime/runtime.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/name_fns.h"
 #include "src/util/pmix_basename.h"
 #include "src/util/pmix_environ.h"
+#include "src/util/pmix_os_path.h"
+#include "src/util/pmix_path.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/pmix_string_copy.h"
 #include "src/util/prte_show_help.h"
 #include "src/util/prte_cmd_line.h"
 
@@ -302,31 +306,6 @@ int prte_schizo_base_add_qualifier(pmix_cli_result_t *results,
     return PRTE_SUCCESS;
 }
 
-char *prte_schizo_base_getline(FILE *fp)
-{
-    char *ret, *buff;
-    size_t len;
-    char input[2048];
-
-    memset(input, 0, 2048);
-    ret = fgets(input, 2048, fp);
-    if (NULL != ret) {
-        /* strip the newline - but only if there IS one.  The last line of a
-         * file that does not end in a newline has none, and blindly chopping
-         * its final character silently corrupts that line (an MCA param file
-         * saved without a trailing newline would lose a character off its
-         * last parameter) */
-        len = strlen(input);
-        if (0 < len && '\n' == input[len - 1]) {
-            input[len - 1] = '\0';
-        }
-        buff = strdup(input);
-        return buff;
-    }
-
-    return NULL;
-}
-
 char *prte_schizo_base_strip_quotes(char *p)
 {
     char *pout;
@@ -347,11 +326,35 @@ char *prte_schizo_base_strip_quotes(char *p)
     return pout;
 }
 
+/* Does this generic parameter name the "if" framework - "if" alone or
+ * "if_<anything>"?  No PRRTE framework has that name; it is the one PMIx
+ * calls pif (and Open MPI calls if) */
+bool prte_schizo_base_is_if_param(const char *name)
+{
+    return (0 == strcmp(name, "if") || 0 == strncmp(name, "if_", 3));
+}
+
+/*
+ * prte_schizo_base_parse_prte and _parse_pmix are the tools' argv
+ * pre-scans, and they run before prte_init_minimum() - they have to, as
+ * an MCA variable reads the environment only when first registered. That
+ * is also before the show_help content is registered, so a message
+ * printed from here comes out as "couldn't find that help reference"
+ * instead of the message itself. An option missing its values is
+ * therefore passed over in silence: the tool's parse_cli sees the same
+ * command line moments later, with the option table and the help content
+ * both in place, and reports it properly - and the scan cannot be sure it
+ * is looking at one of the tool's own options anyway, since it does not
+ * know where the application's arguments begin.
+ */
 int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target)
 {
     int i;
     bool use;
     char *p1, *p2, *param;
+
+    /* the PRRTE check below fixes its list on first use */
+    prte_publish_mca_prefixes();
 
     for (i = 0; i < (argc - start); ++i) {
         if (0 == strcmp("--", argv[i])) {
@@ -360,10 +363,8 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
         }
         if (0 == strcmp("--prtemca", argv[i])) {
             if (NULL == argv[i + 1] || NULL == argv[i + 2]) {
-                /* this is an error */
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "missing-values", true,
-                               "--prtemca");
-                return PRTE_ERR_SILENT;
+                /* left for parse_cli to report - see above */
+                return PRTE_SUCCESS;
             }
             p1 = prte_schizo_base_strip_quotes(argv[i + 1]);
             p2 = prte_schizo_base_strip_quotes(argv[i + 2]);
@@ -387,10 +388,8 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
         }
         if (0 == strcmp("--mca", argv[i])) {
             if (NULL == argv[i + 1] || NULL == argv[i + 2]) {
-                /* this is an error */
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "missing-values", true,
-                               "--mca");
-                return PRTE_ERR_SILENT;
+                /* left for parse_cli to report - see above */
+                return PRTE_SUCCESS;
             }
             p1 = prte_schizo_base_strip_quotes(argv[i + 1]);
             p2 = prte_schizo_base_strip_quotes(argv[i + 2]);
@@ -403,17 +402,16 @@ int prte_schizo_base_parse_prte(int argc, int start, char **argv, char ***target
                  * one so we know this has been processed */
                 free(argv[i]);
                 argv[i] = strdup("--prtemca");
-                /* if this refers to the "if" framework, convert to "prteif" */
-                if (0 == strncasecmp(p1, "if", 2)) {
-                    pmix_asprintf(&param, "prteif_%s", &p1[3]);
+                /* rename the framework, or a parameter of it - the bare
+                 * name selects components, so it has no '_' to step over */
+                if (0 == strncasecmp(p1, "reachable", strlen("reachable")) &&
+                    ('\0' == p1[strlen("reachable")] || '_' == p1[strlen("reachable")])) {
+                    pmix_asprintf(&param, "prtereachable%s", &p1[strlen("reachable")]);
                     free(p1);
                     p1 = param;
-                } else if (0 == strncasecmp(p1, "reachable", strlen("reachable"))) {
-                    pmix_asprintf(&param, "prtereachable_%s", &p1[strlen("reachable_")]);
-                    free(p1);
-                    p1 = param;
-                } else if (0 == strncasecmp(p1, "plm_rsh", strlen("plm_rsh"))) {
-                    pmix_asprintf(&param, "plm_ssh_%s", &p1[strlen("plm_rsh_")]);
+                } else if (0 == strncasecmp(p1, "plm_rsh", strlen("plm_rsh")) &&
+                           ('\0' == p1[strlen("plm_rsh")] || '_' == p1[strlen("plm_rsh")])) {
+                    pmix_asprintf(&param, "plm_ssh%s", &p1[strlen("plm_rsh")]);
                     free(p1);
                     p1 = param;
                 }
@@ -455,10 +453,8 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
         }
         if (0 == strcmp("--pmixmca", argv[i]) || 0 == strcmp("--gpmixmca", argv[i])) {
             if (NULL == argv[i + 1] || NULL == argv[i + 2]) {
-                /* this is an error */
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "missing-values", true,
-                               "--pmixmca");
-                return PRTE_ERR_SILENT;
+                /* left for parse_cli to report - see parse_prte */
+                return PRTE_SUCCESS;
             }
             /* strip any quotes around the args */
             p1 = prte_schizo_base_strip_quotes(argv[i + 1]);
@@ -483,8 +479,10 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
         }
         if (0 == strcmp("--mca", argv[i]) || 0 == strcmp("--gmca", argv[i])) {
             if (NULL == argv[i + 1] || NULL == argv[i + 2]) {
-                /* this is an error */
-                return PRTE_ERR_FATAL;
+                /* left for parse_cli to report - see parse_prte. This
+                 * one used to fail outright, so the tool exited with
+                 * nothing said at all */
+                return PRTE_SUCCESS;
             }
             /* strip any quotes around the args */
             p1 = prte_schizo_base_strip_quotes(argv[i + 1]);
@@ -521,6 +519,28 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
                 continue;
             }
 
+            /* "if" is not a framework of PRRTE's.  It is PMIx's pif, so
+             * apply it there - but it is also Open MPI's own if framework, so
+             * leave the generic option where it is for the ompi personality
+             * to forward too */
+            if (prte_schizo_base_is_if_param(p1)) {
+                pmix_asprintf(&param, "pif%s", &p1[2]);
+                free(p1);
+                if (NULL == target) {
+                    pmix_asprintf(&p1, "PMIX_MCA_%s", param);
+                    setenv(p1, p2, true);
+                    free(p1);
+                } else {
+                    PMIx_Argv_append_nosize(target, "--pmixmca");
+                    PMIx_Argv_append_nosize(target, param);
+                    PMIx_Argv_append_nosize(target, p2);
+                }
+                free(param);
+                free(p2);
+                i += 2;
+                continue;
+            }
+
             /* this is a generic MCA designation, so see if the parameter it
              * refers to belongs to one of our frameworks */
             use = pmix_pmdl_base_check_pmix_param(p1);
@@ -529,20 +549,6 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
                  * one so we know this has been processed */
                 free(argv[i]);
                 argv[i] = strdup("--pmixmca");
-                /* if this refers to the "if" framework, convert to "pif" */
-                if (0 == strncasecmp(p1, "if", 2)) {
-                    pmix_asprintf(&param, "pif_%s", &p1[3]);
-                    free(p1);
-                    p1 = param;
-                } else if (0 == strncasecmp(p1, "reachable", strlen("reachable"))) {
-                    pmix_asprintf(&param, "preachable_%s", &p1[strlen("reachable_")]);
-                    free(p1);
-                    p1 = param;
-                } else if (0 == strncasecmp(p1, "dl", strlen("dl"))) {
-                    pmix_asprintf(&param, "pdl_%s", &p1[strlen("dl_")]);
-                    free(p1);
-                    p1 = param;
-                }
                 if (NULL == target) {
                     /* push it into our environment */
                     pmix_asprintf(&param, "PMIX_MCA_%s", p1);
@@ -564,6 +570,264 @@ int prte_schizo_base_parse_pmix(int argc, int start, char **argv, char ***target
         }
     }
     return PRTE_SUCCESS;
+}
+
+FILE *prte_schizo_base_open_tune_file(const char *name)
+{
+    FILE *fp;
+    char *path;
+
+    fp = fopen(name, "r");
+    if (NULL != fp) {
+        return fp;
+    }
+    if (pmix_path_is_absolute(name)) {
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt",
+                       "missing-param-file", true, name);
+        return NULL;
+    }
+    /* a relative name that is not in the cwd may name one of the
+     * parameter sets installed with PRRTE */
+    path = pmix_os_path(false, PRTE_SCHIZO_PARAM_SETS_DIR, name, NULL);
+    fp = fopen(path, "r");
+    if (NULL == fp) {
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt",
+                       "missing-param-file-def", true, name, path);
+    }
+    free(path);
+    return fp;
+}
+
+/* trim leading and trailing whitespace in place, returning the start */
+static char *trim(char *s)
+{
+    char *end;
+
+    while (isspace((unsigned char) *s)) {
+        ++s;
+    }
+    end = s + strlen(s);
+    while (end > s && isspace((unsigned char) end[-1])) {
+        --end;
+    }
+    *end = '\0';
+    return s;
+}
+
+/*
+ * Walk the "param = value" entries of a comma-delimited list of tune
+ * files.
+ *
+ * A tune file entry is a *generic* MCA parameter - it names no project -
+ * so it is given exactly the treatment a generic "--mca param value" on
+ * the command line gets: prte_schizo_base_parse_prte() claims it for
+ * PRRTE if it belongs to a PRRTE framework, and failing that
+ * prte_schizo_base_parse_pmix() claims it for PMIx. Routing it through
+ * those two, rather than repeating their tests here, keeps the framework
+ * renames (if -> pif, reachable -> prtereachable and so on) in one place.
+ *
+ * The pre-scan (strict == false) runs before any personality has been
+ * chosen, and the ompi personality reads the same files with a richer
+ * grammar of its own ("-x", "--mca", several "k=v" tokens to a line). So
+ * the pre-scan applies the entries it understands and passes over the
+ * rest - including a file it cannot find, since a pre-scan of the raw
+ * argv cannot tell a --tune of ours from one in the application's own
+ * arguments. The personality that owns the grammar reports those.
+ *
+ * With strict == true nothing is applied; every entry is checked, and a
+ * line that is not "param = value", a file that cannot be opened, a
+ * parameter no PRRTE or PMIx framework claims, or a parameter given twice
+ * with different values (there is no telling which was meant) is an
+ * error. The prte personality's parse_cli uses this, since under it these
+ * files can hold nothing else.
+ *
+ * The pre-scan reports nothing at all, and not only because the grammar
+ * may not be ours: it runs before prte_init_minimum() has registered the
+ * show_help content, so any message it tried to print would come out as
+ * "couldn't find that help reference". Of two conflicting values it
+ * applies the first and leaves the conflict for the strict pass (or the
+ * ompi personality's own) to report.
+ */
+static int process_tune_files(const char *files, bool strict)
+{
+    char **names, *line, *entry, *eq, *name, *value, *argv[4];
+    char **cache = NULL, **cachevals = NULL;
+    bool claimed, failed = false;
+    FILE *fp;
+    int i, k, rc = PRTE_SUCCESS;
+
+    names = PMIx_Argv_split(files, ',');
+    if (NULL == names) {
+        return PRTE_SUCCESS;
+    }
+    for (i = 0; PRTE_SUCCESS == rc && NULL != names[i]; i++) {
+        if (strict) {
+            fp = prte_schizo_base_open_tune_file(names[i]);
+            if (NULL == fp) {
+                rc = PRTE_ERR_SILENT;
+                break;
+            }
+        } else {
+            fp = fopen(names[i], "r");
+            if (NULL == fp && !pmix_path_is_absolute(names[i])) {
+                entry = pmix_os_path(false, PRTE_SCHIZO_PARAM_SETS_DIR, names[i], NULL);
+                fp = fopen(entry, "r");
+                free(entry);
+            }
+            if (NULL == fp) {
+                continue;
+            }
+        }
+        while (PRTE_SUCCESS == rc && NULL != (line = pmix_getline(fp, &failed))) {
+            entry = trim(line);
+            if ('\0' == entry[0] || '#' == entry[0]) {
+                free(line);
+                continue;
+            }
+            eq = strchr(entry, '=');
+            if ('-' == entry[0] || NULL == eq) {
+                /* not ours - somebody else's grammar, or a mistake */
+                if (strict) {
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt",
+                                   "bad-param-line", true, names[i], line);
+                    rc = PRTE_ERR_SILENT;
+                }
+                free(line);
+                continue;
+            }
+            *eq = '\0';
+            name = trim(entry);
+            value = prte_schizo_base_strip_quotes(trim(eq + 1));
+            if ('\0' == name[0]) {
+                if (strict) {
+                    *eq = '=';
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt",
+                                   "bad-param-line", true, names[i], entry);
+                    rc = PRTE_ERR_SILENT;
+                }
+                free(value);
+                free(line);
+                continue;
+            }
+            /* the same parameter may appear more than once, but only
+             * ever with the one value */
+            for (k = 0; NULL != cache && NULL != cache[k]; k++) {
+                if (0 == strcmp(cache[k], name)) {
+                    break;
+                }
+            }
+            if (NULL != cache && NULL != cache[k]) {
+                if (strict && 0 != strcmp(cachevals[k], value)) {
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt",
+                                   "duplicate-mca-value", true, name, value, cachevals[k]);
+                    rc = PRTE_ERR_SILENT;
+                }
+                free(value);
+                free(line);
+                continue;
+            }
+            PMIx_Argv_append_nosize(&cache, name);
+            PMIx_Argv_append_nosize(&cachevals, value);
+
+            if (strict) {
+                claimed = (0 == strncmp(name, "mca_base_", strlen("mca_base_")) ||
+                           prte_schizo_base_is_if_param(name) ||
+                           pmix_pmdl_base_check_prte_param(name) ||
+                           pmix_pmdl_base_check_pmix_param(name));
+                if (!claimed) {
+                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt",
+                                   "unknown-tune-param", true, names[i], name, value);
+                    rc = PRTE_ERR_SILENT;
+                }
+            } else {
+                /* hand it over exactly as "--mca name value" */
+                argv[0] = strdup("--mca");
+                argv[1] = strdup(name);
+                argv[2] = strdup(value);
+                argv[3] = NULL;
+                rc = prte_schizo_base_parse_prte(3, 0, argv, NULL);
+                if (PRTE_SUCCESS == rc) {
+                    rc = prte_schizo_base_parse_pmix(3, 0, argv, NULL);
+                }
+                for (k = 0; k < 3; k++) {
+                    free(argv[k]);
+                }
+            }
+            free(value);
+            free(line);
+        }
+        if (PRTE_SUCCESS == rc && failed) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-util.txt", "file-read-failed", true,
+                           names[i]);
+            rc = PRTE_ERR_SILENT;
+        }
+        fclose(fp);
+    }
+    PMIx_Argv_free(names);
+    PMIx_Argv_free(cache);
+    PMIx_Argv_free(cachevals);
+    return rc;
+}
+
+int prte_schizo_base_parse_tune(int argc, int start, char **argv)
+{
+    int i, rc;
+    size_t len = strlen("--" PRTE_CLI_TUNE);
+    char *files = NULL, *tmp;
+
+    /* the entries are routed by the PRRTE check, which fixes its list on
+     * first use */
+    prte_publish_mca_prefixes();
+
+    /* gather every --tune on the line, in order, so a parameter
+     * given different values in two of them is caught */
+    for (i = 0; i < (argc - start) && NULL != argv[i]; ++i) {
+        if (0 == strcmp("--", argv[i])) {
+            break;
+        }
+        tmp = NULL;
+        if (0 == strcmp("--" PRTE_CLI_TUNE, argv[i])) {
+            if (NULL == argv[i + 1]) {
+                break;
+            }
+            tmp = argv[++i];
+        } else if (0 == strncmp("--" PRTE_CLI_TUNE, argv[i], len) &&
+                   '=' == argv[i][len]) {
+            tmp = &argv[i][len + 1];
+        }
+        if (NULL != tmp && '\0' != tmp[0]) {
+            if (NULL == files) {
+                files = strdup(tmp);
+            } else {
+                char *joined;
+                pmix_asprintf(&joined, "%s,%s", files, tmp);
+                free(files);
+                files = joined;
+            }
+        }
+    }
+    if (NULL == files) {
+        return PRTE_SUCCESS;
+    }
+    rc = process_tune_files(files, false);
+    free(files);
+    return rc;
+}
+
+int prte_schizo_base_check_tune(pmix_cli_result_t *results)
+{
+    pmix_cli_item_t *opt;
+    char *files;
+    int rc;
+
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_TUNE);
+    if (NULL == opt || NULL == opt->values) {
+        return PRTE_SUCCESS;
+    }
+    files = PMIx_Argv_join(opt->values, ',');
+    rc = process_tune_files(files, true);
+    free(files);
+    return rc;
 }
 
 int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
@@ -619,7 +883,11 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
             // and need to set LD_LIBRARY_PATH
             exists = false;
             for (i = 0; NULL != app->env[i]; i++) {
-                saveptr = strchr(app->env[i], '='); // cannot be NULL
+                saveptr = strchr(app->env[i], '=');
+                if (NULL == saveptr) {
+                    /* not an assignment - nothing to match */
+                    continue;
+                }
                 *saveptr = '\0';
                 if (0 == strcmp(app->env[i], "LD_LIBRARY_PATH")) {
                     /* we have the var - prepend it */
@@ -662,7 +930,11 @@ int prte_schizo_base_setup_fork(prte_job_t *jdata, prte_app_context_t *app)
             // and need to set LD_LIBRARY_PATH
             exists = false;
             for (i = 0; NULL != app->env[i]; i++) {
-                saveptr = strchr(app->env[i], '='); // cannot be NULL
+                saveptr = strchr(app->env[i], '=');
+                if (NULL == saveptr) {
+                    /* not an assignment - nothing to match */
+                    continue;
+                }
                 *saveptr = '\0';
                 if (0 == strcmp(app->env[i], "LD_LIBRARY_PATH")) {
                     /* we have the var - prepend it */

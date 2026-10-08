@@ -179,6 +179,18 @@ still parsing, or still inside the spawn finds it empty. Both
 and note that the window is not small — the spawn covers the whole mapping
 and launch of the job.
 
+**In `prun_common.c` the handler only writes the signal number down a
+pipe.** It is a plain `signal()` handler and may run on any thread -
+including PMIx's progress thread, where a blocking PMIx call is refused
+outright - and at any moment, so it may call nothing that is not
+async-signal-safe. `forward_signal()`, on a progress thread of its own
+(`prun-signals`), reads the pipe and makes the non-blocking
+`PMIx_Job_control_nb` request. The main thread cannot do it: it spends the
+run parked in `PRTE_PMIX_WAIT_THREAD` and never looks at an event base.
+That thread is stopped before `PMIx_tool_finalize`; the pipe is left open,
+so a late signal never writes to a descriptor number reused for something
+else.
+
 **And the borrowed-array rule above is about a pure server, not about
 `prun`.** `prun_common.c`'s `defhandler()` hands `PMIx_Job_control_nb`
 a `pmix_proc_t` and a `pmix_info_t` on its own stack, and that is correct:
@@ -207,6 +219,10 @@ relative to `prte_init()`.
    options (`--daemonize`, `--report-uri`, `--singleton`, `--prefix`,
    `--report-pid`, `--keepalive`, …).
 4. **Proxy hand-off.** `--dvm` + proxy ⇒ `prun_common()` and `exit()`.
+   It must be handed `pargc`/`pargv` - the copy the MCA pre-scan, the
+   spelling normalizer and the `--app` expansion worked on - never the raw
+   `argv`: that made the app parse see `--map-by` where the tables spell
+   `--mapby`, so `mpirun --dvm ... --map-by X` was refused outright.
 5. **`prte_init(PRTE_PROC_MASTER)`.** After this the daemon job object,
    the node pool, and the PMIx server all exist. **Anything that must
    reject bad user input before PMIx sees it has to happen above this
@@ -240,9 +256,12 @@ relative to `prte_init()`.
   inside the event loop.
 - **`prte_event_reinit()` after `--daemonize`.** The event base is opened
   before the fork and some backends (kqueue on macOS) do not survive it.
-- **The `--dvm <keyword>` values are keywords, not prefixes.** The block
-  that rewrites the `--dvm` option's key into the one `prun_common()`
-  expects tests `file:`, `uri:`, `pid:` and `ns:` as prefixes, which they
+- **The `--dvm <keyword>` values are keywords, not prefixes.** The
+  translation of `--dvm` into the key that names a DVM now lives in
+  `prun_common()` (`translate_dvm_option()`), so `prun` under the ompi
+  personality - whose option table offers `--dvm` and none of prun's own
+  `--dvm-uri`/`--pid`/`--namespace` - gets it too; it used to be done only
+  here, before the proxy hand-off. It tests `file:`, `uri:`, `pid:` and `ns:` as prefixes, which they
   are, and then `system`, `system-first` and `search`, which are not.
   Testing those three with `strncasecmp(..., 6)` made `system-first`
   unreachable — it matches `system` in its first six characters, so the
@@ -259,12 +278,18 @@ relative to `prte_init()`.
   failed. Three failure paths did this. Pass the failure you actually
   detected, and if you have nothing better, `PRTE_ERR_FATAL`.
 
-- **`prte_parse_appfile()` is the `--app` reader**, extracted so it can be
-  unit-tested. `PMIx_Argv_split` returns **NULL**, not an empty array, for
-  a string that yields no tokens, so a blank line in an appfile — entirely
+- **`prte_load_appfile()` (in `src/util/prte_cmd_line.c`) is the `--app`
+  reader**, shared with `prun` and unit-tested from both. `prte.c` used to
+  carry its own, `prte_parse_appfile()`; the two drifted — this one
+  skipped `#` comment lines and prun's did not, so a comment in a `prun`
+  appfile became an app context named `#`. Do not grow a second one.
+  `PMIx_Argv_split` returns **NULL**, not an empty array, for a string
+  that yields no tokens, so a blank line in an appfile — entirely
   ordinary — segfaulted the tool on `split[0]`. Such a line is skipped
   whole rather than merely contributing no words: emitting the `:`
-  delimiter for it would hand the parser an empty app context.
+  delimiter for it would hand the parser an empty app context. The file
+  is appended with no leading `:`, so its first line joins the command
+  line's own last app segment (see `src/tools/prun/AGENTS.md`).
 
 - **`prep_singleton()` builds a job by hand.** It fabricates a
   `prte_job_t`/`prte_app_context_t`/`prte_proc_t` and registers the
@@ -360,7 +385,7 @@ command line whose *final* segment fails to parse leaked it —
 `--display map --display cpus` is enough, because a repeated option is
 refused right there. (There used to be an `env` array here too, threaded
 through `create_app()` as the "base environment" an appfile's recursive
-parse would need. There is no recursion — `prte_parse_appfile()` folds an
+parse would need. There is no recursion — `prte_load_appfile()` folds an
 appfile into the command line before any of this runs — and `create_app()`
 had long since stopped writing through the parameter, so it was always
 NULL. It is gone.)
@@ -408,9 +433,22 @@ support".
 search directive the user gave), register event handlers for job
 termination and debugger events, `PMIx_Spawn`, push stdin, wait, then
 report the job's exit status. Signal forwarding is done with
-`PMIx_Job_control(PMIX_JOB_CTRL_SIGNAL)` against the spawned nspace,
-which is what eventually arrives at `prted_comm.c`'s
-`SIGNAL_LOCAL_PROCS`.
+`PMIx_Job_control_nb(PMIX_JOB_CTRL_SIGNAL)` against the spawned nspace,
+from the `prun-signals` progress thread (see above), which is what
+eventually arrives at `prted_comm.c`'s `SIGNAL_LOCAL_PROCS`.
+
+**prun's own name is the static `myproc`, never `prte_process_info.myproc`.**
+`PMIx_tool_init()` fills in `myproc`; nothing sets
+`prte_process_info.myproc` in a tool, so it holds an empty namespace. The
+environment harvest (`PMIx_server_setup_application`) was asked in that
+empty name, PMIx refused it, and `setupcbfunc()` threw the status away — so
+for as long as that lasted, nothing from the submitting shell (`PMIX_MCA_*`,
+`OMPI_MCA_*` under the ompi personality, the MCA param files) reached any
+job, while prun still told the DVM the harvest was done so no daemon did it
+either. `-x` kept working because it does not go through the harvest. A
+failed harvest now fails the launch. The IOF-failure kill in `defhandler()`
+had the same fault; it targets `spawnednspace`. The job prun *launched* is
+`spawnednspace`, prun itself is `myproc`, and there is no third name.
 
 **Its return value IS the tool's exit status**, and `rc` holds
 `PRTE_SUCCESS` for most of the function's length — it is left there by the
@@ -507,7 +545,7 @@ correctly. Do not move the close back out to `prun.c`/`prte.c`.
 
 **Unit — `test/unit/prted/` (`make check`).** Everything in here that can
 be exercised without a DVM: the `--prefix` normalizer, the `--singleton`
-identifier parser, the `--app` appfile reader (including the blank lines
+identifier parser, the `--app` appfile reader (including the blank and comment lines
 that used to crash it), `prte_pmix_xfer_job_info()`'s directive handling
 (including its conflict rejection and its cache-the-unknown default),
 `prte_pmix_xfer_app()`'s translation and — importantly — its ownership

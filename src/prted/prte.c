@@ -105,6 +105,8 @@
 #include "src/runtime/prte_globals.h"
 #include "src/runtime/prte_wait.h"
 #include "src/runtime/runtime.h"
+#include "src/util/prte_dvm_key.h"
+#include "src/util/prte_output_file.h"
 
 #include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
@@ -136,6 +138,7 @@ static int term_pipe[2];
 static pmix_mutex_t prun_abort_inprogress_lock = PMIX_MUTEX_STATIC_INIT;
 static prte_event_t *forward_signals_events = NULL;
 static char *mypidfile = NULL;
+static struct stat mypidstat;
 static bool verbose = false;
 static bool want_prefix_by_default = (bool) PRTE_WANT_PRTE_PREFIX_BY_DEFAULT;
 static void abort_signal_callback(int signal);
@@ -331,63 +334,6 @@ int prte_parse_singleton_id(const char *name, pmix_nspace_t nspace, pmix_rank_t 
     return PRTE_SUCCESS;
 }
 
-/* Read an appfile and append its contents to a command line.  Each line of
- * the file is one app context, so the lines are joined with the ":"
- * delimiter the parser expects.
- *
- * A blank line - or one holding nothing but spaces - splits to no tokens at
- * all, and PMIx_Argv_split reports that by returning NULL rather than an
- * empty array, so the result must be checked before it is indexed: a single
- * empty line in an appfile used to segfault the tool right here.  Such a
- * line is skipped entirely rather than merely contributing no words,
- * because emitting the delimiter for it would hand the parser an empty app
- * context.
- */
-int prte_parse_appfile(const char *path, char ***pargv, int *pargc)
-{
-    FILE *fp;
-    char *line, *p, **split;
-    size_t n;
-    bool first = true;
-
-    if (NULL == path || NULL == pargv || NULL == pargc) {
-        return PRTE_ERR_BAD_PARAM;
-    }
-    fp = fopen(path, "r");
-    if (NULL == fp) {
-        return PRTE_ERR_FILE_OPEN_FAILURE;
-    }
-    while (NULL != (line = pmix_getline(fp))) {
-        /* skip blank lines and comments (a line whose first non-whitespace
-         * character is '#'), per the documented appfile format - neither
-         * should contribute any tokens to the resulting argv */
-        for (p = line; ' ' == *p || '\t' == *p; p++) {
-        }
-        if ('\0' == *p || '#' == *p) {
-            free(line);
-            continue;
-        }
-        split = PMIx_Argv_split(line, ' ');
-        free(line);
-        if (NULL == split) {
-            continue;
-        }
-        if (!first) {
-            // add a colon delimiter
-            PMIx_Argv_append_nosize(pargv, ":");
-            ++(*pargc);
-        }
-        for (n = 0; NULL != split[n]; n++) {
-            PMIx_Argv_append_nosize(pargv, split[n]);
-            ++(*pargc);
-        }
-        PMIx_Argv_free(split);
-        first = false;
-    }
-    fclose(fp);
-    return PRTE_SUCCESS;
-}
-
 PRTE_EXPORT int prte(int argc, char *argv[])
 {
     int rc = 1, i;
@@ -402,7 +348,7 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     size_t napps;
     mylock_t mylock;
     char **pargv, **split;
-    int pargc;
+    int pargc, tag;
     prte_job_t *jdata;
     prte_app_context_t *dapp;
     bool proxyrun = false;
@@ -454,7 +400,14 @@ PRTE_EXPORT int prte(int argc, char *argv[])
 
     /* because we have to use the schizo framework and init our hostname
      * prior to parsing the incoming argv for cmd line options, do a hacky
-     * search to support passing of impacted options (e.g., verbosity for schizo) */
+     * search to support passing of impacted options (e.g., verbosity for schizo).
+     * The --tune files go first, so a param given explicitly on the
+     * cmd line overrides the one in a file */
+    rc = prte_schizo_base_parse_tune(pargc, 0, pargv);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+
     rc = prte_schizo_base_parse_prte(pargc, 0, pargv, NULL);
     if (PRTE_SUCCESS != rc) {
         return rc;
@@ -565,6 +518,14 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         return 1;
     }
 
+    /* Create the DVM key.  Each daemon we launch is handed it, privately,
+     * and must prove it holds it before any other daemon will talk to it -
+     * see src/util/prte_dvm_key.h.  It is created before we might detach,
+     * so the DVM has one key however it is started. */
+    if (PRTE_SUCCESS != prte_dvm_key_generate()) {
+        return 1;
+    }
+
     /* parse the input argv to get values, including everyone's MCA params */
     PMIX_CONSTRUCT(&results, pmix_cli_result_t);
     // check for special case of executable immediately following tool
@@ -623,69 +584,28 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     // check for an appfile
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_APPFILE);
     if (NULL != opt) {
+        // the file supplies every app - refuse one named here as well
+        if (PRTE_SUCCESS != prte_check_appfile_tail(results.tail)) {
+            param = PMIx_Argv_join(results.tail, ' ');
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "appfile-with-app", true,
+                           opt->values[0], (NULL == param) ? "" : param);
+            free(param);
+            return 1;
+        }
         // parse the file and add its context to the argv array
-        rc = prte_parse_appfile(opt->values[0], &pargv, &pargc);
+        rc = prte_load_appfile(opt->values[0], &pargv);
         if (PRTE_SUCCESS != rc) {
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "appfile-failure", true, opt->values[0]);
             return 1;
         }
+        pargc = PMIx_Argv_count(pargv);
     }
 
     /* decide if we are to use a persistent DVM, or act alone */
     opt = pmix_cmd_line_get_param(&results, PRTE_CLI_DVM);
     if (proxyrun && (NULL != opt || NULL != getenv("PRTEPROXY_USE_DVM"))) {
-        /* use a persistent DVM - act like prun */
-        if (NULL != opt && NULL != opt->values && NULL != opt->values[0]) {
-            /* they provided a directive on how to find the DVM */
-            if (0 == strncasecmp(opt->values[0], "file:", 5)) {
-                /* change the key to match what prun expects */
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_DVM_URI);
-            } else if (0 == strncasecmp(opt->values[0], "uri:", 4)) {
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_DVM_URI);
-                /* must remove the "uri:" prefix */
-                cptr = strdup(&opt->values[0][4]);
-                free(opt->values[0]);
-                opt->values[0] = cptr;
-            } else if (0 == strncasecmp(opt->values[0], "pid:", 4)) {
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_PID);
-                /* must remove the "pid:" prefix */
-                cptr = strdup(&opt->values[0][4]);
-                free(opt->values[0]);
-                opt->values[0] = cptr;
-            } else if (0 == strncasecmp(opt->values[0], "ns:", 3)) {
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_NAMESPACE);
-                /* must remove the "ns:" prefix */
-                cptr = strdup(&opt->values[0][3]);
-                free(opt->values[0]);
-                opt->values[0] = cptr;
-            } else if (0 == strcasecmp(opt->values[0], "system-first")) {
-                /* direct to search for a system server first, and then
-                 * take the first available DVM */
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_SYS_SERVER_FIRST);
-            } else if (0 == strcasecmp(opt->values[0], "system")) {
-                /* direct to search for a system server */
-                free(opt->key);
-                opt->key = strdup(PRTE_CLI_SYS_SERVER_ONLY);
-            } else if (0 != strcasecmp(opt->values[0], "search")) {
-                /* "search" would mean to look for first available DVM,
-                 * so we wouldn't have to adjust anything as the opt
-                 * key is already set to PRTE_CLI_DVM, which will be
-                 * ignored so that the PMIx_tool_init in prun_common
-                 * will conduct its standard server search.
-                 * However, if this is not "search", then this is an
-                 * unknown option and must be reported to the user as
-                 * an error */
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-dvm-option", true,
-                               opt->values[0], prte_tool_basename);
-                return 1;
-            }
-        }
-
+        /* use a persistent DVM - act like prun.  prun_common() works out
+         * which one from the --dvm directive, as it does for prun */
         // open the ess framework so it can init the signal forwarding
         // list - we don't actually need the components.  prun_common()
         // closes it, because it has to be closed before PMIx_tool_finalize
@@ -697,7 +617,13 @@ PRTE_EXPORT int prte(int argc, char *argv[])
             (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             exit(rc);
         }
-        rc = prun_common(&results, schizo, argc, argv);
+        /* pargv, not argv: it is the copy the MCA pre-scan, the spelling
+         * normalizer and the --app expansion all worked on, and that
+         * "results" was parsed from.  Handing over the raw argv made the
+         * app parse see "--map-by" where every option table spells it
+         * "--mapby", so "mpirun --dvm ... --map-by X" was refused as an
+         * unrecognized option, and an --app file's contents were lost. */
+        rc = prun_common(&results, schizo, pargc, pargv);
 
         exit(rc);
     }
@@ -841,7 +767,7 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         if (PRTE_SUCCESS != rc || 0 == pmix_list_get_size(&apps)) {
             if (proxyrun) {
                 prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "prun:executable-not-specified", true,
-                               prte_tool_basename, prte_tool_basename);
+                               prte_tool_basename);
                 PRTE_UPDATE_EXIT_STATUS(rc);
                 goto DONE;
             }
@@ -869,8 +795,12 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     if (NULL != opt) {
         for (i = 0; NULL != opt->values[i]; i++) {
             split = PMIx_Argv_split(opt->values[i], ',');
-            for (n = 0; NULL != split[n]; n++) {
-                if (PMIX_CHECK_CLI_OPTION(split[n], PRTE_CLI_XML)) {
+            for (n = 0; NULL != split && NULL != split[n]; n++) {
+                /* an abbreviation that fits more than "xml", or a malformed
+                 * value, is reported where the directive is parsed - all
+                 * this needs is to not act on it */
+                if (PMIX_CLI_MATCH_FOUND == pmix_cli_match(split[n], prte_cli_output_directives, &tag) &&
+                    PRTE_OUTPUT_XML == tag) {
                     if (PRTE_SUCCESS != prte_cli_bool_value(PMIX_CLI_QUALIFIER_VALUE(split[n]),
                                                             &prte_xml_output)) {
                         /* the value is reported where the directive is
@@ -1061,7 +991,7 @@ PRTE_EXPORT int prte(int argc, char *argv[])
             if (0 != strcmp(cptr, param)) {
                 prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-base.txt", "multiple-prrte-prefixes", true,
                                prte_tool_basename, prte_tool_basename,
-                               prte_tool_basename, param, cptr);
+                               prte_tool_basename, prte_tool_basename, param, cptr);
                 free(param);
                 free(cptr);
                 PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
@@ -1134,6 +1064,14 @@ PRTE_EXPORT int prte(int argc, char *argv[])
         rc = prte_state_base_set_runtime_options(jdata, prte_schizo_base.default_runtime_options);
     }
     if (PRTE_SUCCESS != rc) {
+        PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+        goto DONE;
+    }
+    /* the users= and groups= among them say who else may change the DVM -
+     * create a session in it, say */
+    rc = prte_pmix_server_access_record_dvm(jdata);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
         PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
         goto DONE;
     }
@@ -1349,9 +1287,10 @@ PRTE_EXPORT int prte(int argc, char *argv[])
                 }
             } else {
                 /* must be a file */
-                fp = fopen(opt->values[0], "w");
+                fp = prte_output_file_open(opt->values[0], 0666, &mypidstat);
                 if (NULL == fp) {
-                    pmix_output(0, "Impossible to open the file %s in write mode\n", opt->values[0]);
+                    pmix_output(0, "Impossible to open the file %s in write mode: %s\n",
+                                opt->values[0], strerror(errno));
                     PRTE_UPDATE_EXIT_STATUS(1);
                     goto DONE;
                 }
@@ -1471,6 +1410,17 @@ PRTE_EXPORT int prte(int argc, char *argv[])
     while (prte_event_base_active && lock.active) {
         prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
     }
+    if (lock.active) {
+        /* We are shutting down before the spawn answered, so there is no
+         * job to report or to push stdin to - and lock.status and lock.msg
+         * are still their constructed defaults, which read as a successful
+         * spawn of a job with no name. The callback still holds this lock,
+         * so leave it alone: destructing it, or constructing it again for
+         * the stdin push below, would hand that late wakeup a lock that no
+         * longer means the spawn. This frame never returns (DONE exits), so
+         * the storage stays valid for it. */
+        goto DONE;
+    }
     PMIX_ACQUIRE_OBJECT(&lock.lock);
     if (PMIX_SUCCESS != lock.status) {
         /* The request was accepted but the spawn itself failed - e.g., the
@@ -1486,7 +1436,14 @@ PRTE_EXPORT int prte(int argc, char *argv[])
                         PMIx_Error_string(lock.status));
         }
         rc = lock.status;
-        PRTE_UPDATE_EXIT_STATUS(rc);
+        /* PMIx_Spawn has just told this tool that its job never launched,
+         * and that is the tool's exit status. Force it: on a launch that
+         * failed on every node the DVM state machine has nothing left to
+         * account for and can record the job's per-proc reason first, which
+         * would otherwise stand instead - the same failure exiting 183
+         * rather than 75 depending on which got there first. See
+         * PRTE_FORCE_EXIT_STATUS. */
+        PRTE_FORCE_EXIT_STATUS(rc);
         goto DONE;
     }
     PMIX_LOAD_NSPACE(spawnednspace, lock.msg);
@@ -1565,7 +1522,8 @@ DONE:
     prte_finalize();
 
     if (NULL != mypidfile) {
-        unlink(mypidfile);
+        /* only if it is still the file we wrote */
+        prte_output_file_remove(mypidfile, &mypidstat);
     }
 
     if (prte_debug_daemons_flag) {

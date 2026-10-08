@@ -90,7 +90,7 @@ prte_mca_plm_ssh_component_t prte_mca_plm_ssh_component = {
         PMIX_MCA_BASE_MAKE_VERSION(component,
                                    PRTE_MAJOR_VERSION,
                                    PRTE_MINOR_VERSION,
-                                   PMIX_RELEASE_VERSION),
+                                   PRTE_RELEASE_VERSION),
 
         /* Component open and close functions */
         .pmix_mca_open_component = ssh_component_open,
@@ -326,22 +326,33 @@ static int ssh_component_close(void)
 
 /*
  * Take a colon-delimited list of agents and locate the first one that
- * we are able to find in the PATH.  Split that one into argv and
- * return it.  If nothing found, then return NULL.
+ * we are able to find, as a shell would: a bare name is looked up on
+ * the PATH (and then in path, if the caller gave one), an absolute path
+ * is taken as given, and a relative path (such as "./myssh") is
+ * resolved against path or, if none was given, the working directory.
+ * Split that one into argv and return it.  If nothing found, then
+ * return NULL.
  */
 char **prte_plm_ssh_search(const char *agent_list, const char *path)
 {
     int i, j;
     char *line, **lines;
     char **tokens, *tmp;
-    char cwd[PRTE_PATH_MAX];
+    char cwd[PRTE_PATH_MAX], *wrkdir = cwd;
 
     if (NULL == agent_list && NULL == prte_mca_plm_ssh_component.agent) {
         return NULL;
     }
 
     if (NULL == path) {
-        pmix_getcwd(cwd, PRTE_PATH_MAX);
+        /* the cwd is only where a relative agent path is resolved, so a
+         * cwd we cannot learn (it was removed from under us, or the path is
+         * too long) means there is nowhere to resolve one - not that the
+         * search cannot proceed. Ignoring the failure handed the path
+         * search whatever was on the stack. */
+        if (PMIX_SUCCESS != pmix_getcwd(cwd, PRTE_PATH_MAX)) {
+            wrkdir = NULL;
+        }
     } else {
         pmix_string_copy(cwd, path, PRTE_PATH_MAX);
     }
@@ -367,8 +378,20 @@ char **prte_plm_ssh_search(const char *agent_list, const char *path)
         /* Split it */
         tokens = PMIx_Argv_split(line, ' ');
 
-        /* Look for the first token in the PATH */
-        tmp = pmix_path_findv(tokens[0], X_OK, environ, cwd);
+        /* Locate the first token as a shell would: a bare name such
+         * as "ssh" on the PATH - plus a directory the caller named, such
+         * as Grid Engine's bin directory for qrsh, but never the working
+         * directory - an absolute path as given, and a relative path
+         * against path or the working directory alone */
+        if (NULL == strchr(tokens[0], '/')) {
+            tmp = pmix_path_findv(tokens[0], X_OK, environ, (NULL == path) ? NULL : wrkdir);
+        } else if (pmix_path_is_absolute(tokens[0])) {
+            tmp = pmix_path_access(tokens[0], NULL, X_OK);
+        } else if (NULL != wrkdir) {
+            tmp = pmix_path_access(tokens[0], wrkdir, X_OK);
+        } else {
+            tmp = NULL;
+        }
         if (NULL != tmp) {
             free(tokens[0]);
             tokens[0] = tmp;
@@ -418,10 +441,12 @@ static int ssh_launch_agent_lookup(const char *agent_list, char *path)
     prte_mca_plm_ssh_component.agent_argv[0] = bname;
     /* see if we need to add an xterm argument */
     if (0 == strcmp(bname, "ssh")) {
-        /* if xterm option was given, add '-X', ensuring we don't do it twice */
-        if (NULL != prte_xterm) {
-            PMIx_Argv_append_unique_nosize(&prte_mca_plm_ssh_component.agent_argv, "-X");
-        } else if (0 >= pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
+        /* "--xterm" is a directive of a job, not of the DVM, so it cannot
+         * be what decides X11 forwarding for daemons that may be launched
+         * long before any job asks for it.  A DVM that is to host xterms
+         * on remote nodes is started with "ssh -X" as its agent (the
+         * plm_ssh_agent param), which the check below leaves alone. */
+        if (0 >= pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
             /* if debug was not specified, and the user didn't explicitly
              * specify X11 forwarding/non-forwarding, add "-x" if it
              * isn't already there (check either case)

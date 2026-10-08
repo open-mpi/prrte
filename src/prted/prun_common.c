@@ -71,6 +71,7 @@
 #include "src/util/pmix_basename.h"
 #include "src/util/prte_cmd_line.h"
 #include "src/util/pmix_fd.h"
+#include "src/util/pmix_os_dirpath.h"
 #include "src/util/pmix_os_path.h"
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_path.h"
@@ -79,6 +80,7 @@
 #include "src/util/pmix_getcwd.h"
 #include "src/util/pmix_show_help.h"
 #include "src/util/prte_show_help.h"
+#include "src/util/session_dir.h"
 
 #include "src/class/pmix_pointer_array.h"
 #include "src/runtime/prte_progress_threads.h"
@@ -146,7 +148,25 @@ static size_t evid = INT_MAX;
 static pmix_proc_t myproc;
 static bool verbose = false;
 
+/* A forwarded signal is caught by a plain handler, which can do nothing
+ * but write its number down this pipe; forward_signal() then reads it on
+ * a progress thread of its own and asks the DVM to deliver it. The main
+ * thread spends the run parked in PRTE_PMIX_WAIT_THREAD, so nothing else
+ * would ever look at the pipe. */
+static int sigfwd_pipe[2] = {-1, -1};
+static prte_event_base_t *sigfwd_base = NULL;
+static prte_event_t sigfwd_ev;
+#define PRUN_SIGFWD_THREAD "prun-signals"
+
+/* a forwarded signal's request, which PMIx borrows until it calls back */
+typedef struct {
+    pmix_proc_t proc;
+    pmix_info_t info;
+} prun_sigfwd_t;
+
 static void signal_forward_callback(int signal);
+static void forward_signal(int fd, short args, void *cbdata);
+static void forward_one(int signum);
 
 static void regcbfunc(pmix_status_t status, size_t ref, void *cbdata)
 {
@@ -203,10 +223,18 @@ static void defhandler(size_t evhdlr_registration_id, pmix_status_t status,
         pmix_proc_t target;
         pmix_info_t directive;
 
-        /* tell PRTE to terminate our job */
-        PMIX_LOAD_PROCID(&target, prte_process_info.myproc.nspace, PMIX_RANK_WILDCARD);
-        PMIX_INFO_LOAD(&directive, PMIX_JOB_CTRL_KILL, NULL, PMIX_BOOL);
-        rc = PMIx_Job_control_nb(&target, 1, &directive, 1, NULL, NULL);
+        /* tell PRTE to terminate the job we launched.  That is
+         * spawnednspace - prte_process_info.myproc is never set in a tool,
+         * and a kill aimed at its empty namespace named no job at all, or
+         * every job, depending on who compared it.  Before the spawn has
+         * returned there is no job of ours to kill. */
+        if ('\0' == spawnednspace[0]) {
+            rc = PMIX_ERR_NOT_FOUND;
+        } else {
+            PMIX_LOAD_PROCID(&target, spawnednspace, PMIX_RANK_WILDCARD);
+            PMIX_INFO_LOAD(&directive, PMIX_JOB_CTRL_KILL, NULL, PMIX_BOOL);
+            rc = PMIx_Job_control_nb(&target, 1, &directive, 1, NULL, NULL);
+        }
         if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
             /* we cannot terminate the job. This handler executes on
              * the PMIx progress thread, so we must not finalize the
@@ -454,8 +482,10 @@ static void setupcbfunc(pmix_status_t status, pmix_info_t info[], size_t ninfo,
 {
     mylock_t *mylock = (mylock_t *) provided_cbdata;
     size_t n;
-    PRTE_HIDE_UNUSED_PARAMS(status);
 
+    /* a failed harvest comes back with no info at all, which looks
+     * exactly like an environment with nothing in it to forward */
+    mylock->lock.status = status;
     if (NULL != info) {
         mylock->ninfo = ninfo;
         PMIX_INFO_CREATE(mylock->info, mylock->ninfo);
@@ -511,12 +541,66 @@ static int stdin_target_rank(pmix_cli_result_t *results, pmix_rank_t *rank)
     return PRTE_SUCCESS;
 }
 
+/* "--dvm <how>" names the DVM to connect to in mpirun's vocabulary, and it
+ * is the only way to name one under the ompi personality, whose option table
+ * has none of prun's own (--dvm-uri, --pid, --namespace, ...).  Turn it into
+ * the key that says the same thing.  This used to happen only in prte.c,
+ * before "prterun --dvm" handed off to us - so "prun --personality ompi
+ * --dvm file:X" parsed the option and then ignored it, and searched for a
+ * server instead.  With more than one DVM running that search fails.
+ *
+ * The prefixed forms are prefixes; the keywords are matched whole, as
+ * "system" is a prefix of "system-first".  "search" leaves the key alone:
+ * nothing reads PRTE_CLI_DVM, so the tool conducts its standard search. */
+static bool translate_dvm_option(pmix_cli_result_t *results)
+{
+    pmix_cli_item_t *opt;
+    const char *newkey = NULL;
+    size_t skip = 0;
+    char *cptr;
+
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_DVM);
+    if (NULL == opt || NULL == opt->values || NULL == opt->values[0]) {
+        return true;
+    }
+    if (0 == strncasecmp(opt->values[0], "file:", 5)) {
+        newkey = PRTE_CLI_DVM_URI;      // the uri option takes "file:" itself
+    } else if (0 == strncasecmp(opt->values[0], "uri:", 4)) {
+        newkey = PRTE_CLI_DVM_URI;
+        skip = 4;
+    } else if (0 == strncasecmp(opt->values[0], "pid:", 4)) {
+        newkey = PRTE_CLI_PID;
+        skip = 4;
+    } else if (0 == strncasecmp(opt->values[0], "ns:", 3)) {
+        newkey = PRTE_CLI_NAMESPACE;
+        skip = 3;
+    } else if (0 == strcasecmp(opt->values[0], "system-first")) {
+        newkey = PRTE_CLI_SYS_SERVER_FIRST;
+    } else if (0 == strcasecmp(opt->values[0], "system")) {
+        newkey = PRTE_CLI_SYS_SERVER_ONLY;
+    } else if (0 != strcasecmp(opt->values[0], "search")) {
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-dvm-option", true,
+                       opt->values[0], prte_tool_basename);
+        return false;
+    }
+    if (NULL != newkey) {
+        free(opt->key);
+        opt->key = strdup(newkey);
+    }
+    if (0 < skip) {
+        cptr = strdup(&opt->values[0][skip]);
+        free(opt->values[0]);
+        opt->values[0] = cptr;
+    }
+    return true;
+}
+
 int prun_common(pmix_cli_result_t *results,
                 prte_schizo_base_module_t *schizo,
                 int pargc, char **pargv)
 {
     int rc = 1;
-    char *param, *ptr;
+    char *param;
     prte_pmix_lock_t lock, rellock;
     pmix_list_t apps, jobdata;
     prte_info_item_t *iprteinfo;
@@ -528,6 +612,8 @@ int prun_common(pmix_cli_result_t *results,
     bool flag;
     size_t n, ninfo;
     pmix_app_t *papps = NULL;
+    char *sessdir = NULL;
+    bool sessdir_created = false;
     size_t napps = 0;
     mylock_t mylock;
     uint32_t ui32;
@@ -538,7 +624,6 @@ int prun_common(pmix_cli_result_t *results,
     char hostname[PRTE_PATH_MAX];
     pmix_rank_t rank;
     pmix_status_t code;
-    pmix_proc_t parent;
     pmix_cli_item_t *opt;
     unsigned long ulval;
     PRTE_HIDE_UNUSED_PARAMS(pargc);
@@ -549,6 +634,12 @@ int prun_common(pmix_cli_result_t *results,
      * option did nothing at all.  prte.c had the same defect and reads its
      * own copy now; this is the one prun and "prterun --dvm" run. */
     verbose = pmix_cmd_line_is_taken(results, PRTE_CLI_VERBOSE);
+    if (!translate_dvm_option(results)) {
+        /* nothing is set up yet but the ess framework our caller opened,
+         * which is ours to close - see the end of this function */
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+        return 1;
+    }
     PMIX_CONSTRUCT(&apps, pmix_list_t);
     /* this only names the tool to PMIx, so a host that will not tell us
      * its name is not fatal - but the buffer has to be readable either
@@ -577,7 +668,27 @@ int prun_common(pmix_cli_result_t *results,
         param = NULL;
     }
     if (PMIX_SUCCESS != (rc = prte_ess_base_setup_signals(param))) {
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
         return rc;
+    }
+    if (0 < pmix_list_get_size(&prte_ess_base_signals)) {
+        /* both ends non-blocking: the handler must never wait on a full
+         * pipe, and the reader drains it until it is empty */
+        if (0 != pipe(sigfwd_pipe) ||
+            PMIX_SUCCESS != pmix_fd_set_cloexec(sigfwd_pipe[0]) ||
+            PMIX_SUCCESS != pmix_fd_set_cloexec(sigfwd_pipe[1]) ||
+            0 != fcntl(sigfwd_pipe[0], F_SETFL, fcntl(sigfwd_pipe[0], F_GETFL) | O_NONBLOCK) ||
+            0 != fcntl(sigfwd_pipe[1], F_SETFL, fcntl(sigfwd_pipe[1], F_GETFL) | O_NONBLOCK) ||
+            NULL == (sigfwd_base = prte_progress_thread_init(PRUN_SIGFWD_THREAD))) {
+            fprintf(stderr, "%s: unable to set up signal forwarding: %s\n",
+                    prte_tool_basename, strerror(errno));
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+            /* our return is the tool's exit status */
+            return 1;
+        }
+        prte_event_set(sigfwd_base, &sigfwd_ev, sigfwd_pipe[0], PRTE_EV_READ | PRTE_EV_PERSIST,
+                       forward_signal, NULL);
+        prte_event_add(&sigfwd_ev, NULL);
     }
     PMIX_LIST_FOREACH(sig, &prte_ess_base_signals, prte_ess_base_signal_t)
     {
@@ -593,6 +704,7 @@ int prun_common(pmix_cli_result_t *results,
         PRTE_ERROR_LOG(ret);
         /* NOT rc: it holds the SUCCESS the signal setup just returned, so
          * returning it told our caller the tool had done its job */
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
         return ret;
     }
 
@@ -634,6 +746,7 @@ int prun_common(pmix_cli_result_t *results,
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true, prte_tool_basename,
                            "--" PRTE_CLI_WAIT_TO_CONNECT, opt->values[0], "a number of seconds");
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         }
         ui32 = (uint32_t) ulval;
@@ -646,6 +759,7 @@ int prun_common(pmix_cli_result_t *results,
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true, prte_tool_basename,
                            "--" PRTE_CLI_NUM_CONNECT_RETRIES, opt->values[0], "a number of retries");
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         }
         ui32 = (uint32_t) ulval;
@@ -663,18 +777,21 @@ int prun_common(pmix_cli_result_t *results,
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "file-open-error", true, prte_tool_basename,
                            "--" PRTE_CLI_PID, opt->values[0], param);
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         case PRTE_ERR_FILE_READ_FAILURE:
             /* we could not obtain the single conversion we require */
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-file", true, prte_tool_basename,
                            "--" PRTE_CLI_PID, opt->values[0], param);
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         default: /* neither an integer nor a usable 'file:' spec */
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true,
                            prte_tool_basename, "--" PRTE_CLI_PID,
                            opt->values[0], "file:path");
             PMIX_INFO_LIST_RELEASE(tinfo);
+            (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
             return PRTE_ERR_BAD_PARAM;
         }
     }
@@ -686,10 +803,20 @@ int prun_common(pmix_cli_result_t *results,
     /* set our session directory to something hopefully unique so
      * our rendezvous files don't conflict with other prun/prte
      * instances */
-    pmix_asprintf(&ptr, "%s/%s.session.%s.%lu.%lu", pmix_tmp_directory(), prte_tool_basename,
+    pmix_asprintf(&sessdir, "%s/%s.session.%s.%lu.%lu", pmix_tmp_directory(), prte_tool_basename,
                   prte_process_info.nodename, (unsigned long) geteuid(), (unsigned long) getpid());
-    PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_SERVER_TMPDIR, ptr, PMIX_STRING);
-    free(ptr);
+    /* PMIx trusts the directory it is given, so this name - which anyone
+     * could predict - has to be seen to be ours before it is handed over;
+     * if it is taken, we are given another beside it.  We then own its
+     * removal: PMIx only removes a directory it made */
+    if (NULL == sessdir ||
+        PRTE_SUCCESS != prte_session_dir_create(&sessdir, &sessdir_created)) {
+        free(sessdir);
+        PMIX_INFO_LIST_RELEASE(tinfo);
+        (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+        return 1;
+    }
+    PMIX_INFO_LIST_ADD(ret, tinfo, PMIX_SERVER_TMPDIR, sessdir, PMIX_STRING);
 
     /* we are also a launcher, so pass that down so PMIx knows
      * to setup rendezvous points */
@@ -724,6 +851,10 @@ int prun_common(pmix_cli_result_t *results,
          * whoever reached this function.  There is nothing to finalize:
          * PMIx never came up. */
         (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+        if (sessdir_created) {
+            (void) pmix_os_dirpath_destroy(sessdir, true, NULL);
+        }
+        free(sessdir);
         /* 1, not a PRTE code: our return IS the tool's exit status, and
          * this is the commonest failure a script driving us will see */
         return 1;
@@ -775,7 +906,6 @@ int prun_common(pmix_cli_result_t *results,
 
     /***** CONSTRUCT THE APP'S JOB-INFO ****/
     PMIX_INFO_LIST_START(jinfo);
-    PMIX_LOAD_PROCID(&parent, prte_process_info.myproc.nspace, prte_process_info.myproc.rank);
 
     /***** CHECK FOR LAUNCH DIRECTIVES - ADD THEM TO JOB INFO IF FOUND ****/
     PMIX_LOAD_PROCID(&pname, myproc.nspace, PMIX_RANK_WILDCARD);
@@ -816,8 +946,13 @@ int prun_common(pmix_cli_result_t *results,
     PMIX_INFO_LOAD(&iptr[2], PMIX_GRPID, &ui32, PMIX_UINT32);
     PMIX_INFO_LOAD(&iptr[3], PMIX_PERSONALITY, schizo->name, PMIX_STRING);
 
+    /* Our own namespace, as PMIx_tool_init gave it to us.  Not
+     * prte_process_info.myproc: nothing sets that in a tool, and PMIx
+     * refuses an empty namespace - so every harvest used to fail, and
+     * nothing from the user's environment (PMIX_MCA_*, OMPI_MCA_*, the
+     * MCA param files) ever reached the job. */
     PRTE_PMIX_CONSTRUCT_LOCK(&mylock.lock);
-    ret = PMIx_server_setup_application(prte_process_info.myproc.nspace, iptr, ninfo, setupcbfunc,
+    ret = PMIx_server_setup_application(myproc.nspace, iptr, ninfo, setupcbfunc,
                                         &mylock);
     if (PMIX_SUCCESS != ret) {
         PMIX_ERROR_LOG(ret);
@@ -829,7 +964,20 @@ int prun_common(pmix_cli_result_t *results,
     }
     PRTE_PMIX_WAIT_THREAD(&mylock.lock);
     PMIX_INFO_FREE(iptr, ninfo);
+    ret = mylock.lock.status;
     PRTE_PMIX_DESTRUCT_LOCK(&mylock.lock);
+    if (PMIX_SUCCESS != ret) {
+        /* launching anyway would run the job without the settings the
+         * user exported for it, and say nothing */
+        fprintf(stderr, "%s: could not collect the environment to forward to the job: %s\n",
+                prte_tool_basename, PMIx_Error_string(ret));
+        if (NULL != mylock.info) {
+            PMIX_INFO_FREE(mylock.info, mylock.ninfo);
+        }
+        PRTE_UPDATE_EXIT_STATUS(ret);
+        rc = ret;
+        goto DONE;
+    }
     /* transfer any returned ENVARS to the job_info */
     if (NULL != mylock.info) {
         for (n = 0; n < mylock.ninfo; n++) {
@@ -1109,6 +1257,14 @@ DONE:
      * process.  It is why the callers no longer close this themselves.
      */
     (void) pmix_mca_base_framework_close(&prte_ess_base_framework);
+    /* stop forwarding signals before PMIx goes. The pipe stays open: a
+     * signal may still arrive, and its handler must not write to a
+     * descriptor number something else has since been given */
+    if (NULL != sigfwd_base) {
+        prte_event_del(&sigfwd_ev);
+        prte_progress_thread_finalize(PRUN_SIGFWD_THREAD);
+        sigfwd_base = NULL;
+    }
     /* cleanup and leave */
     ret = PMIx_tool_finalize();
     if (PMIX_SUCCESS != ret) {
@@ -1117,6 +1273,12 @@ DONE:
         // a warning here, if prte logging is on.
         pmix_output(0, "PMIx_tool_finalize() failed. Status = %d", ret);
     }
+    /* PMIx has removed its rendezvous files; the directory is ours */
+    if (sessdir_created) {
+        (void) pmix_os_dirpath_destroy(sessdir, true, NULL);
+    }
+    free(sessdir);
+    sessdir = NULL;
 
     /* Only NOW is the release lock finished with.  It is on our stack, and
      * the default event handler holds a pointer to it that is never
@@ -1254,6 +1416,34 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     opt = pmix_cmd_line_get_param(results, PRTE_CLI_EXEC_AGENT);
     if (NULL != opt) {
         PMIX_INFO_LIST_ADD(ret, jinfo, PMIX_EXEC_AGENT, opt->values[0], PMIX_STRING);
+    }
+
+    /* check for ranks to be displayed in xterm windows.  Refuse a value
+     * we cannot read here, on the user's terminal: the daemons are the
+     * ones who act on it, and by then all they can do is fail the launch */
+    opt = pmix_cmd_line_get_param(results, PRTE_CLI_XTERM);
+    if (NULL != opt) {
+        prte_rank_range_t *xranges = NULL;
+        size_t nxranges;
+        bool xall, xhold;
+        long badrank = 0;
+
+        ret = prte_parse_xterm_option(opt->values[0], &xranges, &nxranges,
+                                      &xall, &xhold, &badrank);
+        free(xranges);
+        if (PRTE_ERR_VALUE_OUT_OF_BOUNDS == ret) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-odls-base.txt",
+                           "prte-odls-base:xterm-neg-rank", true, (int) badrank);
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        } else if (PRTE_SUCCESS != ret) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prun.txt", "bad-option-input", true,
+                           prte_tool_basename, "--" PRTE_CLI_XTERM, opt->values[0],
+                           "\"all\" or a comma-delimited list of ranks and rank ranges");
+            PRTE_UPDATE_EXIT_STATUS(PRTE_ERR_FATAL);
+            return PRTE_ERR_BAD_PARAM;
+        }
+        PMIX_INFO_LIST_ADD(ret, jinfo, PRTE_XTERM_RANKS, opt->values[0], PMIX_STRING);
     }
 
     /* mark if recovery was enabled on the cmd line */
@@ -1429,11 +1619,53 @@ int prte_prun_parse_common_cli(void *jinfo, pmix_cli_result_t *results,
     return PRTE_SUCCESS;
 }
 
+/* The handler itself: write the number down the pipe and nothing else,
+ * since a handler may call only async-signal-safe functions - and it can
+ * interrupt the main thread in the middle of anything, PMIx included. */
 static void signal_forward_callback(int signum)
 {
+    int saved = errno;
+    ssize_t n;
+
+    /* a full pipe already holds signals enough to forward, and a handler
+     * has nothing else it may safely do about a failure */
+    n = write(sigfwd_pipe[1], &signum, sizeof(signum));
+    (void) n;
+    errno = saved;
+}
+
+static void sigfwd_cbfunc(pmix_status_t status, pmix_info_t *info, size_t ninfo, void *cbdata,
+                          pmix_release_cbfunc_t release_fn, void *release_cbdata)
+{
+    prun_sigfwd_t *sf = (prun_sigfwd_t *) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(info, ninfo);
+
+    if (PMIX_SUCCESS != status && PMIX_OPERATION_SUCCEEDED != status) {
+        fprintf(stderr, "Signal could not be sent to job %s (returned %s)\n",
+                sf->proc.nspace, PMIx_Error_string(status));
+    }
+    if (NULL != release_fn) {
+        release_fn(release_cbdata);
+    }
+    PMIX_INFO_DESTRUCT(&sf->info);
+    free(sf);
+}
+
+/* forward each signal the handler wrote down - on our own progress thread */
+static void forward_signal(int fd, short args, void *cbdata)
+{
+    int signum;
+    PRTE_HIDE_UNUSED_PARAMS(args, cbdata);
+
+    while ((ssize_t) sizeof(signum) == read(fd, &signum, sizeof(signum))) {
+        forward_one(signum);
+    }
+}
+
+static void forward_one(int signum)
+{
     pmix_status_t rc;
-    pmix_proc_t proc;
-    pmix_info_t info;
+    prun_sigfwd_t *sf;
 
     /* We are installed before the tool has connected to anything, let alone
      * spawned, and every forwardable signal is forwarded by default - so a
@@ -1454,12 +1686,22 @@ static void signal_forward_callback(int signum)
         fprintf(stderr, "%s: Forwarding signal %d to job\n", prte_tool_basename, signum);
     }
 
-    /* send the signal out to the processes */
-    PMIX_LOAD_PROCID(&proc, spawnednspace, PMIX_RANK_WILDCARD);
-    PMIX_INFO_LOAD(&info, PMIX_JOB_CTRL_SIGNAL, &signum, PMIX_INT);
-    rc = PMIx_Job_control(&proc, 1, &info, 1, NULL, NULL);
-    if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
-        fprintf(stderr, "Signal %d could not be sent to job %s (returned %s)", signum,
-                spawnednspace, PMIx_Error_string(rc));
+    /* send the signal out to the processes. PMIx borrows both arrays and
+     * reads them after this returns, so neither may live on our stack */
+    sf = (prun_sigfwd_t *) malloc(sizeof(prun_sigfwd_t));
+    if (NULL == sf) {
+        return;
+    }
+    PMIX_LOAD_PROCID(&sf->proc, spawnednspace, PMIX_RANK_WILDCARD);
+    PMIX_INFO_LOAD(&sf->info, PMIX_JOB_CTRL_SIGNAL, &signum, PMIX_INT);
+    rc = PMIx_Job_control_nb(&sf->proc, 1, &sf->info, 1, sigfwd_cbfunc, sf);
+    if (PMIX_SUCCESS != rc) {
+        /* the callback will not fire, so the request is ours to release */
+        if (PMIX_OPERATION_SUCCEEDED != rc) {
+            fprintf(stderr, "Signal %d could not be sent to job %s (returned %s)\n", signum,
+                    spawnednspace, PMIx_Error_string(rc));
+        }
+        PMIX_INFO_DESTRUCT(&sf->info);
+        free(sf);
     }
 }

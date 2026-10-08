@@ -105,6 +105,28 @@ PRTE_EXPORT void prte_state_base_local_launch_complete(int fd, short argc, void 
 PRTE_EXPORT void prte_state_base_report_progress(int fd, short argc, void *cbdata);
 PRTE_EXPORT void prte_state_base_track_procs(int fd, short argc, void *cbdata);
 PRTE_EXPORT void prte_state_base_check_fds(prte_job_t *jdata);
+
+/* Record one half of a local proc's termination and, if that completes the
+ * pair, declare the proc terminated.
+ *
+ * A local proc is accounted terminated only when two independent things have
+ * both happened: its output has drained and its pipes are closed
+ * (PRTE_PROC_FLAG_IOF_COMPLETE), and the child has been reaped
+ * (PRTE_PROC_FLAG_WAITPID).  Either can be last, so whichever arrives second
+ * has to be the one that activates PRTE_PROC_STATE_TERMINATED - which means
+ * the same test has to sit on both arms, and the two must agree.  They did
+ * not: the copies had drifted apart, and one route through the error manager
+ * had no copy at all, so a proc that took it was never counted and its
+ * daemon's batched report to the master was never sent.  This is that test,
+ * once.
+ *
+ * Callers must NOT set the flag themselves and then call here - pass it in.
+ * Setting it early opens a window in which the other half, already queued,
+ * fires the join before this caller has finished deciding what the proc's
+ * state is.
+ */
+PRTE_EXPORT void prte_state_base_join(prte_proc_t *pdata, pmix_proc_t *proc,
+                                      prte_proc_flags_t half);
 /* A lifetime ended: drop the published data that was not to outlive it.
  *
  * Each is called by the process that holds the store having to act - a
@@ -131,6 +153,14 @@ PRTE_EXPORT void prte_state_base_orphaned_proc(pmix_proc_t *proc, prte_proc_stat
 
 // resource recovery
 PRTE_EXPORT void prte_state_base_recover_resources(prte_job_t *jdata, prte_proc_t *pptr);
+
+/* How the cpus of a proc of the given app were consumed when it was bound,
+ * so they can be given back the same way: the object type one binding took
+ * (a core, or a hwthread for procs whose cpus are hwthreads), or - when
+ * *takeall is true - every cpu of the binding.  The app's own directives
+ * win over the job's, since apps of one job may differ; app may be NULL. */
+PRTE_EXPORT void prte_state_base_cpu_release_policy(prte_job_t *jdata, prte_app_context_t *app,
+                                                    hwloc_obj_type_t *type, bool *takeall);
 
 END_C_DECLS
 

@@ -161,6 +161,11 @@ PRTE_EXPORT extern int prte_exit_status;
  * --host syntax. */
 #define PRTE_ACTIVATE_HOSTS "prte.activate.hosts"
 
+/* Spawn directive carrying the "--xterm" value: the ranks whose output is to
+ * be displayed in their own xterm window.  PMIx has no attribute for this.
+ * The value is a string in prte_parse_xterm_option() syntax. */
+#define PRTE_XTERM_RANKS "prte.xterm.ranks"
+
 /* State Machine lists */
 PRTE_EXPORT extern pmix_list_t prte_job_states;
 PRTE_EXPORT extern pmix_list_t prte_proc_states;
@@ -200,6 +205,34 @@ PRTE_EXPORT extern int prte_clean_output;
                                  newstatus));                                                  \
             prte_exit_status = newstatus;                                                      \
         }                                                                                      \
+    } while (0);
+
+/* Set the exit status even though one has already been recorded.
+ *
+ * PRTE_UPDATE_EXIT_STATUS keeps the FIRST non-zero status, which is right
+ * when several parts of a dying job all have an opinion: the first one is
+ * the cause and the rest are consequences. It is wrong in one place. A
+ * proxy tool (prterun) asks for its job with PMIx_Spawn and is told the
+ * outcome by its return; that answer is the tool's exit status by
+ * definition. But the DVM state machine runs in the same process, and when
+ * the job fails to launch on EVERY node there is nothing left to account
+ * for, so its own termination path can reach PRTE_UPDATE_EXIT_STATUS with
+ * the job's per-proc reason - PMIX_ERR_EXE_NOT_ACCESSIBLE, say - before
+ * PMIx_Spawn has returned PMIX_ERR_JOB_FAILED_TO_LAUNCH to the tool. The
+ * tool's answer is then refused as "already set", and the same failure
+ * exits 183 instead of 75 depending on which won.
+ *
+ * It is a race, so it is intermittent: measured at 3 in 14 on a four-node
+ * swarm. A partial failure never shows it - the ranks that did start keep
+ * the accounting alive past the tool's exit, so the state machine is not
+ * done in time - which is why the two disagreed.
+ */
+#define PRTE_FORCE_EXIT_STATUS(newstatus)                                              \
+    do {                                                                               \
+        PMIX_OUTPUT_VERBOSE((1, prte_debug_output, "%s:%s(%d) forcing exit status %d", \
+                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), __FILE__, __LINE__,   \
+                             newstatus));                                              \
+        prte_exit_status = newstatus;                                                  \
     } while (0);
 
 /* sometimes we need to reset the exit status - for example, when we
@@ -299,6 +332,9 @@ typedef struct{
      * PRTE_INVALID_UID when the requester presented no identity, which
      * matches nothing. */
     uid_t owner_uid;
+    /* that user's group - its members may operate on the session too.
+     * PRTE_INVALID_GID when none is known */
+    gid_t owner_gid;
     /* Disposition recorded at creation, governing teardown when the owning
      * namespace (NONE/DEFAULT) or the last derived child (CHILD/CHILD_DEFAULT)
      * terminates. Stored as the uint8_t underlying pmix_alloc_inheritance_t so
@@ -504,16 +540,22 @@ typedef struct prte_job_t {
     pmix_list_t children;
     /* track the launcher of these jobs */
     pmix_nspace_t launcher;
-    /* The user this job belongs to. Recorded only for a TOOL job, from the
-     * PMIX_USERID/PMIX_GRPID the tool presented when it connected, and left
-     * PRTE_INVALID_UID/GID everywhere else - an application job's identity is
-     * its namespace, and nothing consults these for one. HNP-local; never
-     * packed. This is what lets a reservation be reached by a LATER tool the
+    /* The user this job belongs to. For a TOOL job, the PMIX_USERID/PMIX_GRPID
+     * the tool presented when it connected; a job launched on request inherits
+     * its parent's (plm_base_receive.c), so identity descends the job tree from
+     * the tool that started it. PRTE_INVALID_UID/GID when nobody presented one.
+     * HNP-local; never packed - a launched job's owner reaches the daemons as
+     * PRTE_JOB_OWNER_UID/GID, which they name to PMIx when they register it.
+     * This is also what lets a reservation be reached by a LATER tool the
      * same user ran: a tool namespace is minted per invocation, so namespace
      * identity alone would make an allocation unusable by everything except
      * the one command that asked for it. */
     uid_t uid;
     gid_t gid;
+    /* Our copy of who may access the job - a pmix_access_t (void here, since
+     * an older PMIx has no such type), built from the info we register the
+     * job with. NULL until then. See prted/pmix/pmix_server_access.c */
+    void *access;
     /* Sessions this job may map onto, resolved from PRTE_JOB_SPAWN_TARGET on the
      * HNP after the ownership check. HNP-local; never packed (rebuilt from the
      * attribute if ever needed). Defaults to { jdata->session } when no spawn
@@ -522,9 +564,11 @@ typedef struct prte_job_t {
      * the array. */
     prte_session_t **target_sessions;
     size_t num_target_sessions;
-    /* track the number of stack traces recv'd */
+    /* track the number of stack traces recv'd, and whether we asked for
+     * them - only the master asks, and a reply nobody asked for is dropped */
     uint32_t ntraces;
     char **traces;
+    bool traces_requested;
     // store the result of parsing this app's cmd line
     pmix_cli_result_t cli;
 } prte_job_t;
@@ -769,6 +813,8 @@ PRTE_EXPORT extern bool prte_dvm_ready;
 PRTE_EXPORT extern bool prte_dvm_started;
 PRTE_EXPORT extern pmix_pointer_array_t *prte_cache;
 PRTE_EXPORT extern bool prte_persistent;
+PRTE_EXPORT extern bool prte_oob_authenticate;
+PRTE_EXPORT extern bool prte_dvm_key_stdin;
 
 /* --- DVM launch fence --- */
 
@@ -899,10 +945,6 @@ PRTE_EXPORT extern pmix_pointer_array_t *prte_local_children;
 PRTE_EXPORT extern pmix_rank_t prte_total_procs;
 PRTE_EXPORT extern char *prte_base_compute_node_sig;
 PRTE_EXPORT extern bool prte_homo_nodes;
-
-/* IOF controls */
-/* generate new xterm windows to display output from specified ranks */
-PRTE_EXPORT extern char *prte_xterm;
 
 /* whether or not to report launch progress */
 PRTE_EXPORT extern bool prte_report_launch_progress;

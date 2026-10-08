@@ -28,7 +28,21 @@ Note:
   number of processes PRRTE may start on that node without
   oversubscribing it.
 
-See the "Host specification" HTML documentation for details about the
+Given to a job, "--host" selects from the hosts already available to
+the DVM — those a resource manager allocated, or those the DVM was
+started with. It does not add any: naming a host that is not among them
+is an error. Use "--add-host" or "--add-hostfile" to bring a new host
+into a running DVM, or "--activate" to start a daemon on a host the
+allocation already contains.
+
+The ":N" count applies to placement, and not merely to the size of the
+job: it is the number of processes that may be placed on that host,
+whatever mapping policy is in effect. Asking for more slots on a host
+than it has is an error under a resource manager, which decided how big
+the host is. Without one, the larger count is taken as the size of the
+host for that job only; the allocation itself is unchanged.
+
+See the "Host specification" documentation for details about the
 format and content of hostfiles.
 #
 [add-host]
@@ -181,8 +195,8 @@ Re-run this command with "--help hosts" for further information.
 A relative host was specified, but the index given is beyond the
 number of hosts in the current allocation:
 
-   Index: %d
-   #hosts: %d
+   Index:          %d
+   Specification:  %s
 
 You could obtain a larger allocation or reduce the relative host
 index.
@@ -199,6 +213,19 @@ You may have forgotten to preface a node with "N" or "n", or used the
 "e" or "E" to indicate empty nodes, or you ended the value with a
 colon but forgot to include the number of empty nodes you were
 requesting.
+
+Re-run this command with "--help hosts" for further information.
+#
+[dash-host:invalid-slots]
+
+The number of slots given for a host is not a number:
+
+   Host:   %s
+   Slots:  %s
+
+A slot count is a whole number. It may begin with "+" or "-" to add
+to or remove from the slots the host already has, or be "*" or "auto"
+to use the number of slots the host was found to have.
 
 Re-run this command with "--help hosts" for further information.
 #

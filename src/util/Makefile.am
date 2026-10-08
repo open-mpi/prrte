@@ -54,6 +54,11 @@ headers = \
         name_fns.h \
         nidmap.h \
         prte_bootstrap.h \
+        prte_dvm_key.h \
+        prte_hmac.h \
+        prte_json_scan.h \
+        prte_json_window.h \
+        prte_output_file.h \
         proc_info.h \
         prte_show_help.h \
         session_dir.h \
@@ -72,7 +77,12 @@ sources = \
         name_fns.c \
         nidmap.c \
         prte_bootstrap.c \
+        prte_dvm_key.c \
+        prte_hmac.c \
         prte_cmd_line.c \
+        prte_json_scan.c \
+        prte_json_window.c \
+        prte_output_file.c \
         proc_info.c \
         prte_show_help.c \
         session_dir.c \
@@ -89,18 +99,6 @@ lib@PRTE_BINARY_PREFIX@prrteutil_la_LIBADD = \
 lib@PRTE_BINARY_PREFIX@prrteutil_la_DEPENDENCIES = \
         hostfile/lib@PRTE_BINARY_PREFIX@prrteutilhostfile.la \
         rankfile/lib@PRTE_BINARY_PREFIX@prrteutilrankfile.la
-
-prte_show_help_content.c: prte-convert-help.py
-if PRTE_PICKY_COMPILERS
-	$(PRTE_V_GEN) $(PYTHON) $(abs_srcdir)/prte-convert-help.py \
-		--root $(abs_top_srcdir) \
-		--out prte_show_help_content.c \
-		--purge
-else
-	$(PRTE_V_GEN) $(PYTHON) $(abs_srcdir)/prte-convert-help.py \
-		--root $(abs_top_srcdir) \
-		--out prte_show_help_content.c
-endif
 
 prte_show_help_content.c: prte-convert-help.py
 if PRTE_PICKY_COMPILERS

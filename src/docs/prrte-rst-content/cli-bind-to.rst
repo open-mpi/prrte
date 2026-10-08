@@ -12,13 +12,14 @@
 .. The following line is included so that Sphinx won't complain
    about this file not being directly included in some toctree
 
-.. note:: PRRTE accepts both the new "--bindto" and the older
-          deprecated "--bind-to" cmd line options. For simplicity, the
-          following description will refer to the new "--bindto" form.
+.. note:: PRRTE accepts both the new ``--bindto`` and the older
+          deprecated ``--bind-to`` cmd line options. For simplicity, the
+          following description will refer to the new ``--bindto`` form.
 
 By default, processes are bound to individual CPUs (either COREs or
 HWTHREADs, as defined by default or by user specification for the
-job). On nodes that are OVERSUBSCRIBEd (i.e., where the number of
+job |mdash| a job or app mapped with the ``HWTCPUS`` qualifier binds
+each process to a hardware thread). On nodes that are OVERSUBSCRIBEd (i.e., where the number of
 procs exceeds the number of assigned slots), the default is to not
 bind the processes.
 
@@ -41,16 +42,18 @@ line option.
 Note that directives and qualifiers are case-insensitive
 and can be shortened to the minimum number of characters
 to uniquely identify them. Thus, ``L1CACHE`` can be given
-as ``l1cache`` or simply as ``L1``.
+as ``l1cache`` or simply as ``L1``. A shortening that fits
+more than one of them is refused rather than guessed at
+|mdash| ``N`` could be ``NONE`` or ``NUMA``.
 
 Supported binding directives include:
 
 * ``NONE`` does not bind the processes
 
 * ``HWTHREAD`` binds each process to a single hardware
-  thread/ This requires that hwthreads be treated
+  thread. This requires that hwthreads be treated
   as independent CPUs (i.e., that either the ``HWTCPUS``
-  qualifier be provided to the ``mapby`` option or
+  qualifier be provided to the ``--mapby`` option or
   that ``hwthreads`` be designated as CPUs by default).
 
 * ``CORE`` binds each process to a single core. This
@@ -74,7 +77,9 @@ Supported binding directives include:
 
 Any directive can include qualifiers by adding a colon (:) and any
 combination of one or more of the following to the ``--bindto``
-option:
+option, each separated from the next by a colon as well - never a
+comma. For example, ``--bindto core:overload-allowed:report`` or
+``--bindto numa:limit=2``:
 
 * ``OVERLOAD`` indicates that objects can have more
   processes bound to them than CPUs within them
@@ -102,3 +107,30 @@ option:
 
 .. note:: Directives and qualifiers are case-insensitive.
           ``OVERLOAD`` is the same as ``overload``.
+
+.. rubric:: Per-app-context binding (MPMD jobs)
+
+In a multi-program multiple-data (MPMD) job, each application context
+may carry its own ``--bindto`` directive, placed ahead of that app's
+executable. The rule is the one described for ``--mapby``: a directive
+written on the first app segment and nowhere else describes the whole
+job; otherwise each app that carries a directive is bound by its own,
+and apps that carry none take the default binding policy |mdash| they
+do not inherit another app's directive.
+
+Example:
+
+.. code::
+
+   prun --bindto core -n 4 app1 : --bindto none -n 2 app2
+
+Here ``app1`` processes are bound to individual cores while ``app2``
+processes are left unbound, all within the same job.
+
+Per-app binding is derived from the mapping options resolved for each
+app context. It therefore follows the same constraints as job-level
+binding: binding can only be done to the mapped object or to a
+resource located beneath it.
+
+A more detailed description of the mapping, ranking, and binding
+procedure can be obtained via the ``--help placement`` option.

@@ -30,6 +30,7 @@ Table of contents
    release-notes
    getting-help
    install
+   testing/index
    configuration
    terminology
    how-things-work/index
@@ -43,6 +44,7 @@ Table of contents
    contributing
    todo
    code-of-conduct
+   security
    license
    man/index
    versions

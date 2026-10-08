@@ -142,6 +142,11 @@ policy is whatever default was resolved for the apps that gave no directive,
 and seq/rank_file/ppr all defer on it. The base fills these fields from the
 job for a whole-job dispatch, so one test serves both paths.
 
+The same holds in the other direction. `map_job` copies the job's policies
+into `options` once, at the `ranking:` label, and everything downstream
+places against the copy — so *writing* a policy onto `jdata->map` after that
+point changes nothing at all. See [`base/AGENTS.md`](base/AGENTS.md).
+
 **The base records who mapped**, not the mapper, and it records it *per app*
 (`PRTE_APP_LAST_MAPPER`). A mapper that stamps itself on entry cannot know
 it will still be the answer, and in per-app dispatch it is asked once per
@@ -378,11 +383,37 @@ cases apart — the same flag that decides whether `--add-host` may grow the
 pool, and for the same reason: both ask whether the node counts are ours to
 change. See [`src/mca/ras/AGENTS.md`](../ras/AGENTS.md).
 
+**A job that counts hwthreads as its cpus re-counts the node through the
+same record.** A node nobody gave a slot count is sized once, when it joins
+the DVM, by `prte_plm_base_set_slots()` counting its cores (the default
+`prte_set_default_slots` policy), which marks it
+`PRTE_NODE_FLAG_SLOTS_FROM_CORES`. For an app that asks for hwthreads
+(`PRTE_APP_HWT_CPUS`, else the job's `PRTE_JOB_HWT_CPUS` — which is what
+`--mapby :hwtcpus` and the deprecated `--use-hwthread-cpus` set),
+`count_slots_for_app()` in `get_target_nodes` resizes such a node to its PU
+count via `record_resize`, before anything judges how full the node is, and
+`restore_resized` puts the core count back at `cleanup`. It is re-derived per
+app, so a core-counting app later in the same map sees the cores again. Only
+a count that is still the core count is touched: one stated by a hostfile,
+`--host` or a resource manager never carries the flag, and one re-described
+since no longer equals the core count. Before this, the conversion of
+`--use-hwthread-cpus` set the global `prte_set_slots` instead — which in
+`prterun` resized every node for the DVM's lifetime (spawned children
+included) and in `prun` did nothing, leaving a hwthread job half the procs
+by default and unbound at the full count. The option is still accepted; it
+just no longer touches the global.
+
+The default binding follows the same setting: a job or app that counts
+hwthreads and maps by core (or `ppr:N:core`) binds each proc to its hwthread,
+in both `prte_hwloc_base_set_default_binding()` and the per-app
+`prte_rmaps_base_derive_binding()` — binding to the core would stack procs
+on cpus the job was told were separate slots.
+
 ### Who owns what in `options`
 
 `node->available` and `options->job_cpuset` are **never NULL**. The mappers
 copy and intersect both without checking (`hwloc_bitmap_copy(node->jobcache,
-node->available)` in `get_target_nodes()` is the first one), so a NULL is a
+node->available)` in `prte_rmaps_base_map_job()` is the first one), so a NULL is a
 segfault in the HNP inside hwloc. When a `--cpu-set` cannot be resolved
 against a node's topology, `prte_hwloc_base_filter_cpus()` and
 `prte_rmaps_base_get_cpuset()` hand back an **empty** set — the node then
@@ -458,10 +489,18 @@ separately out of `options->job_cpuset`. Handing back `obj->cpuset` raw —
 which is what this used to do — meant a cpu-set was honored by `--bind-to
 core` (where the object sits inside the set anyway) and silently discarded
 by `--bind-to package` or `numa`: the rank came back owning every core of
-the object. Note that `prte_node_construct()` leaves `jobcache` allocated
-but **empty**, and the colocation path reaches binding without going
-through `get_target_nodes`, so the intersection falls back to the bare
-object when it would otherwise come up empty.
+the object.
+
+**`jobcache` is taken once per job, not per app.** `prte_rmaps_base_map_job()`
+copies every pool node's `available` into it before any mapper or the
+colocation path runs. It used to be refreshed by `get_target_nodes()`,
+which runs once per *app* — after the job's own earlier apps had already
+consumed cpus — so a later app's object binding came back short by exactly
+those cpus: on one 8-core NUMA domain, `--bindto numa -n 3 a` bound all
+three procs to cores 0-7, but `-n 2 a : -n 1 b` bound the third to 2-7. Do
+not reintroduce a per-app refresh. `prte_node_construct()` leaves
+`jobcache` allocated but **empty**, so `set_proc_cpuset()` still falls back
+to the bare object should a caller ever bind without the snapshot.
 
 **`--bind-to` is parsed in two places and gated in a third.** Per-app by
 `prte_rmaps_base_set_app_binding_policy()` here, job-level by
@@ -569,19 +608,29 @@ refusal names, what the pre-count may judge) — is in
   unavailable object map to by-slot, and to drop the offending node from
   consideration first — places the job by a rule nobody asked for and
   quietly shrinks the allocation the user gave us.
+- **Every word of a directive is matched against its whole vocabulary.**
+  The vocabularies - `prte_cli_mappers`, `prte_cli_mapquals`,
+  `prte_cli_ppr_objects`, `prte_cli_rankers`, `prte_cli_binders`,
+  `prte_cli_bindquals` - live once, in `src/util/prte_cmd_line.c`, and the
+  schizo sanity checker and the parsers here both match against them with
+  `pmix_cli_match()`, so they cannot disagree about what a word is. (They
+  did: schizo let `ppr:2:slot` through to a ppr parser that never knew
+  `slot`.) Matching a word against every entry at once is what lets an
+  abbreviation that fits two of them be refused: one comparison at a time,
+  a chain of `if (PMIX_CHECK_CLI_OPTION(...))` arms settled it by
+  whichever arm came first, which is why `:s` meant SPAN and `:i` meant
+  INHERIT and why arms had to be kept in a particular order. Each entry also
+  says whether it takes a value, so `span=false` is refused rather than read
+  as `span`. Switch on the tag the match returns, never on a position in
+  the table. `prte_cli_match()` reports ambiguity and value errors itself
+  and returns `PRTE_ERR_NOT_FOUND` - unreported - for a word that matches
+  nothing, since each option already has its own message for that.
 - **Qualifier names may be abbreviated; read values after the `=`, never at
-  a fixed offset.** `PMIX_CHECK_CLI_OPTION` matches any unambiguous prefix,
-  so `P=2` is `PE=2` and `F=path` is `FILE=path`. Indexing past the full
-  spelling turned `--map-by core:P=2` into pes-per-proc **0** (and then a
-  misleading "out of resource") and `seq:F=path` into an attempt to open the
-  path five characters in. `qualifier_value()` in `rmaps_base_frame.c` is the
-  one way to get a qualifier's value. (`src/hwloc/hwloc.c` had the same bug in
-  the job-level `--bind-to` `LIMIT=` value and now uses
-  `pmix_cli_qualifier_value()`.) A related trap in the same family: an
-  **empty** string matches whatever `PMIX_CHECK_CLI_OPTION` tests it against
-  first, because the comparison is only `min(strlen(a), strlen(b))` long —
-  which is why the `--map-by :QUALIFIER` form needs its own explicit branch,
-  and why `--bind-to :overload-allowed` used to resolve to `none`.
+  a fixed offset.** `P=2` is `PE=2` and `F=path` is `FILE=path`. Indexing
+  past the full spelling turned `--map-by core:P=2` into pes-per-proc
+  **0** (and then a misleading "out of resource") and `seq:F=path` into an
+  attempt to open the path five characters in.
+  `pmix_cli_qualifier_value()` is the one way to get a qualifier's value.
 - **A cpu number shown to a user goes through
   `prte_hwloc_base_cpuset2ranges()`.** The bits of a cpuset are PU *OS*
   indices; every grammar this framework accepts — slot lists, rankfile
@@ -622,6 +671,7 @@ without a node pool, a topology, or a DVM:
 | `test_resolve_options.c` | `resolve_app_options` and the rank/bind default derivations |
 | `test_ranking.c` | `compute_vpids`: by-slot/by-node traversal, the per-app cursor, by-user pass-through, and that a cycling scheme terminates |
 | `test_check_avail.c` | `check_avail`: the map-add-once rule, `max_slots`, and the node-removal contract above |
+| `test_hwt_slots.c` | `get_target_nodes` on a real SMT topology: a hwthread job sees the PU count, the next job the core count, apps of one map each see their own, stated counts are left alone |
 | `test_resize.c` | `record_resize`/`restore_resized`: a node re-sized for one map goes back — the count and the SLOTS_GIVEN flag — and the hostfile `slots=` cap that rides the same list |
 | `test_dispatch.c`, `test_<component>.c` | each mapper's accept/defer gate |
 

@@ -33,6 +33,7 @@ differences are in §3, §9 and §10 and nowhere else.
 | `Dockerfile` | Base image: toolchain, a baked PMIx, **SLURM built from source**, munge, SSH wiring. It does **not** contain PRRTE. |
 | `slurm.conf` | The cluster configuration, one copy baked into the image. Every container-specific choice is commented in the file; see §9. |
 | `cgroup.conf` | `CgroupPlugin=disabled`. Two lines, and the reason the containers can stay unprivileged; see §9. |
+| `gres.conf` | Two GPUs each on node9 and node10, backed by `/dev/null` and `/dev/zero`; see §9. |
 | `slurm-alloc.py` | Creates and holds a real allocation across many `docker exec` calls, and replays the environment SLURM put in it. See §11. |
 | `slurm-shim.py` | A recording, optionally misbehaving, **wrapper** around the real `salloc`/`scontrol`/`scancel`. Answers the two questions slurmctld cannot: what PRRTE *asked* for, and what PRRTE does when the scheduler misbehaves. See §14. |
 | `docker-compose.yml` | The ten nodes `prteslurm-node1..prteslurm-node10`. Every name derives from `$PRTE_SLURM_SWARM`, so two clones can each run a cluster. |
@@ -227,7 +228,12 @@ any kind over there, so every DVM it builds goes out over ssh no matter what
 the ras was told. The cases assert that `plm/slurm` won
 selection, that the command really is `srun`, that it carried
 `--jobid=<the allocation>` (a launcher that omitted it would work on an idle
-cluster and queue a second job on a busy one), that PRRTE read the srun exit
+cluster and queue a second job on a busy one), that the nodes went to `srun`
+in a node file (`--nodelist=<session dir>/srun-nodes.<vpid>`, mode 0600, one
+name per line, the list itself in the HNP's verbose log) with
+`--distribution=arbitrary` and no `--nodes`, so the daemons are numbered in
+vpid order, that each daemon reported from its assigned node, that PRRTE read
+the srun exit
 as a **hand-off** rather than a failure once `prted` daemonized, that SLURM
 is left with no dangling job step, that `pterm` does not cancel the user's
 allocation, and — the other side of the gate — that with no allocation in the
@@ -305,6 +311,16 @@ Three more groups came over when the fake scheduler was retired:
   two requests, because the sleep is the bug.
 - **What PRRTE put on the `salloc` command line**, and the `propagate_*`
   parameters that gate it. §14.
+- **What an expander inherits from its parent**: GPUs and the per-GPU
+  options, the memory option, node features, excluded nodes, the
+  reservation, and members named by `ras_slurm_propagate_extra`. Where
+  Slurm records the value, a case compares the expander's record with the
+  parent's; otherwise it asserts the argv. One about placement also puts
+  its parent so that the node Slurm would otherwise grant is the wrong one,
+  and asserts the grant. node1, where the HNP runs, is parked: PRRTE refuses
+  a grant of a node it already holds. §9 has the node shape they rely on. The group also checks that a bad
+  `ras_slurm_propagate_extra` entry, and an extend outside elastic mode, are
+  refused.
 - **Malformed JSON and a failing `scancel`.** §14.
 
 **The phase is a sequence of independent groups, and that is load-bearing.**
@@ -315,6 +331,17 @@ phase, so five later groups — none of which depended on it — silently did no
 run, and the only visible symptom was a suite total about fifty checks lower
 than the run before. A group that gives up now says what it gave up on, and
 the caller runs the next one regardless.
+
+One more group runs on a DVM of its own:
+
+- **A node granted again, out of SLURM's order.** vpids follow the node
+  pool, where a regranted node keeps its old place, so a grant can list
+  nodes in a different order from SLURM's. Unless `srun` numbers the tasks
+  in pool order, the daemons swap vpids and the next grant of both nodes
+  gets one daemon. The case forces that order by parking every other node,
+  checks from the HNP's log that each daemon reported from its assigned
+  node, then grants the pair again and checks for a daemon and a job on
+  each. A grant that lands elsewhere is a skip: the order was not forced.
 
 [#2617]: https://github.com/openpmix/prrte/issues/2617
 [#2491]: https://github.com/openpmix/prrte/issues/2491
@@ -454,6 +481,13 @@ not ordinary cluster configuration:
   `/proc` parentage, which needs nothing a container lacks. See §7 for the
   cleanup consequence and §9a for the much larger one.
 
+The nodes are not all alike, so an expander job can be checked for asking
+what its parent asked: node[7-10] carry the feature `fast`, and node[9-10]
+two GPUs each, declared in [`gres.conf`](gres.conf). Slurm drops a GPU with
+no `File=`, so the two are `/dev/null` and `/dev/zero`; with the cgroup
+plugins off nothing ever opens them, and a GPU is only something to
+schedule.
+
 ### 9a. Process tracking, and why the default hides bugs
 
 `ProctrackType` is not a tuning knob here. It decides which PRRTE behaviors
@@ -529,7 +563,7 @@ that schema a job's resources are:
 "job_resources": { "nodes": "node[1-3]", "allocated_nodes": [ ... ] }
 ```
 
-`ras_slurm_jansson.c` reads the shape SLURM adopted in data parser **v0.0.41**,
+`ras_slurm_jansson_nodes.c` reads the shape SLURM adopted in data parser **v0.0.41**,
 which ships in SLURM **24.05** and is the default output from 24.05 onward:
 
 ```json
@@ -551,7 +585,7 @@ It says so now, at configure time.
 [`src/mca/ras/slurm/configure.m4`](../../src/mca/ras/slurm/configure.m4) asks
 the SLURM client tools their version and folds the answer, together with
 jansson availability, into `PRTE_HAVE_SLURM_EXTENSIONS` — which gates *which
-sources compile* (`ras_slurm_jansson.c` versus its stub) and what the run-time
+sources compile* (the `ras_slurm_jansson*.c` files versus the stub) and what the run-time
 refusal says. `--enable`/`--disable-slurm-extensions` overrides it in either direction.
 A machine with no SLURM to interrogate — a build node, or this harness's
 sibling — defaults to **enabled**, so nothing that worked before stops
@@ -674,17 +708,24 @@ answer these two:
   exist for precisely that.
 
 `slurm-shim.py` is installed by `build.sh` as
-`/opt/prte/slurmshim/bin/{salloc,scontrol,scancel}` — dispatching on
+`/opt/prte/slurmshim/bin/{salloc,scontrol,scancel,srun}` — dispatching on
 `argv[0]`, and deliberately **not** into the install `bin/` that the node
 entrypoint puts on every PATH. A case opts in by starting its DVM with that
 directory first (`DVM_SHIM=1` in `run-tests.sh`), so nothing else in the
 suite can be perturbed by it. It is the **HNP** that needs it: the HNP is
 what shells out, the tools never do.
 
+It wraps `srun` for one assertion, that a launch past the kernel's 128 KiB
+per-argument limit still starts it: as one argument such a node list makes
+the exec fail with `E2BIG`. For each `srun` it records the line and byte
+count of the `--nodelist` file, and `elastic_launch_arg_limit_group` checks
+them after an extend onto 10000 invented nodes.
+
 ```sh
 slurm-shim reset                 # clear argv records and faults
 slurm-shim argv                  # argv of the most recent salloc
 slurm-shim audit                 # every wrapped command, in order
+slurm-shim nodefile              # lines and bytes of the last srun's node file
 slurm-shim set bad_json 1        # scontrol --json prints garbage, exits 0
 slurm-shim set scancel_fail 1    # scancel fails, verbosely
 ```

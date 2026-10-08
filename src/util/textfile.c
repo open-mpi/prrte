@@ -16,6 +16,7 @@
 #include <sys/types.h>
 
 #include "constants.h"
+#include "src/util/pmix_string_copy.h"
 #include "src/util/textfile.h"
 
 /* A carriage return is whitespace here, which it was not to the lexer this
@@ -25,61 +26,15 @@
  * not be a parse error. */
 #define IS_SPACE(c) (' ' == (c) || '\t' == (c) || '\f' == (c) || '\v' == (c) || '\r' == (c))
 
-static bool read_raw_line(prte_textfile_t *tf)
-{
-    size_t used = 0;
-    size_t want;
-    char *grown;
-
-    for (;;) {
-        if (used + 2 > tf->rawsize) {
-            want = (0 == tf->rawsize) ? 256 : tf->rawsize * 2;
-            grown = (char *) realloc(tf->raw, want);
-            if (NULL == grown) {
-                /* tf->raw is still ours, and prte_textfile_close() frees it */
-                tf->failed = true;
-                return false;
-            }
-            tf->raw = grown;
-            tf->rawsize = want;
-        }
-        if (NULL == fgets(tf->raw + used, (int) (tf->rawsize - used), tf->fp)) {
-            if (ferror(tf->fp)) {
-                /* not the end of the file: whatever is left of it was never
-                 * read, so neither this fragment nor the lines before it
-                 * are the whole of what the file says */
-                tf->failed = true;
-                return false;
-            }
-            /* A final line with no newline is still a line. */
-            return (0 < used);
-        }
-        used += strlen(tf->raw + used);
-        if (0 < used && '\n' == tf->raw[used - 1]) {
-            tf->raw[used - 1] = '\0';
-            return true;
-        }
-        if (ferror(tf->fp)) {
-            tf->failed = true;
-            return false;
-        }
-        if (feof(tf->fp)) {
-            return (0 < used);
-        }
-        /* the line is longer than the buffer: go round and read the rest
-         * of it rather than handing back a fragment as a record */
-    }
-}
-
 /*
  * Copy the line into tf->code with the comments taken out, carrying an
  * open block comment across the line break.
  *
  * A block comment is replaced by a space, not by nothing, because it
- * separates fields: the lexer this replaces ended a token at one, so a
- * name with a block comment written into the middle of it has always been
- * two names rather than one, and deleting the comment outright would
- * silently join them.
+ * separates fields: the lexer this replaces emitted a newline token at
+ * each marker, so a name with a block comment written into the middle of
+ * it has always been two names rather than one, and deleting the comment
+ * outright would silently join them.
  */
 static void strip_comments(prte_textfile_t *tf)
 {
@@ -180,12 +135,27 @@ char **prte_textfile_next(prte_textfile_t *tf)
     size_t need;
     char *code;
     char **fields;
+    bool failed;
 
     if (NULL == tf->fp) {
         return NULL;
     }
 
-    while (read_raw_line(tf)) {
+    for (;;) {
+        /* a NUL byte is refused along with a read error.  The fields reach
+         * their callers as C strings, so the rest of its line would vanish;
+         * and a hostfile saved as UTF-16 - which is what a Windows editor
+         * will do if asked - is a NUL after every ASCII character, which
+         * would otherwise be a node list built from fragments, reported as
+         * a success */
+        free(tf->raw);
+        tf->raw = pmix_getline(tf->fp, &failed);
+        if (NULL == tf->raw) {
+            if (failed) {
+                tf->failed = true;
+            }
+            return NULL;
+        }
         tf->lineno++;
 
         /* the stripped line is never longer than the raw one, and it can
@@ -214,7 +184,6 @@ char **prte_textfile_next(prte_textfile_t *tf)
         }
         /* the line held nothing but whitespace and comments */
     }
-    return NULL;
 }
 
 void prte_textfile_close(prte_textfile_t *tf)
@@ -235,9 +204,11 @@ void prte_textfile_close(prte_textfile_t *tf)
         free(tf->fields);
         tf->fields = NULL;
     }
-    tf->rawsize = 0;
     tf->nfields = 0;
     tf->in_comment = false;
-    /* "failed" is left as it is: it is the answer to a question a caller
-     * may still be asking after closing the file */
+    /* "failed" and "lineno" are left as they are: together they are the
+     * answer to a question a caller may still be asking after closing the
+     * file - whether the read reached the end, and where it stopped if not.
+     * prte_textfile_open() zeroes the whole struct, so reusing one for a
+     * second file does not inherit them. */
 }

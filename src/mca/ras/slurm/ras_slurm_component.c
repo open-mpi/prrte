@@ -59,7 +59,7 @@ prte_mca_ras_slurm_component_t prte_mca_ras_slurm_component = {
         PMIX_MCA_BASE_MAKE_VERSION(component,
                                    PRTE_MAJOR_VERSION,
                                    PRTE_MINOR_VERSION,
-                                   PMIX_RELEASE_VERSION),
+                                   PRTE_RELEASE_VERSION),
 
         /* Component open and close functions */
         .pmix_mca_open_component = ras_slurm_open,
@@ -112,13 +112,13 @@ static int ras_slurm_register(void)
 
     prte_mca_ras_slurm_component.propagate_mem_per_cpu = true;
     (void) pmix_mca_base_component_var_register(component, "propagate_mem_per_cpu",
-                                                "Propagate Slurm memory per CPU information when requesting additional resources",
+                                                "Propagate the original job's --mem-per-cpu, read from SLURM_MEM_PER_CPU, when requesting additional resources",
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_ras_slurm_component.propagate_mem_per_cpu);
 
     prte_mca_ras_slurm_component.propagate_mem_per_node = true;
     (void) pmix_mca_base_component_var_register(component, "propagate_mem_per_node",
-                                                "Propagate Slurm memory per node information when requesting additional resources",
+                                                "Propagate the original job's --mem, read from SLURM_MEM_PER_NODE, when requesting additional resources",
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_ras_slurm_component.propagate_mem_per_node);
 
@@ -133,6 +133,36 @@ static int ras_slurm_register(void)
                                                 "Propagate threads per core of original job when requesting additional resources",
                                                 PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                                 &prte_mca_ras_slurm_component.propagate_threads_per_core);
+
+    prte_mca_ras_slurm_component.propagate_gres = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_gres",
+                                                "Propagate the original job's per-node GRES, and its --cpus-per-gpu and --mem-per-gpu read from SLURM_CPUS_PER_GPU and SLURM_MEM_PER_GPU, when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_gres);
+
+    prte_mca_ras_slurm_component.propagate_reservation = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_reservation",
+                                                "Propagate the original job's reservation when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_reservation);
+
+    prte_mca_ras_slurm_component.propagate_features = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_features",
+                                                "Propagate the original job's required node features as --constraint when requesting additional resources. A --prefer the original job's nodes satisfied is among them, and becomes a requirement",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_features);
+
+    prte_mca_ras_slurm_component.propagate_exclude = true;
+    (void) pmix_mca_base_component_var_register(component, "propagate_exclude",
+                                                "Propagate the original job's excluded nodes when requesting additional resources",
+                                                PMIX_MCA_BASE_VAR_TYPE_BOOL,
+                                                &prte_mca_ras_slurm_component.propagate_exclude);
+
+    prte_mca_ras_slurm_component.propagate_extra = NULL;
+    (void) pmix_mca_base_component_var_register(component, "propagate_extra",
+                                                "Further members of the original job's record to propagate when requesting additional resources, as comma-separated json_key:--option pairs (e.g. comment:--comment). Keys are the job's top-level members in \"scontrol show job <id> --json\". Each sends --option=<the job's value>, copied as Slurm prints it, so a member printed differently from what salloc accepts does not propagate correctly",
+                                                PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                                &prte_mca_ras_slurm_component.propagate_extra);
 
 
     return PRTE_SUCCESS;

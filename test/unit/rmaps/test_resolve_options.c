@@ -88,7 +88,10 @@ int test_resolve_options(void)
         CHECK("derive_bind package", PRTE_BIND_TO_PACKAGE == DB(PRTE_MAPPING_BYPACKAGE, false, 1));
         CHECK("derive_bind numa", PRTE_BIND_TO_NUMA == DB(PRTE_MAPPING_BYNUMA, false, 1));
         CHECK("derive_bind core", PRTE_BIND_TO_CORE == DB(PRTE_MAPPING_BYCORE, false, 1));
-        CHECK("derive_bind core+hwt", PRTE_BIND_TO_CORE == DB(PRTE_MAPPING_BYCORE, true, 1));
+        /* an app that counts hwthreads as its cpus binds each proc to its
+         * hwthread, not the whole core - it was given the node's hwthreads
+         * as its slots, so a core binding would stack two procs */
+        CHECK("derive_bind core+hwt", PRTE_BIND_TO_HWTHREAD == DB(PRTE_MAPPING_BYCORE, true, 1));
         CHECK("derive_bind hwthread", PRTE_BIND_TO_HWTHREAD == DB(PRTE_MAPPING_BYHWTHREAD, false, 1));
         CHECK("derive_bind node->core", PRTE_BIND_TO_CORE == DB(PRTE_MAPPING_BYNODE, false, 1));
         CHECK("derive_bind node+hwt", PRTE_BIND_TO_HWTHREAD == DB(PRTE_MAPPING_BYNODE, true, 1));
@@ -152,6 +155,30 @@ int test_resolve_options(void)
     CHECK("bindovl: appbind overload", 0 != PRTE_BIND_OVERLOAD_ALLOWED(opts.appbind));
     PMIX_RELEASE(app);
 
+    /* === resolve: a bind-to that is qualifiers only - ":overload-allowed" -
+     *     keeps the binding the app would otherwise have had.  The parser
+     *     used to read the empty policy word as "none", so the app was not
+     *     bound at all, and a policy of zero would be no binding either === */
+    app = PMIX_NEW(prte_app_context_t);
+    prte_rmaps_base_set_app_binding_policy(app, ":overload-allowed");
+    baseline(&opts);
+    CHECK("bindqualonly: rc", PRTE_SUCCESS == prte_rmaps_base_resolve_app_options(NULL, app, &opts));
+    CHECK("bindqualonly: job binding stands", PRTE_BIND_TO_NONE == opts.bind);
+    CHECK("bindqualonly: overload flag", opts.overload);
+    CHECK("bindqualonly: a default binding is a preference",
+          0 != (PRTE_BIND_IF_SUPPORTED & opts.appbind));
+    PMIX_RELEASE(app);
+
+    app = PMIX_NEW(prte_app_context_t);
+    prte_rmaps_base_set_app_mapping_policy(app, "package");
+    prte_rmaps_base_set_app_binding_policy(app, ":overload-allowed");
+    baseline(&opts);
+    CHECK("bindqualonly+map: rc", PRTE_SUCCESS == prte_rmaps_base_resolve_app_options(NULL, app, &opts));
+    CHECK("bindqualonly+map: binding derived from the app's map",
+          PRTE_BIND_TO_PACKAGE == opts.bind);
+    CHECK("bindqualonly+map: overload flag", opts.overload);
+    PMIX_RELEASE(app);
+
     /* === resolve: an app that gave only a map-by gets a *derived* binding,
      *     which is best-effort - it must not claim the app asked for it === */
     app = PMIX_NEW(prte_app_context_t);
@@ -169,6 +196,43 @@ int test_resolve_options(void)
     CHECK("pehwt: cpus_per_rank", 2 == opts.cpus_per_rank);
     CHECK("pehwt: use_hwthreads", opts.use_hwthreads);
     PMIX_RELEASE(app);
+
+    /* === resolve: a ppr pattern's count half ===
+     * The count is multiplied by an object count into an int, so anything
+     * that is not a positive integer fitting one has to be refused here.
+     * It used to go through a bare strtoul(): "-2" wrapped back to a
+     * NEGATIVE process count, a value past INT_MAX silently truncated, and
+     * non-numeric text became zero - which the ppr mapper reads as "this app
+     * named no pattern" and quietly maps by the job's instead. */
+    app = PMIX_NEW(prte_app_context_t);
+    prte_rmaps_base_set_app_mapping_policy(app, "ppr:2:core");
+    baseline(&opts);
+    CHECK("ppr: rc", PRTE_SUCCESS == prte_rmaps_base_resolve_app_options(NULL, app, &opts));
+    CHECK("ppr: policy", PRTE_MAPPING_PPR == opts.map);
+    CHECK("ppr: count", 2 == opts.pprn);
+    CHECK("ppr: maptype", HWLOC_OBJ_CORE == opts.maptype);
+    PMIX_RELEASE(app);
+
+    {
+        const char *bad[] = {"ppr:0:core",       /* zero places nothing */
+                             "ppr:-2:core",      /* wrapped to a negative count */
+                             "ppr:abc:core",     /* not a number at all */
+                             "ppr:2x:core",      /* trailing junk */
+                             "ppr:4294967296:core", /* past INT_MAX */
+                             NULL};
+        int b;
+        for (b = 0; NULL != bad[b]; b++) {
+            app = PMIX_NEW(prte_app_context_t);
+            prte_rmaps_base_set_app_mapping_policy(app, (char *) bad[b]);
+            baseline(&opts);
+            if (PRTE_SUCCESS == prte_rmaps_base_resolve_app_options(NULL, app, &opts)) {
+                fprintf(stderr, "FAIL [ppr bad]: %s was accepted (count %d)\n",
+                        bad[b], opts.pprn);
+                failures++;
+            }
+            PMIX_RELEASE(app);
+        }
+    }
 
     if (0 == failures) {
         fprintf(stdout, "  PASS test_resolve_options\n");

@@ -25,7 +25,10 @@ Files:
 | `ras_slurm_modify_release.c` | `PMIX_ALLOC_RELEASE`: `scontrol update job` to shrink; remove nodes by count. |
 | `ras_slurm_modify_cancel.c` | `PMIX_ALLOC_REQ_CANCEL`: track and cancel pending extend requests. |
 | `ras_slurm_modify_common.c` | Shared helpers: `kill_job`, control-char checks, command-output draining. |
-| `ras_slurm_jansson.c` | JSON path: `scontrol show job <id> --json`, extract job fields, add/detach modified resources. |
+| `ras_slurm_jansson.c` | JSON path: reads a record through a fixed window; knows nothing of its shape past `jobs[0]`. |
+| `ras_slurm_jansson_nodes.c` | Walks `job_resources.nodes.allocation`, with the two readers that consume it. |
+| `ras_slurm_jansson_fields.c` | Reads the top-level fields, the job state and the job's times. |
+| `ras_slurm_jansson.h` | What those three share. |
 | `ras_slurm_jansson_stub.c` | No-Jansson stubs so the component builds without the JSON parser. |
 | `ras_slurm.h` | Component struct, constants, field enums, the session-stack item type. |
 
@@ -80,12 +83,13 @@ deviation* and the framework guide.
 `modify` dispatches on `req->allocdir`:
 
 - **`PMIX_ALLOC_EXTEND`** → `serve_extend_req`: propagates the original
-  job's SLURM attributes (account, partition, qos, cwd, mem-per-cpu,
-  mem-per-node, time, threads-per-core — each gated by a `propagate_*`
-  MCA param, all default true), builds `salloc` args, launches an
-  **expander job**, waits for its `salloc` to exit, trims its time limit to
-  the parent's end, then adds the modified resources. Answers in two
-  phases — see below.
+  job's SLURM attributes (account, partition, qos, cwd, time,
+  threads-per-core, per-node GRES, reservation, node features, excluded
+  nodes, and the memory and per-GPU options read as described below — each
+  gated by a `propagate_*` MCA param, all default true), builds `salloc`
+  args, launches an **expander job**, waits for its `salloc` to exit, trims
+  its time limit to the parent's end, then adds the modified resources.
+  Answers in two phases — see below.
 - **`PMIX_ALLOC_NEW`** → the same request; see below.
 - **`PMIX_ALLOC_RELEASE`** → `serve_release_req`: shrinks the SLURM job
   with `scontrol update job`, removing nodes by count or by name while
@@ -107,6 +111,81 @@ and queues until it can — including for a node the DVM already holds, which
 is submitted: no per-node slot counts, since Slurm sizes the node. A grow
 naming neither selector is refused, not passed on — inside a Slurm allocation
 no other module could legitimately serve it.
+
+A name the parent excluded is refused by Slurm at submit ("Invalid node name
+specified"), since the parent's `--exclude` goes to the expander too.
+
+### The expander continues the parent
+
+An extend makes the new nodes a continuation of the parent allocation. The
+request picks how many nodes or which; everything else the expander is,
+it takes from the parent through the `propagate_*` parameters, and a request
+cannot override them.
+
+### Memory and per-GPU options come from the environment, not the record
+
+`--mem-per-cpu`, `--mem`, `--mem-per-gpu` and `--cpus-per-gpu` are taken from
+`SLURM_MEM_PER_CPU`, `SLURM_MEM_PER_NODE`, `SLURM_MEM_PER_GPU` and
+`SLURM_CPUS_PER_GPU`. The first two hold the memory Slurm settled on for the
+job; the per-GPU two are exported only for options the job was given. An
+unset variable sends nothing, so the expander gets the same default as the
+parent. The two per-GPU options are sent only with a `--gres`, since Slurm
+refuses them on a job that asks for no GPU — the expander of a `--gpus` or
+`--gpus-per-task` parent.
+
+The memory Slurm settled on includes a default: a batch job exports the
+partition's `DefMemPerCPU` or `DefMemPerNode`, else the cluster's, as though
+asked for (salloc exports nothing), so its expander asks for the default
+explicitly.
+
+The record cannot be read for this. Once a job has GPUs and the partition a
+`DefMemPerGPU`, Slurm keeps the per-GPU default in the job's one memory
+slot, and `scontrol show job --json` prints it as `memory_per_node`: a job
+given `--mem-per-cpu=30` reads `memory_per_node: 100`, and one with two GPUs
+reads 100 for an allocation of 200. `DefCpuPerGPU` and `DefMemPerGPU` are
+also printed into `cpus_per_tres` and `memory_per_tres` as if requested.
+
+GRES itself is read from the record: `tres_per_node` holds `--gres` and
+`--gpus-per-node` alike (`gres/gpu:2`), and goes back verbatim as `--gres=`.
+`--gpus` and `--gpus-per-task` land in `tres_per_job` and `tres_per_task`,
+which are not propagated: one counts GPUs for the whole job, the other per
+task, and the expander has neither the parent's size nor tasks. `--exclusive`
+already hands the expander every GPU on its nodes; the request is what makes
+Slurm choose nodes that have them.
+
+### Node features: a satisfied preference becomes a requirement
+
+`features` goes back as `--constraint`, expressions (`a&b`, `a|b`) included.
+`prefer` is not propagated: Slurm empties it when the job starts, moving a
+preference the nodes met into `features` and dropping one they did not. The
+parent is always running when it grows, so `prefer` is always empty there,
+and a `--prefer` its nodes satisfied reaches the expander as a hard
+`--constraint` — the expander gets the node type the parent got.
+
+### Fields a site names: `ras_slurm_propagate_extra`
+
+Further members of the record, as comma-separated `json_key:--option` pairs
+(`comment:--comment`). Each sends `--option=<the parent's value>`; the value
+always comes from the parent, never from the parameter, so an extend stays a
+continuation.
+
+- **Checked once, in `modify_extend_init`**, so only where extends can run.
+  A bad entry is reported with `propagate-extra-bad-entry`, naming it, and
+  every extend is then refused with `propagate-extra-refused`; the DVM still
+  comes up, since a failed `init()` would only hand the allocation to the
+  next component. Keys are top-level member names (`[a-z_]+`); options are
+  long ones (`--[a-z][a-z0-9-]*`); neither may repeat; and an option may not
+  be, or abbreviate, one PRRTE sets (`initial_args`, `owned_formats`) —
+  getopt_long takes abbreviations, so `--exc` would reach `--exclusive`.
+- **Read with the built-ins**, in the same pass over the record. A string
+  goes as is; a `{set, infinite, number}` object holding a whole number goes
+  as that number, and is omitted when unset or infinite; empty and null are
+  omitted. A member the record lacks, or of any other type, fails the extend
+  with `propagate-extra-bad-member`. PRRTE's own entries in that table
+  (`record_job_data_fields`) carry a `:`, so no member can overwrite them.
+- **No transforms.** The value is sent as Slurm printed it, so only members
+  that round-trip verbatim work. Some do not; for example, Slurm prints a
+  default `wckey` with a leading `*`.
 
 ### The expander job ends with the parent allocation
 
@@ -142,9 +221,8 @@ reports `PMIX_OPERATION_IN_PROGRESS` with the allocation id and
   one campaign can cover several.
 - **Without a requester a failed grow is silent.** `grow_target_failed` notifies
   only a campaign that has one.
-- **Outside `prte_elastic_mode` phase one stays terminal.** No campaign is
-  recorded, so no event can come. Unlike `serve_release_req` the extend does not
-  refuse there — it has already done what was asked of Slurm.
+- **An extend never runs outside `prte_elastic_mode`.** The ras base refuses
+  it before any module sees it (`ras_base_allocate.c`).
 - **Both phase-one statuses are `#if PRTE_HAVE_DVM_MOD_EVENTS`.**
   `prte_plm_base_dvm_mod_notify` compiles away without the event codes.
 
@@ -226,7 +304,7 @@ the in-flight extend registries; `finalize` tears them down. A successful
 atomic modify returns `PMIX_OPERATION_SUCCEEDED` so the base completes the
 request.
 
-The JSON helpers (`ras_slurm_jansson.c`) are compiled only when the
+The JSON helpers (the three `ras_slurm_jansson*.c` files) are compiled only when the
 **extensions** are built — jansson available *and* a new enough SLURM, see
 the build gate below; otherwise `ras_slurm_jansson_stub.c` provides
 `prte_ras_slurm_have_jansson()==false` and no-op stubs. All three `modify`
@@ -270,12 +348,45 @@ coverage follows that seam.
 | Half | Covered by |
 |------|------------|
 | `query` + `allocate` (nodelist expansion, taint refusal, `PRTE_EXISTS` on re-discovery) | `test/unit/ras/test_ras.c` — no scheduler needed, since both read only the environment |
-| `modify` (extend/release/cancel, the JSON parser, `validate_hostname`, `drain_cmd_output`) | [`contrib/dockerswarm`](../../../../contrib/dockerswarm/) — it shells out and is inherently multi-node, and it is one of the two automated builds that configure `--with-jansson`, so `ras_slurm_jansson.c` is compiled nowhere else |
+| `modify` (extend/release/cancel, the JSON parser, `validate_hostname`, `drain_cmd_output`) | [`contrib/dockerswarm`](../../../../contrib/dockerswarm/) — it shells out and is inherently multi-node, and it is one of the two automated builds that configure `--with-jansson`, so the `ras_slurm_jansson*.c` files are compiled nowhere else |
 | the same surface against a scheduler that can refuse it | [`contrib/slurmswarm`](../../../../contrib/slurmswarm/) — ten containers running a real SLURM, so `salloc` really allocates, `scontrol update ... ReqNodeList=` really has to be a resize SLURM accepts on a RUNNING job, and the JSON is SLURM's own |
+
+### A job record is streamed, never held
+
+Slurm prints every socket and every core of every allocated node, so a
+record grows with the total core count of the job's nodes: on a 10k-node DVM
+it is hundreds of megabytes, and several times that again as a jansson DOM.
+
+`prte_ras_slurm_json_run` therefore walks the record with
+`src/util/prte_json_window.c` through a fixed 1MB window
+(`PRTE_SLURM_JSON_WINDOW_SIZE`). The walker knows nothing about JSON beyond
+the punctuation between values: it hands this file the bytes of a member it
+asks for, and measures and discards every other member as it arrives. Jansson
+only ever sees the bytes of a member this file wants. Two entry points sit on
+it:
+
+- `prte_ras_slurm_read_job_fields` returns an object holding just the named
+  members, so the helpers that used to read a whole record work unchanged.
+- `prte_ras_slurm_walk_alloc_nodes` reports `job_resources.nodes.allocation`
+  one element at a time, releasing each before the next is read.
+
+The members to keep are listed by name and everything else goes, whatever it
+holds. `gres_detail` carries one string per node and arrives *before*
+`job_resources`, so discarding only the member known to be large would have
+left that one in memory.
+
+Two consequences worth knowing. The record is always drained, so `scontrol`
+exits on its own terms and its status means what it says. And
+`threads_per_core` is a member of the job that Slurm prints *after* the node
+array, which is why `add_modified_resources` settles slot counts once the
+walk returns rather than inside it.
+
+The only size that can still be refused is a single member larger than the
+window, which is reported by name and maps to `PMIX_ERR_OUT_OF_RESOURCE`.
 
 ### The extensions are a separate build gate: SLURM 24.05 or newer
 
-`prte_ras_slurm_get_jobinfo_json` reads
+`ras_slurm_jansson_nodes.c` reads
 `job_resources.nodes.{count,list,allocation}`, which is the shape SLURM
 adopted in data parser **v0.0.41**. Through 23.11 the same query answers with
 `job_resources.nodes` as a plain *string* alongside a flat `allocated_nodes`
@@ -293,7 +404,7 @@ builds SLURM from source rather than taking the distribution package.
 |----------|-----|
 | `PRTE_HAVE_SLURM_EXTENSIONS` (0/1) | the C gate — test with `#if`, never `#ifdef` |
 | `PRTE_SLURM_VERSION_STRING`, `PRTE_SLURM_MIN_EXT_VERSION` | what the run-time diagnostic names |
-| `PRTE_WANT_SLURM_EXTENSIONS` (automake) | the **build** gate: `Makefile.am` compiles `ras_slurm_jansson.c` or `ras_slurm_jansson_stub.c`, and configure drops the jansson flags entirely when off |
+| `PRTE_WANT_SLURM_EXTENSIONS` (automake) | the **build** gate: `Makefile.am` compiles the three `ras_slurm_jansson*.c` files or `ras_slurm_jansson_stub.c`, and configure drops the jansson flags entirely when off |
 | `--enable`/`--disable-slurm-extensions` | the override, in both directions. A feature switch, not a package location: the component links no SLURM library, so there is nothing to point a `--with-` at |
 
 Three things about that decision are deliberate:

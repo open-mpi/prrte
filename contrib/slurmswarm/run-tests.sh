@@ -149,6 +149,24 @@ prted_count() { local c=0 n; for n in "$@"; do ON "$n" 'pgrep -x prted' >/dev/nu
 # "node2,node4" -> "2 4"
 idx_of() { echo "$1" | tr ',' '\n' | sed 's/^node//' | tr '\n' ' '; }
 
+# Daemons that reported from a node other than the one setup_vm assigned
+# them, one per line.  Reads the HNP's plm_base_verbose 5 log: nothing else
+# shows a swap at launch, since prted_report_launch renames the nodes to match.
+daemon_node_mismatches() {
+    SA 'cat /tmp/prte.out' 2>/dev/null | tr -d '\r' | awk '
+        /setup_vm assigning new daemon/ { want[$(NF-3)] = $NF }
+        /prted_report_launch from daemon .* on node/ {
+            d = $(NF-3)
+            if ((d in want) && want[d] != $NF) {
+                print d " assigned " want[d] ", reported from " $NF
+            }
+        }'
+}
+# Daemon reports in the HNP's log, so an empty mismatch list is not vacuous.
+daemon_reports_logged() {
+    SA 'grep -c "prted_report_launch from daemon .* on node" /tmp/prte.out' 2>/dev/null | tr -d ' \r'
+}
+
 ########################################################################
 # starting a DVM inside an allocation
 ########################################################################
@@ -480,7 +498,9 @@ test_ras_alloc() {
     # The same authority, reached from the command line instead of a PMIx
     # directive.  This used to insert the node and then kill the DVM trying to
     # launch a daemon on it.
-    out=$(SA 'timeout 60 prterun --add-host node9:2 -n 2 hostname 2>&1 | tr -d "\0"')
+    # Elastic mode, or the refusal under test is unreachable: the same
+    # function refuses a non-elastic --add-host first.
+    out=$(SA 'timeout 60 prterun --prtemca prte_elastic_mode 1 --add-host node9:2 -n 2 hostname 2>&1 | tr -d "\0"')
     echo "$out" | grep -q "is owned by a resource manager" \
         && ok "add-host is refused, and says why" \
         || bad "add-host was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
@@ -527,7 +547,7 @@ test_ras_alloc() {
     # four nodes, two in the DVM: node3 for the named form and node4 for the
     # hostfile form, so neither is already in the DVM when its case runs
     ALLOC new --tag dvm --nodes 5 --tasks-per-node 2 >/dev/null 2>&1
-    if dvm_start --host node1:2,node2:2; then
+    if dvm_start --prtemca prte_elastic_mode 1 --host node1:2,node2:2; then
         [ "$(prted_count 3 4 5)" = 0 ] \
             && ok "node3, node4 and node5 are allocated but not in the DVM" \
             || bad "they already have daemons - the test premise is gone"
@@ -577,16 +597,12 @@ test_ras_alloc() {
         # prte_ras_base_modify, where ras/slurm owns the allocation and would
         # have to refuse anything that needed the scheduler's consent - so it
         # being served here is a property of its own, and this is the only
-        # harness that can show it.  No elastic mode on this DVM, so no
-        # campaign is recorded and the grant is the whole answer.
-        out=$(SA 'timeout 90 elastic activate node5 --no-wait 2>&1 | tr -d "\0"')
-        echo "$out" | grep -q 'PHASE 1 (acceptance): allocation request returned PMIX_SUCCESS' \
-            && ok "PMIX_ALLOC_ACTIVATE was granted under SLURM" \
-            || bad "the activation request was not granted: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
-        # Run the job before counting daemons rather than sleeping for one:
-        # granting the request marks the DVM not-ready, so this prun is parked
-        # until the grow reaches VM_READY - which makes its completion the
-        # signal that the daemon is up, and its output the proof.
+        # harness that can show it.
+        out=$(SA 'timeout 90 elastic activate node5 2>&1 | tr -d "\0"')
+        echo "$out" | grep -q PMIX_DVM_IS_READY \
+            && ok "PMIX_ALLOC_ACTIVATE was granted under SLURM, and completed" \
+            || bad "no completion event for the activation: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        # ...and the point of the exercise: the node is now usable
         out=$(SA 'timeout 90 prun --host node5:2 -n 2 --map-by node hostname 2>&1 | tr -d "\0"')
         c=$(echo "$out" | grep -c '^node5$')
         [ "$c" = 2 ] \
@@ -713,9 +729,48 @@ test_plm() {
     echo "$out" | grep -q -- "--jobid=$jid" \
         && ok "srun was told to run inside the allocation (--jobid=$jid)" \
         || bad "srun did not carry --jobid=$jid: $(echo "$out" | tail -c 200)"
+    # The nodes go to srun in a file: as one --nodelist argument the list
+    # hits the kernel's 128 KiB per-argument limit at scale.  PRRTE removes
+    # the file only when srun exits, so it is still there to read.
+    local nf; nf=$(echo "$out" | grep -o -- '--nodelist=[^ ]*' | head -1 | cut -d= -f2)
+    case "$nf" in
+        */srun-nodes.*)
+            ok "srun reads its nodes from a file ($nf)" ;;
+        *)
+            bad "srun was not given a node file: $(echo "$out" | tail -c 200)" ;;
+    esac
+    # Each daemon adds its task index to the base vpid, so srun must number
+    # the tasks in file order, which is vpid order.
+    echo "$out" | grep -q -- '--distribution=arbitrary' \
+        && ok "srun numbers the daemons in the order PRRTE lists them (--distribution=arbitrary)" \
+        || bad "srun was not told to keep the node file's order: $(echo "$out" | tail -c 200)"
+    echo "$out" | grep -q -- '--nodes=' \
+        && bad "srun was given --nodes, which it refuses alongside --distribution=arbitrary" \
+        || ok "no --nodes beside the arbitrary distribution"
+    if [ -n "$nf" ]; then
+        n=$(SA "stat -c %a '$nf'" 2>/dev/null | tr -d ' \r')
+        [ "$n" = 600 ] && ok "the node file is mode 0600" \
+                       || bad "the node file is mode '$n', not 0600"
+        n=$(SA "sort '$nf'" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+        [ "$n" = "node2 node3 node4 " ] \
+            && ok "the node file lists the three non-head nodes, one per line" \
+            || bad "the node file reads '$n', not 'node2 node3 node4'"
+    fi
+    # The argv shows only the path, so the list itself is logged.
+    SA 'grep -q "plm:slurm: launching on nodes node[234],node[234],node[234]$" /tmp/prte.out' \
+        && ok "the HNP logged the node list it put in the file" \
+        || bad "no 'launching on nodes' line with the three nodes in the HNP's log"
     [ "$(prted_count 2 3 4)" = 3 ] \
         && ok "a daemon is running on each non-head allocated node" \
         || bad "only $(prted_count 2 3 4)/3 daemons came up"
+    out=$(daemon_node_mismatches)
+    if [ "$(daemon_reports_logged)" != 3 ]; then
+        bad "expected 3 daemon reports in the HNP's log, found $(daemon_reports_logged)"
+    elif [ -z "$out" ]; then
+        ok "every daemon reported in from the node it was assigned"
+    else
+        bad "daemons reported from nodes other than their own: $(echo "$out" | tr '\n' ';')"
+    fi
 
     banner "plm/slurm: the daemons stay inside the step srun launched them in"
     #
@@ -755,6 +810,33 @@ test_plm() {
     else
         bad "no prted on node2 to check against the step"
     fi
+
+    banner "plm/slurm: the DVM key reaches the daemons through srun's environment only"
+    # Every daemon must prove it holds the DVM key before another will talk
+    # to it, and plm/slurm delivers the key in the environment srun hands
+    # each task - a channel private to the DVM's user.  The command line
+    # is not: anything on the node can see it.  That
+    # the DVM formed at all says the key arrived; what is asserted here is
+    # that it went nowhere else, and did not stay where it arrived.  (The
+    # variable's NAME may linger in /proc/<pid>/environ, which shows the
+    # environment the process started with; the prted wipes the value in
+    # place, so it is the value that is looked for.)
+    out=$(SA 'grep -A2 "final top-level argv" /tmp/prte.out' 2>/dev/null | tr '\n' ' ')
+    echo "$out" | grep -qE '[0-9a-fA-F]{64}' \
+        && bad "a 64-digit hex string - a DVM key - is on the srun command line" \
+        || ok "the DVM key is not on the srun command line"
+    out=$(ON 2 'p=$(pgrep -x prted | head -1); [ -n "$p" ] && { tr "\0" " " < /proc/$p/cmdline; echo; tr "\0" "\n" < /proc/$p/environ | grep -c "^PRTE_DVM_KEY=[0-9a-fA-F]"; }' 2>/dev/null)
+    if [ -z "$out" ]; then
+        bad "no prted on node2 to examine"
+    else
+        echo "$out" | head -1 | grep -qE '[0-9a-fA-F]{64}' \
+            && bad "a DVM key is on node2's prted command line" \
+            || ok "...nor on the prted's"
+        [ "$(echo "$out" | tail -1 | tr -d ' \r')" = 0 ] \
+            && ok "...and the prted wiped it from its environment once read" \
+            || bad "node2's prted kept PRTE_DVM_KEY in its environment"
+    fi
+
     out=$(SA 'timeout 60 prun -n 4 --map-by node hostname' 2>&1)
     n=$(echo "$out" | grep -E '^node[0-9]+$' | sort -u | wc -l | tr -d ' ')
     [ "$n" = 4 ] && ok "a job runs across the srun-launched DVM" \
@@ -966,6 +1048,136 @@ elastic_external_cancel_group() {
     cleanup_cluster
 }
 
+# Poll until every node in $1 (comma-separated) is grantable.  A released
+# job does not hand its nodes back at once; see grantable_nodes.
+wait_grantable() {
+    local want=$1 n g missing
+    for _ in $(seq 30); do
+        g=$(grantable_nodes)
+        missing=0
+        for n in $(echo "$want" | tr ',' ' '); do
+            echo "$g" | tr ',' '\n' | grep -qx "$n" || missing=1
+        done
+        [ "$missing" = 0 ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# A grant where a regranted node comes before a new one in the DVM's node
+# pool and after it in Slurm's order.  vpids follow pool order, and a
+# regranted node keeps its pool place, so unless srun numbers the tasks in
+# that order the two daemons swap vpids, and the next grant of both nodes
+# gets one daemon.  Parking every other node forces the order: the first
+# extend can only land on the higher-numbered node, the second on both.
+#
+# Own DVM: it needs plm_base_verbose 5 and the free pool to itself.
+elastic_regrant_order_group() {
+    local out jid ajid bjid cjid pool lo hi others m
+
+    banner "plm/slurm: a re-grant in reverse pool order starts each daemon on its own node"
+    cleanup_cluster
+    ALLOC new --tag dvm --nodelist node1 --tasks-per-node 2 >/dev/null 2>&1
+    jid=$(ALLOC jobid --tag dvm | tr -d ' \r')
+    if ! dvm_start --prtemca prte_elastic_mode 1 --prtemca plm_base_verbose 5; then
+        bad "no DVM came up for the regrant-order case"
+        cleanup_cluster
+        return
+    fi
+    # the two lowest-numbered grantable nodes; Slurm's order here is numeric
+    pool=$(grantable_nodes)
+    lo=$(echo "$pool" | tr ',' '\n' | sort -t e -k2 -n | sed -n 1p)
+    hi=$(echo "$pool" | tr ',' '\n' | sort -t e -k2 -n | sed -n 2p)
+    if [ -z "$hi" ]; then
+        skp "SLURM can grant only '$pool' -- the regrant-order case needs two nodes"
+        dvm_stop; cleanup_cluster
+        return
+    fi
+
+    # first grant: everything but $hi parked
+    others=$(echo "$pool" | tr ',' '\n' | grep -vxF "$hi" | paste -sd, -)
+    ALLOC new --tag park --nodelist "$others" --timeout 30 >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    ajid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$ajid" ] || [ "$(job_nodes "$ajid")" != "$hi" ]; then
+        skp "the first extend did not land on $hi alone (job '$ajid' on '$(job_nodes "$ajid" 2>/dev/null)')"
+        [ -n "$ajid" ] && SA "timeout 180 elastic release-id $ajid" >/dev/null 2>&1
+        ALLOC free --tag park >/dev/null 2>&1
+        dvm_stop; cleanup_cluster
+        return
+    fi
+    out=$(SA "timeout 180 elastic release-id $ajid" 2>&1)
+    echo "$out" | grep -q PMIX_DVM_IS_READY \
+        && ok "$hi joined the DVM and was released again" \
+        || bad "releasing $hi never completed: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+    # second grant: everything but $lo and $hi parked; $lo joins the pool
+    # after $hi, the reverse of Slurm's order
+    ALLOC free --tag park >/dev/null 2>&1
+    if ! wait_grantable "$lo,$hi"; then
+        skp "SLURM did not make $lo and $hi grantable again"
+        dvm_stop; cleanup_cluster
+        return
+    fi
+    others=$(grantable_nodes | tr ',' '\n' | grep -vxF -e "$lo" -e "$hi" | paste -sd, -)
+    [ -n "$others" ] && ALLOC new --tag park --nodelist "$others" --timeout 30 >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 2' 2>&1)
+    bjid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$bjid" ] || [ "$(job_nodes "$bjid")" != "$lo,$hi" ]; then
+        skp "the second extend did not land on $lo,$hi (job '$bjid' on '$(job_nodes "$bjid" 2>/dev/null)')"
+        [ -n "$bjid" ] && SA "timeout 180 elastic release-id $bjid" >/dev/null 2>&1
+        ALLOC free --tag park >/dev/null 2>&1
+        dvm_stop; cleanup_cluster
+        return
+    fi
+    echo "$out" | grep -q PMIX_DVM_IS_READY \
+        && ok "the extend onto $lo and a regranted $hi completed" \
+        || bad "the extend onto $lo,$hi never completed: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    m=$(daemon_node_mismatches)
+    [ -z "$m" ] \
+        && ok "each daemon reported in from the node it was assigned" \
+        || bad "daemons swapped nodes: $(echo "$m" | tr '\n' ';')"
+    sleep 6
+    # shellcheck disable=SC2086
+    [ "$(prted_count $(idx_of "$lo,$hi"))" = 2 ] \
+        && ok "both granted nodes have a daemon" \
+        || bad "only $(prted_count $(idx_of "$lo,$hi"))/2 daemons on $lo,$hi"
+
+    # third grant of the same two: where swapped nodes would get one daemon
+    out=$(SA "timeout 180 elastic release-id $bjid" 2>&1)
+    echo "$out" | grep -q PMIX_DVM_IS_READY \
+        || bad "releasing $lo,$hi never completed: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    if ! wait_grantable "$lo,$hi"; then
+        skp "SLURM did not make $lo and $hi grantable a second time"
+        ALLOC free --tag park >/dev/null 2>&1
+        dvm_stop; cleanup_cluster
+        return
+    fi
+    out=$(SA 'timeout 180 elastic extend 2' 2>&1)
+    cjid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$cjid" ] || [ "$(job_nodes "$cjid")" != "$lo,$hi" ]; then
+        skp "the third extend did not land on $lo,$hi (job '$cjid' on '$(job_nodes "$cjid" 2>/dev/null)')"
+    else
+        echo "$out" | grep -q PMIX_DVM_IS_READY \
+            && ok "granting $lo and $hi again completed" \
+            || bad "the re-grant of $lo,$hi never completed: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        sleep 6
+        # shellcheck disable=SC2086
+        [ "$(prted_count $(idx_of "$lo,$hi"))" = 2 ] \
+            && ok "the re-grant started a daemon on each of $lo and $hi" \
+            || bad "the re-grant left $lo,$hi with $(prted_count $(idx_of "$lo,$hi"))/2 daemons"
+        out=$(SA "timeout 60 prun --host $lo:1,$hi:1 -n 2 hostname" 2>&1)
+        [ "$(echo "$out" | grep -E '^node[0-9]+$' | sort | paste -sd, -)" \
+          = "$(echo "$lo,$hi" | tr ',' '\n' | sort | paste -sd, -)" ] \
+            && ok "a job runs on both re-granted nodes" \
+            || bad "a job on $lo,$hi ran on: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        SA "timeout 180 elastic release-id $cjid" >/dev/null 2>&1
+    fi
+    ALLOC free --tag park >/dev/null 2>&1
+    dvm_stop
+    cleanup_cluster
+}
+
 # THE PHASE IS A SEQUENCE OF INDEPENDENT GROUPS, AND THAT IS DELIBERATE.
 #
 # Each group below is its own function so that a group which cannot proceed
@@ -1008,13 +1220,17 @@ test_elastic() {
     elastic_tainted_hostname_group
     dvm_stop
     elastic_external_cancel_group
+    elastic_regrant_order_group
     cleanup_cluster
 
     # The last two groups need the recording shim in front of the real SLURM
     # commands, and one of them needs different MCA parameters, so each brings
     # up a DVM of its own.
     elastic_argv_group
+    elastic_propagate_group
     elastic_fault_group
+    elastic_oversize_group
+    elastic_launch_arg_limit_group
 }
 
 # The first extend, and everything that can only be asserted about a grant
@@ -1658,12 +1874,358 @@ elastic_argv_group() {
     cleanup_cluster
 }
 
+# What an expander job inherits from its parent beyond partition and time.
+#
+# Each case needs a parent allocated with the attribute under test, so each
+# brings up a DVM of its own under the recording shim, extends it by one node,
+# and asserts what PRRTE asked (the argv) and, where SLURM can show it, what
+# was granted (the expander's nodes and record).  A case about placement puts
+# its parent so that the lowest free node, which SLURM would otherwise hand
+# out, is the wrong one.  The node shape -- the feature "fast" on node[7-10],
+# two GPUs each on node[9-10] -- is in slurm.conf.
+#
+# The HNP runs on node1, outside the parent's allocation; a real one runs
+# inside it, where SLURM cannot grant its node again.  node1 is parked so an
+# expander cannot land there either: PRRTE already holds it, and rightly
+# refuses the grant (PMIX_ERR_EXISTS).
+PROP_ARGS= PROP_AJID= PROP_NODES= PROP_REC= PROP_PREC=
+
+# $1 = case name, then slurm-alloc "new" options; prte options after "--".
+# Fills PROP_*; the caller asserts, then calls propagate_case_end.
+propagate_case() {
+    local name=$1 out; shift
+    local alloc=()
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do alloc+=("$1"); shift; done
+    [ "${1:-}" = -- ] && shift
+    PROP_ARGS= PROP_AJID= PROP_NODES= PROP_REC= PROP_PREC=
+    cleanup_cluster
+    SHIM reset >/dev/null 2>&1
+    if ! out=$(ALLOC new --tag dvm --nodes 1 "${alloc[@]}"); then
+        bad "$name: the parent allocation was refused: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        return 1
+    fi
+    if ! out=$(ALLOC new --tag park --nodelist node1 --timeout 30); then
+        bad "$name: could not park node1: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        return 1
+    fi
+    PROP_PREC=$(SQ "scontrol show job $(ALLOC jobid --tag dvm | tr -d '\r') -o" | tr -d '\r')
+    DVM_SHIM=1
+    if ! dvm_start --prtemca prte_elastic_mode 1 "$@"; then
+        bad "$name: no DVM came up under the recording shim"
+        return 1
+    fi
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    PROP_AJID=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    PROP_ARGS=$(shim_argv)
+    if [ -z "$PROP_AJID" ]; then
+        bad "$name: the extend was refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        return 1
+    fi
+    PROP_NODES=$(job_nodes "$PROP_AJID")
+    PROP_REC=$(SQ "scontrol show job $PROP_AJID -o" | tr -d '\r')
+    return 0
+}
+
+propagate_case_end() {
+    [ -n "$PROP_AJID" ] && SA "timeout 120 elastic release-id $PROP_AJID" >/dev/null 2>&1
+    dvm_stop
+    DVM_SHIM=0
+    cleanup_cluster
+}
+
+# $1 = an argument the salloc line must carry, exactly
+argv_has() {
+    echo "$PROP_ARGS" | grep -qxF -- "$1" \
+        && ok "salloc carried $1" \
+        || bad "salloc missing $1 (got: $(echo "$PROP_ARGS" | tr '\n' ' '))"
+}
+
+# $1 = an option the salloc line must not carry, in any form
+argv_lacks() {
+    echo "$PROP_ARGS" | grep -q -- "^$1\(=\|$\)" \
+        && bad "salloc carried $1 (got: $(echo "$PROP_ARGS" | tr '\n' ' '))" \
+        || ok "salloc carried no $1"
+}
+
+# $@ = fields of `scontrol show job -o` the expander must share with its
+# parent, unset in both counting as shared.  At least one must be set.
+record_matches() {
+    local k p e set=0
+    for k in "$@"; do
+        p=$(echo "$PROP_PREC" | tr ' ' '\n' | sed -n "s/^$k=//p")
+        e=$(echo "$PROP_REC" | tr ' ' '\n' | sed -n "s/^$k=//p")
+        [ -n "$p" ] && set=1
+        [ "$p" = "$e" ] \
+            && ok "the expander's $k matches the parent's (${p:-unset})" \
+            || bad "the expander's $k is ${e:-unset}, the parent's ${p:-unset}"
+    done
+    [ "$set" = 1 ] || bad "the parent's record has none of: $*"
+}
+
+elastic_propagate_group() {
+    if ! ON 1 "test -x $SHIM_BIN/slurm-shim"; then
+        skp "the propagation cases need the recording shim -- rerun ./build.sh"
+        return
+    fi
+
+    banner "ras/slurm: the expander gets the parent's GPUs and per-GPU options"
+    # node9 and node10 are the only nodes with GPUs.
+    if propagate_case gres --nodelist node9 --salloc-arg=--gres=gpu:1 \
+                      --salloc-arg=--cpus-per-gpu=1 --salloc-arg=--mem-per-gpu=10; then
+        [ "$PROP_NODES" = node10 ] \
+            && ok "the expander was granted the other GPU node" \
+            || bad "the expander landed on $PROP_NODES, not the GPU node node10"
+        record_matches TresPerNode CpusPerTres MemPerTres
+    fi
+    propagate_case_end
+
+    banner "ras/slurm: the expander gets the parent's memory"
+    if propagate_case memory --nodelist node3 --salloc-arg=--mem-per-cpu=20; then
+        record_matches MinMemoryCPU MinMemoryNode
+    fi
+    propagate_case_end
+
+    banner "ras/slurm: the expander asks for the parent's node features"
+    # Without the constraint the lowest free node, node2, would do.
+    if propagate_case features --nodelist node7 --salloc-arg=--constraint=fast; then
+        argv_has --constraint=fast
+        case $PROP_NODES in
+        node8|node9|node10) ok "the expander was granted a fast node ($PROP_NODES)" ;;
+        *) bad "the expander landed on $PROP_NODES, which lacks the feature" ;;
+        esac
+    fi
+    propagate_case_end
+
+    banner "ras/slurm: the expander avoids the parent's excluded nodes"
+    if propagate_case exclude --nodelist node3 '--salloc-arg=--exclude=node[1-2,4-6]'; then
+        argv_has '--exclude=node[1-2,4-6]'
+        case $PROP_NODES in
+        node[1-6]) bad "the expander landed on $PROP_NODES, which the parent excluded" ;;
+        "") bad "no nodes recorded for the expander" ;;
+        *) ok "the expander avoided the excluded nodes ($PROP_NODES)" ;;
+        esac
+    fi
+    propagate_case_end
+
+    banner "ras/slurm: the expander joins the parent's reservation"
+    # Outside the reservation node2 is free, so a grant in it shows the flag
+    # reached the scheduler.
+    if SQ "scontrol create reservation ReservationName=prte_prop Nodes=node[5-6] StartTime=now Duration=30 Users=root" \
+            | grep -q 'Reservation created'; then
+        if propagate_case reservation --nodelist node5 --salloc-arg=--reservation=prte_prop; then
+            argv_has --reservation=prte_prop
+            [ "$PROP_NODES" = node6 ] \
+                && ok "the expander was granted the other reserved node" \
+                || bad "the expander landed on $PROP_NODES, outside the reservation"
+            echo "$PROP_REC" | grep -q 'Reservation=prte_prop' \
+                && ok "SLURM recorded the expander in the reservation" \
+                || bad "the expander is not in the reservation: $(echo "$PROP_REC" | tr ' ' '\n' | grep -m1 Reservation)"
+        fi
+        propagate_case_end
+        SQ "scontrol delete ReservationName=prte_prop" >/dev/null
+    else
+        bad "could not create the reservation the case needs"
+    fi
+
+    banner "ras/slurm: ras_slurm_propagate_extra copies a member the site names"
+    if propagate_case extra --nodelist node3 --salloc-arg=--comment=prrte-x \
+                      -- --prtemca ras_slurm_propagate_extra comment:--comment; then
+        argv_has --comment=prrte-x
+        echo "$PROP_REC" | grep -q 'Comment=prrte-x' \
+            && ok "SLURM recorded the propagated comment" \
+            || bad "no comment on the expander: $(echo "$PROP_REC" | tr ' ' '\n' | grep -m1 Comment)"
+    fi
+    propagate_case_end
+
+    banner "ras/slurm: each new propagate_* switch drops its own arguments"
+    if propagate_case off --nodelist node9 --salloc-arg=--gres=gpu:1 \
+                      --salloc-arg=--mem-per-gpu=10 --salloc-arg=--constraint=fast \
+                      --salloc-arg=--exclude=node1 \
+                      -- --prtemca ras_slurm_propagate_gres 0 \
+                         --prtemca ras_slurm_propagate_features 0 \
+                         --prtemca ras_slurm_propagate_exclude 0; then
+        for o in --gres --mem-per-gpu --constraint --exclude; do
+            argv_lacks "$o"
+        done
+        argv_has --no-shell
+    fi
+    propagate_case_end
+
+    banner "ras/slurm: a bad ras_slurm_propagate_extra refuses extends, not the DVM"
+    cleanup_cluster
+    ALLOC new --tag dvm --nodes 1 >/dev/null 2>&1
+    if dvm_start --prtemca prte_elastic_mode 1 \
+                 --prtemca ras_slurm_propagate_extra comment:--nodes; then
+        ok "the DVM came up with propagate_extra naming --nodes"
+        SA 'grep -q "PRRTE sets --nodes itself" /tmp/prte.out' \
+            && ok "the bad entry was reported at startup" \
+            || bad "no startup report naming the entry: $(SA 'tail -5 /tmp/prte.out' | tr '\n' ' ')"
+        out=$(SA 'timeout 120 elastic extend 1' 2>&1)
+        echo "$out" | grep -q 'ALLOC_ID' \
+            && bad "an extend went through despite the bad entry" \
+            || ok "the extend was refused"
+        echo "$out" | grep -q "PRRTE sets --nodes itself" \
+            && ok "the refusal named the entry and why" \
+            || bad "the refusal did not name the entry: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        dvm_stop
+    else
+        bad "no DVM came up with propagate_extra naming --nodes"
+    fi
+    cleanup_cluster
+
+    banner "ras/slurm: an extend outside elastic mode is refused"
+    ALLOC new --tag dvm --nodes 1 >/dev/null 2>&1
+    if dvm_start; then
+        out=$(SA 'timeout 120 elastic extend 1' 2>&1)
+        echo "$out" | grep -q 'ALLOC_ID' \
+            && bad "an extend went through without prte_elastic_mode" \
+            || ok "the extend was refused"
+        echo "$out" | grep -q 'was not started in elastic mode' \
+            && ok "the refusal said elastic mode is needed" \
+            || bad "the refusal did not name elastic mode: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        [ "$(SQ "squeue -h -o %i" | grep -c .)" = 1 ] \
+            && ok "nothing was submitted to SLURM" \
+            || bad "an expander job exists: $(SQ 'squeue -h -o "%i %j"' | tr '\n' ' ')"
+        dvm_stop
+    else
+        bad "no DVM came up"
+    fi
+    cleanup_cluster
+}
+
 # What PRRTE does when the scheduler misbehaves.
 #
 # A live slurmctld will not emit unparsable JSON or fail a scancel on request,
 # and those paths exist precisely for it doing so.  The shim arms exactly one
 # fault at a time and passes everything else through, so the rest of the
 # conversation is still with the real scheduler.
+# A record far larger than anything PRRTE holds in memory.  The reader streams
+# it, so the two halves are asserted apart: a member it does not read costs
+# nothing however large, and the node array it does read must come back whole.
+elastic_oversize_group() {
+    local out seg before after nodes
+
+    banner "ras/slurm: a huge job record is read without being held"
+    cleanup_cluster
+    if ! ON 1 "test -x $SHIM_BIN/slurm-shim"; then
+        skp "the recording shim is not in the volume -- rerun ./build.sh"
+        return
+    fi
+    SHIM reset >/dev/null 2>&1
+    ALLOC new --tag dvm --nodes 2 --tasks-per-node 2 >/dev/null 2>&1
+    DVM_SHIM=1
+    if ! dvm_start --prtemca prte_elastic_mode 1; then
+        DVM_SHIM=0
+        bad "no DVM came up under the recording shim"
+        skp "the oversize-record cases need a DVM"
+        cleanup_cluster
+        return
+    fi
+
+    before=$(SA "awk '/VmHWM/ {print \$2}' /proc/\$(pgrep -x prte)/status")
+
+    # Eight megabytes in a member PRRTE never reads.  It is measured and
+    # discarded as it arrives, so the extend has to behave as if it were not
+    # there.
+    SHIM set fat_json 8388608 >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    SHIM set fat_json 0 >/dev/null 2>&1
+    echo "$out" | grep -q 'ALLOC_ID' \
+        && ok "an extend succeeded on a record with an 8MB member in it" \
+        || bad "a large but irrelevant member broke the extend: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    drop_extra_jobs "$(ALLOC jobid --tag dvm | tr -d ' \r')"
+
+    # A member PRRTE reads has to be held whole, so one past the window cannot
+    # be read at all.  fat_field pads current_working_directory, which the
+    # extend propagates, rather than the member fat_json adds -- that one is
+    # skipped at any size, which is what the case above already showed.  The
+    # refusal has to name the member rather than report a size with no cause.
+    SA 'cp /tmp/prte.out /tmp/prte.out.preoversize' >/dev/null 2>&1
+    SHIM set fat_field 4194304 >/dev/null 2>&1
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    SHIM set fat_field 0 >/dev/null 2>&1
+    seg=$(SA "diff /tmp/prte.out.preoversize /tmp/prte.out | sed -n 's/^> //p'")
+    if echo "$seg" | grep -q 'current_working_directory in the record does not fit'; then
+        ok "the refusal named the member that did not fit"
+    else
+        bad "a 4MB member PRRTE reads was not refused by name: $(echo "$seg" | tr '\n' ' ' | tail -c 300)"
+    fi
+    SA 'pgrep -x prte >/dev/null' && ok "HNP survived the oversized records" \
+                                  || bad "HNP died reading an oversized record"
+
+    # Peak RSS is what the whole branch is for: reading a record many times
+    # the size of the window must not move it.
+    after=$(SA "awk '/VmHWM/ {print \$2}' /proc/\$(pgrep -x prte)/status")
+    if [ -n "$before" ] && [ -n "$after" ]; then
+        [ "$((after - before))" -lt 65536 ] \
+            && ok "the HNP's peak memory held across both records (${before}kB to ${after}kB)" \
+            || bad "reading the records cost the HNP $((after - before))kB of peak memory"
+    else
+        skp "could not read the HNP's peak memory"
+    fi
+    dvm_stop
+
+    # The bulk in the array PRRTE does read, so every one of those nodes is
+    # parsed, one at a time.  The nodes are the shim's inventions, so the grant
+    # cannot be launched: srun refuses it, and a grow whose launch fails
+    # currently ends the DVM.  Last, on a DVM of its own, and asserting only
+    # the read.
+    cleanup_cluster
+    ALLOC new --tag dvm --nodes 2 --tasks-per-node 2 >/dev/null 2>&1
+    if dvm_start --prtemca prte_elastic_mode 1; then
+        SHIM set fat_nodes 4000 >/dev/null 2>&1
+        out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+        SHIM set fat_nodes 0 >/dev/null 2>&1
+        echo "$out" | grep -q 'ALLOC_ID\|REJECTED' \
+            && ok "a 4000-node allocation array was read to the end" \
+            || bad "a large allocation array broke the extend: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        dvm_stop
+    else
+        bad "no DVM came up under the recording shim for the 4000-node record"
+    fi
+
+    DVM_SHIM=0
+    cleanup_cluster
+}
+
+# plm/slurm passes srun its nodes in a file.  As one argument, a list past
+# the kernel's 128 KiB per-argument limit (MAX_ARG_STRLEN) makes the exec of
+# srun fail with E2BIG, so srun never starts.  The shim invents the nodes:
+# 10000 names of about 17 bytes, some 170 KB.  srun refuses them and the
+# failed grow ends the DVM, so this runs on a DVM of its own and asserts only
+# that srun started with every one of them.
+elastic_launch_arg_limit_group() {
+    local lines bytes
+
+    banner "plm/slurm: a launch past the 128 KiB argument limit starts srun"
+    cleanup_cluster
+    if ! ON 1 "test -x $SHIM_BIN/srun"; then
+        skp "the recording shim does not wrap srun -- rerun ./build.sh"
+        return
+    fi
+    SHIM reset >/dev/null 2>&1
+    ALLOC new --tag dvm --nodes 2 --tasks-per-node 2 >/dev/null 2>&1
+    DVM_SHIM=1
+    if ! dvm_start --prtemca prte_elastic_mode 1; then
+        DVM_SHIM=0
+        bad "no DVM came up under the recording shim"
+        cleanup_cluster
+        return
+    fi
+    SHIM set fat_nodes 10000 >/dev/null 2>&1
+    SA 'timeout 180 elastic extend 1' >/dev/null 2>&1
+    SHIM set fat_nodes 0 >/dev/null 2>&1
+    read -r lines bytes <<< "$(SHIM nodefile | tr -d '\r')"
+    if [ "${lines:-0}" -eq 10000 ] 2>/dev/null && [ "${bytes:-0}" -gt 131072 ] 2>/dev/null; then
+        ok "srun started with all $lines nodes, a $bytes-byte node file past the 128 KiB argument limit"
+    else
+        bad "srun never started with the 10000 nodes (last node file: ${lines:-no} lines, ${bytes:-no} bytes)"
+    fi
+    dvm_stop
+    DVM_SHIM=0
+    cleanup_cluster
+}
+
 elastic_fault_group() {
     local out ajid seg
 

@@ -64,6 +64,8 @@
 #include "src/util/pmix_output.h"
 #include "src/util/pmix_path.h"
 #include "src/util/pmix_environ.h"
+#include "src/util/pmix_fd.h"
+#include "src/util/prte_dvm_key.h"
 
 #include "src/mca/errmgr/errmgr.h"
 #include "src/mca/rmaps/rmaps.h"
@@ -128,6 +130,10 @@ static int plm_pals_init(void)
     }
 
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        return PRTE_ERR_NOT_FOUND;
+    }
     if (PRTE_ATTR_IS_TRUE(&daemons->attributes, PRTE_JOB_DO_NOT_LAUNCH)) {
         /* must map daemons since we won't be launching them */
         prte_plm_globals.daemon_nodes_assigned_at_launch = true;
@@ -197,6 +203,11 @@ static void launch_daemons(int fd, short args, void *cbdata)
 
     /* start by setting up the virtual machine */
     daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
+    if (NULL == daemons) {
+        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+        rc = PRTE_ERR_NOT_FOUND;
+        goto cleanup;
+    }
     if (PRTE_SUCCESS != (rc = prte_plm_base_setup_virtual_machine(state->jdata))) {
         PRTE_ERROR_LOG(rc);
         goto cleanup;
@@ -628,6 +639,17 @@ static int plm_pals_start_proc(int argc, char **argv, char **env,
 
         if (fd > 2) {
             close(fd);
+        }
+
+        /* the launcher lives as long as the daemons it launched, so
+         * anything else it inherited - our sockets to other daemons among
+         * them - would stay open on its account until the job ended */
+        pmix_close_open_file_descriptors(-1);
+
+        /* the DVM key rides in the daemons' environment, the one channel
+         * to them that is private to the DVM's user - unlike the command line */
+        if (prte_oob_authenticate) {
+            prte_dvm_key_setenv(&env);
         }
 
         /* get the pals process out of prun's process group so that

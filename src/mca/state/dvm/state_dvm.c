@@ -747,6 +747,9 @@ static void check_complete(int fd, short args, void *cbdata)
     if (jdata->state < PRTE_JOB_STATE_UNTERMINATED) {
         jdata->state = PRTE_JOB_STATE_TERMINATED;
     }
+    /* ...and record that its termination has actually begun, which the state
+     * alone cannot say - see check_complete_resume() */
+    PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TERMINATING);
 
     /* apply any reservation inheritance dispositions triggered by the
      * termination of this namespace */
@@ -799,6 +802,8 @@ static void check_complete(int fd, short args, void *cbdata)
      * for as long as PMIx takes to tear the nspace down.  That is unbounded:
      * the deregistration runs each peer's filesystem epilog.  On a persistent
      * DVM it stalls every other job in flight. */
+    /* and let go of its owner, if nothing else of theirs is left */
+    prte_pmix_server_access_job_done(pname.nspace);
     PMIx_server_deregister_nspace(pname.nspace, dvm_dereg_complete, caddy);
     /* the continuation owns the caddy now */
     return;
@@ -898,7 +903,21 @@ static void check_complete_resume(int fd, short args, void *cbdata)
             if (PMIX_CHECK_NSPACE(jptr->nspace, PRTE_PROC_MY_NAME->nspace)) {
                 continue;
             }
-            if (jptr->state < PRTE_JOB_STATE_TERMINATED) {
+            /* A job's state is not enough to say it is over.  The errmgr
+             * records WHY a job is ending the moment its first proc fails -
+             * NON_ZERO_TERM, CALLED_ABORT, all above TERMINATED - and then
+             * kills the rest, so a job can sit in one of those states with
+             * procs still alive on other nodes.  Taking that for "done" shut
+             * the DVM down under it: its surviving procs were killed by the
+             * teardown, it never came through here, and its exit status was
+             * never recorded - a child job that exited 7 while its parent
+             * was finishing left prterun exiting 0.  A job is over once
+             * check_complete has begun its termination.  Tool job objects
+             * never reach check_complete, so for them the state still
+             * decides. */
+            if (jptr->state < PRTE_JOB_STATE_TERMINATED ||
+                (!PRTE_FLAG_TEST(jptr, PRTE_JOB_FLAG_TOOL) &&
+                 !PRTE_FLAG_TEST(jptr, PRTE_JOB_FLAG_TERMINATING))) {
                 /* still alive - finish processing this job's termination */
                 goto release;
             }
@@ -965,17 +984,6 @@ release:
     }
     if (NULL != jdata->map) {
         map = jdata->map;
-        takeall = false;
-        if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_HWT_CPUS)) {
-            type = HWLOC_OBJ_PU;
-        } else {
-            type = HWLOC_OBJ_CORE;
-        }
-        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, NULL, PMIX_UINT16) ||
-            PRTE_MAPPING_BYUSER == PRTE_GET_MAPPING_POLICY(map->mapping) ||
-            PRTE_MAPPING_SEQ == PRTE_GET_MAPPING_POLICY(map->mapping)) {
-            takeall = true;
-        }
         boundcpus = hwloc_bitmap_alloc();
         for (index = 0; index < map->nodes->size; index++) {
             node = (prte_node_t *) pmix_pointer_array_get_item(map->nodes, index);
@@ -995,6 +1003,9 @@ release:
                     continue;
                 }
                 app = (prte_app_context_t*) pmix_pointer_array_get_item(jdata->apps, proc->app_idx);
+                /* the proc was bound in its own app's terms, which need not
+                 * be the job's - release it in them */
+                prte_state_base_cpu_release_policy(jdata, app, &type, &takeall);
                 if (!PRTE_FLAG_TEST(app, PRTE_APP_FLAG_TOOL) &&
                     !PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL)) {
                     node->slots_inuse--;

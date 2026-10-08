@@ -51,13 +51,22 @@ The query decides *which agent* to use and offers the module at priority
      `using_tmrsh`.
 3. Fall back to looking up the `plm_ssh_agent` list (default
    `"ssh : rsh"` — a colon-delimited preference list) in PATH via
-   `ssh_launch_agent_lookup` → `prte_plm_ssh_search`.
+   `ssh_launch_agent_lookup` → `prte_plm_ssh_search`. Each agent is
+   located as a shell would locate it: a bare name (`ssh`) on the PATH,
+   an absolute path as given, and a relative path (`./myssh`,
+   `tools/myssh`) against the working directory alone - never the PATH.
+   A bare name is never looked for in the working directory, but it *is*
+   looked for in a directory the caller passes as `path`: that is how
+   `qrsh` is found in `$SGE_ROOT/bin/$ARC`, so keep it.
 
 If the user named an agent that cannot be found, it is a hard error
 (`agent-not-found`, activates `NEVER_LAUNCHED`); if only the default
 couldn't be found, the component simply declines (returns a module of
-NULL). When an `ssh` agent is chosen it auto-adds `-X` (if `--xterm`) or
-`-x` (disable X11 forwarding, unless debugging).
+NULL). When an `ssh` agent is chosen it auto-adds `-x` (disable X11
+forwarding) unless debugging or the agent already says `-x`/`-X`. It no
+longer adds `-X` for `--xterm`: that is a per-job directive that arrives
+long after a persistent DVM's daemons were launched, so a DVM meant to
+host remote xterms is started with `ssh -X` as its agent.
 
 `daemon_nodes_assigned_at_launch` is **`true`** for ssh: because we
 `ssh` to a specific host, each daemon vpid's node is known at launch.
@@ -132,8 +141,18 @@ This is the intricate part. It assembles the argv passed to the agent:
 Drains `launch_list` up to `num_concurrent` (default **128**) at a time.
 For each caddy it registers a `prte_wait_cb` (SIGCHLD → `ssh_wait_daemon`)
 on the daemon proc, then `fork()`s. The child calls **`ssh_child`**:
-redirect stdin from `/dev/null`, close inherited fds, reset signal
-handlers to default and unblock signals, then `execve` the agent. Both
+make stdin the read end of a pipe (or `/dev/null` with
+`prte_oob_authenticate` off), close inherited fds, reset signal
+handlers to default and unblock signals, then `execve` the agent. The
+parent writes the **DVM key** down that pipe and closes it: ssh carries
+it, over its encrypted channel, to the remote prted's stdin, which the
+prted reads before it daemonizes (`setup_launch` adds
+`--prtemca prte_dvm_key_stdin 1` to tell it to). That is the one route to
+the remote daemon that stays private to the DVM's user - the remote
+command is the ssh process's argv here and the shell's there, both
+visible to `ps` - so do not move the key onto the command line, and an
+agent that cannot forward stdin cannot launch an authenticated DVM. See
+`src/util/prte_dvm_key.h`. Both
 sides `setpgid` the child into its own process group so a `Ctrl-C` to
 the HNP doesn't `SIGINT` the ssh processes (which would litter the
 session dir and lose orted diagnostics). The parent records the ssh
@@ -225,6 +244,14 @@ process exits — see the ownership note below.
 
 ## Things to watch when editing
 
+- **A host goes on the agent's command line as an argument.**
+  `launch_daemons` checks every node in the map - its name, raw name and
+  any user name - before building anything, and `remote_spawn` checks
+  each child's host, refusing one that begins with `-` (`bad-host-arg`)
+  rather than handing the agent something it would read as an option.
+  `--` is deliberately not inserted before the host: the agent may be
+  `rsh`, `qrsh` or a site script, which need not accept it.
+
 - **`num_concurrent` vs. `--debug-daemons` is a real deadlock**, guarded
   explicitly in `launch_daemons`. Any change to session-attach behavior
   must keep that check.
@@ -257,7 +284,8 @@ process exits — see the ownership note below.
   check, not before it.
 - **`ssh_probe` forks.** If you touch it, keep the pipe fds closed on the
   error paths and keep reaping the probe child — PRRTE's SIGCHLD handler
-  knows nothing about it.
+  knows nothing about it. The child keeps only its stdio: everything else,
+  the read end of its own pipe included, is closed before the exec.
 - **Launch pacing is `num_concurrent`, nothing else.** There used to be a
   `plm_ssh_delay` parameter that was parsed into `component.delay` and
   never read by anything; it was retired rather than left advertising a

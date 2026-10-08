@@ -75,46 +75,74 @@ typedef struct {
      * the default of one device per proc a group IS a device and the
      * ancestor is that device's own locality, so nothing changes. */
     hwloc_obj_t *grouploc;
+    /* ...and the cpus actually local to its members - the union of their
+     * localities, which is what a binding finer than the ancestor has to
+     * be chosen from.  NULL for a group whose locality is unknown. */
+    hwloc_cpuset_t *groupcpus;
     size_t ngroups;
     size_t per;                 /* devices per group */
 } prte_rmaps_device_map_t;
 
+/* The device classes, and the spellings of each.
+ *
+ * Every spelling of "the thing this node talks to the network with" means
+ * the same set, deliberately.  One HCA presents itself twice - an
+ * OpenFabrics OS device (mlx5_0) and a network one (ib0) on the same PCI
+ * function - and a user asking for a NIC wants the card, not one of
+ * hwloc's two views of it.  Splitting the spellings, as this once did,
+ * made "network" and "openfabrics" return the same hardware under
+ * different names and gave whichever the user did not type an answer that
+ * looked wrong.  The enumeration dedupes by PCI function, so the union is
+ * one entry per card; a particular interface is still reachable by naming
+ * it (device=eno6).
+ *
+ * The cost is that there is no longer a spelling for "ethernet only".
+ * That is a narrower question than the directive is for, and naming the
+ * interface answers it exactly.
+ *
+ * A coprocessor is a GPU that hwloc happened to learn about through a
+ * vendor backend rather than through DRM, so the GPU class takes both. */
+enum {
+    DEVCLASS_GPU,
+    DEVCLASS_NETWORK,
+    DEVCLASS_BLOCK
+};
+
+static const pmix_cli_choice_t device_classes[] = {
+    PMIX_CLI_CHOICE("gpu", DEVCLASS_GPU, PMIX_CLI_VALUE_NONE),
+    PMIX_CLI_CHOICE("network", DEVCLASS_NETWORK, PMIX_CLI_VALUE_NONE),
+    PMIX_CLI_CHOICE("openfabrics", DEVCLASS_NETWORK, PMIX_CLI_VALUE_NONE),
+    PMIX_CLI_CHOICE("fabric", DEVCLASS_NETWORK, PMIX_CLI_VALUE_NONE),
+    PMIX_CLI_CHOICE("nic", DEVCLASS_NETWORK, PMIX_CLI_VALUE_NONE),
+    PMIX_CLI_CHOICE("block", DEVCLASS_BLOCK, PMIX_CLI_VALUE_NONE),
+    PMIX_CLI_CHOICE_END
+};
+
 /* Map a --map-by device= value to a device class.  Returns
  * PMIX_DEVTYPE_UNKNOWN when the value is not a class, in which case it is
- * taken as the name or uuid of one particular device. */
+ * taken as the name or uuid of one particular device.
+ *
+ * A class may be abbreviated, but nothing may follow it: the comparison
+ * used to stop at the end of the class name, so "gpu,ndev=2" - a request
+ * for two GPUs per process written with a comma - was the class "gpu" and
+ * each process silently got one. */
 static pmix_device_type_t device_class(const char *spec)
 {
-    char *s = (char *) spec;
+    int tag;
 
-    if (PMIX_CHECK_CLI_OPTION(s, "gpu")) {
-        /* a coprocessor is a GPU that hwloc happened to learn about through
-         * a vendor backend rather than through DRM */
-        return PMIX_DEVTYPE_GPU | PMIX_DEVTYPE_COPROC;
+    if (PMIX_CLI_MATCH_FOUND != pmix_cli_match(spec, device_classes, &tag)) {
+        return PMIX_DEVTYPE_UNKNOWN;
     }
-    /* Every spelling of "the thing this node talks to the network with"
-     * means the same set, deliberately.  One HCA presents itself twice -
-     * an OpenFabrics OS device (mlx5_0) and a network one (ib0) on the same
-     * PCI function - and a user asking for a NIC wants the card, not one of
-     * hwloc's two views of it.  Splitting the spellings, as this once did,
-     * made "network" and "openfabrics" return the same hardware under
-     * different names and gave whichever the user did not type an answer
-     * that looked wrong.  The enumeration dedupes by PCI function, so the
-     * union is one entry per card; a particular interface is still
-     * reachable by naming it (device=eno6).
-     *
-     * The cost is that there is no longer a spelling for "ethernet only".
-     * That is a narrower question than the directive is for, and naming the
-     * interface answers it exactly. */
-    if (PMIX_CHECK_CLI_OPTION(s, "network")
-        || PMIX_CHECK_CLI_OPTION(s, "openfabrics")
-        || PMIX_CHECK_CLI_OPTION(s, "fabric")
-        || PMIX_CHECK_CLI_OPTION(s, "nic")) {
-        return PMIX_DEVTYPE_NETWORK | PMIX_DEVTYPE_OPENFABRICS;
+    switch (tag) {
+        case DEVCLASS_GPU:
+            return PMIX_DEVTYPE_GPU | PMIX_DEVTYPE_COPROC;
+        case DEVCLASS_NETWORK:
+            return PMIX_DEVTYPE_NETWORK | PMIX_DEVTYPE_OPENFABRICS;
+        case DEVCLASS_BLOCK:
+            return PMIX_DEVTYPE_BLOCK;
+        default:
+            return PMIX_DEVTYPE_UNKNOWN;
     }
-    if (PMIX_CHECK_CLI_OPTION(s, "block")) {
-        return PMIX_DEVTYPE_BLOCK;
-    }
-    return PMIX_DEVTYPE_UNKNOWN;
 }
 
 /* Does the spec name one device rather than a class?
@@ -410,9 +438,9 @@ int prte_rmaps_base_devices_begin(prte_job_t *jdata, prte_node_t *node,
         return PRTE_SUCCESS;
     }
     dc->grouploc = (hwloc_obj_t *) calloc(dc->ngroups, sizeof(hwloc_obj_t));
-    if (NULL == dc->grouploc) {
-        pmix_hwloc_release_devices(dc->devs, dc->ndevs);
-        free(dc);
+    dc->groupcpus = (hwloc_cpuset_t *) calloc(dc->ngroups, sizeof(hwloc_cpuset_t));
+    if (NULL == dc->grouploc || NULL == dc->groupcpus) {
+        prte_rmaps_base_devices_end(dc);
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
     for (n = 0; n < dc->ngroups; n++) {
@@ -427,6 +455,18 @@ int prte_rmaps_base_devices_begin(prte_job_t *jdata, prte_node_t *node,
             loc = hwloc_get_common_ancestor_obj(node->topology->topo, loc, other);
         }
         dc->grouploc[n] = loc;
+        if (NULL == loc) {
+            continue;
+        }
+        dc->groupcpus[n] = hwloc_bitmap_alloc();
+        if (NULL == dc->groupcpus[n]) {
+            prte_rmaps_base_devices_end(dc);
+            return PRTE_ERR_OUT_OF_RESOURCE;
+        }
+        for (m = 0; m < dc->per; m++) {
+            hwloc_bitmap_or(dc->groupcpus[n], dc->groupcpus[n],
+                            dc->devs[n * dc->per + m].locality->cpuset);
+        }
     }
 
     /* Refuse a binding coarser than the devices are local to, before any
@@ -438,24 +478,30 @@ int prte_rmaps_base_devices_begin(prte_job_t *jdata, prte_node_t *node,
             prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "rmaps:bind-above-device", true,
                            prte_hwloc_base_print_binding(opts->bind),
                            opts->map_device, node->name);
-            pmix_hwloc_release_devices(dc->devs, dc->ndevs);
-            free(dc);
+            prte_rmaps_base_devices_end(dc);
             return PRTE_ERR_SILENT;
         }
     }
 
     /* If every device resolves to the same place, "near this device" is
      * saying nothing about cpus - each proc still gets a distinct device,
-     * which is half of what was asked for, so proceed and say so. */
-    for (n = 1; n < dc->ngroups; n++) {
-        if (dc->grouploc[n] != dc->grouploc[0]) {
+     * which is half of what was asked for, so proceed and say so.
+     *
+     * Decided by the devices, not by the groups: that is what the message
+     * says - that the machine hangs every device off one place.  Groups can
+     * coincide on a machine where no two devices do - with ndev and
+     * interleave together, each proc gets one GPU from each package, so
+     * every group's common ancestor is the whole node - and the message
+     * then described a machine the user did not have. */
+    for (n = 1; n < dc->ngroups * dc->per; n++) {
+        if (dc->devs[n].locality != dc->devs[0].locality) {
             degenerate = false;
             break;
         }
     }
     if (degenerate && 1 < dc->ngroups) {
         prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "rmaps:degenerate-device-locality",
-                       true, opts->map_device, node->name, (int) dc->ngroups);
+                       true, opts->map_device, node->name, (int) (dc->ngroups * dc->per));
     }
 
     *ctx = dc;
@@ -479,9 +525,23 @@ hwloc_obj_t prte_rmaps_base_devices_locale(prte_node_t *node, prte_rmaps_options
 {
     prte_rmaps_device_map_t *dc = (prte_rmaps_device_map_t *) ctx;
 
-    PRTE_HIDE_UNUSED_PARAMS(node, opts);
+    PRTE_HIDE_UNUSED_PARAMS(node);
     if (NULL == dc || (size_t) j >= dc->ngroups) {
         return NULL;
+    }
+    /* what a binding finer than the returned object is chosen from - see
+     * narrow_to_devices() in rmaps_base_binding.c.  Copied, not lent: the
+     * context is gone by the time the options are, and a group whose
+     * locality is unknown leaves nothing to narrow to. */
+    if (NULL == dc->groupcpus[j]) {
+        if (NULL != opts->devcpus) {
+            hwloc_bitmap_free(opts->devcpus);
+            opts->devcpus = NULL;
+        }
+    } else if (NULL == opts->devcpus) {
+        opts->devcpus = hwloc_bitmap_dup(dc->groupcpus[j]);
+    } else {
+        hwloc_bitmap_copy(opts->devcpus, dc->groupcpus[j]);
     }
     return dc->grouploc[j];
 }
@@ -564,6 +624,7 @@ int prte_rmaps_base_devices_record(prte_proc_t *proc, prte_rmaps_options_t *opts
 void prte_rmaps_base_devices_end(void *ctx)
 {
     prte_rmaps_device_map_t *dc = (prte_rmaps_device_map_t *) ctx;
+    size_t n;
 
     if (NULL == dc) {
         return;
@@ -573,6 +634,14 @@ void prte_rmaps_base_devices_end(void *ctx)
     }
     if (NULL != dc->grouploc) {
         free(dc->grouploc);
+    }
+    if (NULL != dc->groupcpus) {
+        for (n = 0; n < dc->ngroups; n++) {
+            if (NULL != dc->groupcpus[n]) {
+                hwloc_bitmap_free(dc->groupcpus[n]);
+            }
+        }
+        free(dc->groupcpus);
     }
     free(dc);
 }
