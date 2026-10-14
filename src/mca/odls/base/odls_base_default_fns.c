@@ -834,7 +834,14 @@ void prte_odls_base_recv_cpuset_slice(int status, pmix_proc_t *sender,
     int32_t cnt;
     prte_odls_slice_t *sl;
     prte_odls_jcaddy_t *cd;
-    PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
+    PRTE_HIDE_UNUSED_PARAMS(status, tag, cbdata);
+
+    /* the master computes every binding and sends each daemon its slice
+     * (prte_odls_base_send_cpuset_slices); nothing else has one to send */
+    if (NULL == sender || !PMIX_CHECK_PROCID(sender, PRTE_PROC_MY_HNP)) {
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+        return;
+    }
 
     cnt = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &nspace, &cnt, PMIX_PROC_NSPACE);
@@ -1176,7 +1183,9 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
             }
             /* connect the proc to its node object */
             dmn = (prte_proc_t *) pmix_pointer_array_get_item(daemons->procs, pptr->parent);
-            if (NULL == dmn) {
+            /* a daemon learns which node it is on from the nidmap, so one
+             * named in a launch before that has no node to place procs on */
+            if (NULL == dmn || NULL == dmn->node) {
                 PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
                 rc = PRTE_ERR_NOT_FOUND;
                 goto REPORT_ERROR;
@@ -1752,17 +1761,24 @@ static char *envar_value(char *entry, const char *name)
 static void unset_envar(const char *name, prte_app_context_t *app)
 {
     char *ptr, *tmp, *p2;
-    size_t n;
+    size_t n, len;
 
-    if (NULL == name) {
+    if (NULL == name || NULL == app->env) {
         return;
     }
-    if (NULL == strchr(name, '*')) {
+    /* only a '*' at the end makes a prefix - anywhere else it is part of
+     * the name, and stripping the last character would unset the wrong
+     * variables */
+    len = strlen(name);
+    if (0 == len || '*' != name[len - 1]) {
         pmix_unsetenv((char *) name, &app->env);
         return;
     }
     ptr = strdup(name);
-    ptr[strlen(ptr) - 1] = '\0'; // trim off the '*'
+    if (NULL == ptr) {
+        return;
+    }
+    ptr[len - 1] = '\0'; // trim off the '*'
     for (n = 0; NULL != app->env[n]; n++) {
         if (0 == strncmp(app->env[n], ptr, strlen(ptr))) {
             // find the '=' sign

@@ -53,6 +53,7 @@
 #include "src/runtime/pmix_init_util.h"
 #include "src/util/session_dir.h"
 #include "src/util/pmix_show_help.h"
+#include "src/util/pmix_string_copy.h"
 #include "src/util/prte_show_help.h"
 
 #include "src/mca/base/pmix_mca_base_vari.h"
@@ -328,8 +329,14 @@ static int parse_cli(char **argv, pmix_cli_result_t *results,
                 pmix_asprintf(&pargv[n], "-%s", p2);
                 free(p2);
             }
-            // now skip the next two positions
-            n += 2;
+            // now skip the next two positions - as many of them as there
+            // are, so an option missing its values stops at the end
+            if (NULL != pargv[n + 1]) {
+                ++n;
+                if (NULL != pargv[n + 1]) {
+                    ++n;
+                }
+            }
             continue;
         }
         /* check for single-dash errors */
@@ -1098,7 +1105,7 @@ static int process_envar(const char *p, char ***cache, char ***cachevals)
         rc = check_cache(cache, cachevals, p1, value);
     } else {
         /* check for a '*' wildcard at the end of the value */
-        if ('*' == p1[strlen(p1) - 1]) {
+        if ('\0' != p1[0] && '*' == p1[strlen(p1) - 1]) {
             /* search the local environment for all params
              * that start with the string up to the '*' */
             p1[strlen(p1) - 1] = '\0';
@@ -1213,6 +1220,7 @@ static int process_tune_files(char *filename, char ***dstenv, char sep)
     int i, n, rc = PRTE_SUCCESS;
     char **cache = NULL, **cachevals = NULL;
     char **xparams = NULL, **xvals = NULL;
+    bool failed = false;
 
     tmp = PMIx_Argv_split(filename, sep);
     if (NULL == tmp) {
@@ -1234,7 +1242,7 @@ static int process_tune_files(char *filename, char ***dstenv, char sep)
             PMIx_Argv_free(xvals);
             return PRTE_ERR_NOT_FOUND;
         }
-        while (NULL != (line = prte_schizo_base_getline(fp))) {
+        while (NULL != (line = pmix_getline(fp, &failed))) {
             if ('\0' == line[0]) {
                 free(line);
                 continue; /* skip empty lines */
@@ -1397,6 +1405,16 @@ static int process_tune_files(char *filename, char ***dstenv, char sep)
             free(line);
         }
         fclose(fp);
+        if (failed) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-util.txt", "file-read-failed", true,
+                           tmp[i]);
+            PMIx_Argv_free(tmp);
+            PMIx_Argv_free(cache);
+            PMIx_Argv_free(cachevals);
+            PMIx_Argv_free(xparams);
+            PMIx_Argv_free(xvals);
+            return PRTE_ERR_SILENT;
+        }
     }
 
     PMIx_Argv_free(tmp);
