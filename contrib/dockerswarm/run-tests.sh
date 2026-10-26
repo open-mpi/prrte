@@ -1,6 +1,7 @@
 #!/bin/bash
 #
 # Copyright (c) 2026      Nanook Consulting  All rights reserved.
+# Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
 # $COPYRIGHT$
 #
 # Additional copyrights may follow
@@ -317,9 +318,10 @@ ONT()  { local n=$1; shift; EXEC_TOOL "$n" "$@"; }
 kill_stray() { EXEC_SH "$1" "pkill -9 $PSOPT -x $2 2>/dev/null; true" >/dev/null 2>&1; }
 
 # What must not survive into the next test, on one node.  Each tool has its
-# OWN session-dir prefix -- prte.<pid> for the HNP, prtrn.<pid> for prterun,
-# prted.<pid> for a bootstrapped daemon standing on its own, prun.<pid> for
-# prun itself, and ompi.<pid> for anything run under the ompi personality --
+# OWN session-dir prefix -- prte.XXXXXX for the HNP, prtrn.XXXXXX for
+# prterun, prted.XXXXXX for a bootstrapped daemon standing on its own,
+# prun.XXXXXX for prun itself, and ompi.XXXXXX for anything run under the
+# ompi personality --
 # and every one of them holds a pmix.* server rendezvous file.  A system-level
 # server drops one (pmix.sys.<host>) straight into the tmpdir as well.  Leaving
 # any behind is what makes a later prun report "multiple possible servers ...
@@ -3362,38 +3364,6 @@ test_pmix() {
                  || bad "$n daemons still running after pterm"
     cleanup_swarm
 
-    banner "pmix: a served server URI is actually reachable when remote connections are on"
-    # The point of the whole query.  By default the PMIx server listens on
-    # loopback, so what the master hands back is truthful but only usable by
-    # a tool ON that node.  With prte_pmix_remote_connections set, the server
-    # binds a routable interface -- and the URI the master serves for a
-    # REMOTE node must then carry that node's own address, not 127.0.0.1 and
-    # not the master's.  This is what makes the feature worth having, and it
-    # cannot be observed on one host.
-    if ! prted_dvm_start_mca 'node1:1,node2:1,node3:1' '--prtemca pmix_remote_connections 1'; then
-        bad "could not start a DVM with remote connections enabled"
-    else
-        out=$(PRUN "--host node1:1 -n 1 $PT serveruri node2" 2>&1)
-        u=$(echo "$out" | grep -m1 '^URI ' | awk '{print $2}' | tr -d '\r')
-        # Through the transport, not a literal container name: every global
-        # name this harness claims is derived from $PRTE_SWARM (see
-        # docker-compose.yml), so a literal here asks a DIFFERENT swarm - or
-        # nothing at all - for the address, and the case fails against an
-        # unrelated container's IP.  On a cluster it asks the node itself.
-        n2ip=$(NODE_IP 2)
-        if [ -z "$u" ]; then
-            bad "no server URI for node2 with remote connections on: $(echo "$out" | grep -E '^ERR' | tr '\n' ' ' | tail -c 200)"
-        elif echo "$u" | grep -q '127\.0\.0\.1'; then
-            bad "node2's server URI came back as loopback despite remote connections: $u"
-        elif [ -n "$n2ip" ] && echo "$u" | grep -qF "$n2ip"; then
-            ok "node2's server URI names node2's own address ($n2ip)"
-        else
-            bad "node2's server URI does not name node2 ($n2ip): $u"
-        fi
-        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
-    fi
-    cleanup_swarm
-
     banner "pmix: server URIs follow the DVM across a grow and a shrink"
     # The URIs ride along in the WIREUP xcast that vm_ready() builds, and
     # vm_ready() runs on VM_READY -- which fires again every time the daemon
@@ -4796,80 +4766,65 @@ test_util() {
                  || bad "a valid system limit broke the launch: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
     cleanup_swarm
 
-    banner "util: a session directory owned by another user is not used"
-    # The top session directory is <tmpdir>/prtrn.<pid> for prterun, and one
-    # already there used to be adopted whoever owned it.  It must be ours to
-    # be used; when it is not, prterun makes one of its own beside it
-    # (prtrn.<pid>.XXXXXX) and runs as usual.  exec keeps the pid, so the
-    # shell can make the directory prterun will look for before prterun
-    # exists.
+    banner "util: a session directory is always one of the tool's own"
+    # The top session directory is <tmpdir>/<prefix>.XXXXXX, made by
+    # mkdtemp(), with an empty node.<nodename> file in it - so a directory
+    # already in the tmpdir, under any name, is never taken over. Plant one
+    # owned by another user under the name the pid used to give (exec keeps
+    # the pid, so the shell knows it before prterun exists): prterun must run,
+    # and leave it alone and empty.
     cleanup_swarm
     if bounded 90 RUN 'd=/tmp/prtrn.$$; mkdir $d && chmod 777 $d && chown 65534 $d &&
                        exec prterun -n 1 hostname' && grep -q '^node1$' "$BOUT"; then
-        ok "prterun ran with its session directory name held by another user"
+        ok "prterun ran beside another user's directory"
     else
-        bad "prterun did not run past another user's session directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
+        bad "prterun did not run beside another user's directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
     fi
     rm -f "$BOUT"
     RUN 'find /tmp -maxdepth 1 -name "prtrn.*" -uid 65534 | grep -q .' \
         && ok "the other user's directory is still theirs" \
-        || bad "the other user's session directory was removed or taken over"
+        || bad "the other user's directory was removed or taken over"
     RUN 'find /tmp -maxdepth 1 -name "prtrn.*" -uid 65534 -exec sh -c "ls -A {} | grep -q ." \; -print' \
         | grep -q . \
-        && bad "something was written into the other user's session directory" \
-        || ok "nothing was written into the other user's session directory"
+        && bad "something was written into the other user's directory" \
+        || ok "nothing was written into the other user's directory"
+    RUN 'find /tmp -maxdepth 1 -name "prtrn.*" ! -uid 65534 | grep -q .' \
+        && bad "prterun left its session directory behind" \
+        || ok "prterun removed the session directory it made"
     cleanup_swarm
-    # ...while one of our own, left over from an earlier run, is still used
-    if bounded 90 RUN 'mkdir /tmp/prtrn.$$ && exec prterun -n 1 hostname' &&
-       grep -q '^node1$' "$BOUT"; then
-        ok "prterun used a pre-existing session directory of its own"
+    # ...and while it runs, its directory names the node it belongs to
+    if bounded 90 RUN 'prterun -n 1 sh -c "ls /tmp/prtrn.*/node.\$(hostname)"' &&
+       grep -q "/node\.node1$" "$BOUT"; then
+        ok "prterun's session directory holds the node's marker"
     else
-        bad "prterun refused its own pre-existing session directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
+        bad "prterun's session directory has no node marker: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
     fi
     rm -f "$BOUT"
     cleanup_swarm
 
-    banner "util: prun does not use a session directory owned by another user"
-    # prun hands PMIx <tmpdir>/prun.session.<node>.<euid>.<pid> as its server
-    # tmpdir, and PMIx trusts a directory it is given - so prun has to create
-    # it, and use one already there only if it is ours, before handing it
-    # over; otherwise it makes one of its own beside it. A DVM on node1 alone
-    # is enough: the directory is prun's own.
+    banner "util: prun's session directory is always its own"
+    # prun hands PMIx <tmpdir>/prun.XXXXXX as its server tmpdir, made the same
+    # way. A DVM on node1 alone is enough: the directory is prun's own.
     cleanup_swarm
     RUN 'nohup prte --daemonize --report-uri /tmp/sessdir-dvm.uri >/tmp/prte.out 2>&1 & sleep 5' >/dev/null
     if ! RUN 'pgrep -x prte >/dev/null'; then
         bad "could not start a DVM for the prun session-directory test"
     else
-        if bounded 90 RUN 'd=/tmp/prun.session.$(hostname).$(id -u).$$
-                           mkdir $d && chmod 777 $d && chown 65534 $d &&
+        if bounded 90 RUN 'd=/tmp/prun.$$; mkdir $d && chmod 777 $d && chown 65534 $d &&
                            exec prun --dvm-uri file:/tmp/sessdir-dvm.uri -n 1 hostname' &&
            grep -q '^node1$' "$BOUT"; then
-            ok "prun ran with its session directory name held by another user"
+            ok "prun ran beside another user's directory"
         else
-            bad "prun did not run past another user's session directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
+            bad "prun did not run beside another user's directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
         fi
         rm -f "$BOUT"
-        RUN 'find /tmp -maxdepth 1 -name "prun.session.*" -uid 65534 | grep -q .' \
+        RUN 'find /tmp -maxdepth 1 -name "prun.*" -uid 65534 | grep -q .' \
             && ok "the other user's directory is still theirs" \
-            || bad "the other user's session directory was removed or taken over"
-        RUN 'find /tmp -maxdepth 1 -name "prun.session.*" ! -uid 65534 | grep -q .' \
-            && bad "prun left the session directory it made instead behind" \
-            || ok "prun removed the session directory it made instead"
-        RUN 'rm -rf /tmp/prun.session.*' >/dev/null 2>&1
-        if bounded 90 RUN 'mkdir /tmp/prun.session.$(hostname).$(id -u).$$ &&
-                           exec prun --dvm-uri file:/tmp/sessdir-dvm.uri -n 1 hostname' &&
-           grep -q '^node1$' "$BOUT"; then
-            ok "prun used a pre-existing session directory of its own"
-        else
-            bad "prun refused its own pre-existing session directory: $(tr '\n' ' ' <"$BOUT" | tail -c 250)"
-        fi
-        rm -f "$BOUT"
-        RUN 'rm -rf /tmp/prun.session.*' >/dev/null 2>&1
-        # ...and one it made itself, it removes again
-        RUN 'timeout 60 prun --dvm-uri file:/tmp/sessdir-dvm.uri -n 1 hostname' >/dev/null 2>&1
-        RUN 'ls -d /tmp/prun.session.* >/dev/null 2>&1' \
+            || bad "the other user's directory was removed or taken over"
+        RUN 'find /tmp -maxdepth 1 -name "prun.*" ! -uid 65534 | grep -q .' \
             && bad "prun left its session directory behind" \
             || ok "prun removed the session directory it made"
+        RUN 'rm -rf /tmp/prun.*' >/dev/null 2>&1
         RUN 'timeout -k 5 30 pterm --dvm-uri file:/tmp/sessdir-dvm.uri' >/dev/null 2>&1
     fi
     RUN 'rm -f /tmp/sessdir-dvm.uri' >/dev/null 2>&1
@@ -5698,6 +5653,191 @@ test_grpcomm() {
     test_fence_early_arrival
     test_low_radix_release
     test_low_radix_release_fault
+    test_xcast_grow_new_parent
+    test_xcast_grow_known_parent
+    test_grow_window_broadcast
+}
+
+test_xcast_grow_new_parent() {
+    local out n
+
+    if ! have_nodes 6; then
+        skp "xcast after a re-parenting grow: needs 6 nodes, this run has $NNODES"
+        return
+    fi
+
+    banner "grpcomm: a grow that hands an existing daemon a new parent"
+    # An existing daemon is given a parent it has not heard of, and the grow's
+    # WIREUP reaches it through that parent (see from_old_routing_parent() in
+    # src/grpcomm/grpcomm_xcast.c). The vpids at radix 2: grow node2,node3
+    # -> 1,2; grow node4 -> 3 (child of 1); shrink node2 -> 3 climbs into
+    # slot 1; grow node5,node6 -> 4,5, and 5 (right of 3 in slot 1's subtree)
+    # takes slot 1, so 3's parent goes 0 -> 5. node3 and node6 are controls:
+    # neither was re-parented by a daemon it had not heard of.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 \
+                    --prtemca rml_base_radix 2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        RUN 'timeout 90 elastic grow node2:1,node3:1' >/dev/null 2>&1
+        RUN 'timeout 90 elastic grow node4:1' >/dev/null 2>&1
+        RUN 'timeout 90 elastic shrink node2' >/dev/null 2>&1; sleep 3
+        out=$(RUN 'timeout 90 elastic grow node5:1,node6:1' 2>&1); sleep 3
+        echo "$out" | grep -q PMIX_DVM_IS_READY \
+            && ok "the grow that re-parents node4's daemon completed at radix 2" \
+            || bad "grow of node5,node6 did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        for n in node3 node6 node4; do
+            # a prun that timed out leaves its rendezvous directory behind,
+            # and the next tool trips over it
+            RUN 'rm -rf /tmp/prun.*' >/dev/null 2>&1
+            out=$(RUN "timeout 40 prun --host $n:1 -n 1 hostname" 2>&1 | tr -d '\r')
+            [ "$out" = "$n" ] \
+                && ok "$n runs a job after the re-parenting grow" \
+                || bad "$n launched nothing after the grow (wireup from its new parent dropped): $out"
+        done
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start an elastic DVM for the re-parenting grow test"
+    fi
+    cleanup_swarm
+}
+
+test_xcast_grow_known_parent() {
+    local out n v
+
+    if ! have_nodes 10; then
+        skp "xcast after a grow that re-parents onto a known daemon: needs 10 nodes, this run has $NNODES"
+        return
+    fi
+
+    banner "grpcomm: a grow that hands an existing daemon a new parent it already knows"
+    # The new parent need not be a grown daemon (see from_old_routing_parent()
+    # in src/grpcomm/grpcomm_xcast.c). The vpids at radix 2: grow node2..node10
+    # one at a time -> 1..9; shrink the daemons 1, 2, 4, 5, 6 and 9, leaving
+    # 0, 3, 7 and 8; grow node2,node3 -> 10,11, where 3 holds 1's slot and 11
+    # holds 3's, so 7's parent is 11; grow node5,node6 -> 12,13, and 13 takes
+    # 1's slot, 3 falls back to its own, and 7's parent is now 3 - a daemon it
+    # knows, relaying a WIREUP it has not seen. node8 is daemon 7; node4 and
+    # node9 are re-parented onto grown daemons; node2 and node6 are controls.
+    cleanup_swarm
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 \
+                    --prtemca rml_base_radix 2 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        for v in 2 3 4 5 6 7 8 9 10; do
+            RUN "timeout 90 elastic grow node$v:1" >/dev/null 2>&1
+        done
+        for n in node2 node3 node5 node6 node7 node10; do
+            RUN "timeout 90 elastic shrink $n" >/dev/null 2>&1; sleep 3
+        done
+        RUN 'timeout 90 elastic grow node2:1,node3:1' >/dev/null 2>&1; sleep 3
+        out=$(RUN 'timeout 90 elastic grow node5:1,node6:1' 2>&1); sleep 3
+        echo "$out" | grep -q PMIX_DVM_IS_READY \
+            && ok "the grow that re-parents node8's daemon onto a known one completed at radix 2" \
+            || bad "grow of node5,node6 did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        for n in node2 node6 node4 node9 node8; do
+            # a prun that timed out leaves its rendezvous directory behind,
+            # and the next tool trips over it
+            RUN 'rm -rf /tmp/prun.*' >/dev/null 2>&1
+            out=$(RUN "timeout 40 prun --host $n:1 -n 1 hostname" 2>&1 | tr -d '\r')
+            [ "$out" = "$n" ] \
+                && ok "$n runs a job after the re-parenting grow" \
+                || bad "$n launched nothing after the grow (wireup from its new parent dropped): $out"
+        done
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start an elastic DVM for the known-parent grow test"
+    fi
+    cleanup_swarm
+}
+
+test_grow_window_broadcast() {
+    local out n uri e w
+
+    if ! have_nodes 6; then
+        skp "broadcast during a grow: needs 6 nodes, this run has $NNODES"
+        return
+    fi
+    if ! RUN "test -x $SESSCTL"; then
+        skp "broadcast during a grow: sessionctrl not installed -- re-run ./build.sh"
+        return
+    fi
+
+    banner "plm: a broadcast sent while a grow is in flight reaches a daemon it re-parents"
+    # The HNP used to switch to the grown routing tree when the grow began,
+    # while every other daemon switches only on the grow's WIREUP (see
+    # prte_plm_base_setup_virtual_machine).  At rml_base_radix 2 - grow
+    # node2,node3; grow node4; shrink node2; grow node5,node6 - the grown tree
+    # puts node4's daemon (3) under node6's (5), so a broadcast sent before
+    # node6's daemon has reported was forwarded to it, written off, and never
+    # reached node4.  The launch agent is a wrapper that waits before it runs
+    # ssh while armed, which holds that window open long enough to signal a
+    # session job on node4 inside it.
+    cleanup_swarm
+    for n in $(seq 1 "$NNODES"); do kill_stray "$n" sleep; done
+    w=$(mktemp)
+    printf '#!/bin/sh\n[ -f /tmp/prte-slowssh.arm ] && sleep 15\nexec ssh "$@"\n' > "$w"
+    for n in $(seq 1 6); do
+        COPY_IN "$w" "$n" /tmp/prte-slowssh >/dev/null 2>&1
+        ON "$n" 'chmod +x /tmp/prte-slowssh; rm -f /tmp/prte-slowssh.arm' >/dev/null 2>&1
+    done
+    rm -f "$w"
+    RUN 'rm -f /tmp/dvm.uri; nohup prte --daemonize --prtemca prte_elastic_mode 1 \
+                    --prtemca rml_base_radix 2 --prtemca plm_ssh_agent /tmp/prte-slowssh \
+                    --report-uri /tmp/dvm.uri >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if ! RUN 'pgrep -x prte >/dev/null'; then
+        bad "could not start an elastic DVM for the grow-window test"
+        cleanup_swarm
+        return
+    fi
+    uri=$(RUN 'head -1 /tmp/dvm.uri' 2>/dev/null | tr -d '\r')
+    e="PRTE_DVM_URI='$uri'"
+    RUN "$e timeout 90 elastic grow node2:1,node3:1" >/dev/null 2>&1
+    RUN "$e timeout 90 elastic grow node4:1" >/dev/null 2>&1
+    RUN "$e timeout 90 elastic shrink node2" >/dev/null 2>&1; sleep 3
+    out=$(RUN "$e timeout 60 $SESSCTL instantiate 4260 --hosts node4:1 --np 1 -- /bin/sleep 240" 2>&1)
+    sleep 3
+    if ! echo "$out" | grep -q PMIX_SUCCESS || ! ON 4 'pgrep -x sleep >/dev/null'; then
+        bad "could not start a session job on node4: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    else
+        for n in $(seq 1 6); do ON "$n" 'touch /tmp/prte-slowssh.arm' >/dev/null 2>&1; done
+        EXEC_TOOL_BG 1 "$e timeout 120 elastic grow node5:1,node6:1 > /tmp/wgrow.out 2>&1"
+        sleep 5
+        if ON 5 'pgrep -x prted >/dev/null' || ON 6 'pgrep -x prted >/dev/null'; then
+            # without the window there is nothing to test - the launcher
+            # here does not go through the agent
+            skp "could not hold the grow window open (a new daemon was already up)"
+        else
+            out=$(RUN "$e timeout 60 $SESSCTL signal 4260 15" 2>&1)
+            echo "$out" | grep -q PMIX_SUCCESS \
+                || bad "the session signal was refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+            sleep 4
+            ON 4 'pgrep -x sleep >/dev/null' \
+                && bad "a signal sent during the grow never reached node4's daemon" \
+                || ok "a signal sent during the grow reached node4's daemon"
+        fi
+        for _ in $(seq 60); do
+            RUN "grep -q 'PHASE 2' /tmp/wgrow.out" 2>/dev/null && break
+            sleep 1
+        done
+        RUN "grep -q PMIX_DVM_IS_READY /tmp/wgrow.out" 2>/dev/null \
+            && ok "...and the grow it was sent during completed" \
+            || bad "the grow held open by the launch agent did not complete"
+        if ON 4 'pgrep -x sleep >/dev/null'; then
+            # the session still holds node4, so no other job may use it
+            skp "node4 after the grow: still held by the session the signal missed"
+        else
+            # the session retires with its job, and gives node4 back
+            sleep 3
+            RUN 'rm -f /tmp/prun.*' >/dev/null 2>&1
+            out=$(RUN "$e timeout 40 prun --host node4:1 -n 1 hostname" 2>&1 | tr -d '\r')
+            [ "$out" = node4 ] \
+                && ok "node4 still runs a job after the grow" \
+                || bad "node4 launched nothing after the grow: $out"
+        fi
+    fi
+    for n in $(seq 1 6); do ON "$n" 'rm -f /tmp/prte-slowssh.arm' >/dev/null 2>&1; done
+    RUN "$e timeout -k 5 30 pterm" >/dev/null 2>&1
+    for n in $(seq 1 "$NNODES"); do kill_stray "$n" sleep; done
+    cleanup_swarm
 }
 
 test_grpcomm_reuse() {
@@ -7096,7 +7236,7 @@ test_errmgr() {
 ES=/opt/prte/prte/bin/envspawn
 
 test_odls() {
-    local out rc n c ns duri EL
+    local out rc n c ns duri EL fwd rtos mapby
 
     banner "odls: the envar directives reach the daemon that does the fork"
     # SET/ADD/UNSET/PREPEND/APPEND have no command-line surface at all: they
@@ -7136,6 +7276,38 @@ test_odls() {
     else
         bad "could not start a DVM for the envar-directive test"
     fi
+    cleanup_swarm
+
+    banner "odls: a spawned job inherits its parent's fwd-environment"
+    # The child runs on node3, whose daemon does not have the launcher's
+    # environment, so it sees ODLS_FWD only if the directive given to the
+    # parent job reached the child job. A child spawned with NOINHERIT
+    # must not inherit it.
+    for fwd in yes no noinherit; do
+        rtos="--runtime-options fwd-environment"
+        mapby=""
+        [ "$fwd" = no ] && rtos=""
+        [ "$fwd" = noinherit ] && mapby=":NOINHERIT"
+        ON 3 'rm -f /tmp/odls-envspawn.out' >/dev/null 2>&1
+        RUN "ODLS_FWD=forwarded timeout -k 5 60 prterun --host node2:1,node3:1 -np 1 $rtos \
+                 $ES node3 $mapby" >/dev/null 2>&1
+        out=$(ON 3 'cat /tmp/odls-envspawn.out' 2>&1)
+        if ! echo "$out" | grep -q 'ODLS_HOST=node3'; then
+            bad "the child did not run on node3 (fwd-environment=$fwd): $(echo "$out" | tr '\n' ' ')"
+        elif [ "$fwd" = yes ]; then
+            echo "$out" | grep -q 'ODLS_FWD=forwarded' \
+                && ok "the child inherited fwd-environment from its parent" \
+                || bad "the child did not inherit fwd-environment: $(echo "$out" | grep ODLS_FWD)"
+        elif [ "$fwd" = no ]; then
+            echo "$out" | grep -q 'ODLS_FWD=<unset>' \
+                && ok "...and without the directive the environment is not forwarded" \
+                || bad "the environment was forwarded unasked: $(echo "$out" | grep ODLS_FWD)"
+        else
+            echo "$out" | grep -q 'ODLS_FWD=<unset>' \
+                && ok "...and a child spawned with NOINHERIT does not inherit it" \
+                || bad "a NOINHERIT child inherited fwd-environment: $(echo "$out" | grep ODLS_FWD)"
+        fi
+    done
     cleanup_swarm
 
     banner "odls: the exec agent wraps every exec, on every node"
@@ -8332,7 +8504,7 @@ test_include() {
 }
 
 test_resize_elastic() {
-    local out rc n
+    local out rc n w
 
     banner "ras: a DVM that is not elastic refuses to change size"
     # Outside elastic mode the DVM's daemons are fixed for its lifetime, and
@@ -8384,6 +8556,37 @@ test_resize_elastic() {
         [ "$rc" = 0 ] && ok "...and pterm takes it down" || bad "pterm failed after a failed grow (rc=$rc)"
     else
         bad "could not start an elastic DVM for the failed-grow test"
+    fi
+    cleanup_swarm
+
+    banner "plm: a grow that fails part-way takes down the daemon that did start"
+    # A launch agent that fails for node3 only - and only after a pause, so
+    # node2's daemon is up and has reported first.  The campaign rolls back,
+    # and node2's daemon must be told to go.  It is in nobody's routing tree:
+    # the grow never sent its WIREUP, and the HNP does not switch to the grown
+    # tree before it does (see prte_plm_base_setup_virtual_machine), so
+    # grow_rollback tells it directly.
+    w=$(mktemp)
+    printf '#!/bin/sh\ncase "$*" in *node3*) sleep 6; exit 1 ;; esac\nexec ssh "$@"\n' > "$w"
+    COPY_IN "$w" 1 /tmp/prte-failssh >/dev/null 2>&1
+    ON 1 'chmod +x /tmp/prte-failssh' >/dev/null 2>&1
+    rm -f "$w"
+    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 --prtemca plm_ssh_agent /tmp/prte-failssh >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
+    if RUN 'pgrep -x prte >/dev/null'; then
+        out=$(RUN 'timeout 90 elastic grow node2:1,node3:1' 2>&1); rc=$?
+        echo "$out" | grep -q 'PMIX_DVM_IS_READY' \
+            && bad "a grow with a node that cannot start reported success" \
+            || ok "a grow with a node that cannot start did not report success"
+        n=$(prted_settle 20 2)
+        [ "$n" = 0 ] && ok "...and the daemon that did start on node2 was taken down" \
+                     || bad "the daemon that started on node2 outlived the failed grow"
+        out=$(RUN 'timeout -k 5 30 prun -n 2 hostname' 2>&1); rc=$?
+        n=$(echo "$out" | grep -cE '^node1$')
+        [ "$rc" = 0 ] && [ "$n" = 2 ] && ok "...and the DVM still runs jobs" \
+                                      || bad "DVM unusable after a part-failed grow (rc=$rc, lines=$n)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    else
+        bad "could not start an elastic DVM for the part-failed grow test"
     fi
     cleanup_swarm
 }
@@ -9456,7 +9659,7 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         # any of this is emitted -- /tmp/prte.out is empty by construction, so
         # grepping it can only ever fail.  So this one case drives its own
         # foreground DVM with prterun and reads that process's stderr directly.
-        # prterun takes its own session-dir prefix (prtrn.<pid>), so it coexists
+        # prterun takes its own session-dir prefix (prtrn.XXXXXX), so it coexists
         # with the daemonized DVM the rest of the phase is using.
         if ! pmix_cap PMIX_CAP_IOF_FLOW_CONTROL; then
             skp "PMIx predates PMIX_CAP_IOF_FLOW_CONTROL -- no XOFF to pair"

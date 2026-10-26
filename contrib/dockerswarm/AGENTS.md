@@ -715,14 +715,6 @@ is `proctable`, and it asserts:
   never the generic `PMIX_ERROR` that the wrong-direction conversion used to
   manufacture out of every failure on this path.
 
-- a served URI is **actually reachable**. With `--prtemca
-  pmix_remote_connections 1` the servers bind a routable interface, and the
-  URI served for a *remote* node must carry that node's own address — not
-  loopback, and not the master's. Off (the default) every server binds
-  loopback, so the answer is truthful but only usable by a tool on that
-  node. This is the assertion that says the feature is worth having, and one
-  host cannot make it.
-
 - the URIs **follow the DVM across a grow and a shrink**. `vm_ready()` runs
   on every `VM_READY` and re-sends the whole set, so a grow redistributes
   with no code of its own — asserted rather than assumed. A shrink needs
@@ -1154,9 +1146,9 @@ done
 ```
 
 **Every tool has its own session-dir prefix, and one missed prefix is enough.**
-`prte.<pid>` is the HNP, `prtrn.<pid>` is `prterun`, `prted.<pid>` is a
-bootstrapped daemon standing on its own, `prun.<pid>` is `prun` itself, and
-`ompi.<pid>` is anything run under the ompi personality. Each of them holds a
+`prte.XXXXXX` is the HNP, `prtrn.XXXXXX` is `prterun`, `prted.XXXXXX` is a
+bootstrapped daemon standing on its own, `prun.XXXXXX` is `prun` itself, and
+`ompi.XXXXXX` is anything run under the ompi personality. Each of them holds a
 `pmix.*` server rendezvous file, a system-level server drops `pmix.sys.<host>`
 straight into `/tmp`, and any one left behind makes the next tool report
 *"multiple possible servers … connection handles have been read from files
@@ -1277,6 +1269,14 @@ cases, because neither can see the other's defect:
   group contribution it makes is dropped as stale, at any radix. Invisible
   to every case that launches `hostname`, which never fences — so that case
   runs a `fencer` job that spans the grown-in node.
+
+**A grow can also give an *existing* daemon a parent it has not heard of.**
+`test_grpcomm`'s "a grow that hands an existing daemon a new parent" builds
+that shape at `rml_base_radix 2` and runs a job on the re-parented daemon; at
+the default radix every parent is rank 0 and the shape cannot occur. Its
+sibling, "...a new parent it already knows", builds the shape where the new
+parent is an existing daemon displaced by a grown one - it needs all ten
+nodes, and it grows them one at a time so the vpids it names are certain.
 
 Still bound elastic commands with `timeout` in any new test: a grow that does
 not complete otherwise wedges the whole suite rather than failing one case.

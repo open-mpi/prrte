@@ -614,9 +614,16 @@ added here inherits them:
   computes a parent *and* children, and they have to describe the same tree
   for every failure pattern. Walking up past dead ancestors to name a parent
   while replacing a dead child in place is two different promotion rules and
-  orphans daemons outright. `test_release_tree` (`test/unit/rml`) brute-forces
-  every failure subset and requires one tree rooted at 0 covering exactly the
-  living daemons — run it before believing any change here.
+  orphans daemons outright. So is climbing only into *dead* slots: a daemon
+  promoted into a dead ancestor's slot leaves its own slot vacated but alive,
+  and its successor must climb into that one too, or that slot's other
+  children name a parent that does not list them (#2850). Occupancy is
+  decided top-down — a slot holds the first living daemon of its subtree, in
+  depth-first order, not already holding a slot above it — and both halves
+  are read off that. `test_release_tree` (`test/unit/rml`) brute-forces every
+  failure subset up to 14 daemons, samples larger DVMs, and requires one tree
+  rooted at 0 covering exactly the living daemons — run it before believing
+  any change here.
 - **Do not screen a forward on "is the sender my parent".** That screen is
   sound on the routing tree, whose repair notice travels the routing tree, so
   a daemon has processed the notice that gave it a new parent before anything
@@ -624,6 +631,21 @@ added here inherits them:
   repaired parent replays to a child that has not heard yet. Both the forward
   and the ack-request screens are therefore asked only of
   `PRTE_GRPCOMM_TOPO_ROUTING`.
+
+  Even there a grow breaks the ordering: a grown daemon can take over an old
+  one's slot and become its parent, and the grow's WIREUP then arrives
+  through that new parent. The displaced daemon falls back into a slot of its
+  own subtree and displaces *that* slot's holder, so the new parent may just
+  as well be a daemon the child already knows (radix 2, 12 → 14 daemons with
+  1, 5 and 9 departed: 7 goes from 11 to 3). Neither is told apart from a
+  superseded forward by who the sender is, so every forward and every ack
+  carries the daemon span its sender's tree was computed over (`pack_span()`,
+  next to the tree version), and the screen (`from_old_routing_parent()`)
+  passes any sender whose span exceeds ours. The span only grows — vpids are
+  never reused and a departure keeps its slot — so a larger one is always the
+  newer tree. `test_xcast_grow_new_parent` (`test/unit/grpcomm`),
+  `test_grow_reparents_existing_daemon` (`test/unit/rml`) and the dockerswarm
+  cases *"a grow that hands an existing daemon a new parent"* cover it.
 - **Ack whoever asked** (`send_ack_to`, `op->upstream`), not whoever this
   daemon's own derivation currently calls its parent. Answering the wrong
   daemon costs nothing; failing to answer the right one hangs the broadcast.
