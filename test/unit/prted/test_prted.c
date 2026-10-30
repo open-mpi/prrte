@@ -1,5 +1,7 @@
 /*
  * Copyright (c) 2026      Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
+ * Copyright (c) 2026      SiPearl.  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -49,6 +51,12 @@
  *    registration names to PMIx, and a tool reaching a session through
  *    the access list of the job that owns it.
  *
+ *  - "--membind", end to end on the HNP side: held on the app by
+ *    create_app(), handed out by distribute_directive() under the same
+ *    first-app-means-the-job rule as --bindto, refused at the front door when
+ *    it is not one, and turned by the spawn translators into the job or app
+ *    attribute the odls reads - parsed, so no daemon parses it again.
+ *
  *  - create_app()'s environment directives, reached through
  *    prte_parse_locals().  --set-env/--prepend-env/--append-env/--unset-env/-x
  *    edit each other, so the order the user gave them in is the value the
@@ -83,6 +91,8 @@
 #include "src/mca/state/base/base.h"
 #include "src/prted/prted.h"
 #include "src/util/prte_cmd_line.h"
+#include "src/hwloc/hwloc-internal.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/prted/pmix/pmix_server.h"
 #include "src/prted/pmix/pmix_server_internal.h"
 #    include "src/server/pmix_server_ops.h"
@@ -1690,6 +1700,276 @@ static int test_directive_distribution(void)
     return failures;
 }
 
+/*
+ * --membind follows --bindto's rule exactly: written on the first app and
+ * nowhere else it is the job's; written anywhere else it belongs to the apps
+ * that carry it, and the others get the default rather than a neighbour's.
+ */
+static distrib_case_t membind_cases[] = {
+    {"membind on the first app only -> the job",
+     {"prterun", "--membind", "bandwidth", "-n", "2", "app1", ":", "-n", "2", "app2", NULL},
+     true, false, false},
+    {"membind on the second app only -> that app alone",
+     {"prterun", "-n", "2", "app1", ":", "--membind", "capacity", "-n", "2", "app2", NULL},
+     false, false, true},
+    {"membind on both apps -> each its own",
+     {"prterun", "--membind", "bandwidth", "-n", "2", "app1", ":",
+      "--membind", "capacity", "-n", "2", "app2", NULL},
+     false, true, true},
+    {"no membind at all",
+     {"prterun", "--bindto", "core", "-n", "2", "app1", ":", "-n", "2", "app2", NULL},
+     false, false, false},
+    {NULL, {NULL}, false, false, false},
+};
+
+/* refused before anything is sent: the front door uses the parser the
+ * server does, so it cannot pass what the server would refuse */
+static const struct {
+    const char *desc;
+    const char *argv[12];
+} membind_refusals[] = {
+    {"an unknown directive", {"prterun", "--membind", "fastest", "-n", "1", "app1", NULL}},
+    {"an ambiguous directive", {"prterun", "--membind", "l", "-n", "1", "app1", NULL}},
+    {"a qualifier on a directive", {"prterun", "--membind", "bandwidth:latency", "-n", "1", "app1", NULL}},
+    {"the old attr: prefix", {"prterun", "--membind", "attr:bandwidth", "-n", "1", "app1", NULL}},
+    {"two --membind in one segment",
+     {"prterun", "--membind", "bandwidth", "--membind", "capacity", "-n", "1", "app1", NULL}},
+    {NULL, {NULL}},
+};
+
+static int test_membind_distribution(void)
+{
+    prte_schizo_base_module_t *schizo;
+    distrib_case_t *c;
+    pmix_list_t apps, jobdata;
+    prte_pmix_app_t *app0, *app1;
+    int failures = 0, rc, n;
+
+    schizo = envar_test_schizo();
+    if (NULL == schizo) {
+        return 1;
+    }
+
+    for (c = membind_cases; NULL != c->desc; c++) {
+        PMIX_CONSTRUCT(&apps, pmix_list_t);
+        PMIX_CONSTRUCT(&jobdata, pmix_list_t);
+        rc = prte_parse_locals(schizo, &apps, (char **) c->argv, NULL, NULL,
+                               &jobdata, NULL);
+        if (PRTE_SUCCESS != rc) {
+            fprintf(stderr, "FAIL [%s]: parse failed: %s\n", c->desc, prte_strerror(rc));
+            ++failures;
+            goto next;
+        }
+        if (2 != pmix_list_get_size(&apps)) {
+            fprintf(stderr, "FAIL [%s]: %d apps, wanted 2\n", c->desc,
+                    (int) pmix_list_get_size(&apps));
+            ++failures;
+            goto next;
+        }
+        app0 = (prte_pmix_app_t *) pmix_list_get_first(&apps);
+        app1 = (prte_pmix_app_t *) pmix_list_get_next(&app0->super);
+        CHECK(c->desc, c->on_job == list_has_key(&jobdata, PMIX_MEMBIND));
+        CHECK(c->desc, c->on_app0 == app_has_key(app0, PMIX_MEMBIND));
+        CHECK(c->desc, c->on_app1 == app_has_key(app1, PMIX_MEMBIND));
+
+    next:
+        PMIX_LIST_DESTRUCT(&apps);
+        PMIX_LIST_DESTRUCT(&jobdata);
+    }
+
+    for (n = 0; NULL != membind_refusals[n].desc; n++) {
+        PMIX_CONSTRUCT(&apps, pmix_list_t);
+        PMIX_CONSTRUCT(&jobdata, pmix_list_t);
+        rc = prte_parse_locals(schizo, &apps, (char **) membind_refusals[n].argv, NULL, NULL,
+                               &jobdata, NULL);
+        CHECK(membind_refusals[n].desc, PRTE_SUCCESS != rc);
+        PMIX_LIST_DESTRUCT(&apps);
+        PMIX_LIST_DESTRUCT(&jobdata);
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "  PASS membind distribution\n");
+    }
+    return failures;
+}
+
+/*
+ * The spawn translators turn PMIX_MEMBIND into the attribute the odls reads:
+ * a job's into PRTE_JOB_MEMBIND, an app's into PRTE_APP_MEMBIND, either way
+ * already parsed.  Any tool can send it, so a bad value or a wrong type is
+ * refused with the request, not carried to a daemon.
+ */
+static int test_xfer_membind(void)
+{
+    int failures = 0;
+    prte_job_t *jdata;
+    prte_app_context_t *app;
+    pmix_app_t papp;
+    pmix_info_t info[1];
+    uint16_t u16 = UINT16_MAX, *u16ptr = &u16;
+    uint32_t u32 = 1;
+
+    /* job level */
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_MEMBIND, "BANDWIDTH", PMIX_STRING);
+    CHECK("membind/job-rc", PRTE_SUCCESS == prte_pmix_xfer_job_info(jdata, info, 1));
+    CHECK("membind/job-set",
+          prte_get_attribute(&jdata->attributes, PRTE_JOB_MEMBIND, (void **) &u16ptr, PMIX_UINT16));
+    CHECK("membind/job-value", PRTE_HWLOC_BASE_MEMATTR_BANDWIDTH == u16);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    /* "none" is a real answer, recorded as such: it overrides an MCA default */
+    jdata = fresh_job();
+    u16 = UINT16_MAX;
+    PMIX_INFO_LOAD(&info[0], PMIX_MEMBIND, "none", PMIX_STRING);
+    CHECK("membind/none-rc", PRTE_SUCCESS == prte_pmix_xfer_job_info(jdata, info, 1));
+    CHECK("membind/none-set",
+          prte_get_attribute(&jdata->attributes, PRTE_JOB_MEMBIND, (void **) &u16ptr, PMIX_UINT16));
+    CHECK("membind/none-value", PRTE_HWLOC_BASE_MEMATTR_DISABLED == u16);
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    /* a value the parser refuses is refused with the request */
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_MEMBIND, "fastest", PMIX_STRING);
+    CHECK("membind/bad-value-refused", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+    CHECK("membind/bad-value-records-nothing",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_MEMBIND, (void **) &u16ptr, PMIX_UINT16));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    /* a second one for the same job is a conflict, not an overwrite */
+    jdata = fresh_job();
+    {
+        pmix_info_t two[2];
+
+        PMIX_INFO_LOAD(&two[0], PMIX_MEMBIND, "bandwidth", PMIX_STRING);
+        PMIX_INFO_LOAD(&two[1], PMIX_MEMBIND, "capacity", PMIX_STRING);
+        CHECK("membind/redefined-refused", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, two, 2));
+        PMIX_INFO_DESTRUCT(&two[0]);
+        PMIX_INFO_DESTRUCT(&two[1]);
+    }
+    PMIX_RELEASE(jdata);
+
+    /* so is a value of the wrong type, rather than read as a string */
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_MEMBIND, &u32, PMIX_UINT32);
+    CHECK("membind/bad-type-refused", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    /* and a string loaded with nothing, which arrives as a NULL string */
+    jdata = fresh_job();
+    PMIX_INFO_LOAD(&info[0], PMIX_MEMBIND, NULL, PMIX_STRING);
+    CHECK("membind/null-value-refused", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+    CHECK("membind/null-value-records-nothing",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_MEMBIND, (void **) &u16ptr, PMIX_UINT16));
+    PMIX_INFO_DESTRUCT(&info[0]);
+    PMIX_RELEASE(jdata);
+
+    /* app level: lands on the app, and not on the job */
+    jdata = fresh_job();
+    PMIX_APP_CONSTRUCT(&papp);
+    papp.cmd = strdup("/bin/hostname");
+    PMIx_Argv_append_nosize(&papp.argv, "hostname");
+    papp.maxprocs = 1;
+    PMIX_INFO_CREATE(papp.info, 1);
+    papp.ninfo = 1;
+    PMIX_INFO_LOAD(&papp.info[0], PMIX_MEMBIND, "cap", PMIX_STRING);
+    CHECK("membind/app-rc", PRTE_SUCCESS == prte_pmix_xfer_app(jdata, &papp));
+    app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
+    CHECK("membind/app-present", NULL != app);
+    if (NULL != app) {
+        u16 = UINT16_MAX;
+        CHECK("membind/app-set",
+              prte_get_attribute(&app->attributes, PRTE_APP_MEMBIND, (void **) &u16ptr, PMIX_UINT16));
+        CHECK("membind/app-value", PRTE_HWLOC_BASE_MEMATTR_CAPACITY == u16);
+    }
+    CHECK("membind/app-not-on-job",
+          !prte_get_attribute(&jdata->attributes, PRTE_JOB_MEMBIND, (void **) &u16ptr, PMIX_UINT16));
+    PMIX_APP_DESTRUCT(&papp);
+    PMIX_RELEASE(jdata);
+
+    if (0 == failures) {
+        fprintf(stdout, "  PASS membind transfer\n");
+    }
+    return failures;
+}
+
+
+/*
+ * A memory binding by attribute hangs off the cpuset the mapper gave each
+ * process, explicit or derived. prte_hwloc_base_membind_resolve() picks the
+ * request (app, then job, then MCA default) and
+ * prte_hwloc_base_membind_count_unbound() counts the procs of an app that
+ * have no cpuset: the HNP warns on that count, and the daemons skip the
+ * binding on the very same test.
+ */
+static prte_proc_t *add_proc(prte_job_t *jdata, int app_idx, const char *cpuset)
+{
+    prte_proc_t *proc = PMIX_NEW(prte_proc_t);
+
+    proc->app_idx = app_idx;
+    proc->cpuset = (NULL == cpuset) ? NULL : strdup(cpuset);
+    pmix_pointer_array_add(jdata->procs, proc);
+    return proc;
+}
+
+static int test_membind_unbound(void)
+{
+    int failures = 0;
+    prte_job_t *jdata;
+    prte_app_context_t *app;
+    uint16_t u16;
+    prte_hwloc_base_memattr_t saved = prte_hwloc_base_memattr;
+
+    jdata = fresh_job();
+    app = PMIX_NEW(prte_app_context_t);
+
+    /* resolution order: app, else job, else the MCA default */
+    prte_hwloc_base_memattr = PRTE_HWLOC_BASE_MEMATTR_LATENCY;
+    CHECK("membind-resolve/mca", PRTE_HWLOC_BASE_MEMATTR_LATENCY ==
+                                 prte_hwloc_base_membind_resolve(jdata, app));
+    u16 = PRTE_HWLOC_BASE_MEMATTR_CAPACITY;
+    prte_set_attribute(&jdata->attributes, PRTE_JOB_MEMBIND, PRTE_ATTR_GLOBAL, &u16, PMIX_UINT16);
+    CHECK("membind-resolve/job", PRTE_HWLOC_BASE_MEMATTR_CAPACITY ==
+                                 prte_hwloc_base_membind_resolve(jdata, app));
+    u16 = PRTE_HWLOC_BASE_MEMATTR_BANDWIDTH;
+    prte_set_attribute(&app->attributes, PRTE_APP_MEMBIND, PRTE_ATTR_GLOBAL, &u16, PMIX_UINT16);
+    CHECK("membind-resolve/app", PRTE_HWLOC_BASE_MEMATTR_BANDWIDTH ==
+                                 prte_hwloc_base_membind_resolve(jdata, app));
+    CHECK("membind-resolve/no-app", PRTE_HWLOC_BASE_MEMATTR_CAPACITY ==
+                                    prte_hwloc_base_membind_resolve(jdata, NULL));
+    prte_hwloc_base_memattr = saved;
+
+    /* no procs mapped: nothing unbound */
+    CHECK("membind-unbound/empty", 0 == prte_hwloc_base_membind_count_unbound(jdata, 0));
+
+    /* app 0: bound - by --bind-to core, or by the binding --map-by or the
+     * default derives; the binding word does not matter, the cpuset does */
+    add_proc(jdata, 0, "0");
+    add_proc(jdata, 0, "1");
+    CHECK("membind-unbound/all-bound", 0 == prte_hwloc_base_membind_count_unbound(jdata, 0));
+
+    /* app 1: --bind-to none, or the default dropped on oversubscription,
+     * leaves the cpuset NULL or empty */
+    add_proc(jdata, 1, NULL);
+    add_proc(jdata, 1, "");
+    add_proc(jdata, 1, "2-3");
+    CHECK("membind-unbound/some-unbound", 2 == prte_hwloc_base_membind_count_unbound(jdata, 1));
+    CHECK("membind-unbound/other-app-untouched",
+          0 == prte_hwloc_base_membind_count_unbound(jdata, 0));
+    CHECK("membind-unbound/no-such-app", 0 == prte_hwloc_base_membind_count_unbound(jdata, 7));
+    CHECK("membind-unbound/null-job", 0 == prte_hwloc_base_membind_count_unbound(NULL, 0));
+
+    PMIX_RELEASE(app);
+    PMIX_RELEASE(jdata);
+    if (0 == failures) {
+        fprintf(stdout, "  PASS membind and unbound procs\n");
+    }
+    return failures;
+}
 
 /*
  * A scheduler's session time limit (PMIX_ALLOC_TIME) is the one directive
@@ -2295,6 +2575,7 @@ static int test_tool_registration(void)
     int failures = 0;
     prte_pmix_server_req_t *req;
     prte_job_t *jdata;
+    prte_proc_t *proc;
     bool made_array = false;
     int rc;
 
@@ -2328,11 +2609,12 @@ static int test_tool_registration(void)
     CHECK("an empty namespace is refused", PRTE_SUCCESS != rc);
     PMIX_RELEASE(req);
 
-    /* A namespace we already hold is answered at once - and the caller has
-     * to tolerate the callback firing before the call returns, which is why
-     * this one is passed none. */
+    /* A tool namespace we already hold is answered at once - and the caller
+     * has to tolerate the callback firing before the call returns, which is
+     * why this one is passed none. */
     jdata = PMIX_NEW(prte_job_t);
     PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-tool@2");
+    PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
     if (PRTE_SUCCESS != prte_set_job_data_object(jdata)) {
         fprintf(stderr, "FAIL [test_tool_registration]: could not register a job\n");
         PMIX_RELEASE(jdata);
@@ -2351,6 +2633,27 @@ static int test_tool_registration(void)
           jdata == prte_get_job_data_object(req->target.nspace));
     PMIX_RELEASE(req);
 
+    /* An application job: a tool may take a rank the job has, as one started
+     * from a job script does, but may not add one - the rank would never
+     * retire and the job could never complete.  The relay on the master asks
+     * the same question, through prte_pmix_server_tool_may_join(). */
+    PRTE_FLAG_UNSET(jdata, PRTE_JOB_FLAG_TOOL);
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    PMIX_LOAD_PROCID(&req->target, "unit-test-tool@2", 0);
+    CHECK("a tool may not add a rank to an application job",
+          PRTE_EXISTS == prte_pmix_server_register_tool(req, NULL, NULL));
+    proc = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&proc->name, "unit-test-tool@2", 0);
+    pmix_pointer_array_set_item(jdata->procs, 0, proc);
+    CHECK("...but may take one it already has",
+          PRTE_SUCCESS == prte_pmix_server_register_tool(req, NULL, NULL));
+    req->target.rank = PMIX_RANK_UNDEF;
+    CHECK("...and a sentinel rank is refused for a known namespace too",
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_register_tool(req, NULL, NULL));
+    CHECK("the may-join check refuses the same sentinel on the relay's behalf",
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, PMIX_RANK_WILDCARD));
+    PMIX_RELEASE(req);
+
     pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
     PMIX_RELEASE(jdata);
     if (made_array) {
@@ -2364,19 +2667,37 @@ static int test_tool_registration(void)
     return failures;
 }
 
+/* give a job a proc at every rank below n it does not have yet */
+static void add_procs(prte_job_t *jdata, int n)
+{
+    prte_proc_t *pptr;
+    int r;
+
+    for (r = 0; r < n; r++) {
+        if (NULL != pmix_pointer_array_get_item(jdata->procs, r)) {
+            continue;
+        }
+        pptr = PMIX_NEW(prte_proc_t);
+        PMIX_LOAD_PROCID(&pptr->name, jdata->nspace, r);
+        pmix_pointer_array_set_item(jdata->procs, r, pptr);
+    }
+    jdata->num_procs = n;
+}
+
 static int test_connections(void)
 {
     int failures = 0;
-    pmix_proc_t members[2], other[2], proc;
-    prte_proc_t pdata;
-    prte_job_t *jdata;
+    pmix_proc_t members[2], other[2], trio[3], proc, listed[4];
+    prte_proc_t pdata, *pptr;
+    prte_job_t *jdata, *third;
+    prte_pmix_server_connection_t *cptr;
     bool made_array = false;
 
     /* the registry lives in the server globals, which a full
      * pmix_server_init() would have constructed - and it declines to record
      * anything until that has happened, which is what keeps every other test
      * in this binary out of it */
-    PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
+    prte_pmix_server_connection_init();
     prte_pmix_server_globals.initialized = true;
     if (NULL == prte_job_data) {
         prte_job_data = PMIX_NEW(pmix_pointer_array_t);
@@ -2398,6 +2719,13 @@ static int test_connections(void)
     prte_pmix_server_connection_record(other, 2);
     CHECK("the same set in another order is the same connection",
           1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+    /* ...made a second time, though, and each disconnect ends one of them:
+     * two connect/accept pairs between the same jobs are two
+     * intercommunicators, and disconnecting one leaves the other connected */
+    prte_pmix_server_connection_drop(members, 2);
+    CHECK("one disconnect ends one of two connects",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+    prte_pmix_server_connection_record(members, 2);
 
     /* a wildcard member stands for every proc of that namespace - which is
      * how a connect between two jobs is nearly always expressed, so getting
@@ -2418,14 +2746,43 @@ static int test_connections(void)
     CHECK("a different set does not drop this one",
           1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
 
-    /* a job of the assemblage ends, but the other is still running: the
-     * survivors are still connected to each other and still owed an event
-     * apiece, so the record has to stay */
+    /* a job of a two-job assemblage ends while the other runs on: the
+     * connection between them is over, and the survivor is not connected to
+     * itself - kept, the record would broadcast each of its procs' exits to
+     * the rest of its own job */
     jdata = PMIX_NEW(prte_job_t);
     PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-conn@2");
     CHECK("the surviving job registers", PRTE_SUCCESS == prte_set_job_data_object(jdata));
     prte_pmix_server_connection_purge(members[0].nspace);
-    CHECK("a connection outlives one member's job",
+    CHECK("a connection between two jobs ends with one of them",
+          0 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* with three, the two that remain are still connected to each other and
+     * still owed an event apiece */
+    PMIX_LOAD_PROCID(&trio[0], "unit-test-conn@1", PMIX_RANK_WILDCARD);
+    PMIX_LOAD_PROCID(&trio[1], "unit-test-conn@2", PMIX_RANK_WILDCARD);
+    PMIX_LOAD_PROCID(&trio[2], "unit-test-conn@3", PMIX_RANK_WILDCARD);
+    third = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(third->nspace, "unit-test-conn@3");
+    CHECK("the third job registers", PRTE_SUCCESS == prte_set_job_data_object(third));
+    prte_pmix_server_connection_record(trio, 3);
+    prte_pmix_server_connection_purge(trio[0].nspace);
+    CHECK("a connection outlives one member's job while two remain",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+    pmix_pointer_array_set_item(prte_job_data, third->index, NULL);
+    PMIX_RELEASE(third);
+    prte_pmix_server_connection_purge(trio[2].nspace);
+    CHECK("and ends when only one does",
+          0 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* a connection within one job never had another job in it: it lasts
+     * while that job does, and the end of an unrelated job leaves it alone */
+    PMIX_LOAD_PROCID(&other[0], "unit-test-conn@2", 0);
+    PMIX_LOAD_PROCID(&other[1], "unit-test-conn@2", 1);
+    prte_pmix_server_connection_record(other, 2);
+    PMIX_LOAD_PROCID(&proc, "unit-test-conn@9", 0);
+    prte_pmix_server_connection_purge(proc.nspace);
+    CHECK("a connection within one job outlives another job's end",
           1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
 
     /* ...and once nothing named in it is left, it has nobody to serve */
@@ -2433,6 +2790,14 @@ static int test_connections(void)
     PMIX_RELEASE(jdata);
     prte_pmix_server_connection_purge(members[1].nspace);
     CHECK("and is forgotten when nothing named in it is left",
+          0 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* the second disconnect of a twice-made connection ends it */
+    prte_pmix_server_connection_record(members, 2);
+    prte_pmix_server_connection_record(members, 2);
+    prte_pmix_server_connection_drop(members, 2);
+    prte_pmix_server_connection_drop(members, 2);
+    CHECK("two disconnects end two connects",
           0 == pmix_list_get_size(&prte_pmix_server_globals.connections));
 
     /* a disconnect of the set that was recorded does drop it */
@@ -2467,6 +2832,129 @@ static int test_connections(void)
           1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
     prte_pmix_server_connection_drop(members, 2);
 
+    /* A connect that lists every rank of a job keeps its members as named,
+     * and is addressed as the job: a departure reads one entry per job, not
+     * one per rank.  Matching still reads the members as named, so the same
+     * jobs connected by wildcard are a second assemblage, and a disconnect
+     * listing the same ranks dissolves only the first. */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-conn@3");
+    add_procs(jdata, 3);
+    CHECK("the listed job registers", PRTE_SUCCESS == prte_set_job_data_object(jdata));
+    PMIX_LOAD_PROCID(&listed[0], "unit-test-conn@3", 2);
+    PMIX_LOAD_PROCID(&listed[1], "unit-test-conn@3", 0);
+    PMIX_LOAD_PROCID(&listed[2], "unit-test-conn@3", 1);
+    listed[3] = members[1];
+    prte_pmix_server_connection_record(listed, 4);
+    cptr = (prte_pmix_server_connection_t *)
+        pmix_list_get_first(&prte_pmix_server_globals.connections);
+    CHECK("a wholly listed job keeps its members as named",
+          NULL != cptr && 4 == cptr->nmembers);
+    CHECK("...and is addressed as the job",
+          NULL != cptr && 2 == cptr->ncollapsed &&
+          PMIX_RANK_WILDCARD == cptr->collapsed[0].rank &&
+          PMIX_CHECK_NSPACE_STRICT(cptr->collapsed[0].nspace, "unit-test-conn@3"));
+    PMIX_LOAD_PROCID(&proc, "unit-test-conn@3", 1);
+    CHECK("...which still covers each of its ranks", prte_pmix_server_is_connected(&proc));
+    PMIX_LOAD_PROCID(&other[0], "unit-test-conn@3", PMIX_RANK_WILDCARD);
+    other[1] = members[1];
+    prte_pmix_server_connection_record(other, 2);
+    CHECK("the same jobs connected by wildcard are another assemblage",
+          2 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+    prte_pmix_server_connection_drop(listed, 4);
+    CHECK("a disconnect listing the ranks dissolves only the listed one",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+    prte_pmix_server_connection_drop(other, 2);
+
+    /* ...and a job not wholly listed is addressed as listed */
+    prte_pmix_server_connection_record(&listed[1], 3);
+    cptr = (prte_pmix_server_connection_t *)
+        pmix_list_get_first(&prte_pmix_server_globals.connections);
+    CHECK("a job not wholly listed is addressed rank by rank",
+          NULL != cptr && 3 == cptr->ncollapsed);
+    prte_pmix_server_connection_drop(&listed[1], 3);
+
+    /* A proc that has terminated never comes back, so the survivors of a job
+     * some procs have left are the whole job: a list naming them all is
+     * addressed as the job, and a listed proc that has gone does not count
+     * towards naming them all. */
+    add_procs(jdata, 4);
+    pptr = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, 3);
+    pptr->state = PRTE_PROC_STATE_TERMINATED;
+    PRTE_FLAG_SET(pptr, PRTE_PROC_FLAG_RECORDED);
+    prte_pmix_server_connection_record(listed, 4);
+    cptr = (prte_pmix_server_connection_t *)
+        pmix_list_get_first(&prte_pmix_server_globals.connections);
+    CHECK("a job's survivors listed in full are addressed as the job",
+          NULL != cptr && 2 == cptr->ncollapsed);
+    prte_pmix_server_connection_drop(listed, 4);
+    PMIX_LOAD_PROCID(&other[0], "unit-test-conn@3", 3);
+    other[1] = listed[1];
+    prte_pmix_server_connection_record(other, 2);
+    cptr = (prte_pmix_server_connection_t *)
+        pmix_list_get_first(&prte_pmix_server_globals.connections);
+    CHECK("...but naming a proc that has gone does not name the survivors",
+          NULL != cptr && 2 == cptr->ncollapsed &&
+          PMIX_RANK_WILDCARD != cptr->collapsed[0].rank &&
+          PMIX_RANK_WILDCARD != cptr->collapsed[1].rank);
+    prte_pmix_server_connection_drop(other, 2);
+
+    /* A proc that has failed but whose termination is not yet recorded has
+     * not left: its departure is still to be reported, and a wildcard would
+     * cover it. */
+    ((prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, 2))->state =
+        PRTE_PROC_STATE_ABORTED_BY_SIG;
+    prte_pmix_server_connection_record(&listed[1], 3);
+    cptr = (prte_pmix_server_connection_t *)
+        pmix_list_get_first(&prte_pmix_server_globals.connections);
+    CHECK("...nor does leaving out a proc that is still on its way out",
+          NULL != cptr && 3 == cptr->ncollapsed);
+    prte_pmix_server_connection_drop(&listed[1], 3);
+    pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+    PMIX_RELEASE(jdata);
+
+    /* A tool's namespace gains a rank whenever another of its processes
+     * attaches, so it is addressed as listed even when the list names every
+     * rank it has today: its wildcard would also reach the ranks that attach
+     * later. */
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-conn@3");
+    PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
+    add_procs(jdata, 3);
+    CHECK("the tool job registers", PRTE_SUCCESS == prte_set_job_data_object(jdata));
+    prte_pmix_server_connection_record(listed, 4);
+    cptr = (prte_pmix_server_connection_t *)
+        pmix_list_get_first(&prte_pmix_server_globals.connections);
+    CHECK("a tool job is addressed rank by rank",
+          NULL != cptr && 4 == cptr->ncollapsed);
+    add_procs(jdata, 4);
+    PMIX_LOAD_PROCID(&proc, "unit-test-conn@3", 3);
+    CHECK("...so a rank it gains later is not covered",
+          !prte_pmix_server_is_connected(&proc));
+    prte_pmix_server_connection_drop(listed, 4);
+    pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+    PMIX_RELEASE(jdata);
+
+    /* ...and so is the daemons' namespace, which a grow adds to */
+    {
+        pmix_proc_t saved = *PRTE_PROC_MY_NAME;
+
+        PMIX_LOAD_PROCID(PRTE_PROC_MY_NAME, "unit-test-conn@3", 0);
+        jdata = PMIX_NEW(prte_job_t);
+        PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-conn@3");
+        add_procs(jdata, 3);
+        CHECK("the daemon job registers", PRTE_SUCCESS == prte_set_job_data_object(jdata));
+        prte_pmix_server_connection_record(listed, 4);
+        cptr = (prte_pmix_server_connection_t *)
+            pmix_list_get_first(&prte_pmix_server_globals.connections);
+        CHECK("the daemon job is addressed rank by rank",
+              NULL != cptr && 4 == cptr->ncollapsed);
+        prte_pmix_server_connection_drop(listed, 4);
+        pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+        PMIX_RELEASE(jdata);
+        *PRTE_PROC_MY_NAME = saved;
+    }
+
     /* a proc that belongs to nothing is not connected, and reporting its
      * termination is a no-op rather than a walk off the end of an empty list */
     PMIX_CONSTRUCT(&pdata, prte_proc_t);
@@ -2477,7 +2965,7 @@ static int test_connections(void)
     PMIX_DESTRUCT(&pdata);
 
     prte_pmix_server_globals.initialized = false;
-    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.connections);
+    prte_pmix_server_connection_finalize();
     if (made_array) {
         PMIX_RELEASE(prte_job_data);
         prte_job_data = NULL;
@@ -2551,7 +3039,7 @@ static int test_connection_fate_sharing(void)
     bool made_array = false;
     int nterminating = 0;
 
-    PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
+    prte_pmix_server_connection_init();
     prte_pmix_server_globals.initialized = true;
     prte_pmix_server_globals.terminate_connected = true;
     if (NULL == prte_job_data) {
@@ -2635,7 +3123,7 @@ cleanup:
         PMIX_RELEASE(grandchild);
     }
     prte_pmix_server_globals.initialized = false;
-    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.connections);
+    prte_pmix_server_connection_finalize();
     if (made_array) {
         PMIX_RELEASE(prte_job_data);
         prte_job_data = NULL;
@@ -2643,6 +3131,478 @@ cleanup:
 
     if (0 == failures) {
         fprintf(stdout, "PASSED test_connection_fate_sharing\n");
+    }
+    return failures;
+}
+
+/*
+ * A departure is announced to its assemblage as one event per set - one job,
+ * one audience - rather than one per proc.
+ *
+ * The events are read off the wire the way pmix_server_notify() reads them on
+ * every daemon, through the registry's xcast pointer, so what is counted here
+ * is what would have been broadcast.
+ */
+typedef struct {
+    pmix_status_t status;
+    pmix_proc_t source;
+    pmix_proc_t affected[8];
+    size_t naffected;
+    size_t ntargets;
+    bool have_exit;
+    int exit_code;
+    int nkilled; /* kills already ordered when it was sent */
+} dep_event_t;
+
+static dep_event_t dep_events[16];
+static int dep_nevents = 0;
+
+static int dep_xcast(prte_rml_tag_t tag, pmix_data_buffer_t *msg)
+{
+    pmix_data_buffer_t copy;
+    dep_event_t *ev;
+    pmix_rank_t vpid;
+    pmix_data_range_t range;
+    pmix_info_t *info = NULL;
+    pmix_data_array_t *darray;
+    size_t ninfo = 0, n, m;
+    int32_t cnt;
+    pmix_status_t rc;
+    PRTE_HIDE_UNUSED_PARAMS(tag);
+
+    if (16 <= dep_nevents) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    ev = &dep_events[dep_nevents++];
+    memset(ev, 0, sizeof(*ev));
+    ev->nkilled = PMIx_Argv_count(fate_killed);
+
+    /* the caller destructs its buffer, so read a copy */
+    PMIX_DATA_BUFFER_CONSTRUCT(&copy);
+    rc = PMIx_Data_copy_payload(&copy, msg);
+    cnt = 1;
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_unpack(NULL, &copy, &vpid, &cnt, PMIX_PROC_RANK);
+    }
+    cnt = 1;
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_unpack(NULL, &copy, &ev->status, &cnt, PMIX_STATUS);
+    }
+    cnt = 1;
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_unpack(NULL, &copy, &ev->source, &cnt, PMIX_PROC);
+    }
+    cnt = 1;
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_unpack(NULL, &copy, &range, &cnt, PMIX_DATA_RANGE);
+    }
+    cnt = 1;
+    if (PMIX_SUCCESS == rc) {
+        rc = PMIx_Data_unpack(NULL, &copy, &ninfo, &cnt, PMIX_SIZE);
+    }
+    if (PMIX_SUCCESS == rc && 0 < ninfo) {
+        PMIX_INFO_CREATE(info, ninfo);
+        cnt = ninfo;
+        rc = PMIx_Data_unpack(NULL, &copy, info, &cnt, PMIX_INFO);
+    }
+    PMIX_DATA_BUFFER_DESTRUCT(&copy);
+    if (PMIX_SUCCESS != rc) {
+        ev->status = rc;
+        if (NULL != info) {
+            PMIX_INFO_FREE(info, ninfo);
+        }
+        return PRTE_SUCCESS;
+    }
+    for (n = 0; n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_AFFECTED_PROC)) {
+            memcpy(&ev->affected[ev->naffected++], info[n].value.data.proc,
+                   sizeof(pmix_proc_t));
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_AFFECTED_PROCS)) {
+            darray = info[n].value.data.darray;
+            for (m = 0; m < darray->size && ev->naffected < 8; m++) {
+                memcpy(&ev->affected[ev->naffected++], &((pmix_proc_t *) darray->array)[m],
+                       sizeof(pmix_proc_t));
+            }
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_EVENT_CUSTOM_RANGE)) {
+            ev->ntargets = info[n].value.data.darray->size;
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_EXIT_CODE)) {
+            ev->have_exit = true;
+            ev->exit_code = info[n].value.data.integer;
+        }
+    }
+    PMIX_INFO_FREE(info, ninfo);
+    return PRTE_SUCCESS;
+}
+
+/* turn the event loop until nothing is left to run - the pass-end flush is an
+ * event of its own */
+static void dep_drain(void)
+{
+    int spins;
+
+    for (spins = 0; spins < 10; spins++) {
+        prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE | PRTE_EVLOOP_NONBLOCK);
+    }
+}
+
+static void dep_depart(prte_job_t *jdata, pmix_rank_t rank, int exit_code)
+{
+    prte_proc_t pdata;
+
+    PMIX_CONSTRUCT(&pdata, prte_proc_t);
+    PMIX_LOAD_PROCID(&pdata.name, jdata->nspace, rank);
+    pdata.exit_code = exit_code;
+    prte_pmix_server_connection_terminated(&pdata);
+    PMIX_DESTRUCT(&pdata);
+}
+
+static prte_job_t *dep_job(const char *nspace, int nprocs)
+{
+    prte_job_t *jdata = fate_job(nspace);
+
+    if (NULL != jdata) {
+        jdata->num_procs = nprocs;
+    }
+    return jdata;
+}
+
+static void dep_drop_job(prte_job_t *jdata)
+{
+    if (NULL != jdata) {
+        pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+        PMIX_RELEASE(jdata);
+    }
+}
+
+static int test_connection_departures(void)
+{
+    int failures = 0;
+    pmix_proc_t members[2];
+    prte_job_t *a = NULL, *b = NULL, *p = NULL, *c = NULL, *x = NULL, *y = NULL;
+    prte_job_t *s = NULL, *k = NULL;
+    prte_proc_t *culprit;
+    prte_plm_base_module_t saved_plm;
+    bool made_array = false;
+    pmix_rank_t r;
+    int nkilled;
+
+    prte_pmix_server_connection_init();
+    prte_pmix_server_globals.initialized = true;
+    prte_pmix_server_globals.terminate_connected = true;
+    prte_pmix_server_connection_xcast = dep_xcast;
+    if (NULL == prte_job_data) {
+        prte_job_data = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_job_data, 8, INT32_MAX, 8);
+        made_array = true;
+    }
+    saved_plm = prte_plm;
+    memset(&prte_plm, 0, sizeof(prte_plm));
+    prte_plm.terminate_procs = fate_terminate_procs;
+
+    a = dep_job("unit-test-dep@1", 4);
+    b = dep_job("unit-test-dep@2", 4);
+    CHECK("the departure jobs register", NULL != a && NULL != b);
+    if (NULL == a || NULL == b) {
+        goto cleanup;
+    }
+    PMIX_LOAD_PROCID(&members[0], a->nspace, PMIX_RANK_WILDCARD);
+    PMIX_LOAD_PROCID(&members[1], b->nspace, PMIX_RANK_WILDCARD);
+    prte_pmix_server_connection_record(members, 2);
+
+    /* one daemon's report of a whole job ending: one event naming the job */
+    dep_nevents = 0;
+    for (r = 0; r < 4; r++) {
+        dep_depart(b, r, 0);
+    }
+    CHECK("nothing is sent while the pass is running", 0 == dep_nevents);
+    dep_drain();
+    CHECK("a job's ending in one pass is one event", 1 == dep_nevents);
+    CHECK("it is a departure", PMIX_ERR_PROC_TERM_WO_SYNC == dep_events[0].status);
+    CHECK("it names the whole job",
+          1 == dep_events[0].naffected && PMIX_RANK_WILDCARD == dep_events[0].affected[0].rank &&
+          PMIX_CHECK_NSPACE_STRICT(dep_events[0].affected[0].nspace, b->nspace));
+    CHECK("it carries the exit code they share",
+          dep_events[0].have_exit && 0 == dep_events[0].exit_code);
+    CHECK("it goes to the assemblage", 2 == dep_events[0].ntargets);
+
+    /* part of a job: one event listing the procs */
+    dep_nevents = 0;
+    dep_depart(a, 0, 0);
+    dep_depart(a, 2, 3);
+    dep_drain();
+    CHECK("two departures in one pass are one event", 1 == dep_nevents);
+    CHECK("it lists both procs",
+          2 == dep_events[0].naffected && 0 == dep_events[0].affected[0].rank &&
+          2 == dep_events[0].affected[1].rank);
+    CHECK("a mixed exit code is not reported", !dep_events[0].have_exit);
+    CHECK("the source is the job, not one proc", PMIX_RANK_WILDCARD == dep_events[0].source.rank);
+
+    /* one departure on its own looks as it always has */
+    dep_nevents = 0;
+    dep_depart(a, 1, 7);
+    dep_drain();
+    CHECK("a lone departure is one event", 1 == dep_nevents);
+    CHECK("it names that proc", 1 == dep_events[0].naffected && 1 == dep_events[0].affected[0].rank);
+    CHECK("with its exit code", dep_events[0].have_exit && 7 == dep_events[0].exit_code);
+
+    /* ranks of one job owed to different audiences are not folded together */
+    p = dep_job("unit-test-dep@3", 2);
+    c = dep_job("unit-test-dep@4", 2);
+    if (NULL == p || NULL == c) {
+        CHECK("the grouping jobs register", false);
+        goto cleanup;
+    }
+    PMIX_LOAD_PROCID(&members[0], p->nspace, 0);
+    PMIX_LOAD_PROCID(&members[1], c->nspace, 0);
+    prte_pmix_server_connection_record(members, 2);
+    PMIX_LOAD_PROCID(&members[0], p->nspace, 1);
+    PMIX_LOAD_PROCID(&members[1], c->nspace, 1);
+    prte_pmix_server_connection_record(members, 2);
+    dep_nevents = 0;
+    dep_depart(c, 0, 0);
+    dep_depart(c, 1, 0);
+    dep_drain();
+    CHECK("two audiences are two events", 2 == dep_nevents);
+    CHECK("neither names the whole job",
+          1 == dep_events[0].naffected && 0 == dep_events[0].affected[0].rank &&
+          1 == dep_events[1].naffected && 1 == dep_events[1].affected[0].rank);
+
+    /* a job the master ordered down is held for its end */
+    dep_nevents = 0;
+    prte_pmix_server_connection_teardown(a->nspace);
+    for (r = 0; r < 4; r++) {
+        dep_depart(a, r, 0);
+    }
+    dep_drain();
+    CHECK("a torn-down job's departures are held", 0 == dep_nevents);
+    prte_pmix_server_connection_job_ended(a);
+    CHECK("and sent as one event at its end", 1 == dep_nevents);
+    CHECK("naming the whole job",
+          1 == dep_events[0].naffected && PMIX_RANK_WILDCARD == dep_events[0].affected[0].rank);
+
+    /* a failure with fate sharing: the culprit, the job killed for it, and
+     * nothing per proc from either */
+    x = dep_job("unit-test-dep@5", 2);
+    y = dep_job("unit-test-dep@6", 2);
+    if (NULL == x || NULL == y) {
+        CHECK("the failure jobs register", false);
+        goto cleanup;
+    }
+    PMIX_LOAD_PROCID(&members[0], x->nspace, PMIX_RANK_WILDCARD);
+    PMIX_LOAD_PROCID(&members[1], y->nspace, PMIX_RANK_WILDCARD);
+    prte_pmix_server_connection_record(members, 2);
+    culprit = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&culprit->name, x->nspace, 1);
+    culprit->exit_code = 9;
+    prte_set_attribute(&x->attributes, PRTE_JOB_ABORTED_PROC, PRTE_ATTR_LOCAL, culprit,
+                       PMIX_POINTER);
+    dep_nevents = 0;
+    nkilled = PMIx_Argv_count(fate_killed);
+    prte_pmix_server_connection_job_failed(x->nspace);
+    CHECK("a failure is announced at once, with the job it costs", 2 == dep_nevents);
+    /* a process told why it is going could act on it before its kill
+     * arrived, and finish the work it was to be stopped from finishing */
+    CHECK("and only once the job it costs has been ordered killed",
+          fate_was_killed(y->nspace) && nkilled < dep_events[0].nkilled);
+    CHECK("first the proc that failed",
+          PMIX_ERR_PROC_TERM_WO_SYNC == dep_events[0].status &&
+          1 == dep_events[0].naffected && 1 == dep_events[0].affected[0].rank &&
+          dep_events[0].have_exit && 9 == dep_events[0].exit_code);
+    CHECK("then the job killed because of it",
+          PMIX_ERR_JOB_TERM_WO_SYNC == dep_events[1].status &&
+          PMIX_CHECK_NSPACE_STRICT(dep_events[1].affected[0].nspace, y->nspace));
+    for (r = 0; r < 2; r++) {
+        dep_depart(x, r, 0);
+        dep_depart(y, r, 0);
+    }
+    dep_drain();
+    prte_pmix_server_connection_job_ended(x);
+    prte_pmix_server_connection_job_ended(y);
+    CHECK("nobody in a condemned assemblage is told of its procs going", 2 == dep_nevents);
+
+    /* without fate sharing, the culprit at once and the rest at the end */
+    prte_pmix_server_globals.terminate_connected = false;
+    PMIX_LOAD_PROCID(&members[0], x->nspace, 0);
+    PMIX_LOAD_PROCID(&members[1], a->nspace, PMIX_RANK_WILDCARD);
+    prte_pmix_server_connection_record(members, 2);
+    PMIX_LOAD_PROCID(&members[0], b->nspace, PMIX_RANK_WILDCARD);
+    PMIX_LOAD_PROCID(&members[1], c->nspace, PMIX_RANK_WILDCARD);
+    prte_pmix_server_connection_record(members, 2);
+    culprit = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&culprit->name, b->nspace, 2);
+    culprit->exit_code = 5;
+    prte_set_attribute(&b->attributes, PRTE_JOB_ABORTED_PROC, PRTE_ATTR_LOCAL, culprit,
+                       PMIX_POINTER);
+    dep_nevents = 0;
+    prte_pmix_server_connection_job_failed(b->nspace);
+    CHECK("the failure alone is announced", 1 == dep_nevents);
+    CHECK("naming the proc", 2 == dep_events[0].affected[0].rank);
+    for (r = 0; r < 4; r++) {
+        dep_depart(b, r, 0);
+    }
+    dep_drain();
+    CHECK("the rest of the job is held", 1 == dep_nevents);
+    prte_pmix_server_connection_job_ended(b);
+    CHECK("and goes as one event at its end", 2 == dep_nevents);
+    CHECK("naming the whole job",
+          PMIX_ERR_PROC_TERM_WO_SYNC == dep_events[1].status &&
+          PMIX_RANK_WILDCARD == dep_events[1].affected[0].rank &&
+          PMIX_CHECK_NSPACE_STRICT(dep_events[1].affected[0].nspace, b->nspace));
+    CHECK("no job is killed without fate sharing", NULL == fate_killed ||
+          !fate_was_killed(c->nspace));
+
+    /* a spawn: once the children have gone, the parent is connected to
+     * nobody, and its own procs' exits are nobody else's news */
+    s = dep_job("unit-test-dep@7", 1);
+    k = dep_job("unit-test-dep@8", 2);
+    if (NULL == s || NULL == k) {
+        CHECK("the spawn jobs register", false);
+        goto cleanup;
+    }
+    PMIX_LOAD_PROCID(&members[0], s->nspace, 0);
+    PMIX_LOAD_PROCID(&members[1], k->nspace, PMIX_RANK_WILDCARD);
+    prte_pmix_server_connection_record(members, 2);
+    dep_nevents = 0;
+    for (r = 0; r < 2; r++) {
+        dep_depart(k, r, 0);
+    }
+    dep_drain();
+    CHECK("the children's exit is announced to the parent", 1 == dep_nevents);
+    dep_drop_job(k);
+    k = NULL;
+    prte_pmix_server_connection_purge(members[1].nspace);
+    dep_depart(s, 0, 0);
+    dep_drain();
+    CHECK("the parent's own exit afterwards is not", 1 == dep_nevents);
+
+cleanup:
+    prte_plm = saved_plm;
+    PMIx_Argv_free(fate_killed);
+    fate_killed = NULL;
+    prte_pmix_server_connection_xcast = prte_grpcomm_xcast;
+    dep_drop_job(a);
+    dep_drop_job(b);
+    dep_drop_job(p);
+    dep_drop_job(c);
+    dep_drop_job(x);
+    dep_drop_job(y);
+    dep_drop_job(s);
+    dep_drop_job(k);
+    prte_pmix_server_globals.initialized = false;
+    prte_pmix_server_globals.terminate_connected = true;
+    prte_pmix_server_connection_finalize();
+    if (made_array) {
+        PMIX_RELEASE(prte_job_data);
+        prte_job_data = NULL;
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_connection_departures\n");
+    }
+    return failures;
+}
+
+/*
+ * prte_pmix_server_connection_spawned(): which launches have a parent
+ * process to connect to.
+ *
+ * A spawn by an application process connects the child to it.  A tool's
+ * launch does not - and a tool started from a job script holds the name of
+ * one of that job's processes, so the requester's name cannot be the test:
+ * PRTE_JOB_NO_PARENT_PROC is (issue #2862).  Connected, a failing step took
+ * the job script down with it by fate sharing.
+ */
+static int test_tool_spawn_parent(void)
+{
+    int failures = 0;
+    prte_job_t *script = NULL, *child = NULL, *step = NULL;
+    pmix_proc_t proxy;
+    pmix_nspace_t saved_nspace;
+    bool made_array = false;
+
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
+    prte_pmix_server_globals.initialized = true;
+    if (NULL == prte_job_data) {
+        prte_job_data = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_job_data, 8, INT32_MAX, 8);
+        made_array = true;
+    }
+
+    script = fate_job("unit-test-step@1");
+    child = fate_job("unit-test-step@2");
+    step = fate_job("unit-test-step@3");
+    CHECK("the job-script jobs register", NULL != script && NULL != child && NULL != step);
+    if (NULL == script || NULL == child || NULL == step) {
+        goto cleanup;
+    }
+    PMIX_LOAD_PROCID(&proxy, script->nspace, 0);
+
+    /* rank 0 of the script spawns: a child, connected to it */
+    prte_set_attribute(&child->attributes, PRTE_JOB_LAUNCH_PROXY, PRTE_ATTR_GLOBAL,
+                       &proxy, PMIX_PROC);
+    prte_pmix_server_connection_spawned(child);
+    CHECK("a process's spawn connects the child to it",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* a prun the script started, under rank 0's name, launches a step */
+    prte_set_attribute(&step->attributes, PRTE_JOB_LAUNCH_PROXY, PRTE_ATTR_GLOBAL,
+                       &proxy, PMIX_PROC);
+    prte_set_bool_attribute(&step->attributes, PRTE_JOB_NO_PARENT_PROC, PRTE_ATTR_GLOBAL, true);
+    prte_pmix_server_connection_spawned(step);
+    CHECK("a tool's launch under that same name connects nothing",
+          1 == pmix_list_get_size(&prte_pmix_server_globals.connections));
+
+    /* ...and only the child is linked under the script: the step does not
+     * join its spawn tree, which is what kept prun waiting for its own
+     * script to end */
+    CHECK("the script is its child's spawn parent", script == prte_get_spawn_parent(child));
+    CHECK("...and not the parent of the tool's step", NULL == prte_get_spawn_parent(step));
+    /* a tool with a namespace of its own still roots its launches' tree */
+    PRTE_FLAG_SET(script, PRTE_JOB_FLAG_TOOL);
+    CHECK("a tool's own job still parents what it launches",
+          script == prte_get_spawn_parent(step));
+    PRTE_FLAG_UNSET(script, PRTE_JOB_FLAG_TOOL);
+
+    /* whose results a job's are: the step's belong to the tool that asked
+     * for it - which said it was a tool - and the script's child's to the
+     * DVM; and prterun's own job is not a tool's even when it carries the
+     * mark, since prterun asked for it itself */
+    CHECK("a job a process spawned is not a tool's", !prte_job_requested_by_tool(child));
+    prte_set_bool_attribute(&step->attributes, PRTE_JOB_DVM_JOB, PRTE_ATTR_GLOBAL, true);
+    CHECK("a job a tool asked for is the tool's", prte_job_requested_by_tool(step));
+    /* this binary has no DVM, so give the master a name for the case */
+    PMIX_LOAD_NSPACE(saved_nspace, PRTE_PROC_MY_NAME->nspace);
+    PMIX_LOAD_NSPACE(PRTE_PROC_MY_NAME->nspace, "unit-test-step-dvm");
+    PMIX_LOAD_PROCID(&proxy, PRTE_PROC_MY_NAME->nspace, 0);
+    prte_set_attribute(&child->attributes, PRTE_JOB_LAUNCH_PROXY, PRTE_ATTR_GLOBAL,
+                       &proxy, PMIX_PROC);
+    prte_set_bool_attribute(&child->attributes, PRTE_JOB_DVM_JOB, PRTE_ATTR_GLOBAL, true);
+    CHECK("prterun's own job is not a tool's, mark or no mark",
+          !prte_job_requested_by_tool(child));
+    PMIX_LOAD_NSPACE(PRTE_PROC_MY_NAME->nspace, saved_nspace);
+
+cleanup:
+    if (NULL != script) {
+        pmix_pointer_array_set_item(prte_job_data, script->index, NULL);
+        PMIX_RELEASE(script);
+    }
+    if (NULL != child) {
+        pmix_pointer_array_set_item(prte_job_data, child->index, NULL);
+        PMIX_RELEASE(child);
+    }
+    if (NULL != step) {
+        pmix_pointer_array_set_item(prte_job_data, step->index, NULL);
+        PMIX_RELEASE(step);
+    }
+    prte_pmix_server_globals.initialized = false;
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.connections);
+    if (made_array) {
+        PMIX_RELEASE(prte_job_data);
+        prte_job_data = NULL;
+    }
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_tool_spawn_parent\n");
     }
     return failures;
 }
@@ -3291,6 +4251,7 @@ int main(void)
     failures += test_monitor_accounting();
     failures += test_connections();
     failures += test_connection_fate_sharing();
+    failures += test_tool_spawn_parent();
     failures += test_tool_registration();
     failures += test_query_qualifiers();
     failures += test_group_left();
@@ -3302,6 +4263,9 @@ int main(void)
     failures += test_job_info_cache();
     failures += test_session_time();
     failures += test_directive_distribution();
+    failures += test_membind_distribution();
+    failures += test_xfer_membind();
+    failures += test_membind_unbound();
     failures += test_prefix_conflicts();
     failures += test_nprocs();
     failures += test_uint_option();
@@ -3310,6 +4274,9 @@ int main(void)
     failures += test_envar_order_permutations(&skipped);
     failures += test_envar_order_mpmd(&skipped);
     failures += test_access();
+    /* it packs what it would broadcast, which needs the PMIx that
+     * test_access() leaves up */
+    failures += test_connection_departures();
 
     (void) pmix_mca_base_framework_close(&prte_schizo_base_framework);
     (void) pmix_mca_base_framework_close(&prte_state_base_framework);

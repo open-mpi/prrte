@@ -874,8 +874,19 @@ static void check_complete_resume(int fd, short args, void *cbdata)
          * same status and PRTE_UPDATE_EXIT_STATUS keeps the first non-zero
          * one, which is the documented default.  The primary job is the one
          * the launcher created, local jobid 1; anything above that was
-         * spawned by it. */
-        if (report_child_jobs_separately() && 1 != PRTE_LOCAL_JOBID(jdata->nspace)) {
+         * spawned by it.
+         *
+         * A job a tool asked for - a prun in a prterun job script - is
+         * neither. Its status went back to that tool, which has reported it
+         * and handed it to the script to act on, so it is not ours to return
+         * and its abnormal termination is not ours to report: the script's
+         * own status says what came of it. */
+        if (prte_job_requested_by_tool(jdata)) {
+            PMIX_OUTPUT_VERBOSE((2, prte_state_base_framework.framework_output,
+                                 "%s state:dvm job %s ended with status %d - its tool has it",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+                                 PRTE_JOBID_PRINT(jdata->nspace), jdata->exit_code));
+        } else if (report_child_jobs_separately() && 1 != PRTE_LOCAL_JOBID(jdata->nspace)) {
             if (0 != jdata->exit_code) {
                 prte_show_help(PRTE_JOB_NSPACE(jdata), "help-state-base.txt", "child-job-status", true,
                                PRTE_LOCAL_JOBID_PRINT(jdata->nspace), jdata->exit_code);
@@ -884,7 +895,7 @@ static void check_complete_resume(int fd, short args, void *cbdata)
             PRTE_UPDATE_EXIT_STATUS(jdata->exit_code);
         }
         /* if this is an abnormal termination, report it */
-        if (jdata->state > PRTE_JOB_STATE_ERROR) {
+        if (jdata->state > PRTE_JOB_STATE_ERROR && !prte_job_requested_by_tool(jdata)) {
             char *msg;
             msg = prte_dump_aborted_procs(jdata);
             if (NULL != msg) {
@@ -1148,7 +1159,6 @@ release:
 
 static void cleanup_job(int sd, short args, void *cbdata)
 {
-    pmix_proc_t *nptr;
     prte_job_t *parent;
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
@@ -1160,22 +1170,14 @@ static void cleanup_job(int sd, short args, void *cbdata)
         prte_plm.terminate_orteds();
     }
     if (NULL != caddy->jdata) {
-        /* if the job had a spawn parent remove it from the parents child list.
-         * Seed the pointer and check it: prte_get_attribute() returns true for
-         * a key it found even when the unload that follows failed, and the
-         * PMIX_PROC arm fails by leaving a NULL behind (PMIX_PROC_CREATE came
-         * back empty).  job_started() and ready_for_debug() read this same
-         * attribute and both guard it; these two did not. */
-        nptr = NULL;
-        if (prte_get_attribute(&caddy->jdata->attributes, PRTE_JOB_LAUNCH_PROXY, (void **) &nptr, PMIX_PROC)
-            && NULL != nptr) {
-            if(NULL != (parent = prte_get_job_data_object(nptr->nspace)) &&
-            !PMIX_CHECK_NSPACE(parent->nspace, PRTE_PROC_MY_NAME->nspace)){
-                pmix_list_remove_item(&parent->children, &caddy->jdata->super);
-                /* We retained the jdata before adding it to the list - maintain ref count */
-                PMIX_RELEASE(caddy->jdata);
-            }
-            PMIX_PROC_RELEASE(nptr);
+        /* if the job had a spawn parent remove it from the parents child
+         * list - asking the same question that put it there, so a job that
+         * was never linked (a tool's launch under a job's name) is not
+         * removed from a list it is not on */
+        if (NULL != (parent = prte_get_spawn_parent(caddy->jdata))) {
+            pmix_list_remove_item(&parent->children, &caddy->jdata->super);
+            /* We retained the jdata before adding it to the list - maintain ref count */
+            PMIX_RELEASE(caddy->jdata);
         }
         /* From here on, the answer to a question about this job is "not
          * found" rather than "wait" - and the difference is a hang.  A

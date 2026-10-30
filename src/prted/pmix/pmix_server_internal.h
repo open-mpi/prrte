@@ -19,6 +19,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -437,6 +438,7 @@ PRTE_EXPORT extern void pmix_server_query_resp(int status, pmix_proc_t *sender,
                                                pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                                                void *cbdata);
 
+PRTE_EXPORT extern int prte_pmix_server_tool_may_join(prte_job_t *jdata, pmix_rank_t rank);
 PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
                                                       pmix_op_cbfunc_t cbfunc, void *cbdata);
 
@@ -555,22 +557,60 @@ PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_pmix_server_pset_t);
  * left to report.
  *
  * The members are the participant array exactly as the connect named it, so
- * an entry may be a wildcard rank standing for a whole namespace. */
+ * an entry may be a wildcard rank standing for a whole namespace.  Matching
+ * a connect or a disconnect reads them.  A departure reads collapsed: the
+ * same members with every wholly listed job named by its wildcard. */
 typedef struct {
     pmix_list_item_t super;
     pmix_proc_t *members;
     size_t nmembers;
+    pmix_proc_t *collapsed;
+    size_t ncollapsed;
+    /* how many connects over exactly this membership are live - each
+     * disconnect covering it ends one */
+    unsigned refs;
     /* this assemblage is already being torn down after a member's failure,
      * so a second failure inside it must not drive the teardown again */
     bool terminating;
 } prte_pmix_server_connection_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_pmix_server_connection_t);
 
+/* Departures from one job, owed to one audience, waiting to be announced as
+ * a single event - see prte_pmix_server_connection_terminated(). */
+typedef struct {
+    pmix_list_item_t super;
+    pmix_nspace_t nspace;
+    /* the union of the memberships owed the news */
+    pmix_proc_t *targets;
+    size_t ntargets;
+    /* the procs that departed */
+    pmix_proc_t *procs;
+    size_t nprocs;
+    size_t cap;
+    /* the exit code they share, if exit_uniform */
+    int exit_code;
+    bool exit_uniform;
+    /* held for the end of a job the master ordered down, rather than sent
+     * when the current pass of the event loop is done */
+    bool held;
+} prte_pmix_server_departure_t;
+PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_pmix_server_departure_t);
+
+/* Construct and destruct the registry.  Called from the server's own
+ * init/finalize, and by the unit test. */
+PRTE_EXPORT void prte_pmix_server_connection_init(void);
+PRTE_EXPORT void prte_pmix_server_connection_finalize(void);
+
+/* The broadcast every assemblage event goes out on - prte_grpcomm_xcast,
+ * exported as a pointer so the unit test can read the events. */
+PRTE_EXPORT extern int (*prte_pmix_server_connection_xcast)(prte_rml_tag_t tag,
+                                                            pmix_data_buffer_t *msg);
+
 /* Record/forget an assemblage.  Both are driven by the connect and disconnect
- * collectives as they complete on the DVM master, and both are no-ops
- * anywhere else.  Recording an assemblage that is already recorded, or
- * dropping one that is not, is not an error: the two collectives are the only
- * things that call these, and a repeat of either is harmless. */
+ * collectives as they converge on the DVM master - once per operation - and
+ * both are no-ops anywhere else.  Recording an assemblage that is already
+ * recorded counts a second connection over it, which a disconnect then ends
+ * one at a time; dropping one that is not recorded is not an error. */
 PRTE_EXPORT void prte_pmix_server_connection_record(const pmix_proc_t *members, size_t nmembers);
 PRTE_EXPORT void prte_pmix_server_connection_drop(const pmix_proc_t *members, size_t nmembers);
 
@@ -581,36 +621,40 @@ PRTE_EXPORT bool prte_pmix_server_is_connected(const pmix_proc_t *proc);
 
 /* A proc has terminated.  Tell every assemblage it belonged to, since it
  * plainly did not disconnect first.  Called once per proc from the DVM
- * master's proc-termination path. */
+ * master's proc-termination path.
+ *
+ * The news is not sent from here.  Departures from one job owed to one
+ * audience gather into a set announced as one event: when the current pass of
+ * the event loop is done, or - for a job the master has ordered down - when
+ * the job has ended. */
 PRTE_EXPORT void prte_pmix_server_connection_terminated(prte_proc_t *proc);
+
+/* The master has ordered this whole job down, so the rest of its procs are
+ * known to be going: hold their departures for the job's end, when a single
+ * event naming <nspace>/WILDCARD tells the assemblage they have all gone. */
+PRTE_EXPORT void prte_pmix_server_connection_teardown(const pmix_nspace_t nspace);
+
+/* The last proc of this job has terminated: announce what is held for it. */
+PRTE_EXPORT void prte_pmix_server_connection_job_ended(prte_job_t *jdata);
 
 /* A job has launched successfully: connect it to the process that spawned
  * it, if it was spawned by a process at all.  The PMIx definition makes that
  * the default for PMIx_Spawn; PMIX_SPAWN_CHILD_SEP opts out. */
 PRTE_EXPORT void prte_pmix_server_connection_spawned(prte_job_t *jdata);
 
-/* A failure has cost this job its life.  "Connected" means the host treats
- * the assemblage as a single application, so every other job connected to it
- * goes too - each one announced with PMIX_ERR_JOB_TERM_WO_SYNC.  Called from
- * the DVM master's error manager as it terminates the job that failed. */
+/* A failure has cost this job its life.  The proc that failed is announced
+ * at once and the rest of the job is held as for a teardown.  "Connected"
+ * means the host treats the assemblage as a single application, so every
+ * other job connected to it goes too - each one announced with
+ * PMIX_ERR_JOB_TERM_WO_SYNC, and none of their procs announced as they go.
+ * Called from the DVM master's error manager as it terminates the job that
+ * failed. */
 PRTE_EXPORT void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace);
 
 /* A job's data object is going away: forget any assemblage that has nothing
  * left in it to notify. */
 PRTE_EXPORT void prte_pmix_server_connection_purge(const pmix_nspace_t nspace);
 
-/* Report a completed connect/disconnect to the DVM master, which is where the
- * membership is held.  Called on each daemon that had a participant, from the
- * completion of the collective that carried the operation. */
-PRTE_EXPORT void prte_pmix_server_connection_report(const pmix_proc_t *members, size_t nmembers);
-PRTE_EXPORT void prte_pmix_server_connection_report_drop(const pmix_proc_t *members,
-                                                         size_t nmembers);
-
-/* Receive such a report - registered on PRTE_RML_TAG_CONNECTED by the DVM
- * master. */
-PRTE_EXPORT void prte_pmix_server_connection_recv(int status, pmix_proc_t *sender,
-                                                  pmix_data_buffer_t *buffer,
-                                                  prte_rml_tag_t tag, void *cbdata);
 
 typedef struct {
     bool initialized;
@@ -670,6 +714,10 @@ typedef struct {
     /* assemblages formed by PMIx_Connect - see prte_pmix_server_connection_t.
      * Populated on the DVM master only. */
     pmix_list_t connections;
+    /* departures waiting to be announced - prte_pmix_server_departure_t */
+    pmix_list_t departures;
+    /* the jobs the master has ordered down whose departures are held */
+    char **teardowns;
     /* whether a failure that terminates one job of an assemblage terminates
      * the rest of it, which is what the PMIx definition of "connected" asks
      * of a host that terminates an application when one of its processes

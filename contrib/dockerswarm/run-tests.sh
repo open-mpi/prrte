@@ -3912,6 +3912,50 @@ test_prted() {
     fi
     cleanup_swarm
 
+    banner "prted: a tool may not add a rank to an application job"
+    # A tool started by one of a job's own processes inherits the job's PMIx
+    # identity, and PMIx lets it claim an unused rank of that job. Attached
+    # through a non-master daemon, the attach reaches the master as
+    # PRTE_PLM_TOOL_ATTACHED_CMD, which used to add the rank to the job. A
+    # tool's departure retires its rank only in a tool's namespace, so the job
+    # could never complete and prun waited for the life of the DVM. The master
+    # now refuses the attach with PMIX_ERR_EXISTS - asserted exactly, since a
+    # tool that cannot connect at all would also fail to initialize. The job
+    # runs on node2 so that the tool attaches through node2's daemon rather
+    # than the master's. The second case is the attach that must still work:
+    # a tool taking the rank its job script already has, as a prun started
+    # from a job script does. The job's process is a shell, which holds no
+    # PMIx connection; were the rank connected, PMIx would refuse the tool
+    # itself and connect it under a fresh name, never asking PRRTE. So the
+    # case checks that the tool kept the job's name.
+    if ! RUN "test -x $ROLETOOL"; then
+        skp "roletool not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2'; then
+        bad "could not start a DVM for the tool-rank test"
+    else
+        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout 20 $ROLETOOL - impersonate \$PMIX_NAMESPACE 7; true' 2>&1; echo RC=\$?")
+        echo "$out" | grep -q 'ROLE INIT PMIX_ERR_EXISTS' \
+            && ok "a tool naming an unused rank of an application job was refused" \
+            || bad "a tool naming an unused rank of an application job was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'RC=0' \
+            && ok "...and the job completed" \
+            || bad "...but the job never completed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'echo JOB \$PMIX_NAMESPACE \$PMIX_RANK; timeout 20 $ROLETOOL - impersonate \$PMIX_NAMESPACE \$PMIX_RANK; true' 2>&1; echo RC=\$?")
+        job=$(echo "$out" | tr -d '\r' | sed -n 's/^JOB //p')
+        name=$(echo "$out" | tr -d '\r' | sed -n 's/^ROLE NAME //p')
+        echo "$out" | grep -q 'ROLE INIT PMIX_SUCCESS' \
+            && ok "a tool taking the rank its job script has still attaches" \
+            || bad "a tool taking the rank its job script has was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        [ -n "$job" ] && [ "$job" = "$name" ] \
+            && ok "...under the job's own name" \
+            || bad "...but not under the job's name ('$job' vs '$name'), so PRRTE was never asked"
+        echo "$out" | grep -q 'RC=0' \
+            && ok "...and that job completed" \
+            || bad "...but that job never completed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
     banner "prted: a malformed --singleton is refused, not a crash"
     # The value is handed straight down to PMIx_server_init as PMIX_SINGLETON,
     # which faults on anything that is not "<nspace>.<rank>", so prte has to
@@ -4590,6 +4634,68 @@ test_tools() {
         bad "could not start a persistent DVM for the prun spawn-tree case"
     fi
     for n in 1 2 3; do ON $n 'rm -rf /tmp/dyn' >/dev/null 2>&1; done
+    cleanup_swarm
+
+    banner "tools: a prun in a job script launches a step, not a child of its job"
+    # A prun started by one of a job's processes takes that process's identity
+    # from its environment - which is how it stays inside the job's
+    # allocation.  Its spawn therefore reached the DVM as one by that
+    # process, and the step was made a child of the job running the script:
+    #  - the step joined the script's spawn tree, so prun waited for the
+    #    script to end, and the script waited for prun (issue #2862);
+    #  - the spawn connected the step to the script, so a step that failed
+    #    took the whole script down by fate sharing.
+    # The job script runs on node2, so the inner prun attaches to node2's
+    # daemon and its request reaches the master by relay; the step runs on
+    # node3.  The inner timeout is what a regression reports, as 124.
+    #
+    # The harness lets ITS commands run as root through their environment,
+    # which a job's environment does not carry on to a prun inside it - so
+    # the inner one is given the same two variables itself.
+    INNERPRUN="env PRTE_ALLOW_RUN_AS_ROOT=1 PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 $BINDIR/prun"
+    if prted_dvm_start 'node1:2,node2:2,node3:2'; then
+        out=$(RUN "timeout -k 5 90 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 echo STEP-OUTPUT; echo INNER RC=\$?' 2>&1; echo OUTER RC=\$?")
+        echo "$out" | grep -q 'INNER RC=0' \
+            && ok "a prun in a job script returns once its step has ended" \
+            || bad "a prun in a job script did not return (issue #2862): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'STEP-OUTPUT' \
+            && ok "...having forwarded the step's output" \
+            || bad "...but the step's output never arrived: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'OUTER RC=0' \
+            && ok "...and the job script completed" \
+            || bad "...but the job script did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        out=$(RUN "timeout -k 5 90 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 false; echo INNER RC=\$?; echo SCRIPT CONTINUED' 2>&1; echo OUTER RC=\$?")
+        echo "$out" | grep -q 'INNER RC=1' \
+            && ok "a failing step's status comes back to the job script" \
+            || bad "a failing step's status did not come back: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'SCRIPT CONTINUED' && echo "$out" | grep -q 'OUTER RC=0' \
+            && ok "...and the script carries on: the step was never connected to it" \
+            || bad "a failing step took its job script down: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN "timeout -k 5 30 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
+        sleep 3
+    else
+        bad "could not start a persistent DVM for the job-script step case"
+    fi
+
+    # ...and the same from a job script under prterun, whose DVM is its own.
+    # prterun writes the output of the jobs in it to the terminal, and the
+    # prun that started a step writes the step's too - so the step's output
+    # was printed twice.  And the step's status is the prun's to return to
+    # the script: prterun returns the script's, not the first failure of
+    # every job it ran.
+    out=$(RUN "timeout -k 5 90 prterun --host node2:1,node3:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 echo STEP-OUTPUT; echo INNER RC=\$?' 2>&1; echo OUTER RC=\$?")
+    echo "$out" | grep -q 'INNER RC=0' && echo "$out" | grep -q 'OUTER RC=0' \
+        && ok "a prun in a prterun job script returns, and so does prterun" \
+        || bad "a prun in a prterun job script hung: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    n=$(echo "$out" | grep -c 'STEP-OUTPUT')
+    [ "$n" = 1 ] \
+        && ok "...and the step's output is printed once" \
+        || bad "the step's output was printed $n times: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    out=$(RUN "timeout -k 5 90 prterun --host node2:1,node3:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 false; echo INNER RC=\$?; exit 0' 2>&1; echo OUTER RC=\$?")
+    echo "$out" | grep -q 'INNER RC=1' && echo "$out" | grep -q 'OUTER RC=0' \
+        && ok "a failed step is the job script's to handle: prterun returns the script's status" \
+        || bad "prterun did not return its job script's status: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
     cleanup_swarm
 }
 
@@ -5320,6 +5426,32 @@ test_connect() {
     n=$(echo "$out" | awk '$1=="CNCT" && $2=="parent" && $4=="EVENTS" {print $5}')
     [ "${n:-1}" = 0 ] \
         && ok "...and heard nothing when the child disconnected before leaving" \
+        || bad "an event was sent about a child that had disconnected: $(echo "$out" | grep CNCT | tr '\n' ' ' | tail -c 400)"
+
+    banner "connect: an assemblage named rank by rank is reported the same way"
+    # Open MPI names a job by wildcard only from MPI_COMM_WORLD and lists its
+    # ranks from any other communicator.  The master addresses a departure
+    # from such a record by job rather than by rank, so the event still has
+    # to reach the parent.  --by-rank lists every rank of both jobs, gives
+    # the child two procs, and spawns it CHILD_SEP so this connect is its
+    # only assemblage.
+    out=$(PRUN "--host node1:1 -n 1 $CN --child-host node2 --by-rank --wait 20" 2>&1)
+    echo "$out" | grep -q 'CNCT parent 0 CONNECT PMIX_SUCCESS' \
+        && ok "the parent connected to both ranks of its child" \
+        || bad "the rank-by-rank connect did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    n=$(echo "$out" | awk '$1=="CNCT" && $2=="parent" && $4=="EVENTS" {print $5}')
+    [ "${n:-0}" -ge 1 ] \
+        && ok "...and was told when the child left without disconnecting" \
+        || bad "no PMIX_ERR_PROC_TERM_WO_SYNC reached the parent: $(echo "$out" | grep CNCT | tr '\n' ' ' | tail -c 400)"
+
+    banner "connect: a disconnect naming the same ranks dissolves it"
+    out=$(PRUN "--host node1:1 -n 1 $CN --child-host node2 --by-rank --disconnect --wait 10" 2>&1)
+    echo "$out" | grep -q 'CNCT parent 0 DISCONNECT PMIX_SUCCESS' \
+        && ok "the parent disconnected from both ranks of its child" \
+        || bad "the rank-by-rank disconnect did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    n=$(echo "$out" | awk '$1=="CNCT" && $2=="parent" && $4=="EVENTS" {print $5}')
+    [ "${n:-1}" = 0 ] \
+        && ok "...and heard nothing when the child left" \
         || bad "an event was sent about a child that had disconnected: $(echo "$out" | grep CNCT | tr '\n' ' ' | tail -c 400)"
 
     banner "connect: a failure in one member terminates the assemblage"

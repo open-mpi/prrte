@@ -37,6 +37,9 @@
 #ifdef HAVE_SYS_TYPES_H
 #    include <sys/types.h>
 #endif
+#ifdef HAVE_SYS_STAT_H
+#    include <sys/stat.h>
+#endif
 #include <fcntl.h>
 #ifdef HAVE_NETINET_IN_H
 #    include <netinet/in.h>
@@ -236,6 +239,7 @@ static char *prte_attrs_spawn[] = {"PMIX_PERSONALITY",
                                    "PMIX_MAPBY",
                                    "PMIX_RANKBY",
                                    "PMIX_BINDTO",
+                                   "PMIX_MEMBIND",
                                    "PMIX_CPUS_PER_PROC",
                                    "PMIX_CPU_LIST",
                                    "PMIX_NO_PROCS_ON_HEAD",
@@ -882,6 +886,48 @@ static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_statu
 /*
  * Initialize global variables used w/in the server.
  */
+#if defined(PMIX_SOCKET_MODE)
+/* A PMIx server that takes its node's connections on a local socket makes
+ * it, and the directory of its own it puts it in beneath our session
+ * directory, for this user alone - and the session directory is this
+ * user's alone too (mkdtemp). So a DVM told to accept tools of other users
+ * could not be reached by one at all. Widen exactly the path to the socket:
+ * its mode lets anyone connect, which PMIx follows by letting anyone into
+ * its directory, and the session directory lets anyone pass through it -
+ * but not list it, and every directory we make inside it stays this
+ * user's alone (src/util/session_dir.c). What a tool that connects may
+ * then do is judged by the user PMIx authenticated for it.
+ *
+ * A PMIx without the directive listens on loopback TCP, which every local
+ * user can already reach, so there is nothing to widen. */
+static int open_to_foreign_tools(void *ilist)
+{
+    uint32_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+    struct stat buf;
+    pmix_status_t prc;
+    int fd, rc = PRTE_SUCCESS;
+
+    /* through a descriptor, so the directory changed is the one checked */
+    fd = open(prte_process_info.top_session_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (0 > fd) {
+        rc = PRTE_ERR_FILE_OPEN_FAILURE;
+    } else {
+        if (0 != fstat(fd, &buf) || geteuid() != buf.st_uid ||
+            0 != fchmod(fd, (buf.st_mode & 07777) | S_IXGRP | S_IXOTH)) {
+            rc = PRTE_ERR_FILE_OPEN_FAILURE;
+        }
+        close(fd);
+    }
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        return rc;
+    }
+
+    PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SOCKET_MODE, &mode, PMIX_UINT32);
+    return prte_pmix_convert_status(prc);
+}
+#endif
+
 int pmix_server_init(void)
 {
     int rc;
@@ -905,7 +951,7 @@ int pmix_server_init(void)
     PMIX_CONSTRUCT(&prte_pmix_server_globals.departed_jobs, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.users, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.groups, pmix_list_t);
-    PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
+    prte_pmix_server_connection_init();
     PMIX_CONSTRUCT(&prte_pmix_server_globals.local_reqs, pmix_pointer_array_t);
     pmix_pointer_array_init(&prte_pmix_server_globals.local_reqs, 128, INT_MAX, 2);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.remote_reqs, pmix_pointer_array_t);
@@ -1063,6 +1109,17 @@ int pmix_server_init(void)
             rc = prte_pmix_convert_status(prc);
             return rc;
         }
+#if defined(PMIX_SOCKET_MODE)
+        /* ...and saying so is not enough to let one in - see
+         * open_to_foreign_tools() */
+        if (flag) {
+            rc = open_to_foreign_tools(ilist);
+            if (PRTE_SUCCESS != rc) {
+                PMIX_INFO_LIST_RELEASE(ilist);
+                return rc;
+            }
+        }
+#endif
 
         /* if requested and persistent, tell the server that we are the system
          * controller - don't do this for the non-persistent mode */
@@ -1363,11 +1420,6 @@ void pmix_server_start(void)
          * state and the session table live only here */
         PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY,
                       PRTE_RML_PERSISTENT, pmix_server_query_request, NULL);
-        /* setup recv for the membership of connected assemblages, which is
-         * held here because we are the one process that sees every proc in
-         * the DVM terminate */
-        PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED,
-                      PRTE_RML_PERSISTENT, prte_pmix_server_connection_recv, NULL);
     }
 }
 
@@ -1397,7 +1449,6 @@ void pmix_server_finalize(void)
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY);
-        PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED);
     }
 
     /* finalize our local data server */
@@ -1458,7 +1509,7 @@ void pmix_server_finalize(void)
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.psets);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.departed_jobs);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.groups);
-    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.connections);
+    prte_pmix_server_connection_finalize();
 
     /* shutdown the local server */
     prte_pmix_server_globals.initialized = false;

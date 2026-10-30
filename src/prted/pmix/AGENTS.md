@@ -1115,13 +1115,20 @@ design:
   every proc termination in the DVM — including the procs of a node whose
   daemon has died, which is exactly when an assemblage most wants telling,
   and exactly when a record kept on that daemon would have died with it.
-- **Each participating daemon reports it**, on `PRTE_RML_TAG_CONNECTED`,
-  from the *completion* of the connect collective (`connect_release`) rather
-  than from its start — so a connect that failed is never recorded. Every
-  such daemon reports, and the master takes the first and ignores the rest:
-  there is no cheap election here that does not depend on one particular
-  daemon still being alive, and the reports are a few dozen bytes on an
-  operation that has just paid for a DVM-wide collective.
+- **The master records it where the connect's fence converges**
+  (`tree_gather_answer()` in `grpcomm`, for a fence whose purpose is
+  `PRTE_GRPCOMM_FENCE_FOR_CONNECT`), and drops it where a disconnect's does.
+  That point sees each operation complete exactly once, whichever daemons
+  host its participants, and only on success - so a connect that failed is
+  never recorded, and the record exists before any participant is released.
+  Each participating daemon used to report the outcome instead, and the
+  master took the first report; that could not tell N daemons reporting one
+  connect from one set of procs connecting N times.
+- **A record counts the connects that made it** (`refs`). Two connects over
+  the same membership - two `MPI_Comm_connect`/`accept` pairs between the
+  same jobs - are two intercommunicators the application disconnects one at
+  a time, so the first disconnect must not end the second. A disconnect
+  covering a record ends one of its connects.
 - **Termination is noticed in one place**: the `PRTE_PROC_STATE_TERMINATED`
   arm of `prte_state_base_track_procs()`, behind the `PRTE_PROC_FLAG_RECORDED`
   guard that makes it exactly once per proc. Every death reaches it, whether
@@ -1138,11 +1145,32 @@ design:
   connect expressed one way with a connect expressed the other. A disconnect
   naming a set that was never recorded must fail to find it rather than drop
   somebody else's.
-- **A record outlives one member's job.** The survivors are still connected
-  to each other and still owed an event apiece, so a record is dropped only
-  by a disconnect or when nothing named in it exists any more
-  (`prte_pmix_server_connection_purge()`, from
-  `prte_pmix_server_job_departed()`).
+- **A departure or a failure reads a collapsed copy.** Each record also keeps
+  `collapsed`: its members with every wholly listed job rewritten to
+  `A/WILDCARD` (`collapse_whole_jobs()`). Each departure merges and
+  broadcasts the memberships covering it, and a client may name a job by
+  listing its ranks (Open MPI does, from any communicator but
+  `MPI_COMM_WORLD`), so reading the collapsed copy keeps that to a handful of
+  entries per record instead of every rank.
+  Matching a connect or a disconnect still reads the members as named.
+  PRRTE grows an allocation, never a job, so a job's table is complete
+  once it is mapped, and a terminated proc is never relaunched, so "wholly
+  listed" means every proc whose termination is not yet recorded
+  (`PRTE_PROC_FLAG_RECORDED`, not the state, which the errmgr writes first):
+  the survivors of a job some procs have left collapse too. The two kinds of namespace that do gain
+  ranks later -
+  a tool's, as further tool processes attach, and the daemons', on a grow -
+  are never collapsed: their wildcard would cover ranks the list never
+  named.
+- **A record outlives one member's job, but not the last but one.** While
+  two or more of its jobs remain they are still connected to each other and
+  still owed an event apiece. Once a record that named several jobs is down
+  to one, it is dropped (`prte_pmix_server_connection_purge()`, from
+  `prte_pmix_server_job_departed()`): kept, it would announce each of that
+  job's procs to the rest of its own job, which is how a spawning parent's
+  ranks went on broadcasting their exits after the children had gone. A
+  record that only ever named one job lasts until that job has gone.
+  Otherwise a record is dropped only by a disconnect.
 
 Two things follow from that record, and they are the rest of the definition:
 
@@ -1213,17 +1241,69 @@ request only covers a member it names, and a wildcard member is covered only
 by a wildcard.
 
 A proc in more than one assemblage — a spawned child that also connects
-explicitly — produces **one** event, addressed to the union of the
-memberships, not one per assemblage. It does, though, produce that event
-**per proc**, and each one is a DVM-wide xcast: `notify_assemblage()`
-broadcasts to every daemon and lets PMIx's custom range decide who hears
-it. That is the PMIx definition — the promise is made to each member about
-each departure — but it means an `MPI_Comm_spawn`ed job of N ranks pays N
-broadcasts as it ends, since a child is connected to its parent by default
-and running to completion is *not* a disconnect. The registry check comes
-first, so a DVM with no assemblages pays nothing at all; see
-[`docs/todo.rst`](../../../docs/todo.rst) for what a cheaper shape would
-have to preserve.
+explicitly — produces **one** announcement, addressed to the union of the
+memberships, not one per assemblage. And departures are **not announced one
+proc at a time**: each event is a DVM-wide xcast (`notify_assemblage()`
+broadcasts to every daemon and lets PMIx's custom range decide who hears it),
+and an `MPI_Comm_spawn`ed job of N ranks ends without disconnecting — a child
+is connected to its parent by default, and running to completion is *not* a
+disconnect — so one event per departure was N broadcasts per job.
+`prte_pmix_server_connection_terminated()` therefore gathers departures into
+**sets** (`prte_pmix_server_departure_t`), one per job *and* audience, and
+announces each set as one event:
+
+- **The key is the audience as well as the job.** Two ranks of one job can
+  belong to different assemblages, and an event goes to everyone in its
+  range, so folding them together would tell a member about a proc it was
+  never connected to. A spurious `PROC_TERM_WO_SYNC` is not harmless: an Open
+  MPI process built without fault tolerance aborts on one.
+- **A set is sent when the current pass of the event loop ends**
+  (`schedule_flush()`), not on a timer. A daemon reports the normal ends of
+  its procs in one `UPDATE_PROC_STATE` per job, and the master activates a
+  termination for each proc in it back to back, so an event activated by the
+  first runs after the last: one report becomes one event per audience, with
+  no added delay. Abnormal ends are reported one message each and gain
+  nothing here, which is what the next point is for.
+- **A job the master has ordered down is held for its end.** Once
+  `_terminate_job()` (through `connection_job_failed()`) or a whole-job
+  `PMIx_Job_control` kill has sent the kill, every remaining departure from
+  that job is known to be coming. They are held
+  (`prte_pmix_server_connection_teardown()`) until the job's last proc is
+  gone (`prte_pmix_server_connection_job_ended()`, from `track_procs`), and go
+  as one event.
+- **A set holding every proc of its job names the job**, as
+  `PMIX_EVENT_AFFECTED_PROC = <nspace>/WILDCARD`. A partial set goes as a
+  `PMIX_EVENT_AFFECTED_PROCS` array; repeating `PMIX_EVENT_AFFECTED_PROC`
+  would not do, because PMIx keeps only the last of them. A lone departure
+  looks exactly as it always has. The exit code travels only when every proc
+  in the set shares it.
+- **The proc whose failure brings a job down is announced by the failure,
+  not by its own termination**, from `connection_job_failed()`
+  (`find_culprit()`, reading `PRTE_JOB_ABORTED_PROC`). Its termination
+  arrives after the teardown has begun, when it would be held or silenced
+  with the rest, and the sweep's `JOB_TERM_WO_SYNC` events name the jobs it
+  kills, never the one the failure began in. Who is owed it is found before
+  the sweep, since the sweep marks what it condemns `terminating`.
+- **Every kill is ordered before anybody hears why.** `_terminate_job()`
+  kills the failed job first and calls `connection_job_failed()` after;
+  the sweep orders each condemned job killed and only then sends the
+  culprit and its `JOB_TERM_WO_SYNC` events. Kill and news travel down the
+  same daemon tree, so news sent first can arrive first - and a process
+  told its peer failed can act on it and finish the run it was to be
+  stopped from finishing (the swarm's `test_connect` "a failure in one
+  member terminates the assemblage" is the case that caught it).
+- **A condemned assemblage is told nothing more about its procs.** Once the
+  sweep has marked it `terminating`, every live member is being killed and
+  has been told why; `departure_targets()` leaves it out, so the procs coming
+  down with it announce themselves to nobody.
+
+The consumer has to read the batched forms: Open MPI's fault-tolerance
+handler did not, and needs the matching change to expand a wildcard and walk
+the array. `test_connection_departures()` in
+[`test/unit/prted/`](../../../test/unit/prted/) reads each case off the wire
+through `prte_pmix_server_connection_xcast`. The registry check comes first,
+so a DVM with no assemblages pays nothing at all; see
+[`docs/todo.rst`](../../../docs/todo.rst) for what is left of the cost.
 
 Note what this depends on: PMIx used to execute a connect or disconnect whose
 participants were **all local** without calling the host at all, which left
@@ -1539,6 +1619,18 @@ and a `PMIX_CMD_LINE` that never arrived leaves a NULL that
 `PMIx_Argv_split()` turns into a NULL `argv`. `test_tool_registration` pins
 the checks that can be reached without a live PMIx server.
 
+**A tool may not add a rank to an application job.** A tool started by one
+of a job's processes inherits the job's identity, and PMIx lets it claim a
+rank of that job, existing or not. Taking an existing rank is how a `prun`
+in a job script works and must keep working. Adding one would leave a rank
+that never retires, since a tool's departure is acted on only in a tool's
+namespace, and the job could never complete. So such an attach is refused
+with `PMIX_ERR_EXISTS` (see `src/mca/plm/AGENTS.md`, `TOOL_ATTACHED_CMD`).
+`prte_pmix_server_tool_may_join()` is the one place that decides it, together
+with the sentinel-rank screen, and both the master's own registration
+(`prte_pmix_server_register_tool()`) and its relay for a tool attached
+elsewhere call it, so both refuse the same attaches.
+
 `lost_connection_hdlr()` in `pmix_server.c` is the other half — the
 *abnormal* departure — and it is registered at the end of
 `pmix_server_init()`. Watch what precedes that registration: an early
@@ -1659,6 +1751,18 @@ codes that has to survive grow, shrink and daemon loss.
   it a loopback interface, so an include list naming only real interfaces
   (the ordinary way to pick the DVM's network) would fail the server's
   init.
+- **Accepting other users' tools has to open a path to the socket.** A
+  PMIx that takes local connections on a unix socket makes the socket,
+  and its directory beneath the session directory, for this user alone,
+  and `mkdtemp()` made the session directory the same way - so
+  `prte_pmix_no_foreign_tools 0` on its own lets nobody in.
+  `open_to_foreign_tools()` widens exactly that path when the parameter is
+  off: `PMIX_SOCKET_MODE` lets anyone connect (PMIx then opens the
+  socket's directory to match), and the session directory gains search
+  permission but not read, so it can be passed through but not listed.
+  Every directory PRRTE makes inside it stays `0700`. Only the master
+  does this, since only the master is told to allow foreign tools; the
+  swarm's `test_requesters` is the case that reaches it.
 - **Verbose output is free.** Everything here is behind
   `pmix_output_verbose(N, prte_pmix_server_globals.output, ...)`; add
   traces liberally at level 2.
