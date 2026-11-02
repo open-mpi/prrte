@@ -30,10 +30,9 @@ action:
   **job catch-up** (`prte_util_decode_job_catchup` — the jobs already
   running in the DVM, which a daemon that just joined has never heard of;
   they used to lead the launch message instead), and then a
-  **three-field record per daemon** — name, `PMIX_PROC_URI` (RML contact
-  info), `PMIX_SERVER_URI` (that node's PMIx server rendezvous,
-  redistributed only so any daemon can answer a tool's query; PRRTE never
-  connects to it). The sender is `vm_ready()` in `state/dvm`. The loop
+  **two-field record per daemon** — name and `PMIX_PROC_URI` (RML contact
+  info). PMIx server URIs are not carried: a daemon answers only for its
+  own (see [`../pmix/AGENTS.md`](../pmix/AGENTS.md)). The sender is `vm_ready()` in `state/dvm`. The loop
   skips storing what it already knows, so mind the invariant: **every
   field of a record must be unpacked before any `continue`**, or the next
   iteration reads the leftover string as a `pmix_proc_t`.
@@ -113,7 +112,7 @@ Plain functions, all `PRTE_EXPORT`, declared in `grpcomm.h`:
 | `prte_grpcomm_fault_handler(status)` | Invoked on **every** daemon by `src/rml/routed_radix.c` when the routing tree changes. Called twice per death (LOCAL scope then GLOBAL scope); which scope a collective keys on depends on what it needs, so read *Surviving a daemon failure* before adding a third. |
 | `prte_grpcomm_xcast(tag, msg)` | Broadcast to **every** daemon, delivered at `tag`. Non-destructive to `msg`. Returns `PRTE_SUCCESS` on *acceptance*, not completion. |
 | `prte_grpcomm_xcast_nb(tag, msg, cbfunc, cbdata)` | As above, but `cbfunc` fires on the **master** once the whole DVM has confirmed receipt — or, if the broadcast is abandoned before it is ever emitted, as soon as that is known (`abandon_xcast`), because a caller waiting on it would otherwise wait forever. It carries no status, so it means only "stop waiting". `cbfunc`/`cbdata` are ignored on non-master daemons. `xcast` is just `xcast_nb(tag, msg, NULL, NULL)`. |
-| `prte_grpcomm_fence(procs, nprocs, info, ninfo, data, ndata, cbfunc, cbdata)` | Non-blocking allgather/barrier across the daemons hosting `procs`. A barrier supplies no data. Returns `PRTE_SUCCESS` once queued. |
+| `prte_grpcomm_fence(procs, nprocs, info, ninfo, data, ndata, purpose, cbfunc, cbdata)` | Non-blocking allgather/barrier across the daemons hosting `procs`. A barrier supplies no data. `purpose` says whether it is a plain fence, a connect or a disconnect - see *What a fence is for*. Returns `PRTE_SUCCESS` once queued. |
 | `prte_grpcomm_group(op, grpid, procs, nprocs, directives, ndirs, cbfunc, cbdata)` | PMIx group construct/destruct/cancel. |
 
 ### The one indirection: `prte_grpcomm_release_bcast`
@@ -1004,6 +1003,27 @@ raises `collection-mismatch`, but a barrier no longer puts anything on the wire
 for it to compare, so PRRTE is now the only thing that can see the two answers
 together.
 
+### What a fence is for
+
+`PMIx_Connect` and `PMIx_Disconnect` are fences as far as the collective goes,
+and the DVM master has to act on each **exactly once**: record the assemblage
+the connect formed, or drop the one the disconnect leaves (see
+[`src/prted/pmix/AGENTS.md`](../prted/pmix/AGENTS.md), *Connected
+assemblages*). So the caller says which it is running
+(`prte_grpcomm_fence_purpose_t`), the purpose rides every contribution as a
+second byte beside the operation, and `prte_grpcomm_fence_purpose_merge()`
+holds the participants to agreeing on it exactly as the operation merge does
+- a connect and a plain fence over the same procs are two collectives, and a
+mismatch fails the fence the same way.
+
+The controller acts on it in `tree_gather_answer()`, on success only and
+**before** the release is broadcast. That is the one point in the DVM that sees
+each round of a collective complete once, whichever daemons host its
+participants; having every participating daemon report the outcome instead
+cannot tell N daemons reporting one connect from one set of procs connecting N
+times. Acting before the release means no participant can be released, and
+depart, ahead of its record.
+
 ### One movement: rollup and release
 
 A fence rolls its contributions **up the routing tree** to the controller,
@@ -1137,6 +1157,26 @@ therefore hangs *every* participant in the DVM, permanently. The `failed:`
 label instead falls back to `abort_group_op()`, whose message is only a
 signature plus a status and so is by far the smallest thing still worth
 trying to build.
+
+**The controller refuses a group ID that is taken.** When a construct
+completes, the master asks `prte_grpcomm_group_id_taken()` and, if so,
+answers every participant `PMIX_ERR_EXISTS` instead of forming the group.
+An ID is taken when it is a job's namespace - a group ID must never be one,
+or it would stand in for that job's procs - or when it names a group the
+master formed and has not seen destructed while any member's job still
+runs. A group whose jobs have all ended frees its ID, so a program that
+never destructs its group can run again on a persistent DVM. The master
+keeps its own record for this, `prte_grpcomm_globals.live_groups`, updated
+in `check_complete()` as each release leaves (`prte_grpcomm_group_formed()`,
+`prte_grpcomm_group_ended()`): `prte_pmix_server_globals.groups` will not
+do, since a release reaches only the daemons taking part - the master
+learns only of groups it hosts a member of - and the master processes its
+own copy of a destruct's release after forwarding it, so the daemons below
+can start the next construct of that ID first. Each daemon's
+`grp_release_complete()` replaces any group of the ID in its list rather
+than appending a second, so the destruct after a reuse finds the group
+that is. The PMIx servers screen their own clients' requests against what
+they hold; this is the DVM-wide half (N07).
 
 **`ft_collective` means "some *surviving* participant asked for it."** It
 is accumulated by sticky-OR as contributions merge, so a participant that

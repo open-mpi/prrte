@@ -70,7 +70,7 @@ It is **not** a Docker Swarm in the orchestration sense — just ten plain
 | `groupcon.c` | A bare PMIx client that drives a **group construct/destruct** (`groupcon` in the install): every rank contributes a local cid, asks for a context id, constructs, reads every peer's contribution back, destructs. Drives grpcomm's `grp_release` on daemons that merely *received* the broadcast. See §15. |
 | `groupinv.c` | A bare PMIx client that forms a group by **invitation** and asks for a context id (`groupinv` in the install). The highest rank leads, so mapped by node the leader is never the HNP - which is the point: that method runs no collective, so its leader asks for the id through job control and only the HNP holds the pool, so the request has to be relayed. Drives `PRTE_PMIX_GROUP_CTXID` in `src/prted/pmix`. See §15. |
 | `envspawn.c` | A PMIx client that spawns a child job carrying one of every **envar directive** (`envspawn` in the install): SET/ADD/UNSET/PREPEND/APPEND, pinned to a named host, with the child reporting the environment it actually got into a file on its own node. Those directives have no command-line surface — they arrive only on a spawn request — and `odls` applies them on whichever daemon forks the process, so the child has to land somewhere the parent is not. Drives `prte_odls_base_process_envars`. |
-| `roletool.c` | A PMIx tool that asks the DVM for what only some users may have (`roletool` in the install): the scheduler role, a spawn naming another job as its parent, a new session, a process set over another job's procs. It connects by URI rather than rendezvous file, so it can be run as a **second user** (`setpriv` to uid 65534) against a root DVM with `prte_pmix_no_foreign_tools` off. Drives the requester checks in `src/prted/pmix` (`test_requesters`). |
+| `roletool.c` | A PMIx tool that asks the DVM for what only some users may have (`roletool` in the install): the scheduler role, a spawn naming another job as its parent, a new session, a process set over another job's procs. It connects by URI rather than rendezvous file, so it can be run as a **second user** (`setpriv` to uid 65534) against a root DVM with `prte_pmix_no_foreign_tools` off. Drives the requester checks in `src/prted/pmix` (`test_requesters`). `impersonate <nspace> <rank>` connects under a name of its choosing, and a URI of `-` attaches to the node's own daemon: run from inside a job, it claims an unused rank of that job, which the master must refuse (`test_prted`) - or PMIx first, `PMIX_ERR_NOT_FOUND`, where it takes a tool only on a rank its host registered. |
 | `slowcat.c` | A deliberately **slow** stdin reader (`slowcat` in the install, no PMIx dependency): copies stdin to a file in small reads with a pause between them, so the daemon feeding it keeps hitting *partial* writes. That is the only way to reach the iof short-write path. |
 | `../scaling/scaletest.c` | A PMIx client that **times** a full-data fence and a bare barrier over the whole job (`scaletest` in the install). Not a pass/fail case — a measurement. See §18. It lives in [`contrib/scaling/`](../scaling/) because it is not container-specific: the same client is driven across a real allocation by `contrib/scaling/cluster-sweep.sh`, which is where the questions this harness *cannot* answer get measured. |
 | `mpinoop.c` | `MPI_Init` and `MPI_Finalize` and nothing else, so the only thing timed is the modex fence and the barrier behind it. Built only when `OMPI_SRC` is set — see §19. |
@@ -697,32 +697,18 @@ is `proctable`, and it asserts:
   making is that the two placements agree. It also requires the two
   survivors to still read as alive, since a table that called everything
   terminated would satisfy the first half.
-- **every daemon serves every node's `PMIX_SERVER_URI`**. The consumer here
-  is a **tool**, not a daemon — daemons reach each other over the RML and
-  never form PMIx connections to one another; see `examples/tool.c --uri
-  <nodename>`. Each daemon ships its own server URI to the master in its
-  `PRTED_CALLBACK` rollup, and the master puts the whole set into the
-  `WIREUP` xcast alongside the nidmap, so the answer does not depend on
-  which daemon the tool attached to. (Before that the query asked for a key
-  nobody published and answered `NOT_FOUND` for every node but the one being
-  asked — the producing half of commit `6e481fbb95` was never written.)
-
-  The case asks a **non-master** daemon about three other nodes — the case
-  that needs the xcast rather than just the rollup — and requires three
-  **distinct** URIs, so an implementation that echoed the local server back
-  would not pass. It then checks the master and a non-master agree on a
-  third node's URI. An unknown node must come back with a specific status,
-  never the generic `PMIX_ERROR` that the wrong-direction conversion used to
-  manufacture out of every failure on this path.
-
-- the URIs **follow the DVM across a grow and a shrink**. `vm_ready()` runs
-  on every `VM_READY` and re-sends the whole set, so a grow redistributes
-  with no code of its own — asserted rather than assumed. A shrink needs
-  nothing: the query resolves hostname → node → `node->daemon` and a shrink
-  NULLs that, so a departed node cannot be answered for at all. The case
-  shrinks node3 and requires its URI to stop being served while node2's is
-  unaffected, so that stays true rather than being an accident of the
-  current teardown order.
+- **a daemon reports its own `PMIX_SERVER_URI`, and no other node's**. The
+  consumer is a **tool**, not a daemon — daemons reach each other over the
+  RML and never form PMIx connections to one another. A PMIx server takes
+  connections from its own node only, so the DVM no longer collects every
+  daemon's URI (see `src/pmix/AGENTS.md`). The case asks a non-master
+  daemon for its own URI, unqualified and by its own node name, and
+  requires the two to match; then requires a non-master and the master
+  each to refuse the other's node with `PMIX_ERR_NOT_SUPPORTED`. One host
+  cannot show the refusal, since there every node is the local one. An
+  unknown node must come back with a specific status, never the generic
+  `PMIX_ERROR` that the wrong-direction conversion used to manufacture out
+  of every failure on this path.
 
 **The daemon body and the PMIx server host module (`src/prted`,
 `test_prted`)**: `src/prted` is where the DVM actually lives, and almost

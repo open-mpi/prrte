@@ -223,7 +223,7 @@ equal to the master's:
 
 - **The pool slot travels on the wire because it is the node's identity.**
   It is the `PMIX_NODEID` a daemon hands its local clients, and the subscript
-  the `PMIX_SERVER_URI` query resolves a nodeid through. It is *not* the
+  a `PMIX_NODEID` qualifier on a query resolves through. It is *not* the
   position in the packed list: the sender skips nodes that have no daemon, so
   after a shrink the packed sequence is compacted while the pool is not, and
   a receiver that used the packed position renamed one node's entry into
@@ -359,8 +359,8 @@ elastic grow/shrink/grow case in `contrib/dockerswarm/run-tests.sh`.
 
 ## Directive vocabularies
 
-`--map-by`, `--rank-by`, `--bind-to`, `--output`, `--display` and `--rtos`
-take values that are a small language of their own -
+`--map-by`, `--rank-by`, `--bind-to`, `--membind`, `--output`, `--display`
+and `--rtos` take values that are a small language of their own -
 `package:span:pe=2`, `tag,file=out:nocopy` - and each set of words a user
 chooses from is one `pmix_cli_choice_t` table in `prte_cmd_line.c`, with an
 enum of tags beside it in `prte_cmd_line.h`. Two rules:

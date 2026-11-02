@@ -37,7 +37,11 @@
 #ifdef HAVE_SYS_TYPES_H
 #    include <sys/types.h>
 #endif
+#ifdef HAVE_SYS_STAT_H
+#    include <sys/stat.h>
+#endif
 #include <fcntl.h>
+#include <limits.h>
 #ifdef HAVE_NETINET_IN_H
 #    include <netinet/in.h>
 #endif
@@ -236,6 +240,7 @@ static char *prte_attrs_spawn[] = {"PMIX_PERSONALITY",
                                    "PMIX_MAPBY",
                                    "PMIX_RANKBY",
                                    "PMIX_BINDTO",
+                                   "PMIX_MEMBIND",
                                    "PMIX_CPUS_PER_PROC",
                                    "PMIX_CPU_LIST",
                                    "PMIX_NO_PROCS_ON_HEAD",
@@ -531,6 +536,15 @@ void pmix_server_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.session_server);
 
+    /* the ID naming its session-level rendezvous file - the controller
+     * computes one, and passes it to its daemons */
+    prte_pmix_server_globals.session_rndz_id = UINT_MAX;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "session_rndz_id",
+                                      "The ID naming this DVM's session-level PMIx rendezvous "
+                                      "file. Set by the DVM controller for its daemons",
+                                      PMIX_MCA_BASE_VAR_TYPE_UNSIGNED_INT,
+                                      &prte_pmix_server_globals.session_rndz_id);
+
     /* whether or not to drop a system-level tool rendezvous point */
     prte_pmix_server_globals.system_server = false;
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "system_server",
@@ -555,6 +569,19 @@ void pmix_server_register_params(void)
                                       "runs as",
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
                                       &prte_pmix_server_globals.scheduler_uids);
+
+    /* the users, besides root and our own, trusted to relay for another */
+    prte_pmix_server_globals.relay_uids = NULL;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "relay_uids",
+                                      "Comma-separated list of the users (names or numeric "
+                                      "uids) trusted to pass on a request for a process of "
+                                      "another user - a privileged DVM relaying its users' "
+                                      "requests, say. A request a relay makes for its own "
+                                      "user, and one relayed by root or by the user the DVM "
+                                      "runs as, needs no entry. Any other relay's claim is "
+                                      "ignored, and the request treated as the relay's own",
+                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
+                                      &prte_pmix_server_globals.relay_uids);
 
     /* whether or not to generate device distances */
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "generate_distances",
@@ -882,6 +909,77 @@ static void alloc_timeout_warning_hdlr(size_t evhdlr_registration_id, pmix_statu
 /*
  * Initialize global variables used w/in the server.
  */
+#if defined(PMIX_SOCKET_MODE)
+/* A PMIx server that takes its node's connections on a local socket makes
+ * it, and the directory of its own it puts it in beneath our session
+ * directory, for this user alone - and the session directory is this
+ * user's alone too (mkdtemp). So a DVM told to accept tools of other users
+ * could not be reached by one at all. Widen exactly the path to the socket:
+ * its mode lets anyone connect, which PMIx follows by letting anyone into
+ * its directory, and the session directory lets anyone pass through it -
+ * but not list it, and every directory we make inside it stays this
+ * user's alone (src/util/session_dir.c). What a tool that connects may
+ * then do is judged by the user PMIx authenticated for it.
+ *
+ * A PMIx without the directive listens on loopback TCP, which every local
+ * user can already reach, so there is nothing to widen. */
+static int open_to_foreign_tools(void *ilist)
+{
+    uint32_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+    struct stat buf;
+    pmix_status_t prc;
+    int fd, rc = PRTE_SUCCESS;
+
+    /* through a descriptor, so the directory changed is the one checked */
+    fd = open(prte_process_info.top_session_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (0 > fd) {
+        rc = PRTE_ERR_FILE_OPEN_FAILURE;
+    } else {
+        if (0 != fstat(fd, &buf) || geteuid() != buf.st_uid ||
+            0 != fchmod(fd, (buf.st_mode & 07777) | S_IXGRP | S_IXOTH)) {
+            rc = PRTE_ERR_FILE_OPEN_FAILURE;
+        }
+        close(fd);
+    }
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
+        return rc;
+    }
+
+    PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SOCKET_MODE, &mode, PMIX_UINT32);
+    return prte_pmix_convert_status(prc);
+}
+#endif
+
+/* OMPI's job-family hash (opal_pmix_convert_nspace): the controller's
+ * namespace less its trailing "-<pid>" - "prte-<host>" - hashed, and the
+ * pid folded in. Unlike a job family it keeps all 32 bits, as nothing else
+ * shares the word, and it never answers 0 or UINT32_MAX: the latter is
+ * PRRTE's default session, and neither is taken as a real one */
+uint32_t prte_pmix_server_compute_rndz_id(const char *nspace, pid_t pid)
+{
+    const char *end, *c;
+    uint32_t hash = 0;
+
+    end = (NULL == nspace) ? NULL : strrchr(nspace, '-');
+    if (NULL == end) {
+        end = (NULL == nspace) ? NULL : nspace + strlen(nspace);
+    }
+    for (c = nspace; NULL != c && c < end; c++) {
+        hash += (uint32_t) (unsigned char) *c;
+        hash += (hash << 10);
+        hash ^= (hash >> 6);
+    }
+    hash += (hash << 3);
+    hash ^= (hash >> 11);
+    hash += (hash << 15);
+    hash ^= (uint32_t) pid;
+    if (0 == hash || UINT32_MAX == hash) {
+        hash = 1;
+    }
+    return hash;
+}
+
 int pmix_server_init(void)
 {
     int rc;
@@ -905,7 +1003,7 @@ int pmix_server_init(void)
     PMIX_CONSTRUCT(&prte_pmix_server_globals.departed_jobs, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.users, pmix_list_t);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.groups, pmix_list_t);
-    PMIX_CONSTRUCT(&prte_pmix_server_globals.connections, pmix_list_t);
+    prte_pmix_server_connection_init();
     PMIX_CONSTRUCT(&prte_pmix_server_globals.local_reqs, pmix_pointer_array_t);
     pmix_pointer_array_init(&prte_pmix_server_globals.local_reqs, 128, INT_MAX, 2);
     PMIX_CONSTRUCT(&prte_pmix_server_globals.remote_reqs, pmix_pointer_array_t);
@@ -920,6 +1018,8 @@ int pmix_server_init(void)
     prte_pmix_server_globals.primary_server_set = false;
     prte_pmix_server_globals.sched_uids = NULL;
     prte_pmix_server_globals.nsched_uids = 0;
+    prte_pmix_server_globals.rly_uids = NULL;
+    prte_pmix_server_globals.nrly_uids = 0;
     prte_pmix_server_globals.dvm_access = NULL;
 
     /* only the master accepts a scheduler. Its users are looked up now -
@@ -930,6 +1030,11 @@ int pmix_server_init(void)
         if (PRTE_SUCCESS != rc) {
             return rc;
         }
+    }
+    /* every daemon judges the relays it hears from */
+    rc = prte_pmix_server_relay_uids_resolve();
+    if (PRTE_SUCCESS != rc) {
+        return rc;
     }
 
     PMIX_INFO_LIST_START(ilist);
@@ -1010,6 +1115,36 @@ int pmix_server_init(void)
         rc = prte_pmix_convert_status(prc);
         return rc;
     }
+    /* A session-level server's rendezvous file is named by an ID of its
+     * host's choosing, PMIX_SESSION_RNDZ_ID: DVMs of different sessions
+     * share a node, and a tool asks for the one it wants. The controller
+     * computes the ID and hands it to its daemons. It is not passed as
+     * PMIX_SESSION_ID, which is the scheduler's ID of the session and what
+     * clients and tools read as such. A server told to be a session server
+     * without an ID cannot be, and says so rather than run as something
+     * else */
+    if (prte_pmix_server_globals.session_server) {
+        if (PRTE_PROC_IS_MASTER && UINT_MAX == prte_pmix_server_globals.session_rndz_id) {
+            prte_pmix_server_globals.session_rndz_id =
+                prte_pmix_server_compute_rndz_id(PRTE_PROC_MY_NAME->nspace, getpid());
+        }
+        if (UINT_MAX == prte_pmix_server_globals.session_rndz_id) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prted.txt", "session-server-no-id",
+                           true, prte_process_info.nodename);
+            PMIX_INFO_LIST_RELEASE(ilist);
+            return PRTE_ERR_SILENT;
+        }
+#ifdef PMIX_SESSION_RNDZ_ID
+        /* a PMIx without it names no session server's file by an ID */
+        uint32_t ui32 = (uint32_t) prte_pmix_server_globals.session_rndz_id;
+        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SESSION_RNDZ_ID, &ui32, PMIX_UINT32);
+        if (PMIX_SUCCESS != prc) {
+            PMIX_INFO_LIST_RELEASE(ilist);
+            rc = prte_pmix_convert_status(prc);
+            return rc;
+        }
+#endif
+    }
 
     if (PRTE_PROC_IS_MASTER) {
         // mark ourselves as a gateway server
@@ -1063,6 +1198,17 @@ int pmix_server_init(void)
             rc = prte_pmix_convert_status(prc);
             return rc;
         }
+#if defined(PMIX_SOCKET_MODE)
+        /* ...and saying so is not enough to let one in - see
+         * open_to_foreign_tools() */
+        if (flag) {
+            rc = open_to_foreign_tools(ilist);
+            if (PRTE_SUCCESS != rc) {
+                PMIX_INFO_LIST_RELEASE(ilist);
+                return rc;
+            }
+        }
+#endif
 
         /* if requested and persistent, tell the server that we are the system
          * controller - don't do this for the non-persistent mode */
@@ -1363,11 +1509,6 @@ void pmix_server_start(void)
          * state and the session table live only here */
         PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY,
                       PRTE_RML_PERSISTENT, pmix_server_query_request, NULL);
-        /* setup recv for the membership of connected assemblages, which is
-         * held here because we are the one process that sees every proc in
-         * the DVM terminate */
-        PRTE_RML_RECV(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED,
-                      PRTE_RML_PERSISTENT, prte_pmix_server_connection_recv, NULL);
     }
 }
 
@@ -1397,7 +1538,6 @@ void pmix_server_finalize(void)
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_LOGGING);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_SCHED);
         PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_QUERY);
-        PRTE_RML_CANCEL(PRTE_NAME_WILDCARD, PRTE_RML_TAG_CONNECTED);
     }
 
     /* finalize our local data server */
@@ -1406,6 +1546,9 @@ void pmix_server_finalize(void)
     free(prte_pmix_server_globals.sched_uids);
     prte_pmix_server_globals.sched_uids = NULL;
     prte_pmix_server_globals.nsched_uids = 0;
+    free(prte_pmix_server_globals.rly_uids);
+    prte_pmix_server_globals.rly_uids = NULL;
+    prte_pmix_server_globals.nrly_uids = 0;
     prte_pmix_server_access_release_dvm();
 
     /* and the users we judged access for */
@@ -1458,7 +1601,7 @@ void pmix_server_finalize(void)
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.psets);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.departed_jobs);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.groups);
-    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.connections);
+    prte_pmix_server_connection_finalize();
 
     /* shutdown the local server */
     prte_pmix_server_globals.initialized = false;

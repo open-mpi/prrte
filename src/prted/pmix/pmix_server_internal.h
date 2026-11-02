@@ -19,6 +19,7 @@
  *                         and Technology (RIST). All rights reserved.
  * Copyright (c) 2020      IBM Corporation.  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      Barcelona Supercomputing Center (BSC-CNS).
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -437,6 +438,7 @@ PRTE_EXPORT extern void pmix_server_query_resp(int status, pmix_proc_t *sender,
                                                pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                                                void *cbdata);
 
+PRTE_EXPORT extern int prte_pmix_server_tool_may_join(prte_job_t *jdata, pmix_rank_t rank);
 PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
                                                       pmix_op_cbfunc_t cbfunc, void *cbdata);
 
@@ -555,22 +557,60 @@ PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_pmix_server_pset_t);
  * left to report.
  *
  * The members are the participant array exactly as the connect named it, so
- * an entry may be a wildcard rank standing for a whole namespace. */
+ * an entry may be a wildcard rank standing for a whole namespace.  Matching
+ * a connect or a disconnect reads them.  A departure reads collapsed: the
+ * same members with every wholly listed job named by its wildcard. */
 typedef struct {
     pmix_list_item_t super;
     pmix_proc_t *members;
     size_t nmembers;
+    pmix_proc_t *collapsed;
+    size_t ncollapsed;
+    /* how many connects over exactly this membership are live - each
+     * disconnect covering it ends one */
+    unsigned refs;
     /* this assemblage is already being torn down after a member's failure,
      * so a second failure inside it must not drive the teardown again */
     bool terminating;
 } prte_pmix_server_connection_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_pmix_server_connection_t);
 
+/* Departures from one job, owed to one audience, waiting to be announced as
+ * a single event - see prte_pmix_server_connection_terminated(). */
+typedef struct {
+    pmix_list_item_t super;
+    pmix_nspace_t nspace;
+    /* the union of the memberships owed the news */
+    pmix_proc_t *targets;
+    size_t ntargets;
+    /* the procs that departed */
+    pmix_proc_t *procs;
+    size_t nprocs;
+    size_t cap;
+    /* the exit code they share, if exit_uniform */
+    int exit_code;
+    bool exit_uniform;
+    /* held for the end of a job the master ordered down, rather than sent
+     * when the current pass of the event loop is done */
+    bool held;
+} prte_pmix_server_departure_t;
+PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_pmix_server_departure_t);
+
+/* Construct and destruct the registry.  Called from the server's own
+ * init/finalize, and by the unit test. */
+PRTE_EXPORT void prte_pmix_server_connection_init(void);
+PRTE_EXPORT void prte_pmix_server_connection_finalize(void);
+
+/* The broadcast every assemblage event goes out on - prte_grpcomm_xcast,
+ * exported as a pointer so the unit test can read the events. */
+PRTE_EXPORT extern int (*prte_pmix_server_connection_xcast)(prte_rml_tag_t tag,
+                                                            pmix_data_buffer_t *msg);
+
 /* Record/forget an assemblage.  Both are driven by the connect and disconnect
- * collectives as they complete on the DVM master, and both are no-ops
- * anywhere else.  Recording an assemblage that is already recorded, or
- * dropping one that is not, is not an error: the two collectives are the only
- * things that call these, and a repeat of either is harmless. */
+ * collectives as they converge on the DVM master - once per operation - and
+ * both are no-ops anywhere else.  Recording an assemblage that is already
+ * recorded counts a second connection over it, which a disconnect then ends
+ * one at a time; dropping one that is not recorded is not an error. */
 PRTE_EXPORT void prte_pmix_server_connection_record(const pmix_proc_t *members, size_t nmembers);
 PRTE_EXPORT void prte_pmix_server_connection_drop(const pmix_proc_t *members, size_t nmembers);
 
@@ -581,36 +621,40 @@ PRTE_EXPORT bool prte_pmix_server_is_connected(const pmix_proc_t *proc);
 
 /* A proc has terminated.  Tell every assemblage it belonged to, since it
  * plainly did not disconnect first.  Called once per proc from the DVM
- * master's proc-termination path. */
+ * master's proc-termination path.
+ *
+ * The news is not sent from here.  Departures from one job owed to one
+ * audience gather into a set announced as one event: when the current pass of
+ * the event loop is done, or - for a job the master has ordered down - when
+ * the job has ended. */
 PRTE_EXPORT void prte_pmix_server_connection_terminated(prte_proc_t *proc);
+
+/* The master has ordered this whole job down, so the rest of its procs are
+ * known to be going: hold their departures for the job's end, when a single
+ * event naming <nspace>/WILDCARD tells the assemblage they have all gone. */
+PRTE_EXPORT void prte_pmix_server_connection_teardown(const pmix_nspace_t nspace);
+
+/* The last proc of this job has terminated: announce what is held for it. */
+PRTE_EXPORT void prte_pmix_server_connection_job_ended(prte_job_t *jdata);
 
 /* A job has launched successfully: connect it to the process that spawned
  * it, if it was spawned by a process at all.  The PMIx definition makes that
  * the default for PMIx_Spawn; PMIX_SPAWN_CHILD_SEP opts out. */
 PRTE_EXPORT void prte_pmix_server_connection_spawned(prte_job_t *jdata);
 
-/* A failure has cost this job its life.  "Connected" means the host treats
- * the assemblage as a single application, so every other job connected to it
- * goes too - each one announced with PMIX_ERR_JOB_TERM_WO_SYNC.  Called from
- * the DVM master's error manager as it terminates the job that failed. */
+/* A failure has cost this job its life.  The proc that failed is announced
+ * at once and the rest of the job is held as for a teardown.  "Connected"
+ * means the host treats the assemblage as a single application, so every
+ * other job connected to it goes too - each one announced with
+ * PMIX_ERR_JOB_TERM_WO_SYNC, and none of their procs announced as they go.
+ * Called from the DVM master's error manager as it terminates the job that
+ * failed. */
 PRTE_EXPORT void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace);
 
 /* A job's data object is going away: forget any assemblage that has nothing
  * left in it to notify. */
 PRTE_EXPORT void prte_pmix_server_connection_purge(const pmix_nspace_t nspace);
 
-/* Report a completed connect/disconnect to the DVM master, which is where the
- * membership is held.  Called on each daemon that had a participant, from the
- * completion of the collective that carried the operation. */
-PRTE_EXPORT void prte_pmix_server_connection_report(const pmix_proc_t *members, size_t nmembers);
-PRTE_EXPORT void prte_pmix_server_connection_report_drop(const pmix_proc_t *members,
-                                                         size_t nmembers);
-
-/* Receive such a report - registered on PRTE_RML_TAG_CONNECTED by the DVM
- * master. */
-PRTE_EXPORT void prte_pmix_server_connection_recv(int status, pmix_proc_t *sender,
-                                                  pmix_data_buffer_t *buffer,
-                                                  prte_rml_tag_t tag, void *cbdata);
 
 typedef struct {
     bool initialized;
@@ -624,6 +668,10 @@ typedef struct {
     pmix_list_t notifications;
     bool pubsub_init;
     bool session_server;
+    /* the ID naming the DVM's session-level rendezvous file - the
+     * controller's computation, handed to each daemon on its command line;
+     * UINT_MAX until then. Not the session's ID */
+    unsigned int session_rndz_id;
     bool system_server;
     bool no_foreign_tools;
     /* the users, besides root and our own, a tool may run as to be accepted
@@ -631,6 +679,11 @@ typedef struct {
     char *scheduler_uids;
     uint32_t *sched_uids;
     size_t nsched_uids;
+    /* the users, besides root and our own, trusted to relay a request for
+     * a process of another user: the MCA list, and what it resolved to */
+    char *relay_uids;
+    uint32_t *rly_uids;
+    size_t nrly_uids;
     /* who may act on the DVM itself - a pmix_access_t, made from the
      * --rtos users=/groups= the DVM was started with */
     void *dvm_access;
@@ -670,6 +723,10 @@ typedef struct {
     /* assemblages formed by PMIx_Connect - see prte_pmix_server_connection_t.
      * Populated on the DVM master only. */
     pmix_list_t connections;
+    /* departures waiting to be announced - prte_pmix_server_departure_t */
+    pmix_list_t departures;
+    /* the jobs the master has ordered down whose departures are held */
+    char **teardowns;
     /* whether a failure that terminates one job of an assemblage terminates
      * the rest of it, which is what the PMIx definition of "connected" asks
      * of a host that terminates an application when one of its processes
@@ -691,10 +748,30 @@ PRTE_EXPORT extern prte_pmix_server_globals_t prte_pmix_server_globals;
  * pmix_server_access.c and PMIx's docs/security-plan.rst. All of these run
  * on the PRRTE progress thread.
  *
- * prte_pmix_server_requester_uid: the requester's uid, as PMIx names it in
- * an up-call's info (PMIX_USERID, from the identity it connected with).
- * false when the info names none. */
+ * prte_pmix_server_requester_uid: the uid to attribute an up-call to. PMIx
+ * names the process connected to it (PMIX_USERID, from the identity it
+ * connected with) - a relay, if the request was relayed. A relay's claim
+ * about who first asked (PMIX_ORIGIN_USERID) is taken in its place only
+ * when prte_pmix_server_relay_permitted says the relay may make it.
+ * false when the info names no requester at all. */
 PRTE_EXPORT bool prte_pmix_server_requester_uid(const pmix_info_t *info, size_t ninfo, uid_t *uid);
+
+/* May a process running as relay speak for one running as origin? Always
+ * when they are the same user - that claims nothing more than the relay
+ * has. Otherwise only root, the user this DVM runs as, and the users
+ * prte_pmix_relay_uids names. */
+PRTE_EXPORT bool prte_pmix_server_relay_permitted(uid_t relay, uid_t origin);
+
+/* Look up the users prte_pmix_relay_uids names, once; a name nobody has is
+ * reported and refused. */
+PRTE_EXPORT int prte_pmix_server_relay_uids_resolve(void);
+
+/* The most entries prte_pmix_server_relay_copy adds */
+#define PRTE_PMIX_ORIGIN_MAX 5
+
+/* True for the keys that say who made a request - the ones PMIx stamps on
+ * an up-call, and a relay's PMIX_ORIGIN_* claims */
+PRTE_EXPORT bool prte_pmix_server_is_identity_key(const char *key);
 
 /* root, or the user this DVM runs as */
 PRTE_EXPORT bool prte_pmix_server_privileged(uid_t uid);
@@ -772,18 +849,30 @@ PRTE_EXPORT pmix_status_t prte_pmix_server_access_record(prte_job_t *jdata,
                                                          const pmix_info_t *info, size_t ninfo);
 PRTE_EXPORT void prte_pmix_server_access_release_job(prte_job_t *jdata);
 
-/* Mark the PMIX_USERID and PMIX_GRPID in info - the identity PMIx gave us
- * for the process that made a request - as relayed, before we pass the
- * request on through a PMIx API (to the scheduler, to another DVM). The
- * server it goes to then keeps them rather than putting ours in their
- * place, and the operation is attributed to whoever asked for it. A no-op
- * against a PMIx without PMIX_INFO_RELAYED */
-PRTE_EXPORT void prte_pmix_server_mark_relayed(pmix_info_t *info, size_t ninfo);
+/* Copy an up-call's info into dst, to pass the request on through a PMIx
+ * API (to the scheduler, to another DVM), saying whom we pass it on for.
+ * The identity PMIx stamped on the up-call, and any PMIX_ORIGIN_* claim,
+ * are not copied: the server it goes to stamps ours, and is told whom we
+ * act for in PMIX_ORIGIN_* instead - the claim we were given, if the relay
+ * that gave it may make it (prte_pmix_server_relay_permitted), and
+ * otherwise the identity PMIx gave us for the process we heard from.
+ * Everything else, a PMIX_REQUESTED_GRPID among it, is copied as is. dst
+ * must have room for nsrc + PRTE_PMIX_ORIGIN_MAX entries; returns how
+ * many were written. Against a PMIx without PMIX_CAP_ORIGIN_ID, which puts
+ * the relay's identity in place of whatever we send, it copies all of
+ * src. */
+PRTE_EXPORT size_t prte_pmix_server_relay_copy(pmix_info_t *dst, const pmix_info_t *src,
+                                               size_t nsrc);
 
 /* A user we now know - a job's owner, a tool's user: make our record of it,
  * its groups looked up, and register it with PMIx. Root and our own user
  * are skipped */
 PRTE_EXPORT void prte_pmix_server_access_user(uid_t uid);
+
+/* The groups uid belongs to, looked up afresh into our record of it, as a
+ * PMIX_UINT32 data array for PMIX_USER_GRPIDS - *out is NULL for root, our
+ * own user, or a user found in none. The caller frees it */
+PRTE_EXPORT pmix_status_t prte_pmix_server_owner_groups(uid_t uid, pmix_data_array_t **out);
 
 /* The job named nspace is ending here. If nothing else of its owner's is
  * left, drop our record of the user and deregister it from PMIx */

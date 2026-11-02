@@ -19,6 +19,7 @@
  * Copyright (c) 2014-2019 Research Organization for Information Science
  *                         and Technology (RIST).  All rights reserved.
  * Copyright (c) 2021-2026 Nanook Consulting  All rights reserved.
+ * Copyright (c) 2026      SiPearl.  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -252,6 +253,7 @@ static const directive_type_t job_directive_types[] = {
     {PMIX_COLOCATE_PROCS, PMIX_DATA_ARRAY, PMIX_PROC},
     {PMIX_RANKBY, PMIX_STRING, PMIX_UNDEF},
     {PMIX_BINDTO, PMIX_STRING, PMIX_UNDEF},
+    {PMIX_MEMBIND, PMIX_STRING, PMIX_UNDEF},
     {PMIX_RUNTIME_OPTIONS, PMIX_STRING, PMIX_UNDEF},
     {PMIX_EXEC_AGENT, PMIX_STRING, PMIX_UNDEF},
     {PRTE_XTERM_RANKS, PMIX_STRING, PMIX_UNDEF},
@@ -285,6 +287,7 @@ static const directive_type_t app_directive_types[] = {
     {PMIX_MAPBY, PMIX_STRING, PMIX_UNDEF},
     {PMIX_RANKBY, PMIX_STRING, PMIX_UNDEF},
     {PMIX_BINDTO, PMIX_STRING, PMIX_UNDEF},
+    {PMIX_MEMBIND, PMIX_STRING, PMIX_UNDEF},
     {PMIX_SET_ENVAR, PMIX_ENVAR, PMIX_UNDEF},
     {PMIX_ADD_ENVAR, PMIX_ENVAR, PMIX_UNDEF},
     {PMIX_UNSET_ENVAR, PMIX_STRING, PMIX_UNDEF},
@@ -325,6 +328,36 @@ static int directive_refuse(prte_job_t *jdata, const pmix_info_t *info, pmix_dat
     prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-runtime.txt", "spawn-directive-type", true,
                    info->key, PMIx_Data_type_string(want), PMIx_Data_type_string(info->value.type));
     return PRTE_ERR_BAD_PARAM;
+}
+
+/* PMIX_MEMBIND, whichever level it was given at: parsed here, where a bad
+ * value can still be refused with the whole request, and recorded as the
+ * attribute the odls reads - the parsed value, so no daemon parses it again.
+ * directive_check() has already held its type to a string; a string loaded
+ * with nothing arrives as NULL, which the parser refuses and reports. Like a
+ * second PMIX_BINDTO, a second one for the same job or app is a conflict,
+ * never an overwrite. */
+static int xfer_membind(prte_job_t *jdata, pmix_info_t *info,
+                        pmix_list_t *attributes, prte_attribute_key_t key)
+{
+    prte_hwloc_base_memattr_t memattr;
+    uint16_t u16, prior = 0, *priorptr = &prior;
+    int rc;
+
+    rc = prte_hwloc_base_parse_membind(PRTE_JOB_NSPACE(jdata), "PMIX_MEMBIND",
+                                       info->value.data.string, &memattr);
+    if (PRTE_SUCCESS != rc) {
+        return rc;
+    }
+    if (prte_get_attribute(attributes, key, (void **) &priorptr, PMIX_UINT16)) {
+        prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-rmaps-base.txt", "redefining-policy", true,
+                       "memory binding", info->value.data.string,
+                       prte_hwloc_base_print_membind((prte_hwloc_base_memattr_t) prior));
+        return PRTE_ERR_BAD_PARAM;
+    }
+    u16 = (uint16_t) memattr;
+    prte_set_attribute(attributes, key, PRTE_ATTR_GLOBAL, &u16, PMIX_UINT16);
+    return PRTE_SUCCESS;
 }
 
 int prte_pmix_xfer_job_info(prte_job_t *jdata,
@@ -641,6 +674,13 @@ int prte_pmix_xfer_job_info(prte_job_t *jdata,
         } else if (PMIX_CHECK_KEY(info, PRTE_XTERM_RANKS)) {
             prte_set_attribute(&jdata->attributes, PRTE_JOB_XTERM, PRTE_ATTR_GLOBAL,
                                info->value.data.string, PMIX_STRING);
+
+            /***   MEMBIND   ***/
+        } else if (PMIX_CHECK_KEY(info, PMIX_MEMBIND)) {
+            rc = xfer_membind(jdata, info, &jdata->attributes, PRTE_JOB_MEMBIND);
+            if (PRTE_SUCCESS != rc) {
+                return rc;
+            }
 
             /***   STOP ON EXEC FOR DEBUGGER   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_DEBUG_STOP_ON_EXEC)) {
@@ -1182,6 +1222,13 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
                     return rc;
                 }
 
+                /***   MEMBIND (per-app)   ***/
+            } else if (PMIX_CHECK_KEY(info, PMIX_MEMBIND)) {
+                rc = xfer_membind(jdata, info, &app->attributes, PRTE_APP_MEMBIND);
+                if (PRTE_SUCCESS != rc) {
+                    return rc;
+                }
+
                 /***   ENVIRONMENTAL VARIABLE DIRECTIVES   ***/
                 /* there can be multiple of these, so we add them to the attribute list */
             } else if (PMIX_CHECK_KEY(info, PMIX_SET_ENVAR)) {
@@ -1260,6 +1307,19 @@ int prte_pmix_xfer_app(prte_job_t *jdata, pmix_app_t *papp)
         }
     }
     return PRTE_SUCCESS;
+}
+
+/* did the request name the job's parent itself? */
+static bool parent_named(const pmix_info_t *info, size_t ninfo)
+{
+    size_t n;
+
+    for (n = 0; n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], PMIX_PARENT_ID)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void interim(int sd, short args, void *cbdata)
@@ -1365,6 +1425,24 @@ static void interim(int sd, short args, void *cbdata)
                 PRTE_FLAG_SET(app, PRTE_APP_FLAG_TOOL);
             }
         }
+    }
+
+    /* A tool asked for this job for itself, and a tool is no parent: it is
+     * not a member of a job and has no procs to be spawned by. Its name
+     * does not settle that - a tool started by one of a job's processes
+     * takes that process's identity from its environment, which is how a
+     * prun in a job script stays inside its job's allocation - so the
+     * requester's job cannot be the test. The job is therefore not linked
+     * into its requester's spawn tree, not connected to it, and not told it
+     * has a PMIX_PARENT_ID, unless the tool named a parent with
+     * PMIX_PARENT_ID, as prterun's proxy does. Without this, a prun in a
+     * job script waited for its own job to end before returning, and a
+     * step that failed took the whole script down by fate sharing. Its
+     * session, user and output still follow the requester. */
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_DVM_JOB) &&
+        !parent_named(cd->info, cd->ninfo)) {
+        prte_set_bool_attribute(&jdata->attributes, PRTE_JOB_NO_PARENT_PROC,
+                                PRTE_ATTR_GLOBAL, true);
     }
 
     /* indicate the requestor so bookmarks can be correctly set */
@@ -1529,11 +1607,6 @@ static void connect_release(pmix_status_t status,
     }
 
 release:
-    /* the assemblage exists only if the collective that formed it succeeded */
-    if (PMIX_SUCCESS == status) {
-        prte_pmix_server_connection_report(md->procs, md->nprocs);
-    }
-
     /* now release the connect call */
     if (NULL != md->opcbfunc) {
         md->opcbfunc(rc, md->cbdata);
@@ -1605,8 +1678,10 @@ pmix_status_t pmix_server_connect_fn(const pmix_proc_t procs[], size_t nprocs,
         return rc;
     }
 
+    /* the DVM master records the assemblage when this converges - once,
+     * however many daemons host its participants */
     rc = prte_grpcomm_fence(procs, nprocs, info, ninfo,
-                            bo.bytes, bo.size,
+                            bo.bytes, bo.size, PRTE_GRPCOMM_FENCE_FOR_CONNECT,
                             connect_release, cd);
     if (PRTE_SUCCESS != rc) {
         /* it refused before taking the blob, so it is still ours */
@@ -1629,15 +1704,6 @@ static void mdxcbfunc(pmix_status_t status,
     PRTE_HIDE_UNUSED_PARAMS(data, ndata, relcbfunc, relcbdata);
 
     PMIX_ACQUIRE_OBJECT(cd);
-    /* these procs have left the assemblage in the sanctioned way, so the
-     * promise made when they connected is discharged */
-    if (PMIX_SUCCESS == status && NULL != cd->procs) {
-        prte_pmix_server_connection_report_drop(cd->procs, cd->nprocs);
-    }
-    if (NULL != cd->procs) {
-        PMIX_PROC_FREE(cd->procs, cd->nprocs);
-        cd->procs = NULL;
-    }
     /* ack the call */
     if (NULL != cd->cbfunc) {
         cd->cbfunc(status, cd->cbdata);
@@ -1650,35 +1716,29 @@ pmix_status_t pmix_server_disconnect_fn(const pmix_proc_t procs[], size_t nprocs
                                         pmix_op_cbfunc_t cbfunc, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd;
-    pmix_status_t rc;
+    int rc;
 
     pmix_output_verbose(2, prte_pmix_server_globals.output, "%s disconnect called",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME));
 
-    /* Execute a fence across the participants, and - once it says they all
-     * arrived - tell the DVM master to forget the assemblage they formed.
-     * Leaving it this way is what discharges the connect's promise: a member
-     * that departs afterwards owes nobody an event.
+    /* Execute a fence across the participants.  The DVM master forgets the
+     * assemblage they formed when it converges - once, however many daemons
+     * host them.  Leaving it this way is what discharges the connect's
+     * promise: a member that departs afterwards owes nobody an event.
      * Note that we do not need to thread-shift here as the fence function
      * will do it for us */
     cd = PMIX_NEW(prte_pmix_server_op_caddy_t);
     cd->cbfunc = cbfunc;
     cd->cbdata = cbdata;
-    if (NULL != procs && 0 < nprocs) {
-        cd->nprocs = nprocs;
-        PMIX_PROC_CREATE(cd->procs, cd->nprocs);
-        memcpy(cd->procs, procs, nprocs * sizeof(pmix_proc_t));
-    }
 
-    rc = pmix_server_fencenb_fn(procs, nprocs, info, ninfo, NULL, 0, mdxcbfunc, cd);
-    if (PMIX_SUCCESS != rc) {
-        PMIX_ERROR_LOG(rc);
-        if (NULL != cd->procs) {
-            PMIX_PROC_FREE(cd->procs, cd->nprocs);
-            cd->procs = NULL;
-        }
+    rc = prte_grpcomm_fence(procs, nprocs, info, ninfo, NULL, 0,
+                            PRTE_GRPCOMM_FENCE_FOR_DISCONNECT, mdxcbfunc, cd);
+    if (PRTE_SUCCESS != rc) {
+        PRTE_ERROR_LOG(rc);
         PMIX_RELEASE(cd);
+        /* grpcomm answers in PRTE codes, our caller reads PMIx ones */
+        return prte_pmix_convert_rc(rc);
     }
 
-    return rc;
+    return PMIX_SUCCESS;
 }

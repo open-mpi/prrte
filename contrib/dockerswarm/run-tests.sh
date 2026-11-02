@@ -397,6 +397,19 @@ pmix_cap() {
     fi
 }
 
+# Whether the PMIx the swarm is built against defines `$1` - an attribute,
+# where pmix_cap looks for a capability
+pmix_attr() {
+    if [ "$HARNESS_MODE" = cluster ]; then
+        ON 1 "grep -qs $1 '$CLUSTER_PMIX/include/pmix_common.h'" >/dev/null 2>&1
+    else
+        ON 1 "p=\$(sed -n 's|.*--with-pmix=\\([^ ]*\\).*|\\1|p' \
+                      /opt/prte/vpath-linux/.configure-args 2>/dev/null); \
+              [ -n \"\$p\" ] || p=/usr/local; \
+              grep -qs $1 \"\$p/include/pmix_common.h\"" >/dev/null 2>&1
+    fi
+}
+
 # --- bootstrap-DVM helpers --------------------------------------------------
 # A bootstrapped DVM is configured by <sysconfdir>/prte.conf, which lives in the
 # install the swarm shares.  The node containers mount that volume READ-ONLY, so
@@ -3295,54 +3308,37 @@ test_pmix() {
             || bad "$who reported $n of 2 survivors as alive: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
     done
 
-    banner "pmix: every daemon serves every node's PMIX_SERVER_URI"
-    # The consumer of this query is a TOOL, not a daemon -- daemons reach
-    # each other over the RML and never form PMIx connections to one another.
-    # A tool asks the DVM "where is the PMIx server on node X?" so it can
-    # connect there directly (examples/tool.c --uri <nodename>).
-    #
-    # This only works because every daemon ships its own server URI to the
-    # master in its PRTED_CALLBACK rollup, and the master then puts the whole
-    # set into the WIREUP xcast alongside the nidmap -- so EVERY daemon can
-    # answer for EVERY node, not just the master.  That uniformity is the
-    # point: a tool must not get a different answer depending on which daemon
-    # it happened to connect to.  Before the collection existed the query was
-    # asking for a key nobody published and answered NOT_FOUND for every node
-    # but the one being asked.  One host cannot show any of this: there is
-    # only one daemon and it is the master.
-    #
-    # Ask a NON-MASTER daemon (a proc on node3) about the others -- that is
-    # the case that needs the xcast rather than just the rollup.  The URIs
-    # must all differ and each must name its own daemon vpid; an
-    # implementation that echoed the local server back would pass a weaker
-    # test.
-    uris=""
-    for target in node1 node2 node4; do
-        out=$(PRUN "--host node3:1 -n 1 $PT serveruri $target" 2>&1)
-        u=$(echo "$out" | grep -m1 '^URI ' | awk '{print $2}' | tr -d '\r')
-        if [ -n "$u" ]; then
-            ok "a non-master daemon served $target's server URI"
-            uris="$uris$u\n"
+    banner "pmix: a daemon reports its own PMIX_SERVER_URI, and no other node's"
+    # A PMIx server takes connections from its own node only, over its local
+    # socket, so another node's server address is of no use to a tool - and
+    # a TCP address, the only kind that crosses nodes, is refused to a tool
+    # of this release. So the DVM no longer collects every daemon's URI: a
+    # daemon answers for its own server, and refuses a query naming another
+    # node with PMIX_ERR_NOT_SUPPORTED. One host cannot show the refusal:
+    # there every node is the local one.
+    out=$(PRUN "--host node3:1 -n 1 $PT serveruri" 2>&1)
+    u0=$(echo "$out" | grep -m1 '^URI ' | awk '{print $2}' | tr -d '\r')
+    [ -n "$u0" ] \
+        && ok "a non-master daemon reports its own server URI" \
+        || bad "a non-master daemon did not report its own server URI: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    out=$(PRUN "--host node3:1 -n 1 $PT serveruri node3" 2>&1)
+    u1=$(echo "$out" | grep -m1 '^URI ' | awk '{print $2}' | tr -d '\r')
+    if [ -n "$u1" ] && [ "$u1" = "$u0" ]; then
+        ok "...and the same URI when its own node is named"
+    else
+        bad "naming its own node gave '$u1', not '$u0'"
+    fi
+    for who in node3:node1 node1:node3; do
+        at=${who%%:*}; target=${who##*:}
+        out=$(PRUN "--host $at:1 -n 1 $PT serveruri $target" 2>&1)
+        if echo "$out" | grep -q '^URI '; then
+            bad "the daemon on $at reported $target's server URI"
+        elif echo "$out" | grep -q '^ERR .*PMIX_ERR_NOT_SUPPORTED'; then
+            ok "the daemon on $at refuses $target's server URI as not supported"
         else
-            bad "non-master daemon could not serve $target's server URI: $(echo "$out" | grep -E '^ERR' | tr '\n' ' ' | tail -c 200)"
+            bad "the daemon on $at answered $target's server URI with: $(echo "$out" | grep -E '^ERR' | tr '\n' ' ' | tail -c 200)"
         fi
     done
-    n=$(printf "$uris" | sort -u | grep -c . | tr -d ' ')
-    [ "$n" = 3 ] \
-        && ok "...and the three URIs are distinct (not the local server echoed back)" \
-        || bad "expected 3 distinct server URIs, got $n: $(printf "$uris" | tr '\n' ' ')"
-    # ...and the master must give the same answers
-    out=$(PRUN "--host node1:1 -n 1 $PT serveruri node3" 2>&1)
-    m3=$(echo "$out" | grep -m1 '^URI ' | awk '{print $2}' | tr -d '\r')
-    out=$(PRUN "--host node3:1 -n 1 $PT serveruri node3" 2>&1)
-    d3=$(echo "$out" | grep -m1 '^URI ' | awk '{print $2}' | tr -d '\r')
-    if [ -n "$m3" ] && [ "$m3" = "$d3" ]; then
-        ok "master and a non-master daemon agree on node3's server URI"
-    elif [ -z "$m3" ] || [ -z "$d3" ]; then
-        bad "node3's server URI was missing from one of the two answers (master='$m3' daemon='$d3')"
-    else
-        bad "master and daemon disagree on node3's server URI: '$m3' vs '$d3'"
-    fi
     # An unknown node must be refused with a status that SAYS something --
     # not the generic PMIX_ERROR (-1) that the wrong-direction conversion
     # used to manufacture out of every failure on this path.
@@ -3362,52 +3358,6 @@ test_pmix() {
     n=$(prted_count 1 2 3 4)
     [ "$n" = 0 ] && ok "no daemons survived the pmix-shim teardown" \
                  || bad "$n daemons still running after pterm"
-    cleanup_swarm
-
-    banner "pmix: server URIs follow the DVM across a grow and a shrink"
-    # The URIs ride along in the WIREUP xcast that vm_ready() builds, and
-    # vm_ready() runs on VM_READY -- which fires again every time the daemon
-    # set changes.  So a GROW should redistribute the whole set (the new
-    # nodes' URIs to everyone, and everyone's to the new nodes) with no code
-    # of its own.  This case checks that rather than assuming it.
-    #
-    # A SHRINK needs nothing: the query resolves hostname -> node ->
-    # node->daemon, and a shrink NULLs that backpointer, so a departed node
-    # cannot be answered for at all.  The store entry keyed on its (never
-    # reused) vpid is orphaned but unreachable.  Asserted here so that stays
-    # true rather than being an accident of the current teardown order.
-    RUN 'nohup prte --daemonize --prtemca prte_elastic_mode 1 >/tmp/prte.out 2>&1 & sleep 8' >/dev/null
-    if ! RUN 'pgrep -x prte >/dev/null'; then
-        bad "could not start an elastic DVM for the grow/shrink URI test"
-    else
-        out=$(RUN 'timeout 90 elastic grow node2:2,node3:2' 2>&1)
-        if ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
-            bad "grow did not complete -- cannot test URI redistribution"
-        else
-            ok "grew node2+node3"
-            for target in node2 node3; do
-                out=$(RUN "timeout 40 prun --host node1:1 -n 1 $PT serveruri $target" 2>&1)
-                echo "$out" | grep -q '^URI ' \
-                    && ok "a grown node's server URI ($target) is served after the grow" \
-                    || bad "no server URI for grown $target: $(echo "$out" | grep -E '^ERR' | tr '\n' ' ' | tail -c 200)"
-            done
-            out=$(RUN 'timeout 90 elastic shrink node3' 2>&1); sleep 3
-            if ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
-                bad "shrink did not complete -- cannot test the stale URI"
-            else
-                ok "shrank node3"
-                out=$(RUN "timeout 40 prun --host node1:1 -n 1 $PT serveruri node3" 2>&1)
-                echo "$out" | grep -q '^URI ' \
-                    && bad "a shrunk node's server URI is still being served -- stale entry" \
-                    || ok "...and node3's server URI is no longer served"
-                out=$(RUN "timeout 40 prun --host node1:1 -n 1 $PT serveruri node2" 2>&1)
-                echo "$out" | grep -q '^URI ' \
-                    && ok "...while node2's is unaffected" \
-                    || bad "node2's server URI was lost by the shrink"
-            fi
-        fi
-        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
-    fi
     cleanup_swarm
 
     banner "pmix: a rank can locate every peer in its job, on any node"
@@ -3889,25 +3839,84 @@ test_prted() {
                 && ok "300 lines from 6 ranks reached the tool, each exactly once" \
                 || bad "relayed output was lost or duplicated (got $n lines, per-line counts '$u'; expected 300 and '6 ')"
 
-            # The relayed copy must not be EMITTED where it lands.  Every
-            # daemon registers the job's namespace with the same output
-            # directives, so a daemon handed another node's output writes its
-            # own copy of that rank's file unless the delivery says not to --
-            # and node3 hosts none of these ranks, so any file appearing there
-            # is a duplicate of one node1 or node2 already wrote.  Measured,
-            # not assumed: flipping the PMIX_IOF_LOCAL_OUTPUT directive to
-            # true puts a full set here.
+            # Who writes the output files.  Every daemon registers the job's
+            # namespace with the same output directives.  With a PMIx that
+            # has PMIX_IOF_FILE_WRITER the launcher writes them, as the
+            # user, on its own node - it is sent every rank's output anyway -
+            # and no daemon writes one: so node3, where prun runs, has both
+            # ranks' files and the hosting daemons none.  With an older PMIx
+            # each hosting daemon writes its own ranks' files, and the
+            # relayed copy must not be EMITTED where it lands: node3 hosts
+            # none of these ranks, so any file there is a duplicate of one
+            # node1 or node2 already wrote (flipping the PMIX_IOF_LOCAL_OUTPUT
+            # directive to true puts a full set there).
             for i in 1 2 3; do ON $i 'rm -rf /tmp/relayout; mkdir -p /tmp/relayout' >/dev/null 2>&1; done
             ONT 3 'timeout -k 5 45 prun --output file=/tmp/relayout/out --host node1:1,node2:1 -n 2 --map-by node hostname' >/dev/null 2>&1
             n=$(ON 3 'find /tmp/relayout -type f 2>/dev/null | wc -l' | tr -d ' \r')
             m=$(ON 2 'find /tmp/relayout -type f 2>/dev/null | wc -l' | tr -d ' \r')
-            [ "$n" = 0 ] \
-                && ok "the tool's daemon wrote no output files for ranks it does not host" \
-                || bad "relayed output was emitted on the tool's node too ($n files); two daemons are writing one --output file"
-            [ "$m" = 1 ] \
-                && ok "...and the daemon that does host a rank still wrote its file" \
-                || bad "output-to-file broke on the hosting daemon ($m files, expected 1)"
+            l=$(ON 1 'find /tmp/relayout -type f 2>/dev/null | wc -l' | tr -d ' \r')
+            if pmix_attr PMIX_IOF_FILE_WRITER; then
+                [ "$n" = 2 ] \
+                    && ok "the launcher wrote both ranks' output files on its own node" \
+                    || bad "the launcher wrote $n output files on its node, expected 2"
+                [ "$m" = 0 ] && [ "$l" = 0 ] \
+                    && ok "...and no hosting daemon wrote one" \
+                    || bad "hosting daemons wrote output files the launcher writes ($l on node1, $m on node2)"
+            else
+                [ "$n" = 0 ] \
+                    && ok "the tool's daemon wrote no output files for ranks it does not host" \
+                    || bad "relayed output was emitted on the tool's node too ($n files); two daemons are writing one --output file"
+                [ "$m" = 1 ] \
+                    && ok "...and the daemon that does host a rank still wrote its file" \
+                    || bad "output-to-file broke on the hosting daemon ($m files, expected 1)"
+            fi
         fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    cleanup_swarm
+
+    banner "prted: a tool may not add a rank to an application job"
+    # A tool started by one of a job's own processes inherits the job's PMIx
+    # identity, and PMIx lets it claim an unused rank of that job. Attached
+    # through a non-master daemon, the attach reaches the master as
+    # PRTE_PLM_TOOL_ATTACHED_CMD, which used to add the rank to the job. A
+    # tool's departure retires its rank only in a tool's namespace, so the job
+    # could never complete and prun waited for the life of the DVM. The master
+    # now refuses the attach with PMIX_ERR_EXISTS - asserted exactly, since a
+    # tool that cannot connect at all would also fail to initialize. A PMIx
+    # that takes a tool only on a rank its host registered refuses this one
+    # first, PMIX_ERR_NOT_FOUND, never asking PRRTE - as specific a refusal. The job
+    # runs on node2 so that the tool attaches through node2's daemon rather
+    # than the master's. The second case is the attach that must still work:
+    # a tool taking the rank its job script already has, as a prun started
+    # from a job script does. The job's process is a shell, which holds no
+    # PMIx connection; were the rank connected, PMIx would refuse the tool
+    # itself and connect it under a fresh name, never asking PRRTE. So the
+    # case checks that the tool kept the job's name.
+    if ! RUN "test -x $ROLETOOL"; then
+        skp "roletool not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2'; then
+        bad "could not start a DVM for the tool-rank test"
+    else
+        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout 20 $ROLETOOL - impersonate \$PMIX_NAMESPACE 7; true' 2>&1; echo RC=\$?")
+        echo "$out" | grep -qE 'ROLE INIT PMIX_ERR_(EXISTS|NOT_FOUND)' \
+            && ok "a tool naming an unused rank of an application job was refused" \
+            || bad "a tool naming an unused rank of an application job was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'RC=0' \
+            && ok "...and the job completed" \
+            || bad "...but the job never completed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'echo JOB \$PMIX_NAMESPACE \$PMIX_RANK; timeout 20 $ROLETOOL - impersonate \$PMIX_NAMESPACE \$PMIX_RANK; true' 2>&1; echo RC=\$?")
+        job=$(echo "$out" | tr -d '\r' | sed -n 's/^JOB //p')
+        name=$(echo "$out" | tr -d '\r' | sed -n 's/^ROLE NAME //p')
+        echo "$out" | grep -q 'ROLE INIT PMIX_SUCCESS' \
+            && ok "a tool taking the rank its job script has still attaches" \
+            || bad "a tool taking the rank its job script has was refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        [ -n "$job" ] && [ "$job" = "$name" ] \
+            && ok "...under the job's own name" \
+            || bad "...but not under the job's name ('$job' vs '$name'), so PRRTE was never asked"
+        echo "$out" | grep -q 'RC=0' \
+            && ok "...and that job completed" \
+            || bad "...but that job never completed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
     cleanup_swarm
@@ -4590,6 +4599,68 @@ test_tools() {
         bad "could not start a persistent DVM for the prun spawn-tree case"
     fi
     for n in 1 2 3; do ON $n 'rm -rf /tmp/dyn' >/dev/null 2>&1; done
+    cleanup_swarm
+
+    banner "tools: a prun in a job script launches a step, not a child of its job"
+    # A prun started by one of a job's processes takes that process's identity
+    # from its environment - which is how it stays inside the job's
+    # allocation.  Its spawn therefore reached the DVM as one by that
+    # process, and the step was made a child of the job running the script:
+    #  - the step joined the script's spawn tree, so prun waited for the
+    #    script to end, and the script waited for prun (issue #2862);
+    #  - the spawn connected the step to the script, so a step that failed
+    #    took the whole script down by fate sharing.
+    # The job script runs on node2, so the inner prun attaches to node2's
+    # daemon and its request reaches the master by relay; the step runs on
+    # node3.  The inner timeout is what a regression reports, as 124.
+    #
+    # The harness lets ITS commands run as root through their environment,
+    # which a job's environment does not carry on to a prun inside it - so
+    # the inner one is given the same two variables itself.
+    INNERPRUN="env PRTE_ALLOW_RUN_AS_ROOT=1 PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1 $BINDIR/prun"
+    if prted_dvm_start 'node1:2,node2:2,node3:2'; then
+        out=$(RUN "timeout -k 5 90 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 echo STEP-OUTPUT; echo INNER RC=\$?' 2>&1; echo OUTER RC=\$?")
+        echo "$out" | grep -q 'INNER RC=0' \
+            && ok "a prun in a job script returns once its step has ended" \
+            || bad "a prun in a job script did not return (issue #2862): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'STEP-OUTPUT' \
+            && ok "...having forwarded the step's output" \
+            || bad "...but the step's output never arrived: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'OUTER RC=0' \
+            && ok "...and the job script completed" \
+            || bad "...but the job script did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+        out=$(RUN "timeout -k 5 90 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 false; echo INNER RC=\$?; echo SCRIPT CONTINUED' 2>&1; echo OUTER RC=\$?")
+        echo "$out" | grep -q 'INNER RC=1' \
+            && ok "a failing step's status comes back to the job script" \
+            || bad "a failing step's status did not come back: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'SCRIPT CONTINUED' && echo "$out" | grep -q 'OUTER RC=0' \
+            && ok "...and the script carries on: the step was never connected to it" \
+            || bad "a failing step took its job script down: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        RUN "timeout -k 5 30 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
+        sleep 3
+    else
+        bad "could not start a persistent DVM for the job-script step case"
+    fi
+
+    # ...and the same from a job script under prterun, whose DVM is its own.
+    # prterun writes the output of the jobs in it to the terminal, and the
+    # prun that started a step writes the step's too - so the step's output
+    # was printed twice.  And the step's status is the prun's to return to
+    # the script: prterun returns the script's, not the first failure of
+    # every job it ran.
+    out=$(RUN "timeout -k 5 90 prterun --host node2:1,node3:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 echo STEP-OUTPUT; echo INNER RC=\$?' 2>&1; echo OUTER RC=\$?")
+    echo "$out" | grep -q 'INNER RC=0' && echo "$out" | grep -q 'OUTER RC=0' \
+        && ok "a prun in a prterun job script returns, and so does prterun" \
+        || bad "a prun in a prterun job script hung: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    n=$(echo "$out" | grep -c 'STEP-OUTPUT')
+    [ "$n" = 1 ] \
+        && ok "...and the step's output is printed once" \
+        || bad "the step's output was printed $n times: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    out=$(RUN "timeout -k 5 90 prterun --host node2:1,node3:1 -n 1 sh -c 'timeout -k 5 30 $INNERPRUN --host node3:1 -n 1 false; echo INNER RC=\$?; exit 0' 2>&1; echo OUTER RC=\$?")
+    echo "$out" | grep -q 'INNER RC=1' && echo "$out" | grep -q 'OUTER RC=0' \
+        && ok "a failed step is the job script's to handle: prterun returns the script's status" \
+        || bad "prterun did not return its job script's status: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
     cleanup_swarm
 }
 
@@ -5320,6 +5391,32 @@ test_connect() {
     n=$(echo "$out" | awk '$1=="CNCT" && $2=="parent" && $4=="EVENTS" {print $5}')
     [ "${n:-1}" = 0 ] \
         && ok "...and heard nothing when the child disconnected before leaving" \
+        || bad "an event was sent about a child that had disconnected: $(echo "$out" | grep CNCT | tr '\n' ' ' | tail -c 400)"
+
+    banner "connect: an assemblage named rank by rank is reported the same way"
+    # Open MPI names a job by wildcard only from MPI_COMM_WORLD and lists its
+    # ranks from any other communicator.  The master addresses a departure
+    # from such a record by job rather than by rank, so the event still has
+    # to reach the parent.  --by-rank lists every rank of both jobs, gives
+    # the child two procs, and spawns it CHILD_SEP so this connect is its
+    # only assemblage.
+    out=$(PRUN "--host node1:1 -n 1 $CN --child-host node2 --by-rank --wait 20" 2>&1)
+    echo "$out" | grep -q 'CNCT parent 0 CONNECT PMIX_SUCCESS' \
+        && ok "the parent connected to both ranks of its child" \
+        || bad "the rank-by-rank connect did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    n=$(echo "$out" | awk '$1=="CNCT" && $2=="parent" && $4=="EVENTS" {print $5}')
+    [ "${n:-0}" -ge 1 ] \
+        && ok "...and was told when the child left without disconnecting" \
+        || bad "no PMIX_ERR_PROC_TERM_WO_SYNC reached the parent: $(echo "$out" | grep CNCT | tr '\n' ' ' | tail -c 400)"
+
+    banner "connect: a disconnect naming the same ranks dissolves it"
+    out=$(PRUN "--host node1:1 -n 1 $CN --child-host node2 --by-rank --disconnect --wait 10" 2>&1)
+    echo "$out" | grep -q 'CNCT parent 0 DISCONNECT PMIX_SUCCESS' \
+        && ok "the parent disconnected from both ranks of its child" \
+        || bad "the rank-by-rank disconnect did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    n=$(echo "$out" | awk '$1=="CNCT" && $2=="parent" && $4=="EVENTS" {print $5}')
+    [ "${n:-1}" = 0 ] \
+        && ok "...and heard nothing when the child left" \
         || bad "an event was sent about a child that had disconnected: $(echo "$out" | grep CNCT | tr '\n' ' ' | tail -c 400)"
 
     banner "connect: a failure in one member terminates the assemblage"

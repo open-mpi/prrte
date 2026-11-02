@@ -128,6 +128,7 @@ static void ccon(prte_grpcomm_fence_t *p)
     p->sig = NULL;
     p->status = PMIX_SUCCESS;
     p->op = PRTE_GRPCOMM_FENCE_OP_UNKNOWN;
+    p->purpose = PRTE_GRPCOMM_FENCE_FOR_UNKNOWN;
     p->generation = PRTE_GRPCOMM_FENCE_GEN_UNKNOWN;
     p->step = 0;
     PMIX_DATA_BUFFER_CONSTRUCT(&p->bucket);
@@ -256,6 +257,25 @@ PMIX_CLASS_INSTANCE(prte_grpcomm_group_memo_t,
                     pmix_list_item_t,
                     memocon, memodes);
 
+static void livecon(prte_grpcomm_live_group_t *p)
+{
+    p->groupID = NULL;
+    p->members = NULL;
+    p->nmembers = 0;
+}
+static void livedes(prte_grpcomm_live_group_t *p)
+{
+    if (NULL != p->groupID) {
+        free(p->groupID);
+    }
+    if (NULL != p->members) {
+        PMIX_PROC_FREE(p->members, p->nmembers);
+    }
+}
+PMIX_CLASS_INSTANCE(prte_grpcomm_live_group_t,
+                    pmix_list_item_t,
+                    livecon, livedes);
+
 static void mdcon(prte_pmix_fence_caddy_t *p)
 {
     p->procs = NULL;
@@ -264,6 +284,7 @@ static void mdcon(prte_pmix_fence_caddy_t *p)
     p->ninfo = 0;
     p->data = NULL;
     p->ndata = 0;
+    p->purpose = PRTE_GRPCOMM_FENCE_FOR_UNKNOWN;
     p->cbfunc = NULL;
     p->cbdata = NULL;
 }

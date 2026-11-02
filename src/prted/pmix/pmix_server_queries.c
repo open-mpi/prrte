@@ -122,8 +122,8 @@ static void qrel(void *cbdata)
  * Deferral is per key, not per query and not per request, because the
  * three things a daemon must answer for *itself* can arrive in the same
  * PMIx_Query_info as a key only the master can answer: PMIX_HWLOC_XML_*
- * exports this node's topology, an unqualified PMIX_SERVER_URI is this
- * daemon's own URI, and PMIX_QUERY_LOCAL_PROC_TABLE means the procs this
+ * exports this node's topology, PMIX_SERVER_URI is this daemon's own URI
+ * (the only one it answers), and PMIX_QUERY_LOCAL_PROC_TABLE means the procs this
  * daemon is hosting.  Relaying a whole query would answer those about
  * the master.
  * ==================================================================== */
@@ -714,6 +714,7 @@ static void _query(int sd, short args, void *cbdata)
                 PMIx_Argv_append_nosize(&ans, PMIX_MAPBY);
                 PMIx_Argv_append_nosize(&ans, PMIX_RANKBY);
                 PMIx_Argv_append_nosize(&ans, PMIX_BINDTO);
+                PMIx_Argv_append_nosize(&ans, PMIX_MEMBIND);
                 PMIx_Argv_append_nosize(&ans, PMIX_COSPAWN_APP);
                 /* create the return kv */
                 tmp = PMIx_Argv_join(ans, ',');
@@ -837,6 +838,14 @@ static void _query(int sd, short args, void *cbdata)
                         ret = PMIX_ERR_NOT_FOUND;
                         goto done;
                     }
+                }
+                /* Only our own server is ours to describe. A PMIx server
+                 * takes connections from its own node, over its local
+                 * socket, so another node's address is of no use to the
+                 * tool asking - and we no longer collect them */
+                if (!PMIX_CHECK_PROCID(&proct->name, PRTE_PROC_MY_NAME)) {
+                    ret = PMIX_ERR_NOT_SUPPORTED;
+                    goto done;
                 }
                 /* get the server uri value - we can block here as we are in
                  * an PRTE progress thread */
