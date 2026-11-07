@@ -37,7 +37,7 @@ differences are in §3, §9 and §10 and nowhere else.
 | `slurm-alloc.py` | Creates and holds a real allocation across many `docker exec` calls, and replays the environment SLURM put in it. See §11. |
 | `slurm-shim.py` | A recording, optionally misbehaving, **wrapper** around the real `salloc`/`scontrol`/`scancel`. Answers the two questions slurmctld cannot: what PRRTE *asked* for, and what PRRTE does when the scheduler misbehaves. See §14. |
 | `docker-compose.yml` | The ten nodes `prteslurm-node1..prteslurm-node10`. Every name derives from `$PRTE_SLURM_SWARM`, so two clones can each run a cluster. |
-| *(no file here)* | The `elastic` test client is compiled from [`../dockerswarm/elastic.c`](../dockerswarm/elastic.c) rather than copied — it is the same program, and two copies would drift. |
+| *(no file here)* | The `elastic` and `slotinfo` test clients are compiled from [`../dockerswarm/elastic.c`](../dockerswarm/elastic.c) and [`../dockerswarm/slotinfo.c`](../dockerswarm/slotinfo.c) rather than copied — they are the same programs, and two copies would drift. |
 
 ## 2. How it works
 
@@ -332,7 +332,7 @@ run, and the only visible symptom was a suite total about fifty checks lower
 than the run before. A group that gives up now says what it gave up on, and
 the caller runs the next one regardless.
 
-One more group runs on a DVM of its own:
+Three more groups run on a DVM of their own:
 
 - **A node granted again, out of SLURM's order.** vpids follow the node
   pool, where a regranted node keeps its old place, so a grant can list
@@ -342,6 +342,18 @@ One more group runs on a DVM of its own:
   checks from the HNP's log that each daemon reported from its assigned
   node, then grants the pair again and checks for a daemon and a job on
   each. A grant that lands elsewhere is a skip: the order was not forced.
+- **A grow under step management.** The parent allocation is made with
+  `--stepmgr`, so its environment carries `SLURM_STEPMGR`, which sends the
+  grow's `srun --jobid=<expander>` to the parent's step manager instead of
+  `slurmctld`. The case asserts the grow completes and its daemons come up.
+  `--stepmgr` needs `PrologFlags=Contain`, which is why `slurm.conf` sets
+  it; without it SLURM accepts the option, ignores it, and the case skips.
+- **Every daemon of an `srun` step lost.** `--no-kill` makes a lost daemon
+  cost one daemon, but losing all of a step's daemons ends its `srun`. The
+  case kills node2's daemon, the only remote one of the DVM's own step, and
+  then the daemon an extend started, and checks from the HNP's log
+  (`plm_base_verbose 1`) that each `srun` end was taken as expected and that
+  the DVM still runs a job.
 
 [#2617]: https://github.com/openpmix/prrte/issues/2617
 [#2491]: https://github.com/openpmix/prrte/issues/2491

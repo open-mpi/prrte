@@ -73,6 +73,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "constants.h"
@@ -408,6 +409,34 @@ static int test_xfer_job_info(void)
     PMIX_INFO_DESTRUCT(&info[0]);
     PMIX_RELEASE(jdata);
 
+    /* cpus per proc is the divisor in the mapper's "how many procs fit on
+     * this object", so zero must be refused here even though it is a valid
+     * uint16. A real count still goes through. */
+    {
+        uint16_t pes = 0, *pesptr = &pes;
+
+        jdata = fresh_job();
+        PMIX_INFO_LOAD(&info[0], PMIX_CPUS_PER_PROC, &pes, PMIX_UINT16);
+        CHECK("xfer/cpus-per-proc-zero-refused",
+              PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
+        CHECK("xfer/cpus-per-proc-zero-not-recorded",
+              !prte_get_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, NULL, PMIX_UINT16));
+        PMIX_INFO_DESTRUCT(&info[0]);
+        PMIX_RELEASE(jdata);
+
+        jdata = fresh_job();
+        pes = 2;
+        PMIX_INFO_LOAD(&info[0], PMIX_CPUS_PER_PROC, &pes, PMIX_UINT16);
+        CHECK("xfer/cpus-per-proc-rc", PRTE_SUCCESS == prte_pmix_xfer_job_info(jdata, info, 1));
+        pes = 0;
+        CHECK("xfer/cpus-per-proc-set",
+              prte_get_attribute(&jdata->attributes, PRTE_JOB_PES_PER_PROC, (void **) &pesptr,
+                                 PMIX_UINT16));
+        CHECK("xfer/cpus-per-proc-value", 2 == pes);
+        PMIX_INFO_DESTRUCT(&info[0]);
+        PMIX_RELEASE(jdata);
+    }
+
     /* map-by is accepted and records the policy on the map */
     jdata = fresh_job();
     PMIX_INFO_LOAD(&info[0], PMIX_MAPBY, "node", PMIX_STRING);
@@ -485,9 +514,9 @@ static int test_xfer_job_info(void)
      * PMIX_INFO_LOAD produces from a NULL - an ordinary thing for an
      * application to hand PMIx_Spawn, and something PMIx itself treats as
      * legal.  The branches that parse such a value rather than pass it on
-     * to a NULL-tolerant callee used to dereference it, so a client could
-     * segfault the daemon it was attached to with one spawn request.  Each
-     * of these must come back as a refusal, and must come back at all. */
+     * to a NULL-tolerant callee used to dereference it, and the daemon
+     * faulted.  Each of these must come back as a refusal, and must come
+     * back at all. */
     jdata = fresh_job();
     PMIX_INFO_LOAD(&info[0], PMIX_STDIN_TGT, NULL, PMIX_STRING);
     CHECK("xfer/null-stdin-tgt", PRTE_SUCCESS != prte_pmix_xfer_job_info(jdata, info, 1));
@@ -717,6 +746,66 @@ static int test_xfer_app(void)
         papp.ninfo = 1;
         PMIX_INFO_LOAD(&papp.info[0], PMIX_WDIR, &i32, PMIX_INT32);
         CHECK("app/wdir-not-string", PRTE_SUCCESS != prte_pmix_xfer_app(jdata, &papp));
+        PMIX_APP_DESTRUCT(&papp);
+        PMIX_RELEASE(jdata);
+    }
+
+    /* zero processes asks the mapper for the count; a negative count is
+     * refused, because the mappers that do not compute one added it to the
+     * job's unsigned total */
+    jdata = fresh_job();
+    PMIX_APP_CONSTRUCT(&papp);
+    papp.cmd = strdup("hostname");
+    papp.maxprocs = -1;
+    CHECK("app/maxprocs-negative", PRTE_SUCCESS != prte_pmix_xfer_app(jdata, &papp));
+    PMIX_APP_DESTRUCT(&papp);
+    PMIX_RELEASE(jdata);
+
+    jdata = fresh_job();
+    PMIX_APP_CONSTRUCT(&papp);
+    papp.cmd = strdup("hostname");
+    papp.maxprocs = 0;
+    CHECK("app/maxprocs-zero", PRTE_SUCCESS == prte_pmix_xfer_app(jdata, &papp));
+    app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
+    CHECK("app/maxprocs-zero-kept", NULL != app && 0 == app->num_procs);
+    PMIX_APP_DESTRUCT(&papp);
+    PMIX_RELEASE(jdata);
+
+    /* a ppr pattern's pe= is a count of cpus held in a uint16: it must be a
+     * whole number from 1 to 65535, as PE= on a mapping policy must */
+    {
+        const char *bad[] = {"ppr:2:node:pe=-1", "ppr:2:node:pe=0", "ppr:2:node:pe=65536",
+                             "ppr:2:node:pe=abc", "ppr:2:node:pe=", "ppr:2:node:pe=3x"};
+        uint16_t pes = 0, *pesptr = &pes;
+        size_t b;
+
+        for (b = 0; b < sizeof(bad) / sizeof(bad[0]); b++) {
+            jdata = fresh_job();
+            PMIX_APP_CONSTRUCT(&papp);
+            papp.cmd = strdup("hostname");
+            papp.maxprocs = 1;
+            PMIX_INFO_CREATE(papp.info, 1);
+            papp.ninfo = 1;
+            PMIX_INFO_LOAD(&papp.info[0], PMIX_PPR, bad[b], PMIX_STRING);
+            CHECK("app/ppr-pe-refused", PRTE_SUCCESS != prte_pmix_xfer_app(jdata, &papp));
+            PMIX_APP_DESTRUCT(&papp);
+            PMIX_RELEASE(jdata);
+        }
+
+        jdata = fresh_job();
+        PMIX_APP_CONSTRUCT(&papp);
+        papp.cmd = strdup("hostname");
+        papp.maxprocs = 1;
+        PMIX_INFO_CREATE(papp.info, 1);
+        papp.ninfo = 1;
+        PMIX_INFO_LOAD(&papp.info[0], PMIX_PPR, "ppr:2:node:pe=4", PMIX_STRING);
+        CHECK("app/ppr-pe-rc", PRTE_SUCCESS == prte_pmix_xfer_app(jdata, &papp));
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
+        CHECK("app/ppr-pe-set",
+              NULL != app &&
+              prte_get_attribute(&app->attributes, PRTE_APP_PES_PER_PROC, (void **) &pesptr,
+                                 PMIX_UINT16));
+        CHECK("app/ppr-pe-value", 4 == pes);
         PMIX_APP_DESTRUCT(&papp);
         PMIX_RELEASE(jdata);
     }
@@ -2291,6 +2380,133 @@ static int test_monitor_accounting(void)
     return failures;
 }
 
+/* A direct-modex request for a namespace this daemon has not heard of.
+ *
+ * Nothing answers such a request when its job arrives - PMIx has handed us
+ * the target and will not ask again - so it used to wait for the life of
+ * the daemon, and any later request for the same proc was parked behind it
+ * and waited too.  It now rechecks once a second, is answered NOT_FOUND
+ * after prte_pmix_dmodex_job_wait seconds, and no more than
+ * prte_pmix_dmodex_job_wait_max wait at once. */
+#define DMDX_NREQ 4
+static int dmdx_calls[DMDX_NREQ];
+static pmix_status_t dmdx_status[DMDX_NREQ];
+
+static void dmdx_cbfunc(pmix_status_t status, const char *data, size_t ndata, void *cbdata,
+                        pmix_release_cbfunc_t relfn, void *relcbdata)
+{
+    int i = (int) (intptr_t) cbdata;
+    PRTE_HIDE_UNUSED_PARAMS(data, ndata);
+
+    dmdx_status[i] = status;
+    ++dmdx_calls[i];
+    if (NULL != relfn) {
+        relfn(relcbdata);
+    }
+}
+
+/* turn the event base until request i has been answered or limit seconds
+ * have passed; the retry timer is all there is to wake it */
+static bool dmdx_wait(int i, int limit)
+{
+    time_t start = time(NULL);
+
+    while (0 == dmdx_calls[i] && time(NULL) - start <= limit) {
+        prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE);
+    }
+    return 0 != dmdx_calls[i];
+}
+
+static void dmdx_spin(void)
+{
+    int n;
+
+    for (n = 0; n < 50; n++) {
+        prte_event_loop(prte_event_base, PRTE_EVLOOP_ONCE | PRTE_EVLOOP_NONBLOCK);
+    }
+}
+
+static int test_dmodex_job_wait(void)
+{
+    int failures = 0;
+    unsigned int saved_wait = prte_pmix_server_globals.dmdx_job_wait;
+    unsigned int saved_max = prte_pmix_server_globals.dmdx_job_wait_max;
+    bool made_array = false;
+    pmix_proc_t ghost, other;
+    prte_job_t *jdata;
+    time_t start;
+
+    if (NULL == prte_job_data) {
+        prte_job_data = PMIX_NEW(pmix_pointer_array_t);
+        pmix_pointer_array_init(prte_job_data, 8, INT32_MAX, 8);
+        made_array = true;
+    }
+    /* a waiting request is held in local_reqs, which nothing has set up
+     * here: zero storage has a block size of 0, and growing it divides by
+     * that */
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.local_reqs, pmix_pointer_array_t);
+    pmix_pointer_array_init(&prte_pmix_server_globals.local_reqs, 8, INT32_MAX, 8);
+    memset(dmdx_calls, 0, sizeof(dmdx_calls));
+    PMIX_LOAD_PROCID(&ghost, "unit-test-dmdx-ghost@1", 0);
+    PMIX_LOAD_PROCID(&other, "unit-test-dmdx-ghost@2", 0);
+
+    /* one may wait, for one second */
+    prte_pmix_server_globals.dmdx_job_wait = 1;
+    prte_pmix_server_globals.dmdx_job_wait_max = 1;
+    CHECK("dmdx/upcall",
+          PMIX_SUCCESS == pmix_server_dmodex_req_fn(&ghost, NULL, 0, dmdx_cbfunc, (void *) 0));
+    dmdx_spin();
+    CHECK("a request for an unknown job waits", 0 == dmdx_calls[0]);
+    CHECK("...and is counted", 1 == prte_pmix_server_globals.dmdx_awaiting_job);
+    (void) pmix_server_dmodex_req_fn(&other, NULL, 0, dmdx_cbfunc, (void *) 1);
+    dmdx_spin();
+    CHECK("one past the cap is answered at once", 1 == dmdx_calls[1]);
+    CHECK("...as not found", PMIX_ERR_NOT_FOUND == dmdx_status[1]);
+    CHECK("the waiting one is answered when its wait runs out", dmdx_wait(0, 5));
+    CHECK("...as not found", PMIX_ERR_NOT_FOUND == dmdx_status[0]);
+    CHECK("...exactly once", 1 == dmdx_calls[0]);
+    CHECK("...and is no longer counted", 0 == prte_pmix_server_globals.dmdx_awaiting_job);
+
+    /* two requests for the same proc of a job that turns up: neither may be
+     * parked behind the other, and both are answered once it is known */
+    memset(dmdx_calls, 0, sizeof(dmdx_calls));
+    prte_pmix_server_globals.dmdx_job_wait = 30;
+    prte_pmix_server_globals.dmdx_job_wait_max = 8;
+    (void) pmix_server_dmodex_req_fn(&ghost, NULL, 0, dmdx_cbfunc, (void *) 2);
+    (void) pmix_server_dmodex_req_fn(&ghost, NULL, 0, dmdx_cbfunc, (void *) 3);
+    dmdx_spin();
+    CHECK("both requests for the same unknown proc wait",
+          0 == dmdx_calls[2] && 0 == dmdx_calls[3] &&
+          2 == prte_pmix_server_globals.dmdx_awaiting_job);
+    jdata = PMIX_NEW(prte_job_t);
+    PMIX_LOAD_NSPACE(jdata->nspace, ghost.nspace);
+    if (PRTE_SUCCESS != prte_set_job_data_object(jdata)) {
+        fprintf(stderr, "FAIL [test_dmodex_job_wait]: could not register a job\n");
+        ++failures;
+    } else {
+        start = time(NULL);
+        CHECK("the first is answered once the job arrives", dmdx_wait(2, 5));
+        CHECK("...and so is the second", dmdx_wait(3, 5));
+        CHECK("...well before the wait would have run out", time(NULL) - start < 10);
+        CHECK("...and neither is counted any more",
+              0 == prte_pmix_server_globals.dmdx_awaiting_job);
+        pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+    }
+    PMIX_RELEASE(jdata);
+
+    prte_pmix_server_globals.dmdx_job_wait = saved_wait;
+    prte_pmix_server_globals.dmdx_job_wait_max = saved_max;
+    PMIX_DESTRUCT(&prte_pmix_server_globals.local_reqs);
+    if (made_array) {
+        PMIX_RELEASE(prte_job_data);
+        prte_job_data = NULL;
+    }
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_dmodex_job_wait\n");
+    }
+    return failures;
+}
+
 static int test_departed_jobs(void)
 {
     int failures = 0;
@@ -2613,9 +2829,9 @@ static int test_query_qualifiers(void)
 }
 
 /* prte_pmix_server_register_tool() builds the daemon's job object for a
- * connecting tool out of what that tool sent, which is untrusted input from
- * the wire.  Everything past the checks below needs a live PMIx server, so
- * this pins the three decisions it makes before reaching one. */
+ * connecting tool out of what that tool sent, which arrives unchecked off
+ * the wire.  It registers nothing with PMIx, so all of it can be reached
+ * here, given the daemon's own job and node. */
 static int test_tool_registration(void)
 {
     int failures = 0;
@@ -2623,6 +2839,7 @@ static int test_tool_registration(void)
     prte_job_t *jdata;
     prte_proc_t *proc;
     bool made_array = false;
+    unsigned int saved_limit = prte_pmix_server_globals.tool_rank_limit;
     int rc;
 
     if (NULL == prte_job_data) {
@@ -2630,6 +2847,29 @@ static int test_tool_registration(void)
         pmix_pointer_array_init(prte_job_data, 8, INT32_MAX, 8);
         made_array = true;
     }
+    /* the MCA default, which nothing registers here */
+    prte_pmix_server_globals.tool_rank_limit = 1048576;
+
+    /* A rank above INT_MAX but below the sentinels is not a subscript
+     * either: pmix_pointer_array_set_item() takes an int, refused it, and
+     * nobody looked, so the proc was never filed and the job never retired.
+     * In a tool's own namespace the rank is also how far the array grows,
+     * so it is held below prte_pmix_tool_rank_limit. */
+    CHECK("a rank above INT_MAX is refused",
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, (pmix_rank_t) INT_MAX + 1));
+    prte_pmix_server_globals.tool_rank_limit = 16;
+    CHECK("a tool rank at the limit is refused",
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, 16));
+    CHECK("...and one below it accepted",
+          PRTE_SUCCESS == prte_pmix_server_tool_may_join(NULL, 15));
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    PMIX_LOAD_PROCID(&req->target, "unit-test-tool@9", (pmix_rank_t) INT_MAX - 1);
+    rc = prte_pmix_server_register_tool(req);
+    CHECK("a tool naming itself with a huge rank is refused", PRTE_ERR_BAD_PARAM == rc);
+    CHECK("...before any job object is built",
+          NULL == prte_get_job_data_object(req->target.nspace));
+    PMIX_RELEASE(req);
+    prte_pmix_server_globals.tool_rank_limit = 1048576;
 
     /* A tool chooses its own rank, and the sentinel ranks are not
      * subscripts: the proc object is filed in jdata->procs at the tool's
@@ -2638,7 +2878,7 @@ static int test_tool_registration(void)
     req = PMIX_NEW(prte_pmix_server_req_t);
     PMIX_LOAD_PROCID(&req->target, "unit-test-tool@1", PMIX_RANK_UNDEF);
     req->cmdline = strdup("a-tool --with args");
-    rc = prte_pmix_server_register_tool(req, NULL, NULL);
+    rc = prte_pmix_server_register_tool(req);
     CHECK("a sentinel rank is refused", PRTE_ERR_BAD_PARAM == rc);
     CHECK("...and no job object was left behind",
           NULL == prte_get_job_data_object(req->target.nspace));
@@ -2651,13 +2891,11 @@ static int test_tool_registration(void)
     req = PMIX_NEW(prte_pmix_server_req_t);
     PMIX_LOAD_NSPACE(req->target.nspace, NULL);
     req->target.rank = 0;
-    rc = prte_pmix_server_register_tool(req, NULL, NULL);
+    rc = prte_pmix_server_register_tool(req);
     CHECK("an empty namespace is refused", PRTE_SUCCESS != rc);
     PMIX_RELEASE(req);
 
-    /* A tool namespace we already hold is answered at once - and the caller
-     * has to tolerate the callback firing before the call returns, which is
-     * why this one is passed none. */
+    /* A tool namespace we already hold is answered at once */
     jdata = PMIX_NEW(prte_job_t);
     PMIX_LOAD_NSPACE(jdata->nspace, "unit-test-tool@2");
     PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
@@ -2672,7 +2910,7 @@ static int test_tool_registration(void)
     }
     req = PMIX_NEW(prte_pmix_server_req_t);
     PMIX_LOAD_PROCID(&req->target, "unit-test-tool@2", 0);
-    rc = prte_pmix_server_register_tool(req, NULL, NULL);
+    rc = prte_pmix_server_register_tool(req);
     CHECK("a namespace already known is accepted without rebuilding it",
           PRTE_SUCCESS == rc);
     CHECK("...and the job object we had is the one still there",
@@ -2687,25 +2925,70 @@ static int test_tool_registration(void)
     req = PMIX_NEW(prte_pmix_server_req_t);
     PMIX_LOAD_PROCID(&req->target, "unit-test-tool@2", 0);
     CHECK("a tool may not add a rank to an application job",
-          PRTE_EXISTS == prte_pmix_server_register_tool(req, NULL, NULL));
+          PRTE_EXISTS == prte_pmix_server_register_tool(req));
     proc = PMIX_NEW(prte_proc_t);
     PMIX_LOAD_PROCID(&proc->name, "unit-test-tool@2", 0);
     pmix_pointer_array_set_item(jdata->procs, 0, proc);
     CHECK("...but may take one it already has",
-          PRTE_SUCCESS == prte_pmix_server_register_tool(req, NULL, NULL));
+          PRTE_SUCCESS == prte_pmix_server_register_tool(req));
     req->target.rank = PMIX_RANK_UNDEF;
     CHECK("...and a sentinel rank is refused for a known namespace too",
-          PRTE_ERR_BAD_PARAM == prte_pmix_server_register_tool(req, NULL, NULL));
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_register_tool(req));
     CHECK("the may-join check refuses the same sentinel on the relay's behalf",
           PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, PMIX_RANK_WILDCARD));
     PMIX_RELEASE(req);
 
     pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
     PMIX_RELEASE(jdata);
+
+    /* A new tool, sent with no command line - PMIx sends PMIX_CMD_LINE only
+     * when it could read its own argv.  Its job is built at the rank it
+     * chose, on the node our own daemon proc is on, with no argv */
+    {
+        pmix_proc_t saved = *PRTE_PROC_MY_NAME;
+        prte_job_t *dmns = PMIX_NEW(prte_job_t);
+        prte_proc_t *dproc = PMIX_NEW(prte_proc_t);
+        prte_node_t *node = PMIX_NEW(prte_node_t);
+        prte_app_context_t *app;
+
+        PMIX_LOAD_PROCID(PRTE_PROC_MY_NAME, "unit-test-tool-dvm", 0);
+        PMIX_LOAD_NSPACE(dmns->nspace, PRTE_PROC_MY_NAME->nspace);
+        PMIX_LOAD_PROCID(&dproc->name, PRTE_PROC_MY_NAME->nspace, 0);
+        dproc->node = node;
+        pmix_pointer_array_set_item(dmns->procs, 0, dproc);
+        if (PRTE_SUCCESS != prte_set_job_data_object(dmns)) {
+            fprintf(stderr, "FAIL [test_tool_registration]: could not file the daemons\n");
+            failures++;
+        } else {
+            req = PMIX_NEW(prte_pmix_server_req_t);
+            PMIX_LOAD_PROCID(&req->target, "unit-test-tool@3", 2);
+            CHECK("a new tool with no command line is recorded",
+                  PRTE_SUCCESS == prte_pmix_server_register_tool(req));
+            jdata = prte_get_job_data_object(req->target.nspace);
+            CHECK("...as a tool job", NULL != jdata && PRTE_FLAG_TEST(jdata, PRTE_JOB_FLAG_TOOL));
+            if (NULL != jdata) {
+                proc = (prte_proc_t *) pmix_pointer_array_get_item(jdata->procs, 2);
+                app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, 0);
+                CHECK("...with its proc at the rank it chose, on our node",
+                      NULL != proc && 2 == proc->name.rank && node == proc->node);
+                CHECK("...and an app with no argv",
+                      NULL != app && NULL == app->argv && NULL == app->app);
+                pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
+                PMIX_RELEASE(jdata);
+            }
+            PMIX_RELEASE(req);
+            pmix_pointer_array_set_item(prte_job_data, dmns->index, NULL);
+        }
+        PMIX_RELEASE(dmns);
+        PMIX_RELEASE(node);
+        *PRTE_PROC_MY_NAME = saved;
+    }
+
     if (made_array) {
         PMIX_RELEASE(prte_job_data);
         prte_job_data = NULL;
     }
+    prte_pmix_server_globals.tool_rank_limit = saved_limit;
 
     if (0 == failures) {
         fprintf(stdout, "PASSED test_tool_registration\n");
@@ -4230,7 +4513,7 @@ static int test_access(void)
         /* a claim from a relay that may not make it is not believed */
         PMIX_INFO_LOAD(&rel[0], PMIX_USERID, &ruid, PMIX_UINT32);
         PMIX_INFO_LOAD(&rel[1], PMIX_ORIGIN_USERID, &claim, PMIX_UINT32);
-        CHECK("relay/untrusted-claim-is-the-relays",
+        CHECK("relay/unpermitted-claim-is-the-relays",
               prte_pmix_server_requester_uid(rel, 2, &got) && ACC_LISTED == got);
         PMIX_INFO_DESTRUCT(&rel[0]);
         PMIX_INFO_LOAD(&rel[0], PMIX_USERID, &myuid, PMIX_UINT32);
@@ -4358,6 +4641,7 @@ int main(void)
 
     failures += test_request_tracker();
     failures += test_departed_jobs();
+    failures += test_dmodex_job_wait();
     failures += test_monitor_accounting();
     failures += test_connections();
     failures += test_connection_fate_sharing();

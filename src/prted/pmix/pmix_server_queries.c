@@ -848,8 +848,11 @@ static void _query(int sd, short args, void *cbdata)
                     goto done;
                 }
                 /* get the server uri value - we can block here as we are in
-                 * an PRTE progress thread */
-                PRTE_MODEX_RECV_VALUE_OPTIONAL(rc, PMIX_SERVER_URI, &proct->name,
+                 * an PRTE progress thread. PMIX_MYSERVER_URI is the URI a
+                 * tool of this PMIx release connects to: the local socket's.
+                 * PMIX_SERVER_URI is the TCP one when the server also takes
+                 * peers of earlier releases */
+                PRTE_MODEX_RECV_VALUE_OPTIONAL(rc, PMIX_MYSERVER_URI, &proct->name,
                                                (char **) &uri, PMIX_STRING);
                 if (PMIX_SUCCESS != rc) {
                     /* the macro yields a PMIx status - it is already in the
@@ -1172,6 +1175,14 @@ static void _query(int sd, short args, void *cbdata)
                     if (NULL == node) {
                         continue;
                     }
+                    // ignore nodes that are down
+                    if (PRTE_NODE_STATE_DOWN == node->state) {
+                        continue;
+                    }
+                    // ignore nodes the scheduler has taken back
+                    if (PRTE_NODE_STATE_NOT_INCLUDED == node->state) {
+                        continue;
+                    }
                     PMIX_INFO_LIST_START(nodeinfolist);
                     /* start with the node name */
                     PMIX_INFO_LIST_ADD(rc, nodeinfolist, PMIX_HOSTNAME, node->name, PMIX_STRING);
@@ -1408,6 +1419,10 @@ static void _query(int sd, short args, void *cbdata)
                     }
                     // ignore nodes that are down
                     if (PRTE_NODE_STATE_DOWN == node->state) {
+                        continue;
+                    }
+                    // ignore nodes the scheduler has taken back
+                    if (PRTE_NODE_STATE_NOT_INCLUDED == node->state) {
                         continue;
                     }
                     // ignore nodes that are at/above max

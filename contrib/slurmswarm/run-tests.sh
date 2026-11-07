@@ -983,7 +983,7 @@ drop_extra_jobs() {   # $1 = the job id to keep
 # answer to it.  It runs on its own allocation and its own DVM so that either
 # outcome is harmless to everything else.
 elastic_external_cancel_group() {
-    local out aj anodes jid n
+    local out aj anodes jid n live
 
     banner "ras/slurm: an absorbed allocation cancelled behind the DVM's back"
     cleanup_cluster
@@ -1011,6 +1011,11 @@ elastic_external_cancel_group() {
         && ok "the DVM absorbed job $aj and has daemons on $anodes" \
         || bad "the absorbed allocation never got its daemons ($n on $anodes)"
 
+    # A tool stays connected through it: a DVM that carries on reports to
+    # its tools, not on its own stderr.
+    SA_BG /tmp/cancel-tool.out 'prun --host node1:1 -n 1 sleep 40'
+    sleep 3
+
     # The scheduler takes it back.  Not through PRRTE - this is a user, or an
     # admin, or a job's time limit, doing what any of them may legitimately do.
     SQ "scancel $aj" >/dev/null 2>&1
@@ -1027,12 +1032,27 @@ elastic_external_cancel_group() {
     # first -- and the oob layer's own "unable to complete a TCP connection"
     # usually wins the race.  Both say the loss was noticed and announced,
     # which is the property under test; which one is displayed is not.
-    SA 'grep -qE "lost communication with a remote daemon|help-errmgr-base.txt / node-died" /tmp/prte.out' \
+    SA 'tr -d "\\000" < /tmp/cancel-tool.out | cat - /tmp/prte.out |
+        grep -qE "lost communication with a remote daemon|help-errmgr-base.txt / node-died"' \
         && ok "the HNP reported the loss rather than waiting on it" \
         || bad "the HNP never reported losing the cancelled allocation's daemons"
 
+    # The DVM may carry on without the lost daemons, or end.  If it carries
+    # on, the loss has to be on record: one proc per node lands on the DVM's
+    # own nodes only.
+    live=""
+    if SA 'pgrep -x prte' >/dev/null 2>&1; then
+        live=$(job_nodes "$jid")
+        out=$(SA 'timeout 60 prun --map-by ppr:1:node hostname' 2>&1 | grep -E '^node[0-9]+$' | sort -V | paste -sd, -)
+        [ "$out" = "$live" ] \
+            && ok "the DVM carried on, mapping onto its own nodes only ($out)" \
+            || bad "the DVM carried on, but a proc per node ran on: $out"
+    fi
+
+    # a daemon of a DVM that carried on is not an orphan
     n=0
     for i in 1 2 3 4 5 6 7 8 9 10; do
+        echo ",$live," | grep -q ",node$i," && continue
         [ "$(prted_count $i)" = 1 ] && n=$((n+1))
     done
     [ "$n" = 0 ] \
@@ -1178,6 +1198,122 @@ elastic_regrant_order_group() {
     cleanup_cluster
 }
 
+# A grow launches its daemons with srun --jobid=<expander> from inside the
+# parent allocation.  Under step management that allocation's environment
+# carries SLURM_STEPMGR, which sends srun to the parent job's step manager -
+# and that has never heard of the expander, so srun fails with "Invalid job
+# id specified" and the DVM is torn down.  Asked for per allocation, with
+# --stepmgr, so every other case keeps running without it.
+#
+# Own DVM: the allocation has to be made with --stepmgr.  It holds two
+# nodes, so the DVM's own srun also runs without SLURM_STEPMGR.
+elastic_stepmgr_group() {
+    local out jid ajid nodes idx
+
+    banner "plm/slurm: a grow launches its daemons under step management"
+    cleanup_cluster
+    ALLOC new --tag dvm --nodelist node1,node2 --tasks-per-node 2 --salloc-arg=--stepmgr >/dev/null 2>&1
+    jid=$(ALLOC jobid --tag dvm | tr -d ' \r')
+    if [ -z "$jid" ]; then
+        skp "salloc --stepmgr gave no allocation"
+        cleanup_cluster
+        return
+    fi
+    if ! ALLOC env --tag dvm | grep -q 'SLURM_STEPMGR='; then
+        skp "SLURM put no SLURM_STEPMGR in job $jid's environment -- step management is not in effect"
+        cleanup_cluster
+        return
+    fi
+    if ! dvm_start --prtemca prte_elastic_mode 1; then
+        bad "no DVM came up in a step-managed allocation: $(SA 'tail -5 /tmp/prte.out' | tr '\n' ' ')"
+        cleanup_cluster
+        return
+    fi
+    out=$(SA 'timeout 180 elastic extend 2' 2>&1)
+    ajid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$ajid" ]; then
+        skp "the extend was refused, so the grow's srun never ran: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        dvm_stop; cleanup_cluster
+        return
+    fi
+    echo "$out" | grep -q PMIX_DVM_IS_READY \
+        && ok "the grow completed under step management" \
+        || bad "the grow did not complete: $(echo "$out" | grep -m1 'srun returned')"
+    nodes=$(job_nodes "$ajid"); idx=$(idx_of "$nodes")
+    sleep 8
+    # shellcheck disable=SC2086
+    [ "$(prted_count $idx)" = 2 ] \
+        && ok "daemons launched on the granted nodes ($nodes)" \
+        || bad "no daemons on the granted nodes ($nodes)"
+    SA "timeout 180 elastic release-id $ajid" >/dev/null 2>&1
+    dvm_stop
+    cleanup_cluster
+}
+
+# Wait for the srun of SLURM job $1 to end, after its daemons were killed:
+# prints "expected", or "the DVM ended", or nothing if neither happened.
+# srun-failed is not in /tmp/prte.out: show_help sends it to the tools.
+wait_srun_exit() {
+    for _ in $(seq 60); do
+        SA "grep -q 'srun for elastic job $1 exited' /tmp/prte.out" && { echo expected; return; }
+        SA 'pgrep -x prte' >/dev/null 2>&1 || { echo "the DVM ended"; return; }
+        sleep 1
+    done
+}
+
+# --no-kill makes losing one daemon cost one daemon, not the whole srun step.
+# Losing every daemon of a step ends its srun, and that end reports losses the
+# DVM has already survived: it must not be read as a failed launch.  Both
+# kinds of step: the one that started the DVM, whose node set includes the
+# HNP's, and the one an extend starts on its own allocation.
+#
+# Own DVM: it needs plm_base_verbose 1, and loses daemons on purpose.
+elastic_daemon_loss_group() {
+    local out jid ajid anode
+
+    banner "plm/slurm: losing every daemon of an srun step does not take the DVM down"
+    cleanup_cluster
+    ALLOC new --tag dvm --nodelist node1,node2 --tasks-per-node 2 >/dev/null 2>&1
+    jid=$(ALLOC jobid --tag dvm | tr -d ' \r')
+    if ! dvm_start --prtemca prte_elastic_mode 1 --prtemca plm_base_verbose 1; then
+        bad "no DVM came up for the daemon-loss case"
+        cleanup_cluster
+        return
+    fi
+
+    ON 2 'pkill -9 -x prted' >/dev/null 2>&1
+    out=$(wait_srun_exit "$jid")
+    [ "$out" = expected ] \
+        && ok "the DVM's own srun ended after losing node2's daemon, as expected" \
+        || bad "the end of the DVM's own srun after losing node2: ${out:-never seen}"
+    out=$(SA 'timeout 30 prun -n 1 hostname' 2>&1 | tail -1 | tr -d '\r')
+    [ "$out" = node1 ] \
+        && ok "...and the DVM still runs a job" \
+        || bad "the DVM did not survive losing node2's daemon: $out"
+
+    out=$(SA 'timeout 180 elastic extend 1' 2>&1)
+    ajid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$ajid" ] || ! echo "$out" | grep -q PMIX_DVM_IS_READY; then
+        skp "the extend did not complete -- no grown step to lose"
+        dvm_stop; cleanup_cluster
+        return
+    fi
+    anode=$(job_nodes "$ajid")
+    # shellcheck disable=SC2046
+    ON $(idx_of "$anode") 'pkill -9 -x prted' >/dev/null 2>&1
+    out=$(wait_srun_exit "$ajid")
+    [ "$out" = expected ] \
+        && ok "the extend's srun ended after losing $anode's daemon, as expected" \
+        || bad "the end of the extend's srun after losing $anode: ${out:-never seen}"
+    out=$(SA 'timeout 30 prun -n 1 hostname' 2>&1 | tail -1 | tr -d '\r')
+    [ "$out" = node1 ] \
+        && ok "...and the DVM still runs a job" \
+        || bad "the DVM did not survive losing $anode's daemon: $out"
+
+    dvm_stop
+    cleanup_cluster
+}
+
 # THE PHASE IS A SEQUENCE OF INDEPENDENT GROUPS, AND THAT IS DELIBERATE.
 #
 # Each group below is its own function so that a group which cannot proceed
@@ -1221,6 +1357,8 @@ test_elastic() {
     dvm_stop
     elastic_external_cancel_group
     elastic_regrant_order_group
+    elastic_stepmgr_group
+    elastic_daemon_loss_group
     cleanup_cluster
 
     # The last two groups need the recording shim in front of the real SLURM
@@ -1236,7 +1374,7 @@ test_elastic() {
 # The first extend, and everything that can only be asserted about a grant
 # that actually happened.
 elastic_grant_group() {
-    local jid=$1 out ajid nodes idx n p_end a_end
+    local jid=$1 out ajid nodes idx n p_end a_end avail
 
     banner "ras/slurm: PMIX_ALLOC_EXTEND submits a real job and absorbs it"
     out=$(SA 'timeout 180 elastic extend 2' 2>&1)
@@ -1331,6 +1469,7 @@ elastic_grant_group() {
     # the one node that could never be released -- so this direction is what
     # allocating with "salloc --no-shell" actually buys, and only a real
     # scheduler can say whether the resize is accepted.
+    avail=$(SA 'timeout 30 prun -n 1 slotinfo' 2>&1 | awk '$1 == "AVAIL" {print $3}')
     out=$(SA "timeout 180 elastic shrink ${nodes%%,*}" 2>&1)
     sleep 6
     echo "$out" | grep -q PMIX_DVM_IS_READY \
@@ -1347,6 +1486,19 @@ elastic_grant_group() {
     [ "$(job_nodes "$ajid")" = "${nodes##*,}" ] \
         && ok "the job kept exactly the node PRRTE named as survivor" \
         || bad "job $ajid holds $(job_nodes "$ajid"), expected ${nodes##*,}"
+    # PMIX_QUERY_ALLOCATION has to agree with SLURM: the survivor is still
+    # in the allocation, the released node is not.
+    out=$(SA 'timeout 30 prun -n 1 slotinfo alloc' 2>&1 | awk '$1 == "ALLOC" {print $3}')
+    echo "$out" | grep -qx "${nodes##*,}" \
+        && ok "the allocation query still lists the survivor (${nodes##*,})" \
+        || bad "the allocation query lost the survivor: $(echo "$out" | tr '\n' ' ')"
+    echo "$out" | grep -qx "${nodes%%,*}" \
+        && bad "the allocation query still lists the released node (${nodes%%,*})" \
+        || ok "the released node is gone from the allocation query"
+    n=$(SA 'timeout 30 prun -n 1 slotinfo' 2>&1 | awk '$1 == "AVAIL" {print $3}')
+    [ -n "$avail" ] && [ -n "$n" ] && [ "$n" -lt "$avail" ] \
+        && ok "the available slots dropped with the released node ($avail -> $n)" \
+        || bad "the available-slots query still counts the released node ($avail -> ${n:-none})"
     # SLURM writes slurm_job_<id>_resize.{sh,csh} into the caller's cwd on a
     # successful shrink for the user to source; PRRTE deletes them.  Their
     # absence only means anything because the resize above really happened.
@@ -1767,14 +1919,14 @@ elastic_tainted_hostname_group() {
     # command separator: it must be refused outright, and nothing may run.
     # The stake is higher against a real scheduler -- the command that would
     # be built here is one a live slurmctld would act on.
-    SA 'rm -f /tmp/pwned' >/dev/null 2>&1
-    out=$(SA "timeout 90 elastic shrink 'node9;touch /tmp/pwned'" 2>&1)
+    SA 'rm -f /tmp/hostname-cmd-ran' >/dev/null 2>&1
+    out=$(SA "timeout 90 elastic shrink 'node9;touch /tmp/hostname-cmd-ran'" 2>&1)
     echo "$out" | grep -q 'REJECTED' \
         && ok "a release naming a tainted hostname was refused" \
         || bad "tainted hostname not refused: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
-    SA 'test -e /tmp/pwned' \
-        && bad "the injected command RAN -- hostname validation is not holding" \
-        || ok "the injected command never ran"
+    SA 'test -e /tmp/hostname-cmd-ran' \
+        && bad "the command in the hostname RAN -- hostname validation is not holding" \
+        || ok "the command in the hostname never ran"
     SA 'pgrep -x prte >/dev/null' && ok "HNP survived the tainted request" \
                                   || bad "HNP died on a tainted hostname"
 }

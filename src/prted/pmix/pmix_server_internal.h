@@ -65,6 +65,10 @@ typedef struct {
     bool event_active;
     prte_event_t cycle;
     bool cycle_active;
+    /* a direct-modex request waiting, on the cycle timer, for a job this
+     * daemon has not heard of yet - and how many times it has waited */
+    bool awaiting_job;
+    int job_waits;
     bool inprogress;
     bool timed_out;
     char *operation;
@@ -439,8 +443,7 @@ PRTE_EXPORT extern void pmix_server_query_resp(int status, pmix_proc_t *sender,
                                                void *cbdata);
 
 PRTE_EXPORT extern int prte_pmix_server_tool_may_join(prte_job_t *jdata, pmix_rank_t rank);
-PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
-                                                      pmix_op_cbfunc_t cbfunc, void *cbdata);
+PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd);
 
 PRTE_EXPORT extern int pmix_server_cache_job_info(prte_job_t *jdata, pmix_info_t *info);
 
@@ -674,6 +677,15 @@ typedef struct {
     unsigned int session_rndz_id;
     bool system_server;
     bool no_foreign_tools;
+    /* a tool's rank is a subscript into its job's procs array, so a rank
+     * of its own choosing must be below this */
+    unsigned int tool_rank_limit;
+    /* how long, in seconds, a direct-modex request for a namespace this
+     * daemon does not know waits for the job to appear; how many may wait
+     * at once; and how many are waiting now */
+    unsigned int dmdx_job_wait;
+    unsigned int dmdx_job_wait_max;
+    unsigned int dmdx_awaiting_job;
     /* the users, besides root and our own, a tool may run as to be accepted
      * as the scheduler: the MCA list, and what it resolved to */
     char *scheduler_uids;
