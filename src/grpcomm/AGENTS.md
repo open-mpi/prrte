@@ -1187,6 +1187,103 @@ rest — do not "fix" it to match.
 
 ---
 
+## A survivable job's departed processes
+
+A fence over a whole namespace (`PMIX_RANK_WILDCARD`, which is what
+`PMIx_Fence(NULL, 0)` sends and so what `MPI_Finalize` uses) counts every
+daemon hosting one of its processes. A daemon contributes once its PMIx
+server has heard from every local participant, and the PMIx server takes a
+terminated client out of that count - so a daemon that loses *some* of its
+processes still contributes. A daemon that loses **all** of them has nobody
+left to call the fence, so it never contributes, and the rollup used to wait
+for it forever. A job that ends at its first loss never noticed; a
+survivable one (`PRTE_JOB_RECOVERABLE` or `PRTE_JOB_CONTINUOUS` - a ULFM
+application) hung every survivor in `MPI_Finalize`.
+
+`grpcomm_departed.c` closes that:
+
+- **Each daemon reports its own terminations up the routing tree**
+  (`prte_grpcomm_proc_terminated()`, called from the state machine's
+  termination accounting, `PRTE_RML_TAG_FENCE_DEPARTED`), and passes up
+  whatever its children report. The master hears of everything.
+  `prte_grpcomm_globals.departed` holds one rank bitmap per job.
+- **A rollup short of its count asks who it is still waiting for**
+  (`departed_only()` in `grpcomm_fence.c`): a participant is awaited unless it
+  has departed, its daemon has failed, or the subtree it lives in has
+  reported. A tracker records *which* subtrees reported
+  (`reported_slots`/`self_reported`), so a subtree that reported and then
+  lost its processes is done, never counted twice.
+- **Up the tree, not by broadcast, because of ordering.** A process that
+  called the fence and then died has its daemon's contribution on the same
+  link to the same parent, ahead of the news of its death. A broadcast from
+  the master would race it. That is also why the HNP records only the
+  processes it hosts itself: news of a remote one reaches it through the PLM,
+  a path no contribution takes.
+- **The fence's status is left alone.** A departed process is no longer a
+  participant, which is how the PMIx server treats a whole-job fence started
+  after one of its clients died. Failing the fence would make every
+  survivor's PMIx server discard the data the survivors did contribute - and
+  would happen only when some daemon lost *every* process, making the answer
+  depend on placement. A loss on a daemon that still has survivors is
+  reported by that daemon's PMIx server through
+  `PMIX_LOCAL_COLLECTIVE_STATUS`, as it always was. This is a deliberate
+  difference from the daemon-failure policy below: a survivable job has said
+  it runs degraded.
+- **Cost.** Nothing when nothing has departed - the predicate is reached only
+  when the count falls short, and returns at once on an empty set or when no
+  job in the signature has lost anyone. A departure costs one message per
+  level of the tree, and only for a survivable job.
+- **A process can come back.** A process the runtime restarts under its old
+  rank is a participant again, and a departure left standing for it is the
+  dangerous error - a fence would stop waiting for a live process and
+  complete without it. `prte_grpcomm_proc_restarted()` (from `odls`'s
+  `restart_proc`, before the new incarnation exists) clears it and sends a
+  return up the same links, ahead of anything the new process contributes.
+  Every notice carries an operation byte - departed or returned.
+- **Recovery rebuilds the set; it does not top it up.** A return can be lost
+  with a failed daemon, leaving an ancestor on the far side holding the
+  departure - and after the repair that ancestor may be our new parent. So
+  `prte_grpcomm_advance_epoch()` has every daemon drop what others reported,
+  keep the departures of the processes it hosts, and report those
+  (`prte_grpcomm_departed_resend()`). While the set re-converges a rollup can
+  only wait longer, never complete short. Notices carry the recovery epoch:
+  one from before the recovery is dropped, and one from after it that
+  arrives before our own notice of the recovery (a broadcast reaches our
+  children first) moves us to that epoch - running our rebuild - before it
+  is applied, or the rebuild would wipe it.
+- **The termination hooks sit outside the `RECORDED` guard.**
+  `prte_grpcomm_proc_terminated()` is a no-op the second time for one
+  incarnation, and a restarted process's next termination has to be reported
+  whether or not the restart reset the flag; on a `prted` the PMIx
+  deregistration sits beside it for the same reason. The HNP's own
+  deregistration stays behind the guard with the rest of its accounting,
+  which a restart has to reset for any of it to see a second death.
+- **A job's entry goes when the job does**, swept the next time anything is
+  recorded rather than through a teardown hook.
+- **A daemon with nothing left of the job still relays for it.**
+  `state/prted`'s `job_teardown` gives up the job's map when this daemon's
+  own share ends, and keeps the job object. `create_dmns()` used to refuse
+  a fence over a job with no map on any daemon but the controller, so the
+  contribution of every daemon *below* one whose processes had all
+  finished was dropped - a hang this mechanism could not reach, since the
+  tracker was never built. A wildcard is now resolved through
+  `jdata->procs` (`add_job_daemons()`) when the map is gone; a named rank
+  always was. `test_fence_tracker_unmapped_daemon` covers it.
+- **Which daemons it matters on.** The HNP also drops a node from the job's
+  map once its processes of the job are all gone
+  (`prte_state_base_recover_resources()`, from `errmgr/dvm`), which is why a
+  DVM of no more than `rml_base_radix + 1` daemons - the HNP the parent of
+  every daemon - never showed the hang. Any daemon deeper in the tree keeps
+  counting the empty node, and depends on the departed set instead. Reproduce
+  with `--prtemca rml_base_radix 2` on four nodes, one rank each.
+
+Not covered: the group collective. A construct over a whole namespace has
+the same shape, but whether it may complete without a member is the
+caller's choice (`PMIX_GROUP_FT_COLLECTIVE`), so it needs its own policy
+rather than this one. Covered by `test_fence_departed` in
+`test/unit/grpcomm/test_grpcomm.c`; the multi-daemon case needs the
+dockerswarm harness.
+
 ## Surviving a daemon failure
 
 This applies to **both** fence and group; they differ only in what they do

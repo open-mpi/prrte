@@ -848,8 +848,11 @@ static void _query(int sd, short args, void *cbdata)
                     goto done;
                 }
                 /* get the server uri value - we can block here as we are in
-                 * an PRTE progress thread */
-                PRTE_MODEX_RECV_VALUE_OPTIONAL(rc, PMIX_SERVER_URI, &proct->name,
+                 * an PRTE progress thread. PMIX_MYSERVER_URI is the URI a
+                 * tool of this PMIx release connects to: the local socket's.
+                 * PMIX_SERVER_URI is the TCP one when the server also takes
+                 * peers of earlier releases */
+                PRTE_MODEX_RECV_VALUE_OPTIONAL(rc, PMIX_MYSERVER_URI, &proct->name,
                                                (char **) &uri, PMIX_STRING);
                 if (PMIX_SUCCESS != rc) {
                     /* the macro yields a PMIx status - it is already in the
@@ -1172,6 +1175,14 @@ static void _query(int sd, short args, void *cbdata)
                     if (NULL == node) {
                         continue;
                     }
+                    // ignore nodes that are down
+                    if (PRTE_NODE_STATE_DOWN == node->state) {
+                        continue;
+                    }
+                    // ignore nodes the scheduler has taken back
+                    if (PRTE_NODE_STATE_NOT_INCLUDED == node->state) {
+                        continue;
+                    }
                     PMIX_INFO_LIST_START(nodeinfolist);
                     /* start with the node name */
                     PMIX_INFO_LIST_ADD(rc, nodeinfolist, PMIX_HOSTNAME, node->name, PMIX_STRING);
@@ -1408,6 +1419,10 @@ static void _query(int sd, short args, void *cbdata)
                     }
                     // ignore nodes that are down
                     if (PRTE_NODE_STATE_DOWN == node->state) {
+                        continue;
+                    }
+                    // ignore nodes the scheduler has taken back
+                    if (PRTE_NODE_STATE_NOT_INCLUDED == node->state) {
                         continue;
                     }
                     // ignore nodes that are at/above max
@@ -1790,14 +1805,13 @@ void pmix_server_query_request(int status, pmix_proc_t *sender,
         rc = PMIX_ERR_BAD_PARAM;
         goto error;
     }
-    /* The count arrives off the wire in a size_t, and PMIX_QUERY_CREATE
-     * multiplies it by sizeof(pmix_query_t) with no overflow guard and then
-     * constructs every element it claimed - so a count large enough to wrap
-     * that product yields a short allocation whose constructor loop runs
-     * straight off the end, before the unpack below gets a chance to screen
-     * anything.  Require the count to survive the round trip through the
-     * int32_t the unpack consumes it as, which bounds it well clear of the
-     * wrap.  PMIx screens its own client-facing query the same way. */
+    /* The count arrives off the wire in a size_t, and the unpack below
+     * consumes it as an int32_t - so one that does not survive the round
+     * trip cannot describe this buffer, and is refused before
+     * PMIX_QUERY_CREATE allocates and constructs that many elements.  (The
+     * allocation itself cannot wrap: PMIx allocates with calloc, which
+     * refuses a product that overflows.)  PMIx screens its own client-facing
+     * query the same way. */
     cnt = (int32_t) nqueries;
     if (0 > cnt || (size_t) cnt != nqueries) {
         rc = PMIX_ERR_BAD_PARAM;

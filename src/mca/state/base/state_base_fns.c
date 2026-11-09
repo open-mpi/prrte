@@ -36,6 +36,7 @@
 #include "src/mca/iof/base/base.h"
 #include "src/mca/plm/plm.h"
 #include "src/mca/rmaps/base/base.h"
+#include "src/grpcomm/grpcomm.h"
 #include "src/rml/rml.h"
 #include "src/prted/pmix/pmix_server_internal.h"
 #include "src/runtime/data_server/prte_data_server.h"
@@ -805,6 +806,18 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
          * line from a random rank whenever a job had a failure in it.
          *
          * state/prted has always used the flag here; this is the same test. */
+        /* A survivable job goes on without it, so its collectives have to
+         * stop waiting for it - see grpcomm_departed.c. Ahead of the
+         * accounting guard below because it is a no-op the second time for
+         * one incarnation, and a process the runtime restarts is a second
+         * incarnation whose termination has to be reported whether or not
+         * the restart reset RECORDED. Only a process we host: news of a
+         * remote one reaches us here by a path no fence contribution takes,
+         * so it could overtake one the process made before it died - its own
+         * daemon reports it up the routing tree instead. */
+        if (PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_LOCAL)) {
+            prte_grpcomm_proc_terminated(proc);
+        }
         if (PRTE_FLAG_TEST(pdata, PRTE_PROC_FLAG_RECORDED)) {
             pmix_output_verbose(5, prte_state_base_framework.framework_output,
                                 "%s state:base:track_procs proc %s already recorded as %s. Skip transition.",
@@ -1064,9 +1077,8 @@ void prte_state_base_recover_resources(prte_job_t *jdata, prte_proc_t *pptr)
      * for PRTE_PROC_STATE_KILLED_BY_RELEASE.  state/dvm's check_complete
      * releases the map and sets jdata->map to NULL, and this routine exists
      * to be re-entered for the same proc, so a later terminal state can
-     * arrive after that.  Reading either one unconditionally took the HNP -
-     * and therefore the whole DVM - down with the proc it was trying to
-     * account for. */
+     * arrive after that.  Reading either one unconditionally dereferenced a
+     * NULL and faulted the HNP while accounting for the proc. */
     if (NULL == node || NULL == map) {
         return;
     }
@@ -1168,6 +1180,9 @@ next:
         if (node_idx < INT_MAX) {
             /* set the node location to NULL */
             pmix_pointer_array_set_item(map->nodes, node_idx, NULL);
+            if (0 < map->num_nodes) {
+                --map->num_nodes;
+            }
         }
         /* flag that the node is no longer in a map.  This must happen BEFORE
          * the release below: the map holds a reference, and dropping it can

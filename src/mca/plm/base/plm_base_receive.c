@@ -432,6 +432,92 @@ int prte_plm_base_comm_stop(void)
  * NOTE: THIS OCCURS INSIDE OF AN EVENT AND IS
  * THEREFORE THREAD-SAFE
  */
+/* The first directive of jdata's that has the master open a file it names
+ * - NULL if it has none. The master reads these as itself, whoever asked,
+ * so for anybody but root and our own user they are refused
+ * (prte_plm_base_recv). Running the job as its owner does not cover them:
+ * they are not the job's processes. */
+static const char *foreign_directive(prte_job_t *jdata)
+{
+    static const struct {
+        prte_attribute_key_t key;
+        const char *name;
+    } app_keys[] = {
+        {PRTE_APP_HOSTFILE, "a hostfile"},
+        {PRTE_APP_ADD_HOSTFILE, "a hostfile to add"},
+        {PRTE_APP_MAP_FILE, "a rankfile or sequential mapping file"},
+        {PRTE_APP_PRELOAD_FILES, "files to preload"},
+    };
+    prte_app_context_t *app;
+    size_t k;
+    int n;
+
+    if (NULL != prte_fetch_attribute(&jdata->attributes, NULL, PRTE_JOB_FILE)) {
+        return "a rankfile or sequential mapping file";
+    }
+    if (NULL != prte_fetch_attribute(&jdata->attributes, NULL, PRTE_JOB_OUTPUT_PROCTABLE)) {
+        return "a file for the process table";
+    }
+    for (n = 0; n < jdata->apps->size; n++) {
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, n);
+        if (NULL == app) {
+            continue;
+        }
+        for (k = 0; k < sizeof(app_keys) / sizeof(app_keys[0]); k++) {
+            if (NULL != prte_fetch_attribute(&app->attributes, NULL, app_keys[k].key)) {
+                return app_keys[k].name;
+            }
+        }
+        /* the master reads the binary to copy it out */
+        if (PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_PRELOAD_BIN)) {
+            return "a binary to preload";
+        }
+    }
+    return NULL;
+}
+
+/* The first of jdata's directives that names hosts to bring into the DVM, or
+ * to start daemons on, which its owner may not ask for - NULL if none. That
+ * is for whoever may change the DVM, and a user to reach a host as
+ * ("user@host") for root and our own user alone
+ * (prte_pmix_server_grow_permitted_uid) - the same rule an allocation
+ * request naming hosts is held to. */
+static const char *grow_directive(prte_job_t *jdata, uid_t owner)
+{
+    static const struct {
+        prte_attribute_key_t key;
+        const char *name;
+    } keys[] = {
+        {PRTE_APP_ADD_HOST, "hosts to add"},
+        {PRTE_APP_ACTIVATE_HOSTS, "hosts to activate"},
+    };
+    prte_app_context_t *app;
+    char *hosts;
+    bool user;
+    size_t k;
+    int n;
+
+    for (n = 0; n < jdata->apps->size; n++) {
+        app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, n);
+        if (NULL == app) {
+            continue;
+        }
+        for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+            hosts = NULL;
+            if (!prte_get_attribute(&app->attributes, keys[k].key, (void **) &hosts,
+                                    PMIX_STRING)) {
+                continue;
+            }
+            user = (NULL != hosts && NULL != strchr(hosts, '@'));
+            free(hosts);
+            if (!prte_pmix_server_grow_permitted_uid(owner, false, user)) {
+                return user ? "a user to reach a host as" : keys[k].name;
+            }
+        }
+    }
+    return NULL;
+}
+
 void prte_plm_base_recv(int status, pmix_proc_t *sender,
                         pmix_data_buffer_t *buffer,
                         prte_rml_tag_t tag, void *cbdata)
@@ -544,7 +630,11 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
                 proc = PMIX_NEW(prte_proc_t);
                 memcpy(&proc->name, &name, sizeof(pmix_proc_t));
                 proc->state = PRTE_PROC_STATE_RUNNING;
-                pmix_pointer_array_set_item(jdata->procs, name.rank, proc);
+                if (PMIX_SUCCESS != pmix_pointer_array_set_item(jdata->procs, name.rank, proc)) {
+                    PMIX_RELEASE(proc);
+                    ret = PMIX_ERR_OUT_OF_RESOURCE;
+                    goto TCONN_ANSWER;
+                }
                 jdata->num_procs++;
             }
             ret = PMIX_SUCCESS;
@@ -613,7 +703,16 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             memcpy(&proc->name, &name, sizeof(pmix_proc_t));
             proc->pid = pid;
             proc->state = PRTE_PROC_STATE_RUNNING;
-            pmix_pointer_array_set_item(jdata->procs, name.rank, proc);
+            /* the rank was screened by prte_pmix_server_tool_may_join(), but
+             * a proc the array will not take is one no lookup finds, and the
+             * tool's job would never retire */
+            if (PMIX_SUCCESS != pmix_pointer_array_set_item(jdata->procs, name.rank, proc)) {
+                PMIX_RELEASE(proc);
+                PMIX_RELEASE(jdata);
+                jdata = NULL;
+                ret = PMIX_ERR_OUT_OF_RESOURCE;
+                goto TCONN_ANSWER;
+            }
             /* Find the node the tool is on: it connected through the daemon
              * that is reporting it, so ask that DAEMON where it is.
              *
@@ -627,8 +726,8 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
              * enough to name the wrong node - or, past the end of the pool,
              * none at all.
              *
-             * Not knowing where a tool sits is also not a reason to bring the
-             * DVM down, which is what the old NOT_FOUND did: it fell through
+             * Not knowing where a tool sits is also not a reason to make the
+             * DVM exit, which is what the old NOT_FOUND did: it fell through
              * to the master's CLEANUP, which activates FORCED_EXIT. Record
              * what we know and carry on. */
             daemons = prte_get_job_data_object(PRTE_PROC_MY_NAME->nspace);
@@ -645,6 +744,7 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             }
             jdata->num_procs = 1;
         }
+    TCONN_ANSWER:
         /* setup the response */
         PMIX_DATA_BUFFER_CREATE(answer);
 
@@ -704,7 +804,7 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
          * anything), so until it is named, every identity test this job
          * passes through succeeds against every other namespace in the DVM.
          * It is not a hypothetical: an unnamed job has been mistaken for the
-         * daemon job by errmgr/dvm and taken the whole DVM down with it, has
+         * daemon job by errmgr/dvm, which then terminated the DVM, has
          * opened a reservation to every namespace by being recorded as its
          * owner, and has cleared another job's slot in session->jobs.
          *
@@ -771,6 +871,51 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
                 uint32_t owngid = (uint32_t) jdata->gid;
                 prte_set_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID, PRTE_ATTR_GLOBAL,
                                    &owngid, PMIX_UINT32);
+            }
+        }
+
+        /* A job runs as the user it belongs to (prte_pmix_server_job_run_as).
+         * One this DVM cannot start as its owner it must not start as
+         * itself either, so it is refused here, before anything is mapped
+         * or sent, and the requester told why. */
+        {
+            uid_t ruid;
+            gid_t rgid;
+            bool change;
+            const char *what;
+
+            rc = prte_pmix_server_job_run_as(jdata, &ruid, &rgid, &change);
+            if (PRTE_ERR_PERM == rc) {
+                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-odls-base.txt",
+                               "run-as-refused", true, prte_process_info.nodename,
+                               PRTE_JOB_NSPACE(jdata),
+                               (unsigned long) prte_pmix_server_job_owner(jdata),
+                               (unsigned long) prte_process_info.euid);
+                goto ANSWER_LAUNCH;
+            }
+            if (PRTE_SUCCESS != rc) {
+                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-odls-base.txt",
+                               "run-as-no-group", true, prte_process_info.nodename,
+                               PRTE_JOB_NSPACE(jdata),
+                               (unsigned long) prte_pmix_server_job_owner(jdata));
+                rc = PRTE_ERR_PERM;
+                goto ANSWER_LAUNCH;
+            }
+            /* and what the master would do for it as itself */
+            if (!prte_pmix_server_privileged(prte_pmix_server_job_owner(jdata)) &&
+                NULL != (what = foreign_directive(jdata))) {
+                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-plm-base.txt", "foreign-directive",
+                               true, PRTE_JOB_NSPACE(jdata),
+                               (unsigned long) prte_pmix_server_job_owner(jdata), what);
+                rc = PRTE_ERR_PERM;
+                goto ANSWER_LAUNCH;
+            }
+            /* and the hosts it would have the DVM bring in */
+            if (NULL != (what = grow_directive(jdata, prte_pmix_server_job_owner(jdata)))) {
+                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-ras-base.txt",
+                               "ras-base:grow-not-permitted", true, "spawn", what);
+                rc = PRTE_ERR_PERM;
+                goto ANSWER_LAUNCH;
             }
         }
 

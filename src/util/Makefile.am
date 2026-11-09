@@ -49,13 +49,13 @@ headers = \
         daemon_init.h \
         dash_host/dash_host.h \
         error_strings.h \
-        ethtool.h \
         error.h \
         name_fns.h \
         nidmap.h \
         prte_bootstrap.h \
         prte_dvm_key.h \
         prte_hmac.h \
+        prte_poly1305.h \
         prte_json_scan.h \
         prte_json_window.h \
         prte_output_file.h \
@@ -71,13 +71,13 @@ sources = \
         daemon_init.c \
         dash_host/dash_host.c \
         error_strings.c \
-        ethtool.c \
         error.c \
         name_fns.c \
         nidmap.c \
         prte_bootstrap.c \
         prte_dvm_key.c \
         prte_hmac.c \
+        prte_poly1305.c \
         prte_cmd_line.c \
         prte_json_scan.c \
         prte_json_window.c \

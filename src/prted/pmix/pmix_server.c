@@ -560,6 +560,32 @@ void pmix_server_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_BOOL,
                                       &prte_pmix_server_globals.no_foreign_tools);
 
+    /* the highest rank a tool may give itself in a namespace of its own */
+    prte_pmix_server_globals.tool_rank_limit = 1048576;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "tool_rank_limit",
+                                      "A tool connecting under a namespace of its own may "
+                                      "name itself only with a rank below this value. The "
+                                      "rank indexes the array the tool's job keeps its "
+                                      "processes in (default 1048576)",
+                                      PMIX_MCA_BASE_VAR_TYPE_UNSIGNED_INT,
+                                      &prte_pmix_server_globals.tool_rank_limit);
+
+    /* how long a request for data of a job we have not heard of waits */
+    prte_pmix_server_globals.dmdx_job_wait = 60;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "dmodex_job_wait",
+                                      "Seconds a request for the data of a job this daemon "
+                                      "has not yet heard of waits for the job to arrive "
+                                      "before it is answered as not found (default 60)",
+                                      PMIX_MCA_BASE_VAR_TYPE_UNSIGNED_INT,
+                                      &prte_pmix_server_globals.dmdx_job_wait);
+    prte_pmix_server_globals.dmdx_job_wait_max = 1024;
+    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "dmodex_job_wait_max",
+                                      "How many requests for the data of jobs this daemon "
+                                      "has not yet heard of may wait at once. Beyond this, a "
+                                      "new one is answered as not found at once (default 1024)",
+                                      PMIX_MCA_BASE_VAR_TYPE_UNSIGNED_INT,
+                                      &prte_pmix_server_globals.dmdx_job_wait_max);
+
     /* the users a scheduler may run as, besides root and our own */
     prte_pmix_server_globals.scheduler_uids = NULL;
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "scheduler_uids",
@@ -1246,6 +1272,22 @@ int pmix_server_init(void)
             rc = prte_pmix_convert_status(prc);
             return rc;
         }
+#if defined(PMIX_SOCKET_MODE)
+        /* A DVM that takes other users' tools takes their jobs too, and a
+         * daemon running as root starts those jobs' processes as the users
+         * they belong to (prte_pmix_server_job_run_as) - which must then
+         * reach this daemon's socket, by the same path the master opens to
+         * tools. PMIx still lets in only the processes it was told of, as
+         * the user it was told. A daemon not running as root starts no other
+         * user's processes, so has nothing to open. */
+        if (!prte_pmix_server_globals.no_foreign_tools && 0 == prte_process_info.euid) {
+            rc = open_to_foreign_tools(ilist);
+            if (PRTE_SUCCESS != rc) {
+                PMIX_INFO_LIST_RELEASE(ilist);
+                return rc;
+            }
+        }
+#endif
     }
 
     /* if requested, tell the server library to output our PMIx URI */
@@ -2472,7 +2514,7 @@ static void pmix_server_dmdx_resp(int status, pmix_proc_t *sender,
      * it.  mdxcbfunc is the discriminator: PRTE_DMX_REQ is the only thing
      * that builds a direct-modex request and it always sets one, and no
      * other operation sets it at all. */
-    if (NULL != req && NULL == req->mdxcbfunc) {
+    if (NULL != req && (NULL == req->mdxcbfunc || req->awaiting_job)) {
         pmix_output_verbose(2, prte_pmix_server_globals.output,
                             "%s dmdx response for index %d found a %s request - dropping it",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), index,
@@ -2516,6 +2558,11 @@ static void pmix_server_dmdx_resp(int status, pmix_proc_t *sender,
          * the life of the DVM.  For allocate and session control that
          * release is also one of three on an object built to take two. */
         if (NULL == req->mdxcbfunc || PMIX_NSPACE_INVALID(req->tproc.nspace)) {
+            continue;
+        }
+        /* nor one waiting for its job to appear: it never sent a request,
+         * and it answers itself from its own timer */
+        if (req->awaiting_job) {
             continue;
         }
         if (PMIX_CHECK_PROCID(&req->tproc, &pproc)) {
@@ -3248,6 +3295,8 @@ static void rqcon(prte_pmix_server_req_t *p)
 {
     p->event_active = false;
     p->cycle_active = false;
+    p->awaiting_job = false;
+    p->job_waits = 0;
     p->inprogress = false;
     p->timed_out = false;
     p->operation = NULL;

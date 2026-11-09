@@ -67,8 +67,8 @@ static void _client_conn(int sd, short args, void *cbdata)
     prte_proc_t *p = NULL, *p2;
     pmix_status_t rc = PMIX_SUCCESS;
     size_t n;
-    uid_t euid;
-    gid_t egid;
+    uid_t euid, runas_uid;
+    gid_t egid, runas_gid;
     pid_t pid;
     bool singleton = false;
     PRTE_HIDE_UNUSED_PARAMS(sd, args);
@@ -121,6 +121,21 @@ static void _client_conn(int sd, short args, void *cbdata)
         }
     }
 
+    /* The user and group the client must have connected as: the ones its
+     * job's processes are started as here, which is the user and group its
+     * registration named (prte_pmix_server_job_run_as) - our own, or the
+     * job's owner when we start its processes as the owner */
+    {
+        prte_job_t *jdata = prte_get_job_data_object(cd->proc.nspace);
+        bool change;
+
+        if (NULL == jdata ||
+            PRTE_SUCCESS != prte_pmix_server_job_run_as(jdata, &runas_uid, &runas_gid, &change)) {
+            rc = PMIX_ERR_NOT_SUPPORTED;
+            goto complete;
+        }
+    }
+
     // check if the uid, gid, and pid match
     for (n=0; n < cd->ninfo; n++) {
         if (PMIx_Check_key(cd->info[n].key, PMIX_USERID)) {
@@ -129,7 +144,7 @@ static void _client_conn(int sd, short args, void *cbdata)
                 PMIX_ERROR_LOG(rc);
                 goto complete;
             }
-            if (prte_process_info.euid != euid) {
+            if (runas_uid != euid) {
                 rc = PMIX_ERR_NOT_SUPPORTED;
                 PMIX_ERROR_LOG(rc);
                 goto complete;
@@ -142,7 +157,7 @@ static void _client_conn(int sd, short args, void *cbdata)
                 PMIX_ERROR_LOG(rc);
                 goto complete;
             }
-            if (prte_process_info.egid != egid) {
+            if (runas_gid != egid) {
                 rc = PMIX_ERR_NOT_SUPPORTED;
                 PMIX_ERROR_LOG(rc);
                 goto complete;
@@ -464,24 +479,6 @@ pmix_status_t pmix_server_abort_fn(const pmix_proc_t *proc, void *server_object,
     return PMIX_SUCCESS;
 }
 
-/* completion of a tool registration - executes on the PRRTE
- * progress thread */
-static void tconn_reg_complete(pmix_status_t status, void *cbdata)
-{
-    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) cbdata;
-
-    if (PMIX_SUCCESS != status) {
-        PMIX_ERROR_LOG(status);
-        // we can live without it
-    }
-    if (NULL != req->toolcbfunc) {
-        req->toolcbfunc(req->pstatus, &req->target, req->cbdata);
-    }
-
-    /* cleanup */
-    PMIX_RELEASE(req);
-}
-
 void pmix_server_tconn_return(int status, pmix_proc_t *sender,
                               pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                               void *cbdata)
@@ -531,34 +528,18 @@ void pmix_server_tconn_return(int status, pmix_proc_t *sender,
             return;
         }
         PMIX_LOAD_NSPACE(req->target.nspace, jobid);
-        /* the tool is not a client of ours, but we can provide at
-         * least some information - the registration completes
-         * asynchronously */
-        req->pstatus = ret;
-        rc = prte_pmix_server_register_tool(req, tconn_reg_complete, req);
-        if (PRTE_SUCCESS == rc) {
-            return;
+        /* the tool is not a client of ours, but we track its job */
+        rc = prte_pmix_server_register_tool(req);
+        if (PRTE_SUCCESS != rc) {
+            PRTE_ERROR_LOG(rc);
+            // we can live without it
         }
-        PMIX_ERROR_LOG(rc);
-        // we can live without it
     }
 
     req->toolcbfunc(ret, &req->target, req->cbdata);
 
     /* cleanup */
     PMIX_RELEASE(req);
-}
-
-/* completion of the local tool registration - executes on the
- * PRRTE progress thread */
-static void toolconn_reg_complete(pmix_status_t status, void *cbdata)
-{
-    prte_pmix_server_req_t *cd = (prte_pmix_server_req_t *) cbdata;
-
-    if (NULL != cd->toolcbfunc) {
-        cd->toolcbfunc(status, &cd->target, cd->cbdata);
-    }
-    PMIX_RELEASE(cd);
 }
 
 static void _toolconn(int sd, short args, void *cbdata)
@@ -758,12 +739,8 @@ static void _toolconn(int sd, short args, void *cbdata)
                 goto complete;
             }
         }
-        // register this job - will add to our array of jobs. The
-        // registration completes asynchronously
-        rc = prte_pmix_server_register_tool(cd, toolconn_reg_complete, cd);
-        if (PRTE_SUCCESS == rc) {
-            return;
-        }
+        // record this job - will add to our array of jobs
+        rc = prte_pmix_server_register_tool(cd);
         rc = prte_pmix_convert_rc(rc);
         goto complete;
     }
@@ -1335,8 +1312,8 @@ static void pmix_server_stdin_push(int sd, short args, void *cbdata)
     }
 
     /* the vtable slot is optional, so a module that left it unset would
-     * otherwise take the daemon down with a NULL call - which is what used
-     * to happen on every daemon but the master, killing the very daemon the
+     * otherwise be called through a NULL pointer - which is what used to
+     * happen on every daemon but the master, faulting the daemon the
      * requesting tool was attached to */
     if (NULL == prte_iof.push_stdin) {
         cd->cbfunc(PMIX_ERR_NOT_SUPPORTED, cd->cbdata);

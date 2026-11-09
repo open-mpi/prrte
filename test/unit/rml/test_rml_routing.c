@@ -820,7 +820,7 @@ static int test_reconcile_ancestry(void)
     }
 
     /*
-     * (d) The regression that used to take the DVM down.  The HNP loses rank 1
+     * (d) The regression that used to force an exit.  The HNP loses rank 1
      * and adopts rank 5 directly, so the adoption notice it sends carries the
      * shortest list there is: [0].  Rank 5 has not noticed anything yet, so its
      * own list is [0,1] -- one entry longer.
@@ -925,7 +925,7 @@ static int test_reconcile_ancestry(void)
      * fatal by construction rather than recoverable.  A well-formed report can
      * never ask for it, since every ancestor list begins with 0 and index 0
      * therefore never differs; an empty one reaching a daemon that is NOT the
-     * root would fall into the tail loop and take the whole DVM with it.
+     * root would fall into the tail loop and never leave it.
      */
     report = mk_ranks(NULL, 0);
     bitmaps_reset();
@@ -1031,7 +1031,7 @@ static int test_dead_dmns_round_trip(void)
     CHECK("a live rank is not marked departed",
           !pmix_bitmap_is_set_bit(&prte_rml_base.dead_dmns, 3));
 
-    /* garbage must not take the daemon down, and must not be believed */
+    /* garbage must be parsed without a fault, and must not be believed */
     bitmaps_reset();
     prte_rml_load_dead_dmns(NULL);
     prte_rml_load_dead_dmns("");
@@ -1152,6 +1152,20 @@ static int test_epoch_guard(void)
     CHECK("a far rank can be recorded", (prte_rml_record_epoch(400, 77), true));
     CHECK("...and read back", 77 == prte_rml_get_epoch(400));
     CHECK("a far rank rejects a stale epoch", !prte_rml_epoch_ok(400, 76));
+
+    /* The rank comes off the wire, and the table was grown to whatever it
+     * said - near the top of the range, some 32 GiB.  A rank past any DVM is
+     * not tracked, and a sentinel is no daemon's rank at all. */
+    CHECK("a rank past the table's reach is accepted untracked",
+          prte_rml_epoch_ok(PMIX_RANK_VALID - 1, 5)
+          && 0 == prte_rml_get_epoch(PMIX_RANK_VALID - 1));
+    CHECK("...without growing the table to it",
+          prte_rml_base.peer_epochs_size < (size_t) 1 << 21);
+    prte_rml_record_epoch(PMIX_RANK_VALID - 2, 9);
+    CHECK("...nor can one be recorded there", 0 == prte_rml_get_epoch(PMIX_RANK_VALID - 2)
+          && prte_rml_base.peer_epochs_size < (size_t) 1 << 21);
+    CHECK("a stamped message from a sentinel rank is refused",
+          !prte_rml_epoch_ok(PMIX_RANK_WILDCARD, 5));
 
     if (0 == failures) {
         fprintf(stdout, "PASSED test_epoch_guard\n");

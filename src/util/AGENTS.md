@@ -28,7 +28,7 @@ linked into `libprrte`. There are no MCA components here.
 | **Names** | `name_fns.[ch]` | Rendering and parsing of `pmix_proc_t`/`pmix_nspace_t`, and `prte_util_compare_name_fields()`. |
 | **Node specifications** | [`hostfile/`](hostfile/AGENTS.md), [`dash_host/`](dash_host/AGENTS.md) | The two ways a user names machines. Each has its own AGENTS.md. |
 | **Rankfile** | [`rankfile/`](rankfile/AGENTS.md) | Reading the per-rank placement file. Here rather than in `rmaps/rank_file` because parsing a file the user wrote is not a mapping policy. |
-| **Line-oriented files** | `textfile.[ch]` | One logical line at a time, comments stripped and fields split, for the two parsers above. What replaced PRRTE's flex scanners. Lines are read with `pmix_getline()`, as is every other line-oriented file in PRRTE: it returns a line of any length, and its `failed` flag tells a read error or a NUL byte from the end of the file. Do not use a fixed `fgets()` buffer, which hands a long line back in pieces, the next piece read as a line of its own. |
+| **Line-oriented files** | `textfile.[ch]` | One logical line at a time, comments stripped and fields split, for the hostfile and rankfile parsers above and the `rmaps/seq` sequence file. `prte_textfile_open()` takes only a regular file, and decides that on the descriptor it opened, non-blocking, rather than by a `stat()` of the path ahead of the open, so the answer is about the file actually read; these files are read on the DVM master's progress thread, which must not block. Read any new file a spawn can name through it. What replaced PRRTE's flex scanners. Lines are read with `pmix_getline()`, as is every other line-oriented file in PRRTE: it returns a line of any length, and its `failed` flag tells a read error or a NUL byte from the end of the file. Do not use a fixed `fgets()` buffer, which hands a long line back in pieces, the next piece read as a line of its own. |
 | **Nidmap** | `nidmap.[ch]` | The compressed node-name/daemon-vpid map the HNP ships to every daemon. |
 | **Errors and states** | `error.[ch]`, `error_strings.[ch]` | `prte_strerror()`, `PRTE_ERROR_LOG()`, and the four state→name renderers. |
 | **Process info** | `proc_info.[ch]` | The `prte_process_info` global: hostname and its aliases, uid/gid, session-dir paths, proc type. |
@@ -36,8 +36,8 @@ linked into `libprrte`. There are no MCA components here.
 | **Session directories** | `session_dir.[ch]` | Construction and teardown of the `$TMPDIR/<prefix>.<pid>/<jobid>/<rank>` tree. |
 | **Tool option values** | `prte_cmd_line.[ch]` | Value interpreters more than one tool needs (`--pid`, `--app`, the daemon umask), and the vocabularies of the directive-valued options - see "Directive vocabularies" below. See [`src/tools/AGENTS.md`](../tools/AGENTS.md). |
 | **Bootstrap** | `prte_bootstrap.[ch]` | Reading `prte.conf` for a launcher-less DVM. |
-| **DVM key** | `prte_dvm_key.[ch]`, `prte_hmac.[ch]` | The per-DVM key daemons prove they hold before the OOB treats them as daemons, how each launcher delivers it, and the SHA-256/HMAC that proof is made with. See "The DVM key" below. |
-| **Process plumbing** | `daemon_init.c`, `sys_limits.[ch]`, `stacktrace.[ch]`, `ethtool.[ch]` | Daemonizing, `setrlimit`, the crash handler, and the Linux interface-speed ioctl. |
+| **DVM key** | `prte_dvm_key.[ch]`, `prte_hmac.[ch]`, `prte_poly1305.[ch]` | The per-DVM key daemons prove they hold before the OOB treats them as daemons, how each launcher delivers it, and the SHA-256/HMAC that proof is made with. See "The DVM key" below. |
+| **Process plumbing** | `daemon_init.c`, `sys_limits.[ch]`, `stacktrace.[ch]` | Daemonizing, `setrlimit`, and the crash handler. |
 | **Help delivery** | `prte_show_help.[ch]` | `prte_show_help()` — a drop-in for `pmix_show_help()` that works on a **daemon**. See below. |
 | **Generated** | `prte_show_help_content.c`, `prte-convert-help.py` | Every `help-*.txt` in the tree, compiled in. **Never edit the generated file.** |
 
@@ -199,6 +199,17 @@ inside the top-level directory, which no one else can write to, and
 `_check_owner()` still refuses one not owned by our euid or group/other
 writable, inspecting it through an `O_NOFOLLOW` descriptor - cheap, and it
 keeps the rule should a directory ever be composed elsewhere.
+
+**A job whose processes run as its owner has directories that are the
+owner's.** A root daemon starts another user's job as that user
+(`prte_pmix_server_job_run_as`, see `src/mca/odls/AGENTS.md`), and those
+processes are handed their job and rank directories as `PMIX_NSDIR` and
+`PMIX_PROCDIR` - where an MPI library keeps its shared-memory files. So
+`_check_owner()` is told the user and group the job runs as: a directory
+we just made is given to them through the descriptor it checked
+(`fchown`), still `0700`, and one already theirs is accepted. The
+top-level directory stays ours; `open_to_foreign_tools()` gives it search
+permission only.
 A job whose directory is refused must also forget
 the path (`jdata->session_dir = NULL`), because finalize recursively destroys
 whatever that names. Verifying the foreign-owner refusal needs a second uid,
@@ -300,12 +311,20 @@ stdin), `plm/slurm`/`lsf`/`pals` the launcher's environment
 `DVMKeyFile` named in `prte.conf`. A new launcher must pick a channel of the
 same kind, or its daemons are no longer the only processes that can join.
 
-`prte_hmac.[ch]` - SHA-256 and HMAC-SHA256, checked against the FIPS 180-4
-and RFC 4231 vectors in `test/unit/util` - is generic code, and the rule below
-says generic code belongs in PMIx. It is here for now because PRRTE must not
-wait on a PMIx release to authenticate its own daemons; if PMIx grows the same
-primitives, use them and delete these. Compare a received proof with
-`prte_secure_equal`, never `memcmp`.
+`prte_poly1305.[ch]` - Poly1305 (RFC 8439), checked against that RFC's
+vectors in `test/unit/util` - is the authenticator for the OOB's per-message
+tags (`prte_oob_authenticate_messages`); a Poly1305 key must never tag two
+messages, so its caller derives one per message - `prte_oob_tcp_msg_tag()` in
+`src/rml/oob/oob_tcp_connection.c`, from the connection's direction key and
+the message's sequence number.
+
+`prte_hmac.[ch]` - SHA-256 and HMAC-SHA256, checked against the FIPS 180-4 and
+RFC 4231 vectors in `test/unit/util` - is generic code (so is
+`prte_poly1305.[ch]`), and the rule below says generic code belongs in PMIx.
+It is here for now because PRRTE must not wait on a PMIx release to
+authenticate its own daemons; if PMIx grows the same primitives, use them and
+delete these. Compare a received proof with `prte_secure_equal`, never
+`memcmp`.
 
 ## `prte_process_info`
 

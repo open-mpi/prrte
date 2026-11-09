@@ -176,6 +176,9 @@ static pmix_list_t launch_list;
 static prte_event_t launch_event;
 static char *ssh_agent_path = NULL;
 static char **ssh_agent_argv = NULL;
+/* the agent carries what it forwards unencrypted (rsh and its relatives), so
+ * it cannot be given the DVM key - see setup_launch() */
+static bool agent_unencrypted = false;
 
 /**
  * Init the module
@@ -198,8 +201,18 @@ static int ssh_init(void)
         /* automatically add -inherit and grid engine PE related flags */
         PMIx_Argv_append_nosize(&ssh_agent_argv, "-inherit");
         /* Don't use the "-noshell" flag as qrsh would have a problem
-         * swallowing a long command */
-        PMIx_Argv_append_nosize(&ssh_agent_argv, "-nostdin");
+         * swallowing a long command.
+         *
+         * The daemon's key comes down the agent's stdin (process_launch_list),
+         * so qrsh must forward it: with "-nostdin" every daemon found its
+         * stdin empty and refused to start, and the only way to run under
+         * Grid Engine at all was to turn authentication off.  The flag was
+         * there to keep qrsh from reading our own stdin, which ssh_child
+         * replaces with the key pipe anyway - so it is wanted only when there
+         * is no key to send, and stdin is /dev/null. */
+        if (!prte_oob_authenticate) {
+            PMIx_Argv_append_nosize(&ssh_agent_argv, "-nostdin");
+        }
         PMIx_Argv_append_nosize(&ssh_agent_argv, "-V");
         if (0 < pmix_output_get_verbosity(prte_plm_base_framework.framework_output)) {
             PMIx_Argv_append_nosize(&ssh_agent_argv, "-verbose");
@@ -398,6 +411,18 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
     char *full_orted_cmd = NULL;
     char **final_argv = NULL;
     char *tmp;
+
+    /* The daemon's key goes down the agent's stdin and the agent takes it
+     * to the remote node, so the agent's channel is the key's channel: rsh
+     * sends it as plain text, and anything that can read the traffic then
+     * holds the key every daemon proves itself with.  Refuse here, once
+     * there is a daemon to launch, rather than when the agent is chosen - a
+     * DVM confined to this node never hands the agent anything. */
+    if (prte_oob_authenticate && agent_unencrypted) {
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-ssh.txt", "agent-unencrypted", true,
+                       prte_process_info.nodename, ssh_agent_path);
+        return PRTE_ERR_SILENT;
+    }
 
     /* Figure out the basenames for the libdir and bindir.  This
        requires some explanation:
@@ -1611,6 +1636,7 @@ static int launch_agent_setup(const char *agent, char *path)
     }
 
     bname = pmix_basename(ssh_agent_argv[0]);
+    agent_unencrypted = (NULL != bname && (0 == strcmp(bname, "rsh") || 0 == strcmp(bname, "remsh")));
     if (NULL != bname && 0 == strcmp(bname, "ssh")) {
         /* "--xterm" is a directive of a job, not of the DVM, so it cannot
          * be what decides X11 forwarding for daemons that may be launched

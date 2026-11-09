@@ -65,6 +65,10 @@ typedef struct {
     bool event_active;
     prte_event_t cycle;
     bool cycle_active;
+    /* a direct-modex request waiting, on the cycle timer, for a job this
+     * daemon has not heard of yet - and how many times it has waited */
+    bool awaiting_job;
+    int job_waits;
     bool inprogress;
     bool timed_out;
     char *operation;
@@ -439,8 +443,7 @@ PRTE_EXPORT extern void pmix_server_query_resp(int status, pmix_proc_t *sender,
                                                void *cbdata);
 
 PRTE_EXPORT extern int prte_pmix_server_tool_may_join(prte_job_t *jdata, pmix_rank_t rank);
-PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd,
-                                                      pmix_op_cbfunc_t cbfunc, void *cbdata);
+PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd);
 
 PRTE_EXPORT extern int pmix_server_cache_job_info(prte_job_t *jdata, pmix_info_t *info);
 
@@ -674,6 +677,15 @@ typedef struct {
     unsigned int session_rndz_id;
     bool system_server;
     bool no_foreign_tools;
+    /* a tool's rank is a subscript into its job's procs array, so a rank
+     * of its own choosing must be below this */
+    unsigned int tool_rank_limit;
+    /* how long, in seconds, a direct-modex request for a namespace this
+     * daemon does not know waits for the job to appear; how many may wait
+     * at once; and how many are waiting now */
+    unsigned int dmdx_job_wait;
+    unsigned int dmdx_job_wait_max;
+    unsigned int dmdx_awaiting_job;
     /* the users, besides root and our own, a tool may run as to be accepted
      * as the scheduler: the MCA list, and what it resolved to */
     char *scheduler_uids;
@@ -778,6 +790,38 @@ PRTE_EXPORT bool prte_pmix_server_privileged(uid_t uid);
 
 /* the user jdata belongs to - our own user when none is known */
 PRTE_EXPORT uid_t prte_pmix_server_job_owner(prte_job_t *jdata);
+
+/* May uid change what the DVM consists of: root, our own user, or the users
+ * and groups the DVM was started with (--rtos users=/groups=). The rule
+ * prte_pmix_server_dvm_permitted applies once it knows who is asking. */
+PRTE_EXPORT bool prte_pmix_server_dvm_permitted_uid(uid_t uid);
+
+/* May a requester have the DVM bring hosts in, or start daemons on hosts
+ * it holds, naming them itself? Naming hosts is for whoever may change the
+ * DVM (prte_pmix_server_dvm_permitted_uid). Naming a file the master reads
+ * for it (`files`), or a user to reach a host as (`user` - "user@host"), is
+ * for root and our own user alone: the master does both as itself. The
+ * scheduler, and a request we made of ourselves, may do all three. */
+PRTE_EXPORT bool prte_pmix_server_grow_permitted(const pmix_proc_t *requestor,
+                                                 const pmix_info_t *info, size_t ninfo,
+                                                 bool files, bool user);
+PRTE_EXPORT bool prte_pmix_server_grow_permitted_uid(uid_t uid, bool files, bool user);
+
+/* Who a job owned by `owner` may be started as by a process running as
+ * `me`. PRTE_SUCCESS with *change false: as `me`, because it is ours or
+ * root's. PRTE_SUCCESS with *change true: as the owner, because `me` is
+ * root and must not lend it root's privileges. PRTE_ERR_PERM: not at all -
+ * we cannot become the owner, and must not run the job as ourselves. */
+PRTE_EXPORT int prte_pmix_server_run_as(uid_t me, uid_t owner, bool *change);
+
+/* The user and group jdata's processes run as on this daemon, and whether
+ * that means changing credentials when they are started. Our own user and
+ * group when no change is needed. PRTE_ERR_PERM when the job may not be
+ * started here at all, PRTE_ERR_NOT_FOUND when its owner's group is not
+ * known. Every PMIx registration of the job's clients names the same user,
+ * since PMIx refuses a client that connects as anyone else. */
+PRTE_EXPORT int prte_pmix_server_job_run_as(prte_job_t *jdata, uid_t *uid, gid_t *gid,
+                                            bool *change);
 
 /* May uid act on jdata? PMIx's rule (pmix_server_access_check) over our
  * copy of the job's owner and access list and our record of the user. A

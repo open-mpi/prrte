@@ -145,6 +145,55 @@ uid_t prte_pmix_server_job_owner(prte_job_t *jdata)
     return prte_process_info.euid;
 }
 
+int prte_pmix_server_run_as(uid_t me, uid_t owner, bool *change)
+{
+    *change = false;
+    if (owner == me) {
+        return PRTE_SUCCESS;
+    }
+    if (0 == me) {
+        /* root can start the job as the user it belongs to - and so it
+         * must: started as root, it would act with root's privileges */
+        *change = true;
+        return PRTE_SUCCESS;
+    }
+    if (0 == owner) {
+        /* root may always act as our user, so a job root asked for may
+         * run as us */
+        return PRTE_SUCCESS;
+    }
+    /* we cannot become the owner, and must not run its job as ourselves */
+    return PRTE_ERR_PERM;
+}
+
+int prte_pmix_server_job_run_as(prte_job_t *jdata, uid_t *uid, gid_t *gid, bool *change)
+{
+    uint32_t id, *idptr = &id;
+    uid_t owner = prte_pmix_server_job_owner(jdata);
+    int rc;
+
+    *uid = prte_process_info.euid;
+    *gid = prte_process_info.egid;
+    rc = prte_pmix_server_run_as(prte_process_info.euid, owner, change);
+    if (PRTE_SUCCESS != rc || !*change) {
+        return rc;
+    }
+    /* the owner's group, as every daemon is told of it - or the HNP's own
+     * record. An owner with no group known leaves nothing to run the job
+     * under: guessing one could hand it a group it does not have */
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID, (void **) &idptr,
+                           PMIX_UINT32)) {
+        *gid = (gid_t) id;
+    } else if (PRTE_INVALID_GID != jdata->gid) {
+        *gid = jdata->gid;
+    } else {
+        *change = false;
+        return PRTE_ERR_NOT_FOUND;
+    }
+    *uid = owner;
+    return PRTE_SUCCESS;
+}
+
 typedef struct {
     pmix_info_t *info;
     size_t ninfo;
@@ -366,7 +415,6 @@ bool prte_pmix_server_dvm_permitted(const pmix_proc_t *requestor, const pmix_inf
                                     size_t ninfo)
 {
     uid_t uid;
-    pmix_user_t *user;
 
     /* the scheduler - only if there IS one: an empty nspace is
      * PMIX_CHECK_PROCID's wildcard */
@@ -380,6 +428,13 @@ bool prte_pmix_server_dvm_permitted(const pmix_proc_t *requestor, const pmix_inf
          * prte_pmix_server_request_permitted */
         return (NULL != requestor && PMIX_CHECK_PROCID(requestor, PRTE_PROC_MY_NAME));
     }
+    return prte_pmix_server_dvm_permitted_uid(uid);
+}
+
+bool prte_pmix_server_dvm_permitted_uid(uid_t uid)
+{
+    pmix_user_t *user;
+
     if (prte_pmix_server_privileged(uid)) {
         return true;
     }
@@ -394,6 +449,38 @@ bool prte_pmix_server_dvm_permitted(const pmix_proc_t *requestor, const pmix_inf
     }
     return (PMIX_SUCCESS ==
             pmix_server_access_check(user, (pmix_access_t *) prte_pmix_server_globals.dvm_access));
+}
+
+bool prte_pmix_server_grow_permitted_uid(uid_t uid, bool files, bool user)
+{
+    /* a file the master reads, or a login it uses, is done as the DVM's own
+     * user - so for root and that user only */
+    if (files || user) {
+        return prte_pmix_server_privileged(uid);
+    }
+    /* hosts brought into the DVM change what it consists of, and get the
+     * DVM's key: for whoever may change the DVM, as creating a session is */
+    return prte_pmix_server_dvm_permitted_uid(uid);
+}
+
+bool prte_pmix_server_grow_permitted(const pmix_proc_t *requestor, const pmix_info_t *info,
+                                     size_t ninfo, bool files, bool user)
+{
+    uid_t uid;
+
+    /* the scheduler - only if there IS one: an empty nspace is
+     * PMIX_CHECK_PROCID's wildcard */
+    if (NULL != requestor &&
+        !PMIX_NSPACE_INVALID(prte_pmix_server_globals.scheduler.nspace) &&
+        PMIX_CHECK_PROCID(&prte_pmix_server_globals.scheduler, requestor)) {
+        return true;
+    }
+    if (!prte_pmix_server_requester_uid(info, ninfo, &uid)) {
+        /* a request we made of ourselves - see
+         * prte_pmix_server_request_permitted */
+        return (NULL != requestor && PMIX_CHECK_PROCID(requestor, PRTE_PROC_MY_NAME));
+    }
+    return prte_pmix_server_grow_permitted_uid(uid, files, user);
 }
 
 void prte_pmix_server_access_release_dvm(void)

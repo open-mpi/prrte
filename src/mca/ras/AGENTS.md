@@ -223,6 +223,41 @@ can still be refused cleanly:
   session at a time - and serves the allocation path through the same
   function.
 
+**And only some requesters may.** Bringing hosts into the DVM - or starting
+daemons on hosts it holds - changes what it consists of, and the daemons
+started there are given the DVM's key, so it is held to
+`prte_pmix_server_grow_permitted()` (`src/prted/pmix/pmix_server_access.c`),
+the rule creating a session follows: root, the DVM's own user, and the users
+and groups `--rtos users=`/`groups=` named when it started. Two things the
+master does *as itself* are narrower - reading a file of hosts
+(`PMIX_ADD_HOSTFILE`, an activation's `PMIX_HOSTFILE`) and logging in as a
+named user (`user@host`) - and are for root and the DVM's own user alone.
+It is judged in two places, with the same rule:
+
+- `prte_ras_base_modify()`, for an allocation request: a NEW or EXTEND that
+  names nodes (`ras_base_names_hosts()`, which reads a node list through
+  `prte_ras_base_parse_node_list()` so a user inside a regex is seen), and
+  every ACTIVATE. A grow is not judged there when `ras/pmix` is the
+  selected module: its scheduler decides, and is told who asked
+  (`PMIX_REQUESTOR`). Every other module acts on the names itself.
+  An allocation a spawn carries (`PMIX_SPAWN_ALLOC`) comes here too, built
+  by `prte_ras_base_spawn_alloc()`, and is judged as the job's owner: that
+  function drops every identity key from the client's array
+  (`prte_pmix_server_is_identity_key()`) and puts in the owner's
+  `PMIX_USERID`, since the array is the client's own and only PMIx or the
+  spawn's admission may say who asked.
+- spawn admission (`plm_base_receive.c`): `--add-host` and `--activate`
+  (`grow_directive()`), and `--add-hostfile` among the files the master
+  reads (`foreign_directive()`). The request `prte_ras_base_add_hosts()`
+  then builds names the master as its requester, since the job was judged
+  already.
+
+`user@host` in a list of hosts (`prte_util_add_dash_host_nodes()`) is split
+the way a hostfile entry is: the node is named for the host, and the user is
+kept as `PRTE_NODE_USERNAME` for the launch agent. A name with any character
+other than letters, digits, `.`, `-` and `_` is refused
+(`dash-host:invalid-name`), since it goes on that agent's command line.
+
 A non-elastic DVM used to serve these. An `--add-host` launched its daemon,
 and when that daemon failed to start the requester waited forever on a daemon
 count nothing would complete - and so did every later launch that needed a
@@ -544,13 +579,11 @@ client's `pmix_info_t[]` straight through, and nothing between there and here
 inspects it. So **never read `value.data.<member>` without first establishing
 the type**. A `PMIX_ALLOC_ID` sent as an integer, taken as `.string`, is a
 wild pointer, and the first `strdup`/`strcmp`/`PMIX_LOAD_NSPACE` of it faults
-the **HNP** — i.e. any process or tool that can connect to the DVM could take
-it down with a one-line allocation request. `ras_base_get_string()` is the
-string reader every directive in `ras_base_allocate.c` goes through, and it
-answers `PMIX_ERR_BAD_PARAM` rather than ignoring a mistyped key, because a
-caller that mistyped one needs to be told and not quietly handed a
-reservation it cannot name. `prte_ras_base_parse_node_list()` does the same
-for `PMIX_ALLOC_NODE_LIST`.
+the **HNP**. `ras_base_get_string()` is the string reader every directive in
+`ras_base_allocate.c` goes through, and it answers `PMIX_ERR_BAD_PARAM`
+rather than ignoring a mistyped key, because a caller that mistyped one
+needs to be told and not quietly handed a reservation it cannot name.
+`prte_ras_base_parse_node_list()` does the same for `PMIX_ALLOC_NODE_LIST`.
 
 `PMIX_ALLOC_INHERITANCE` has **two** legitimate spellings and both must be
 accepted: `PMIX_ALLOC_INHERIT`, the attribute's own type and the one the PMIx
@@ -742,11 +775,11 @@ documented in each component's guide.
   reachable from user input: `--display topo=';'` used to fault the HNP in
   `prte_ras_base_allocate`'s topology dump.
 - **A parser reading an RM's file or env must tolerate malformed input.**
-  These run on the HNP, so a NULL deref on a blank line takes the whole
-  DVM down. `strtok_r` returns NULL for a short line; `fgets` does not
-  guarantee a trailing newline; and every `ctype.h` call needs its
-  argument cast to `unsigned char` (a plain `char` is UB for any byte
-  with the high bit set).
+  These run on the HNP, so a NULL deref on a blank line faults the HNP.
+  `strtok_r` returns NULL for a short line; `fgets` does not guarantee a
+  trailing newline; and every `ctype.h` call needs its argument cast to
+  `unsigned char` (a plain `char` is UB for any byte with the high bit
+  set).
 - Standard PRRTE rules apply: `prte_config.h` first, braces on every
   block, `NULL ==`/constant-on-left, no new warnings,
   `PRTE_ERROR_LOG`/`PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_ALLOC_FAILED)`

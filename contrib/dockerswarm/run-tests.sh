@@ -468,8 +468,7 @@ bootstrap_start() {
 #
 #   - a mapping request that cannot be satisfied must fail the job and leave
 #     the DVM standing.  A mapper that walks off the end of its node list
-#     takes the HNP down with it, and on a persistent DVM that is every other
-#     user's job too, not just the one that asked.
+#     faults the HNP, so the case checks the DVM still answers afterwards.
 #   - the user-ranked mappers (rankfile, seq) name hosts.  With one node, any
 #     placement is the right placement; the rank -> host assignment only
 #     means something when there is more than one host to get wrong.
@@ -1897,11 +1896,11 @@ test_state() {
     # processes must decline, leave the targets alone, and still run the job.
     cleanup_swarm
     for n in 1 2; do
-        ON $n 'rm -rf /tmp/statelog /tmp/statelog-victim; mkdir -p /tmp/statelog
-               echo original > /tmp/statelog-victim' >/dev/null 2>&1
+        ON $n 'rm -rf /tmp/statelog /tmp/statelog-target; mkdir -p /tmp/statelog
+               echo original > /tmp/statelog-target' >/dev/null 2>&1
     done
-    RUN 'ln -s /tmp/statelog-victim /tmp/statelog/prtectrlr-$(hostname)-log' >/dev/null 2>&1
-    ON 2 'ln -s /tmp/statelog-victim /tmp/statelog/prted-$(hostname)-log' >/dev/null 2>&1
+    RUN 'ln -s /tmp/statelog-target /tmp/statelog/prtectrlr-$(hostname)-log' >/dev/null 2>&1
+    ON 2 'ln -s /tmp/statelog-target /tmp/statelog/prted-$(hostname)-log' >/dev/null 2>&1
     out=$(RUN 'timeout 90 prterun --prtemca state_base_log_jobstate 1 \
                    --prtemca state_base_log_procstate 1 \
                    --prtemca state_base_log_path /tmp/statelog \
@@ -1910,7 +1909,7 @@ test_state() {
     [ "$n" = 2 ] && ok "the job ran with the state log declined" \
                  || bad "the job did not run: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
     for h in 1 2; do
-        c=$(ON $h 'cat /tmp/statelog-victim' 2>/dev/null)
+        c=$(ON $h 'cat /tmp/statelog-target' 2>/dev/null)
         [ "$c" = original ] \
             && ok "node$h: the symlink's target was left alone" \
             || bad "node$h: the state log was written thru the symlink ($(echo "$c" | wc -l | tr -d ' ') lines)"
@@ -1921,7 +1920,7 @@ test_state() {
             && bad "node$h: a log was written under another name -- the planted link missed" \
             || ok "node$h: no log was written under any other name"
     done
-    for n in 1 2; do ON $n 'rm -rf /tmp/statelog /tmp/statelog-victim' >/dev/null 2>&1; done
+    for n in 1 2; do ON $n 'rm -rf /tmp/statelog /tmp/statelog-target' >/dev/null 2>&1; done
     cleanup_swarm
 }
 
@@ -3898,14 +3897,14 @@ test_prted() {
     elif ! prted_dvm_start 'node1:2,node2:2'; then
         bad "could not start a DVM for the tool-rank test"
     else
-        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout 20 $ROLETOOL - impersonate \$PMIX_NAMESPACE 7; true' 2>&1; echo RC=\$?")
+        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'timeout 20 $ROLETOOL - claim \$PMIX_NAMESPACE 7; true' 2>&1; echo RC=\$?")
         echo "$out" | grep -qE 'ROLE INIT PMIX_ERR_(EXISTS|NOT_FOUND)' \
             && ok "a tool naming an unused rank of an application job was refused" \
             || bad "a tool naming an unused rank of an application job was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
         echo "$out" | grep -q 'RC=0' \
             && ok "...and the job completed" \
             || bad "...but the job never completed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
-        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'echo JOB \$PMIX_NAMESPACE \$PMIX_RANK; timeout 20 $ROLETOOL - impersonate \$PMIX_NAMESPACE \$PMIX_RANK; true' 2>&1; echo RC=\$?")
+        out=$(RUN "timeout -k 5 30 prun --dvm-uri file:$PRTED_URI --host node2:1 -n 1 sh -c 'echo JOB \$PMIX_NAMESPACE \$PMIX_RANK; timeout 20 $ROLETOOL - claim \$PMIX_NAMESPACE \$PMIX_RANK; true' 2>&1; echo RC=\$?")
         job=$(echo "$out" | tr -d '\r' | sed -n 's/^JOB //p')
         name=$(echo "$out" | tr -d '\r' | sed -n 's/^ROLE NAME //p')
         echo "$out" | grep -q 'ROLE INIT PMIX_SUCCESS' \
@@ -4382,6 +4381,211 @@ test_requesters() {
             && ok "a scheduler user nobody has is reported and stops the DVM" \
             || bad "prte failed without naming the unknown user: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
     fi
+    cleanup_swarm
+}
+
+# Who may bring hosts into an elastic DVM (P02's fix). Naming hosts is for
+# whoever may change the DVM - root, its own user, and the users it was
+# started with - on the allocation route and the spawn route alike. A user
+# to reach a host as ("user@host") is for root and its own user alone, and
+# is kept apart from the host's name. See src/mca/ras/AGENTS.md.
+test_grow_authz() {
+    local out uri
+    local u65534 u65533
+
+    banner "grow: an unlisted user may not bring a host into the DVM"
+    cleanup_swarm
+    if ! RUN 'test "$(id -u)" = 0 && command -v setpriv >/dev/null'; then
+        skp "requesting as a second user needs root and setpriv on the head node"
+        return
+    fi
+    if ! prted_dvm_start_mca 'node1:1,node2:1' \
+            '--prtemca prte_elastic_mode 1 --prtemca prte_pmix_no_foreign_tools 0 --rtos users=65533'; then
+        bad "could not start an elastic DVM that accepts other users' tools"
+        return
+    fi
+    uri=$(RUN "head -1 $PRTED_URI" 2>/dev/null | tr -d '\r\n')
+    u65534="setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp PRTE_DVM_URI='$uri'"
+    u65533="setpriv --reuid=65533 --regid=65533 --clear-groups env HOME=/tmp PRTE_DVM_URI='$uri'"
+
+    out=$(RUN "cd /tmp && timeout 60 $u65534 elastic grow node3:1" 2>&1)
+    echo "$out" | grep -q "PHASE 1.*PMIX_ERR_NO_PERMISSIONS" \
+        && ok "its allocation request naming a host is refused" \
+        || bad "an unlisted user's grow was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    out=$(RUN "cd /tmp && timeout 60 setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp prun --dvm-uri '$uri' --add-host node3 -n 1 hostname" 2>&1)
+    if echo "$out" | grep -q "PMIX_ERR_NO_PERMISSIONS" && echo "$out" | grep -q "hosts to add"; then
+        ok "its spawn adding a host is refused, saying why"
+    else
+        bad "an unlisted user's --add-host was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    out=$(RUN "cd /tmp && timeout 60 $u65534 elastic spawnalloc node3:1 -- hostname" 2>&1)
+    # the refusal is the allocation's, so the spawn fails as a refused
+    # allocation does; its message is the one the grow above already
+    # printed, and a repeated message is not printed twice
+    if echo "$out" | grep -q "SPAWN FAILED: PMIX_ERR_JOB_ALLOC_FAILED" &&
+       echo "$out" | grep -q "ALLOCATION REFUSED"; then
+        ok "its spawn carrying an allocation that names a host is refused"
+    else
+        bad "an unlisted user's PMIX_SPAWN_ALLOC was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    [ "$(prted_count 3)" = 1 ] \
+        && bad "a daemon was started on node3 anyway" \
+        || ok "no daemon was started on node3"
+
+    banner "grow: a user the DVM was started with may - but not with a user@"
+    out=$(RUN "cd /tmp && timeout 90 $u65533 elastic grow node3:1" 2>&1)
+    if echo "$out" | grep -q "PMIX_DVM_IS_READY" && [ "$(prted_count 3)" = 1 ]; then
+        ok "a listed user's grow brings node3 in"
+    else
+        bad "a listed user's grow did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    out=$(RUN "cd /tmp && timeout 60 $u65533 elastic grow root@node4:1" 2>&1)
+    echo "$out" | grep -q "PHASE 1.*PMIX_ERR_NO_PERMISSIONS" \
+        && ok "a listed user may not name a user to reach a host as" \
+        || bad "a listed user's user@host was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    [ "$(prted_count 4)" = 1 ] \
+        && bad "a daemon was started on node4 anyway" \
+        || ok "no daemon was started on node4"
+
+    banner "grow: root may name a user, and the node is named for the host"
+    out=$(RUN "timeout 90 env PRTE_DVM_URI='$uri' elastic grow root@node4:1" 2>&1)
+    if echo "$out" | grep -q "PMIX_DVM_IS_READY" && [ "$(prted_count 4)" = 1 ]; then
+        ok "root's grow onto root@node4 brings node4 in"
+    else
+        bad "root's grow onto root@node4 did not complete: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    out=$(RUN "timeout 90 env PRTE_DVM_URI='$uri' elastic spawnalloc node5:1 -- hostname" 2>&1)
+    if echo "$out" | tr -d '\r' | grep -q '^node5$' && [ "$(prted_count 5)" = 1 ]; then
+        ok "root's spawn carrying an allocation of node5 runs there"
+    else
+        bad "root's PMIX_SPAWN_ALLOC of node5 did not run: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    out=$(RUN "timeout 60 prun --dvm-uri '$uri' --host node4 -n 1 hostname" 2>&1)
+    [ "$(echo "$out" | tr -d '\r' | grep -c '^node4$')" = 1 ] \
+        && ok "a job placed on node4 by its own name runs there" \
+        || bad "node4 is not known by its own name: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
+}
+
+# A job's processes run as the user the job belongs to. On a root DVM that
+# takes other users' tools, another user's job runs as that user on every
+# node - as its processes see themselves, as their PMIx server judges them,
+# and in the session directories they are given. A DVM that cannot become
+# the user (not root) refuses the job, and no DVM acts for another user on a
+# file or host it names. See src/mca/odls/AGENTS.md, "Who the child runs as".
+test_run_as() {
+    local out uri n rq jd ownuri
+    local probe=/tmp/runas-probe.sh
+
+    banner "run-as: another user's job runs as that user, on every node"
+    cleanup_swarm
+    if ! RUN 'test "$(id -u)" = 0 && command -v setpriv >/dev/null'; then
+        skp "running a job as a second user needs root and setpriv on the head node"
+        return
+    fi
+    if ! prted_dvm_start_mca 'node1:2,node2:2' '--prtemca prte_pmix_no_foreign_tools 0'; then
+        bad "could not start a DVM that accepts other users' tools"
+        return
+    fi
+    uri=$(RUN "head -1 $PRTED_URI" 2>/dev/null | tr -d '\r\n')
+    # HOME too: root's is not readable by the second user
+    rq="setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp prun --dvm-uri '$uri'"
+
+    out=$(RUN "cd /tmp && timeout 60 $rq -n 4 --map-by node sh -c 'echo RUNAS \$(hostname) \$(id -u) \$(id -g) \$(id -G)'" 2>&1)
+    n=$(echo "$out" | grep -c '^RUNAS node[12] 65534 65534 65534$')
+    [ "$n" = 4 ] \
+        && ok "all 4 processes, on both nodes, run as user 65534 with its group alone" \
+        || bad "another user's job did not run as that user (matched $n of 4): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+    banner "run-as: such a process is a client its PMIx server accepts"
+    # PMIx_Init, then gets of every peer's placement - across the two nodes
+    out=$(RUN "cd /tmp && timeout 60 $rq -n 4 --map-by node /opt/prte/prte/bin/peerinfo" 2>&1)
+    n=$(echo "$out" | grep -c '^PEERINFO-DONE')
+    [ "$n" = 4 ] \
+        && ok "all 4 initialized and read their peers" \
+        || bad "another user's processes could not use their PMIx server ($n of 4): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+
+    banner "run-as: its session directories are its own, and no one else's"
+    # the probe waits while root looks at the job's directories on node2
+    ON 2 "printf '#!/bin/sh\\nsleep 8\\n' > $probe && chmod 755 $probe"
+    RUN "cd /tmp && ($rq -n 1 --host node2 $probe > /dev/null 2>&1 &)"
+    jd=""
+    for _ in $(seq 1 10); do
+        jd=$(ON 2 'find /tmp -mindepth 2 -maxdepth 2 -path "/tmp/prted.*" -type d -user 65534 2>/dev/null | head -1' | tr -d '\r')
+        [ -n "$jd" ] && break
+        sleep 1
+    done
+    if [ -z "$jd" ]; then
+        bad "found no session directory of the job's user on node2"
+    else
+        out=$(ON 2 "stat -c '%a %u' '$jd'" | tr -d '\r')
+        [ "$out" = "700 65534" ] \
+            && ok "the job's directory is the user's own, mode 700" \
+            || bad "the job's directory is $out, not 700 65534"
+        ON 2 "setpriv --reuid=65534 --regid=65534 --clear-groups touch '$jd/runas-probe'" \
+            && ok "the job's user can write in it" \
+            || bad "the job's user cannot write in its own directory"
+        ON 2 "setpriv --reuid=65533 --regid=65533 --clear-groups ls '$jd' >/dev/null 2>&1" \
+            && bad "another user can list the job's directory" \
+            || ok "another user cannot list it"
+    fi
+    sleep 8
+    n=$(ON 2 'find /tmp -mindepth 2 -maxdepth 3 -path "/tmp/prted.*" -user 65534 2>/dev/null | wc -l' | tr -d ' \r')
+    [ "$n" = 0 ] \
+        && ok "the job's directories are removed when it ends" \
+        || bad "$n of the job's directories were left behind"
+
+    banner "run-as: root's own job still runs as root"
+    out=$(RUN "cd /tmp && timeout 60 prun --dvm-uri '$uri' -n 2 --map-by node sh -c 'echo RUNAS \$(id -u)'" 2>&1)
+    n=$(echo "$out" | grep -c '^RUNAS 0$')
+    [ "$n" = 2 ] && ok "root's job runs as root" \
+                 || bad "root's job did not run as root: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
+    banner "run-as: another user may not have the DVM read a hostfile for it"
+    ON 1 'printf "node1 slots=2\nnode2 slots=2\n" > /tmp/runas-hosts && chmod 644 /tmp/runas-hosts'
+    out=$(RUN "cd /tmp && timeout 60 $rq --hostfile /tmp/runas-hosts -n 2 hostname" 2>&1)
+    if echo "$out" | grep -q "Asked for: *a hostfile" &&
+       echo "$out" | grep -q "PMIX_ERR_NO_PERMISSIONS"; then
+        ok "another user's hostfile is refused, saying why"
+    else
+        bad "another user's hostfile was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    out=$(RUN "cd /tmp && timeout 60 prun --dvm-uri '$uri' --hostfile /tmp/runas-hosts -n 2 hostname" 2>&1)
+    [ "$(echo "$out" | grep -c '^node')" = 2 ] \
+        && ok "root's hostfile is used as before" \
+        || bad "root's hostfile was not used: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
+
+    banner "run-as: a DVM not running as root refuses another user's job"
+    ON 1 'mkdir -p /tmp/runas-dvm && chown 65533:65533 /tmp/runas-dvm'
+    ownuri=/tmp/runas-dvm/dvm.uri
+    EXEC_SH_BG 1 "cd /tmp/runas-dvm && setpriv --reuid=65533 --regid=65533 --clear-groups env HOME=/tmp/runas-dvm TMPDIR=/tmp/runas-dvm timeout -k 5 120 prte --report-uri $ownuri --prtemca prte_pmix_no_foreign_tools 0 --host node1:2 > /tmp/runas-dvm/prte.out 2>&1"
+    uri=""
+    for _ in $(seq 1 15); do
+        uri=$(ON 1 "head -1 $ownuri 2>/dev/null" | tr -d '\r\n')
+        [ -n "$uri" ] && break
+        sleep 1
+    done
+    if [ -z "$uri" ]; then
+        bad "a DVM of user 65533 did not start"
+    else
+        out=$(RUN "cd /tmp/runas-dvm && timeout 60 setpriv --reuid=65533 --regid=65533 --clear-groups env HOME=/tmp/runas-dvm prun --dvm-uri '$uri' -n 1 sh -c 'echo RUNAS \$(id -u)'" 2>&1)
+        echo "$out" | grep -q '^RUNAS 65533$' \
+            && ok "the DVM's own user's job runs" \
+            || bad "the DVM's own user's job did not run: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+        # a tool trusts another user's server only when told to
+        out=$(RUN "cd /tmp && timeout 60 setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp PMIX_MCA_ptl_base_server_access=users=65533 prun --dvm-uri '$uri' -n 1 sh -c 'echo RUNAS \$(id -u)'" 2>&1)
+        if echo "$out" | grep -q '^RUNAS'; then
+            bad "a DVM of user 65533 ran another user's job"
+        elif echo "$out" | grep -q "cannot run" && echo "$out" | grep -q "PMIX_ERR_NO_PERMISSIONS"; then
+            ok "another user's job is refused, saying why"
+        else
+            bad "another user's job failed oddly: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+    fi
+    ON 1 'pkill -u 65533 -x prte; sleep 1; true'
     cleanup_swarm
 }
 
@@ -5074,7 +5278,7 @@ test_hwloc() {
     # diagnostic was followed by a segfault in the HNP inside hwloc.
     echo "$out" | grep -qE 'Segmentation fault|Bus error|signal' \
         && bad "the HNP crashed after refusing the cpu-set: $(echo "$out" | tr '\n' ' ' | tail -c 300)" \
-        || ok "the refusal did not take the HNP down"
+        || ok "the HNP did not fault after the refusal"
     # an id past the end of the topology is the same class of mistake
     out=$(RUN 'timeout 60 prterun --prtemca hwloc_default_cpu_list 0,99 \
                    --host node2:1 -n 1 hostname' 2>&1)
@@ -5083,7 +5287,7 @@ test_hwloc() {
                    || bad "a cpu-set of 0,99 was accepted on an 8-core node"
     echo "$out" | grep -qE 'Segmentation fault|Bus error|signal' \
         && bad "the HNP crashed on an out-of-range cpu-set: $(echo "$out" | tr '\n' ' ' | tail -c 300)" \
-        || ok "an out-of-range cpu-set did not take the HNP down"
+        || ok "the HNP did not fault on an out-of-range cpu-set"
     cleanup_swarm
 
     banner "hwloc: every node's topology can be printed"
@@ -7087,6 +7291,20 @@ test_errmgr() {
             out=$(PRUN '--host node2:1,node3:1 -n 2 --map-by node hostname' 2>&1); rc=$?
             [ "$rc" = 0 ] && ok "...and still runs a job on the survivors" \
                           || bad "the reduced DVM could not run a job: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
+            # The cases above name the survivors.  These do not: the lost
+            # node has to be out of the allocation a client sizes its work
+            # by, and out of what the mapper will place on.
+            out=$(PRUN "--host node1:1 -n 1 $SI alloc" 2>&1)
+            n=$(echo "$out" | grep -cE '^ALLOC node1 node[123]$')
+            if [ "$n" = 3 ] && ! echo "$out" | grep -q '^ALLOC node1 node4$'; then
+                ok "...and the allocation query no longer lists node4"
+            else
+                bad "the allocation query after losing node4: $(echo "$out" | grep -E '^(ALLOC|ERROR)' | tr '\n' ' ')"
+            fi
+            out=$(PRUN '--map-by ppr:1:node hostname' 2>&1)
+            [ "$(echo "$out" | grep -E '^node[0-9]+$' | sort | paste -sd, -)" = "node1,node2,node3" ] \
+                && ok "...and a job with no --host is mapped on the survivors only" \
+                || bad "one proc per node after losing node4 ran on: $(echo "$out" | tr '\n' ' ' | tail -c 200)"
         fi
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     else
@@ -10362,7 +10580,7 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     # (state_dvm's release path removes the job from session->jobs and hands
     # the session to prte_pmix_server_session_job_terminated). With the
     # job-side pointer borrowed rather than counted, that read is of freed
-    # memory and it takes the HNP with it.
+    # memory and the HNP faults.
     #
     # Gated on PMIX_CAP_TOOL_FINALIZED for the same reason the departing-tool
     # case above is: without it the host is never told the tool went, the
@@ -11101,6 +11319,10 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
 
     phase test_requesters
 
+    phase test_run_as
+
+    phase test_grow_authz
+
     phase test_tools
 
     phase test_util
@@ -11433,13 +11655,13 @@ test_macos() {
     fi
     rm -f "$BOUT"; macpk
 
-    banner "macOS: a rejected spawn request must not take the DVM down"
+    banner "macOS: the DVM keeps running after a rejected spawn request"
     # The HNP unpacks a job object from a spawn request before validating
     # anything about it, so a request it then rejects exercises the error path
     # that answers the requester and disposes of that half-built job. The DVM
-    # has to survive it: a persistent DVM that dies on one bad prun takes
-    # every other job on the machine with it. Single host is enough - the
-    # request is rejected at the HNP, before any daemon is involved.
+    # has to keep running and launching jobs afterwards. Single host is
+    # enough - the request is rejected at the HNP, before any daemon is
+    # involved.
     macpk; sleep 1
     bounded 60 "$B/prte" --daemonize; sleep 3
     if mypgrep prte; then

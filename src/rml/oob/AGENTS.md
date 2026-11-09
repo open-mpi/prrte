@@ -51,12 +51,13 @@ peer is connected the message is queued for immediate send
 (`MCA_OOB_TCP_QUEUE_PENDING`) and the connection state machine in
 `oob_tcp_connection.c` is started. Once the socket is up and the IDENT
 handshake has completed, the send handler in `oob_tcp_sendrecv.c` writes the
-header then the payload.
+header, the payload and - on a connection that tags its messages - the tag.
 
 ## The recv path in one paragraph
 
-When a peer's socket has delivered a complete message, the recv handler in
-`oob_tcp_sendrecv.c` inspects `hdr.dst`. If it is us, it calls
+When a peer's socket has delivered a complete message - and, on a connection
+that tags its messages, the tag behind it, which has checked out - the recv
+handler in `oob_tcp_sendrecv.c` inspects `hdr.dst`. If it is us, it calls
 `PRTE_RML_POST_MESSAGE` to hand the message up to the RML matching layer. If it
 is not us, this daemon is an intermediate hop: the handler rebuilds a
 `prte_rml_send_t` with the same `origin`/`dst` and re-enters `PRTE_OOB_SEND`, so
@@ -140,11 +141,46 @@ The exchange, ahead of the IDENT exchange it leaves untouched
 
 Rules that are easy to break:
 
-- **A proof covers both nonces, both ranks, the namespace and a role byte**
-  (`prte_oob_tcp_auth_mac()`). Drop the role byte and a listener's proof can be
-  sent back to it as a dialer's; drop the ranks and a daemon's own proof,
-  carried between two of its connections, could pass for another's.
-  If what goes into a proof changes, change `PRTE_OOB_TCP_AUTH_LABEL` too.
+- **A proof covers both nonces, both ranks, the namespace, a role byte and
+  a mode byte** (`prte_oob_tcp_auth_mac()`). Drop the role byte and a
+  listener's proof can be sent back to it as a dialer's; drop the ranks and a
+  daemon's own proof, carried between two of its connections, could pass for
+  another's. The mode byte is `prte_oob_authenticate_messages` (`'T'` or
+  `'U'`): the two settings put different bytes on the wire after the
+  handshake, so two daemons that disagree must fail the handshake rather than
+  misread each other's stream. If what goes into a proof changes, change
+  `PRTE_OOB_TCP_AUTH_LABEL` too.
+- **A successful handshake leaves the keys its messages are tagged under**
+  when `prte_oob_authenticate_messages` is on (`peer->msgauth`). The
+  connection key is an HMAC under the DVM key of the same endpoints a proof
+  covers, under its own label (`PRTE_OOB_TCP_MSG_LABEL`); each direction's
+  key is an HMAC of it with `"D"` or `"L"`, so a message cannot be reflected
+  back to the end that tagged it (`prte_oob_tcp_msg_keys()`). They are
+  installed at the end of `prte_oob_tcp_peer_recv_connect_ack`, after
+  `retry()` has settled which socket survives and before anything publishes
+  `CONNECTED` - so no worker ever sees a connection without them - and
+  cleared when a new socket is made for the peer. Both sequence numbers start
+  at 0 on every connection.
+- **A message is tagged on its first write, on the thread servicing the
+  socket** (`send_msg()`), and never again on that connection. That thread
+  alone sends, one message at a time in queue order, so the sequence number
+  taken there is the message's place on the wire; tagged when queued, from
+  whichever thread queued it, the numbers could go out of order. `msg->sent`
+  is one offset into header, payload and tag together, so a write may stop
+  anywhere and the next carries on from there; a write that took nothing
+  must not take a second number, which is what `msg->tagged` is for.
+- **Nothing in a message is acted on until its tag has checked out**
+  (`recv_tag_ok()`): not the epoch check, not delivery, not the relay. The
+  tag is over the fixed header **as it came off the wire** - the recv object
+  keeps a copy (`wirehdr`) before `MCA_OOB_TCP_HDR_NTOH` converts it - then
+  the payload, under the receive key and the next expected number, which
+  advances only on a match. So a message repeated, out of order, left out, or
+  tagged in our own direction fails, as well as one that was changed. A
+  failure is not skipped: the stream can no longer be relied on, so the
+  connection is closed (`msg-auth-failed`, `FAILED`, `peer_close`). The
+  header's own bounds - `nslen` zero, `nbytes` under `prte_max_msg_size` -
+  are still checked before the payload is read, because they decide what is
+  allocated and read; the tag can only be checked once all of it is in.
 - **The dialer gives its proof only after checking the listener's.** Whatever
   answers at a dead daemon's address learns nothing.
 - **The proven rank is the identity.** The IDENT must name the rank the HELLO
@@ -169,20 +205,53 @@ Rules that are easy to break:
   stdin; the HNP passes it to its daemons explicitly
   (`prte_plm_base_prted_append_basic_args`).
 
-This authenticates endpoints; it does not encrypt or sign the stream after
-it, and every daemon of the DVM holds the key.
+This authenticates endpoints and, with `prte_oob_authenticate_messages` on,
+every message after the handshake (the bullets above on `msgauth`, tagging
+and checking). Nothing is encrypted, and every daemon of the DVM holds the
+key. Every daemon must also share the tagging setting - the mode byte makes
+two that differ fail the handshake - which `prte_plm_base_prted_append_basic_args`
+passes on to daemons the HNP launches and a bootstrapped DVM has to put in
+an MCA parameter file every node reads (`docs/configuration.rst`).
 
-## An inbound connection may hold a descriptor only so long, and only so many may
+## A connection may hold a descriptor only so long, and only so many inbound ones may
 
 Every inbound connection that has not finished its handshake holds a
-descriptor for something that may never complete it. So
-`prte_oob_accept_connection()` counts it (`pending_admit()`: overall against
-`prte_oob_max_pending`, default half the fd limit, and per source address
-against `prte_oob_max_pending_per_host`, default 64), refuses it when either
-is full, and arms a deadline (`prte_oob_handshake_timeout`, default 30 s,
-`handshake_expired()`). The conn op's destructor undoes both - it is the one
-place every ending passes through - so a new exit path needs no bookkeeping
-of its own.
+descriptor for something that may never complete it. So it is counted
+overall against `prte_oob_max_pending` (default half the fd limit) and per
+source host against `prte_oob_max_pending_per_host` (default 64), refused
+when either is full, and given a deadline (`prte_oob_handshake_timeout`,
+default 30 s, `handshake_expired()`). The conn op's destructor gives back
+both counts and the deadline - it is the one place every ending passes
+through - so a new exit path needs no bookkeeping of its own.
+
+Two things about the counting are easy to undo by "simplifying":
+
+- **The overall count starts at `accept()`, in the listen thread.**
+  `prte_oob_tcp_pending_reserve()` takes the place before the descriptor is
+  queued for the main thread, and `prte_oob_accept_reserved(..., true)` does
+  not take it again. Counted only once the main thread took the connection
+  up, as it used to be, descriptors piled up in that queue without limit
+  while the main thread was busy. So `num_pending` is a `prte_atomic_int_t`:
+  the listen thread adds, the main thread gives back. The event-driven
+  listener, which accepts on the main thread, reserves inside
+  `pending_admit()` instead.
+- **An IPv6 host is a prefix, not an address.** `same_host()` compares the
+  leading `prte_oob_pending_ipv6_prefix` bits (default 64) - a host may use
+  any address in its /64, so counting by full address gave one host the
+  whole overall limit. A v4-mapped address is compared whole.
+
+A connection **we** open has the same deadline (`peer->hs_deadline`, armed by
+`prte_oob_tcp_peer_arm_deadline()` where the HELLO goes out and the peer enters
+`CONNECT_ACK`). Whatever accepted the dial - at the port of a daemon that has
+gone or not yet started, which a static bootstrap port makes easy to sit on -
+may never answer, and the read event fires only on bytes or a close, so
+nothing else ends that wait. On expiry the attempt is a failed address:
+`peer_close` moves on to the next one with the queue intact, and reports the
+peer when none is left, which in a bootstrapped DVM is what lets the tree heal
+round a parent that is not there. It is disarmed at `CONNECTED`, when a new
+socket is made, when `retry()` abandons our attempt for the peer's, and in
+`peer_close`'s still-connecting branch; all of those run on `prte_event_base`,
+where the timer lives.
 
 And when `accept()` still fails for want of descriptors or memory
 (`accept_error_is_exhaustion()`: `EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`), the
@@ -443,7 +512,9 @@ main thread reconnecting it:
 lock, then the deletes (which wait out a handler in flight). It also throws
 away the old stream's half-read message and restarts its half-sent one from
 the header - the far end discarded both with its end of that connection, and
-carried across they would splice two streams together.
+carried across they would splice two streams together. The restarted one
+is tagged again (`sent` and `tagged` cleared): the new connection has new
+keys and its sequence starts at 0, so the old tag would fail there.
 
 With an empty pool, `peer->evbase` **is** `prte_event_base`:
 `PRTE_OOB_COMPLETE_SEND` completes inline instead of posting, the rebind is a
@@ -454,7 +525,11 @@ after it is gone, still gets a usable base.
 
 The one piece of state outside this directory that a worker touches directly is
 the RML's incarnation table (`prte_rml_epoch_ok`, bootstrap only), which
-reallocates; it carries its own mutex in `src/rml/rml.c`. Anything else you make
+reallocates; it carries its own mutex in `src/rml/rml.c`. The rank it is
+indexed by is the header's `origin`, so the table grows no further than
+`PRTE_RML_EPOCH_MAX_RANKS` (a rank past it is accepted untracked, as on a
+failed realloc), and a stamped message whose origin is a sentinel rank is
+refused. Anything else you make
 a socket handler call has to be safe off the main thread or has to be shifted.
 
 ## Interface selection and the listeners
@@ -597,7 +672,14 @@ challenge gets the proof and the IDENT, a listener without the key gets
 nothing), the
 pending-handshake bounds and deadline (`test_pending_handshakes_bounded`, over
 real loopback TCP), the dial guard (`test_stale_attempt_does_not_dial`),
-and the
+the outbound deadline (`test_outbound_handshake_deadline`), message tagging
+(`test_msg_key_derivation`; `test_msg_keys_installed`: each end's keys, and a
+handshake refused when the two ends' settings differ;
+`test_send_tags_messages`: tags in sequence, an empty message, a write
+resumed from every boundary, a message over many writes;
+`test_adopted_connection_retags`; `test_recv_checks_tags`: a tag read in
+pieces, and a changed byte, a repeat, a gap and a reflected message each
+closing the connection), and the
 queued-send drain above (`test_queued_sends_complete_on_close`), driven through
 `prte_oob_tcp_peer_close()` because that is the one give-up path reachable
 without sockets; the arms in `prte_oob_tcp_peer_try_connect()` share the same
