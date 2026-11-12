@@ -1283,6 +1283,28 @@ Two things follow from that record, and they are the rest of the definition:
   The assemblage is marked `terminating` as it goes, so the failures its own
   teardown produces do not drive it again.
 
+  **A recoverable or continuous member is spared.** PMIx terminates an
+  assemblage as one application only "in the absence of any application
+  directives", and `PRTE_JOB_RECOVERABLE`/`PRTE_JOB_CONTINUOUS` are such
+  directives: the job said it survives the loss of a process. The sweep does
+  not kill it, does not condemn anything through it, and leaves its
+  assemblage unmarked so it still hears the departures. Each job the sweep
+  does condemn has its departures held (`connection_teardown()`), so a spared
+  member hears of it once, as `<nspace>:WILDCARD`, when it ends.
+
+  **A spawned job takes its parent's error handling** (`inherit_error_handling()`
+  in `pmix_server_dyn.c`): recoverable, continuous and notify-errors, ahead of
+  the site defaults - as one choice, so a spawn that sets any of the three
+  gets none of the parent's (mixing them made notify-errors without
+  recoverable, which `prte_state_base_set_runtime_options()` refuses). Without it, a parent
+  started with `--with-ft ulfm` spawned a child that was not recoverable; the
+  child's first failure terminated the child job, and through the sweep above,
+  the parent. "Has a parent" is `prte_pmix_server_spawn_parent()`, the same
+  screen `connection_spawned()` uses. The site defaults are therefore filled in
+  (`set_default_rto`) *after* the spawn's job info is read and its parent
+  settled, not before - an explicit spawn directive wins, then the parent, then
+  the default.
+
   **That termination is transitive, and has to be.** Killing a job because a
   job it was connected to failed is itself the loss of that job, so whatever
   *it* was connected to has lost a member too. The case is ordinary rather

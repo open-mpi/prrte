@@ -876,10 +876,45 @@ void prte_pmix_server_connection_job_ended(prte_job_t *jdata)
  *
  * PMIX_SPAWN_CHILD_SEP is honored as the opt-out: a spawn that asked for the
  * child to be independent of its parent has said in as many words that the
- * two jobs' fates are not to be linked. */
-void prte_pmix_server_connection_spawned(prte_job_t *jdata)
+ * two jobs' fates are not to be linked.
+ *
+ * The spawn path asks the same question, before the job has a launch proxy
+ * recorded, to decide whose error-handling settings the new job takes - so
+ * the screening lives in prte_pmix_server_spawn_parent(), and the proxy is
+ * passed in. */
+prte_job_t *prte_pmix_server_spawn_parent(prte_job_t *jdata, const pmix_proc_t *proxy)
 {
     prte_job_t *parent;
+
+    if (NULL == jdata || NULL == proxy) {
+        return NULL;
+    }
+    if (PMIX_NSPACE_INVALID(proxy->nspace) || PMIX_RANK_INVALID == proxy->rank ||
+        same_nspace(proxy->nspace, PRTE_PROC_MY_NAME->nspace)) {
+        /* no requestor, or one of our own daemons - either way there is no
+         * parent process */
+        return NULL;
+    }
+    parent = prte_get_job_data_object(proxy->nspace);
+    if (NULL == parent || PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL)) {
+        return NULL;
+    }
+    /* nor is there one when a tool asked for the job for itself, whatever
+     * name it holds - see PRTE_JOB_NO_PARENT_PROC */
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_NO_PARENT_PROC)) {
+        return NULL;
+    }
+    /* PMIX_SPAWN_CHILD_SEP opts the child out of being connected to its
+     * parent.  Only an explicit TRUE does so: not having said is not an
+     * opt-out, and the PMIx default is that a spawn connects the two. */
+    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_CHILD_SEP)) {
+        return NULL;
+    }
+    return parent;
+}
+
+void prte_pmix_server_connection_spawned(prte_job_t *jdata)
+{
     pmix_proc_t *proxy = NULL, members[2];
 
     if (!registry_live() || NULL == jdata) {
@@ -889,25 +924,7 @@ void prte_pmix_server_connection_spawned(prte_job_t *jdata)
                             (void **) &proxy, PMIX_PROC) || NULL == proxy) {
         return;
     }
-    if (PMIX_NSPACE_INVALID(proxy->nspace) || PMIX_RANK_INVALID == proxy->rank ||
-        same_nspace(proxy->nspace, PRTE_PROC_MY_NAME->nspace)) {
-        /* no requestor, or one of our own daemons - either way there is no
-         * parent process to connect to */
-        goto done;
-    }
-    parent = prte_get_job_data_object(proxy->nspace);
-    if (NULL == parent || PRTE_FLAG_TEST(parent, PRTE_JOB_FLAG_TOOL)) {
-        goto done;
-    }
-    /* nor is there one when a tool asked for the job for itself, whatever
-     * name it holds - see PRTE_JOB_NO_PARENT_PROC */
-    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_NO_PARENT_PROC)) {
-        goto done;
-    }
-    /* PMIX_SPAWN_CHILD_SEP opts the child out of being connected to its
-     * parent.  Only an explicit TRUE does so: not having said is not an
-     * opt-out, and the PMIx default is that a spawn connects the two. */
-    if (PRTE_ATTR_IS_TRUE(&jdata->attributes, PRTE_JOB_CHILD_SEP)) {
+    if (NULL == prte_pmix_server_spawn_parent(jdata, proxy)) {
         goto done;
     }
 
@@ -995,7 +1012,7 @@ void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace)
     char **condemned = NULL;
     const char *cause;
     size_t n;
-    bool swept;
+    bool swept, spared;
     int i;
 
     if (!registry_live() ||
@@ -1042,9 +1059,17 @@ void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace)
      *
      * So sweep to a fixed point.  Each pass condemns the assemblages naming a
      * job that is already coming down, and the pass after it sees the jobs
-     * that pass just condemned.  It terminates because an assemblage is
-     * marked `terminating` as it is swept and is never revisited, so every
-     * pass either marks at least one more or is the last one. */
+     * that pass just condemned.  It terminates because a pass that condemns
+     * no job is the last one, and there are only so many jobs.
+     *
+     * A member that is recoverable or continuous is not killed.  The PMIx
+     * definition terminates an assemblage as one application only where the
+     * application has given no directive of its own, and those are exactly
+     * such directives: the job said it survives the loss of a process, and
+     * losing a connected job is no different.  It is told instead - of the
+     * culprit, of each job the sweep condemns in its assemblage, and of that
+     * job's end - and since it is not coming down, nothing is condemned
+     * through it. */
     do {
         swept = false;
         PMIX_LIST_FOREACH(cptr, &prte_pmix_server_globals.connections,
@@ -1067,13 +1092,7 @@ void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace)
                 continue;
             }
 
-            /* the rest of this assemblage is coming down with it, and each of
-             * those jobs will report its own procs failing as it goes - none of
-             * which should drive this again, or be announced to an assemblage
-             * that is being told here why it is going (departure_targets()) */
-            cptr->terminating = true;
-            swept = true;
-
+            spared = false;
             for (n = 0; n < cptr->ncollapsed; n++) {
                 /* a namespace can appear more than once in a membership - one
                  * entry per rank - and it is to be killed once.  The condemned
@@ -1093,7 +1112,18 @@ void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace)
                      * no longer there to take down peers that survived it. */
                     continue;
                 }
+                if (PRTE_ATTR_IS_TRUE(&jptr->attributes, PRTE_JOB_RECOVERABLE) ||
+                    PRTE_ATTR_IS_TRUE(&jptr->attributes, PRTE_JOB_CONTINUOUS)) {
+                    /* it asked to survive a loss - see above */
+                    spared = true;
+                    continue;
+                }
                 PMIx_Argv_append_nosize(&condemned, cptr->collapsed[n].nspace);
+                swept = true;
+                /* its departures are known to be coming, all of them: hold
+                 * them for its end, so a member that is spared hears of it
+                 * once, as a job */
+                prte_pmix_server_connection_teardown(jptr->nspace);
 
                 /* the user is about to lose a job they did not ask about, so say
                  * why - "connected" is not a property they can see in ps */
@@ -1117,17 +1147,28 @@ void prte_pmix_server_connection_job_failed(const pmix_nspace_t nspace)
                 }
                 PMIX_DESTRUCT(&procs);
             }
+
+            /* Unless a member is staying, the rest of this assemblage is
+             * coming down with it, and each of those jobs will report its own
+             * procs failing as it goes - none of which should be announced to
+             * an assemblage that is being told here why it is going
+             * (departure_targets()).  One with a member that stays is left
+             * open, so that member hears of the jobs that went. */
+            if (!spared) {
+                cptr->terminating = true;
+            }
         }
     } while (swept);
 
-    /* Only now does anybody hear why.  Every process told is one this sweep
-     * is killing, and the news travels down the same daemon tree as its
+    /* Only now does anybody hear why.  Nearly every process told is one this
+     * sweep is killing, and the news travels down the same daemon tree as its
      * kill, so sent first it could arrive first - and a process that learns
      * its peer failed can act on it, run to the end of its own work, and be
      * reported as having finished when the host was to bring it down.
      * Behind the kills, it reaches nobody who has not already been given
-     * their orders.  (Nothing here removes an assemblage, so told[] still
-     * points into the list.) */
+     * their orders, except the members spared above, which are meant to
+     * carry on.  (Nothing here removes an assemblage, so told[] still points
+     * into the list.) */
     announce_culprit(&culprit);
     for (i = 0; NULL != condemned[i] && NULL != condemned[i + 1]; i++) {
         cptr = (prte_pmix_server_connection_t *) pmix_pointer_array_get_item(&told, i);
