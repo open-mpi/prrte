@@ -137,21 +137,29 @@ class Obj:
 def _count_gpus(root):
     """How many compute GPUs this topology holds.
 
-    Mirrors the two rules pmix_hwloc_get_devices() applies, because the
+    Mirrors the rules pmix_hwloc_get_devices() applies, because the
     interesting number here is the one the runtime will arrive at: the unit
     is the PCI *function* (a GPU commonly exposes a card node, a render node
     and a vendor compute node, and they are one device), and a display-class
     function counts only if it carries a vendor backend or a DRM render node
     -- which is what separates a real GPU from a management controller's VGA
-    adapter.
+    adapter -- except a 3D controller (class 0302), which is never a
+    management controller's display and counts with no OS device at all.
     """
     backends = ("cuda", "nvml", "rsmi", "levelzero", "opencl")
     ngpu = 0
     for pci in root.iter("object"):
         if pci.get("type") != "PCIDev":
             continue
+        # A 3D controller (class 0302) is a GPU whether or not hwloc gave it
+        # an OS device: an hwloc without the vendor backend, on a node with
+        # no render nodes, records the function and nothing under it.
+        cls_id = (pci.get("pci_type") or "").split()
+        cls = cls_id[0].lower() if cls_id else ""
+        is_display = cls.startswith("03")
+        is_3d = (cls == "0302")
         osdevs = [c for c in pci if c.tag == "object" and c.get("type") == "OSDev"]
-        if not osdevs:
+        if not osdevs and not is_3d:
             continue
         compute = False
         render = False
@@ -164,9 +172,7 @@ def _count_gpus(root):
                     compute = True
             if (od.get("name") or "").lower().startswith("renderd"):
                 render = True
-        cls_id = (pci.get("pci_type") or "").split()
-        is_display = bool(cls_id) and cls_id[0].startswith("03")
-        if compute or (render and is_display):
+        if compute or (render and is_display) or is_3d:
             ngpu += 1
     return ngpu
 
@@ -189,8 +195,15 @@ def _gpus_nameable(root):
     for pci in root.iter("object"):
         if pci.get("type") != "PCIDev":
             continue
+        # A 3D controller (class 0302) is a GPU whether or not hwloc gave it
+        # an OS device: an hwloc without the vendor backend, on a node with
+        # no render nodes, records the function and nothing under it.
+        cls_id = (pci.get("pci_type") or "").split()
+        cls = cls_id[0].lower() if cls_id else ""
+        is_display = cls.startswith("03")
+        is_3d = (cls == "0302")
         osdevs = [c for c in pci if c.tag == "object" and c.get("type") == "OSDev"]
-        if not osdevs:
+        if not osdevs and not is_3d:
             continue
         compute = False
         render = False
@@ -206,9 +219,7 @@ def _gpus_nameable(root):
                     named = True
             if (od.get("name") or "").lower().startswith("renderd"):
                 render = True
-        cls_id = (pci.get("pci_type") or "").split()
-        is_display = bool(cls_id) and cls_id[0].startswith("03")
-        if (compute or (render and is_display)) and not named:
+        if (compute or (render and is_display) or is_3d) and not named:
             return False
     return True
 
@@ -911,8 +922,13 @@ def device_cases(topo):
     """
     if getattr(topo, "ngpus", 0) < 2:
         return
-    hostspec, pool = LAYOUTS["single"]
     n = topo.ngpus
+    # Room for the largest case below, two procs per GPU, so that a case
+    # meant to map is never refused for want of slots.  "single" has 8,
+    # which is exactly that on a four-GPU node and too few on an eight-GPU
+    # one; gpu-toomany is still refused, for want of devices.
+    nslots = max(8, 2 * n)
+    hostspec, pool = "node0:%d" % nslots, [("node0", nslots)]
     if not getattr(topo, "gpus_nameable", True):
         yield Case("device.%s.gpu-unnameable" % topo.name, "device", topo,
                    "single", hostspec, pool, map_by="device=gpu",
@@ -950,6 +966,16 @@ def device_cases(topo):
         yield Case("device.%s.named" % topo.name, "device", topo, "single",
                    hostspec, pool, map_by="device=mlx5_0", rank_by="slot",
                    bind_to="core", n=n, expect="map")
+
+    # each GPU with the NIC under its own root complex; the map shows both
+    yield Case("device.%s.gpu-nic" % topo.name, "device", topo, "single",
+               hostspec, pool, map_by="device=gpu:nic", rank_by="slot",
+               bind_to="core", n=n, expect="map")
+    # nic adds NICs to GPUs: on a map by NICs there is nothing to add to
+    yield Case("device.%s.nic-nic" % topo.name, "device", topo, "single",
+               hostspec, pool, map_by="device=nic:nic", rank_by="slot",
+               bind_to="core", n=2, expect="reject",
+               expect_banner="not being mapped against")
 
     # the reverse ratio: N procs on each device
     yield Case("device.%s.ppr2" % topo.name, "device", topo, "single",
@@ -994,6 +1020,35 @@ def device_cases(topo):
                    "single", hostspec, pool,
                    map_by="device=gpu:interleave", rank_by="slot",
                    bind_to="core", n=n // 2, expect="map")
+
+
+def nic_cases(topo):
+    """--map-by device=nic with several NICs per proc, whose groups must stay
+    under one PCI root complex where the counts allow.
+
+    Emitted only for a topology carrying the shape that tells the two rules
+    apart: the turin machines have one NIC per host bridge except for the two
+    ports of one card (mlx5_1, mlx5_2), which share one.  Cut into pairs in
+    bus order every group spanned two complexes and that card was split
+    across two processes; grouped by complex, it is the first pair.  No GPU
+    identity is involved, so both turin topologies get these.
+
+    The package binding is the case the grouping changes from a map to a
+    refusal, deliberately: a group under one complex is local to less of
+    the machine than a group spanning two, and a binding coarser than a
+    group's locality is refused exactly as it is with one NIC per proc.
+    """
+    names = getattr(topo, "osdev_names", ())
+    if "mlx5_1" not in names or "mlx5_2" not in names:
+        return
+    hostspec, pool = LAYOUTS["single"]
+    yield Case("device.%s.nic-ndev2" % topo.name, "device", topo, "single",
+               hostspec, pool, map_by="device=nic:ndev=2", rank_by="slot",
+               bind_to="core", n=3, expect="map")
+    yield Case("device.%s.nic-ndev2-package" % topo.name, "device", topo,
+               "single", hostspec, pool, map_by="device=nic:ndev=2",
+               rank_by="slot", bind_to="package", n=3, expect="reject",
+               expect_banner="coarser than the devices")
 
 
 def perapp_cases(topo):
@@ -1098,6 +1153,7 @@ def generate_cases(topos, layouts, ns, full):
         cases.extend(group_cases(topo))
         cases.extend(hostcap_cases(topo))
         cases.extend(device_cases(topo))
+        cases.extend(nic_cases(topo))
         cases.extend(perapp_cases(topo))
         cases.extend(hwtcpus_cases(topo))
     return cases

@@ -169,15 +169,19 @@ applied at the job level:
 
   A process mapped against a **network** device is handed it the same
   way, in the variables the fabric libraries read: "NCCL_IB_HCA" and
-  "UCX_NET_DEVICES" for a Mellanox or NVIDIA InfiniBand adapter, and
-  "PSM3_NIC" for an Intel Omni-Path adapter. The device is named by the
-  name those libraries accept - "mlx5_0" - which is the name hwloc gave
-  it, so unlike the GPU case there is no identity that can be missing.
-  Nothing is set for an adapter whose fabric has no component behind
-  it, and no variable that takes a device *unit number* is set at all
-  ("HFI_UNIT", "FI_OPX_HFI_SELECT"): a unit number is meaningful only
-  against the enumeration it came from, and a wrong one there does not
-  fail, it quietly puts the process on another adapter.
+  "UCX_NET_DEVICES" for an InfiniBand or RoCE adapter (NVIDIA, Broadcom,
+  or Intel's in RoCE mode), with "FI_VERBS_DEVICE_NAME" as well unless
+  that name would also select another device on the node;
+  "FI_EFA_IFACE" for an EFA device; "FI_CXI_DEVICE_NAME" for a Slingshot
+  NIC; and "PSM3_NIC" for a single Cornelis Omni-Path adapter. The
+  device is named by the name those libraries accept - "mlx5_0" - which
+  is the name hwloc gave it, so unlike the GPU case there is no identity
+  that can be missing. Nothing is set for an adapter whose fabric has no
+  component behind it, or where the variable cannot name the device
+  exactly, and no variable that takes a device *unit number* is set at
+  all ("HFI_UNIT", "FI_OPX_HFI_SELECT"): a unit number is meaningful
+  only against the enumeration it came from, and a wrong one there does
+  not fail, it quietly puts the process on another adapter.
 
   The assignment is also readable directly, whether or not a device
   variable was set, as the "PMIX_DEVICE_ID" key of the process's own
@@ -279,11 +283,59 @@ and is refused. For example:
   one of them - never to a part of the package that is local to
   neither.
 
-  Devices are handed out in groups taken in order from the device
-  list, so a group is a contiguous run of that order and the
-  "INTERLEAVE" qualifier composes with this one. On a node with two
-  GPUs per socket, interleaving across packages and then taking
-  "ndev=2" gives each process one GPU from each socket.
+  Devices are handed out in groups, and a group is kept under one PCI
+  root complex wherever the counts allow. A process driving devices
+  under two root complexes can do much worse than one using fewer
+  devices under a single complex, and GPU peer-to-peer traffic between
+  complexes crosses the CPU interconnect, where it is offered at all.
+  So the devices under each root complex are cut into whole groups
+  first, in PCI bus order, and the devices left over from every complex
+  are pooled and grouped after them; those last groups are the only
+  ones that span complexes, and a job with fewer processes never gets
+  them. The number of groups is the same either way. Where no complex
+  holds enough devices for a whole group, the groups are simply
+  consecutive devices in bus order.
+
+  Keeping a group under one complex usually makes it local to less of
+  the machine, so a binding a spanning group admitted can be refused
+  for it: on a node whose dual-port NIC is the only pair under one
+  complex, "--mapby device=nic:ndev=2 --bindto package" is refused for
+  that pair, exactly as "--mapby device=nic --bindto package" is for
+  any one of its ports.
+
+  The "INTERLEAVE" qualifier turns the root-complex grouping off: with
+  it, groups are taken as consecutive runs of the interleaved order,
+  which is what asking for both means. On a node with two GPUs per
+  socket, interleaving across packages and then taking "ndev=2" gives
+  each process one GPU from each socket.
+
+* "NIC[=<n>]" only applies to the "DEVICE" directive, and only when
+  the devices are GPUs. In addition to its GPUs, each process is
+  assigned up to *n* NICs (one when *n* is not given) from the PCI root
+  complexes of those GPUs. A process told which GPU it has is otherwise
+  left to guess which NIC goes with it, and every communication library
+  guesses differently; PRRTE placed the GPU, so it can say. For example:
+
+     --mapby device=gpu:nic           each GPU with the NIC beside it
+     --mapby device=gpu:ndev=2:nic=2  two GPUs and their two NICs
+
+  Among the NICs under a GPU's root complex, one carrying an
+  OpenFabrics (RDMA) device is preferred to plain Ethernet, then one
+  behind the same PCIe switch as the GPU, then one with the faster PCIe
+  link (which keeps a management port beside the GPU from being chosen
+  over the fabric NIC next to it), then one fewer processes have been
+  given, so that GPUs sharing a complex get different NICs while
+  there are enough of them. Processes sharing a GPU ("SHARED") share
+  its NICs. A GPU whose root complex has no NIC is still assigned, and
+  its process gets no NIC rather than one from elsewhere, since naming
+  a distant NIC to the libraries would override their own choice; the
+  job is told so, once. Placement and binding are decided by the GPUs
+  alone.
+
+  The NICs are reported with the GPUs, in the "PMIX_DEVICE_ID" key of
+  the process's job data, and are named to the libraries that will use
+  them through the same variables a "--mapby device=nic" assignment
+  sets.
 
 * "ORDERED" only applies to the "PE-LIST" option to indicate that
   procs are to be bound to each of the specified CPUs in the order in

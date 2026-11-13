@@ -3124,6 +3124,41 @@ test_runtime() {
                 && ok "...and it took only that job's data, not the whole store" \
                 || bad "the purge removed data belonging to a job that is still alive: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
         fi
+
+        banner "runtime/data_server: the server's URI file is read only when it is sound"
+        # The file pmix_server_uri names says which server every publish
+        # and lookup goes to, so the master reads it only if it is the file
+        # at that name (not a symbolic link), has one name, cannot be
+        # written by its group or others, and is owned by root or the
+        # DVM's own user.  A DVM is pointed at each variant of the server's
+        # own file in turn; a failed attach fails every request after it,
+        # so a publish says which were read.  The 0644 copy is the control.
+        RUN 'rm -f /tmp/ds-copy.uri /tmp/ds-link.uri /tmp/ds-gw.uri /tmp/ds-hl.uri /tmp/ds-hl2.uri &&
+             cp /tmp/ds-server.uri /tmp/ds-copy.uri && chmod 0644 /tmp/ds-copy.uri &&
+             ln -s /tmp/ds-copy.uri /tmp/ds-link.uri &&
+             cp /tmp/ds-server.uri /tmp/ds-gw.uri && chmod 0664 /tmp/ds-gw.uri &&
+             cp /tmp/ds-server.uri /tmp/ds-hl.uri && chmod 0644 /tmp/ds-hl.uri &&
+             ln /tmp/ds-hl.uri /tmp/ds-hl2.uri' >/dev/null 2>&1
+        for v in copy:read link:refused gw:refused hl:refused; do
+            f=${v%%:*}; want=${v##*:}
+            if ! dvm_start_uri /tmp/ds-c.uri 'node8:2' "--prtemca pmix_server_uri file:/tmp/ds-$f.uri"; then
+                bad "could not start a DVM pointed at the $f file"
+                continue
+            fi
+            out=$(PRUN_URI /tmp/ds-c.uri "--host node8:1 -n 1 $DS publish prte.test.sound.$f v session 2" 2>&1)
+            if echo "$out" | grep -q "^PUBLISHED prte.test.sound.$f"; then
+                [ "$want" = read ] \
+                    && ok "a sound URI file ($f) is read" \
+                    || bad "a URI file that is not sound ($f) was read"
+            else
+                [ "$want" = refused ] \
+                    && ok "a URI file that is not sound ($f) is refused" \
+                    || bad "a sound URI file ($f) was not read: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            fi
+            RUN "timeout -k 5 30 pterm --dvm-uri file:/tmp/ds-c.uri" >/dev/null 2>&1
+        done
+        RUN 'rm -f /tmp/ds-copy.uri /tmp/ds-link.uri /tmp/ds-gw.uri /tmp/ds-hl.uri /tmp/ds-hl2.uri' >/dev/null 2>&1
+
         for u in /tmp/ds-b.uri /tmp/ds-a.uri /tmp/ds-server.uri; do
             RUN "timeout -k 5 30 pterm --dvm-uri file:$u" >/dev/null 2>&1
         done
@@ -9654,6 +9689,50 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     [ "$c" = 0 ] && ok "no daemons linger after the archive preload" || bad "$c stray prted after archive preload"
     for n in 1 2 3; do
         EXEC_SH "$n" 'rm -rf /root/pfarc /root/inner "/root/my run.v2.tar.gz"' >/dev/null 2>&1
+    done
+
+    fi   # FS_SHARED
+    _fl="filem: --preload-files refuses an archive that writes through a link"
+    if [ "$FS_SHARED" != 0 ]; then skp "${_fl}: $WORKDIR is shared, so staging cannot be proved"; else
+    banner "filem: --preload-files refuses an archive that writes through a link"
+    # An archive is unpacked by the system's tar, and whether that tar keeps
+    # every member inside the directory is up to it. So the daemon lists the
+    # archive first and refuses it outright if any member would leave: an
+    # absolute name, a "..", or - built here - a member beneath one that is
+    # not a directory. The archive holds a symbolic link "out" to a
+    # directory that exists on the receiving nodes, then "out/x.txt"; a tar
+    # that follows the link would put x.txt in that directory.
+    EXEC_SH 1 'rm -rf /root/pfsym /root/pfsym.tar && mkdir -p /root/pfsym/a /root/pfsym/b/out \
+        && ln -s /root/pfsym-target /root/pfsym/a/out \
+        && echo THROUGH-THE-LINK > /root/pfsym/b/out/x.txt \
+        && tar cf /root/pfsym.tar -C /root/pfsym/a out \
+        && tar rf /root/pfsym.tar -C /root/pfsym/b out/x.txt' >/dev/null 2>&1
+    for n in 2 3; do
+        EXEC_SH "$n" 'rm -rf /root/pfsym-target /root/pfsym.tar && mkdir -p /root/pfsym-target' >/dev/null 2>&1
+    done
+    if RUN 'tar tf /root/pfsym.tar | grep -qx out/x.txt'; then
+        out=$(RUN 'cd /root && prterun --host node2:1,node3:1 -np 2 --map-by node \
+                     --preload-files /root/pfsym.tar -- hostname' 2>&1); rc=$?
+        [ "$rc" != 0 ] \
+            && ok "an archive with a member beneath a link was refused" \
+            || bad "an archive with a member beneath a link was accepted (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'out/x.txt' \
+            && ok "the refusal named the member" \
+            || bad "the refusal did not name the member: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        through=0
+        for n in 2 3; do
+            EXEC_SH "$n" 'test -e /root/pfsym-target/x.txt' >/dev/null 2>&1 && through=1
+        done
+        [ "$through" = 0 ] \
+            && ok "nothing was written through the link" \
+            || bad "a member was written through the link on a receiving node"
+    else
+        bad "could not build the link archive on node1"
+    fi
+    c=$(prted_settle 10 1 2 3 4 5 6 7 8 9 10)
+    [ "$c" = 0 ] && ok "no daemons linger after the refused archive" || bad "$c stray prted after refused archive"
+    for n in 1 2 3; do
+        EXEC_SH "$n" 'rm -rf /root/pfsym /root/pfsym.tar /root/pfsym-target' >/dev/null 2>&1
     done
 
     fi   # FS_SHARED

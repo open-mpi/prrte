@@ -36,6 +36,7 @@
 
 #include "constants.h"
 #include "src/hwloc/hwloc-internal.h"
+#include "src/hwloc/pmix_hwloc.h"
 #include "src/mca/rmaps/base/base.h"
 #include "src/mca/rmaps/base/rmaps_private.h"
 #include "src/mca/rmaps/rmaps_types.h"
@@ -303,8 +304,9 @@ static void check_named_unnameable_refused(void)
     PMIX_RELEASE(t);
 }
 
-/* The order the devices come out in, as the OS names each group was given,
- * joined with ','.  Caller frees. */
+/* The order the devices come out in, as the OS names each group was given:
+ * groups joined with ',', the members of one group with '+'.  Caller
+ * frees. */
 static char *device_order(prte_node_t *node, prte_rmaps_options_t *opts)
 {
     pmix_data_array_t *darray;
@@ -313,6 +315,7 @@ static char *device_order(prte_node_t *node, prte_rmaps_options_t *opts)
     void *ctx = NULL;
     char *order = NULL, *tmp;
     unsigned n, count;
+    size_t m;
 
     if (PRTE_SUCCESS != prte_rmaps_base_devices_begin(NULL, node, opts, &ctx)) {
         return NULL;
@@ -326,10 +329,13 @@ static char *device_order(prte_node_t *node, prte_rmaps_options_t *opts)
                                   (void **) &darray, PMIX_DATA_ARRAY)
             && NULL != darray && 0 < darray->size) {
             dev = (pmix_device_t *) darray->array;
-            pmix_asprintf(&tmp, "%s%s%s", (NULL == order) ? "" : order,
-                          (NULL == order) ? "" : ",", dev[0].osname);
-            free(order);
-            order = tmp;
+            for (m = 0; m < darray->size; m++) {
+                pmix_asprintf(&tmp, "%s%s%s", (NULL == order) ? "" : order,
+                              (NULL == order) ? "" : ((0 == m) ? "," : "+"),
+                              dev[m].osname);
+                free(order);
+                order = tmp;
+            }
         }
         if (NULL != darray) {
             PMIX_DATA_ARRAY_FREE(darray);
@@ -386,6 +392,444 @@ static void check_interleave_numa(void)
     free(numa);
 
     PMIX_RELEASE(node);
+    PMIX_RELEASE(t);
+}
+
+/* An ndev group stays under one PCI root complex where the counts allow.
+ *
+ * Seven network cards in bus order, each under a host bridge of its own
+ * except mlx5_1 and mlx5_2 - the two ports of one card - which share one.
+ * Cut into pairs from the top of that list, every pair spanned two
+ * complexes and the one pair the machine has was split between two
+ * processes.  The pair now comes first, the cards that have to share a
+ * group with a card from another complex follow in bus order, and mlx5_5
+ * is left over exactly as before: seven cards still make three pairs.
+ *
+ * The GPUs are one per complex, so nothing can be kept together and the
+ * order must be the one it always was.  And interleave asks for groups
+ * that span, so it must not be overridden. */
+static void check_ndev_root_complex(void)
+{
+    prte_rmaps_options_t opts;
+    prte_topology_t *t;
+    prte_node_t *node;
+    char *order;
+
+    t = load_topo(TOPO_FILE);
+    if (NULL == t) {
+        fprintf(stdout, "  SKIP test_devices ndev root complex (no %s)\n", TOPO_FILE);
+        return;
+    }
+    node = build_node("node-eta", t);
+
+    memset(&opts, 0, sizeof(opts));
+    opts.app_idx = -1;
+    opts.map_device = "network";
+    opts.map_ndev = 2;
+    opts.bind = PRTE_BIND_TO_NONE;
+    order = device_order(node, &opts);
+    CHECK("nic pairs keep the shared complex together", NULL != order
+          && 0 == strcmp(order, "mlx5_1+mlx5_2,mlx5_0+mlx5_3,eno6+mlx5_4"));
+    if (NULL != order && 0 != strcmp(order, "mlx5_1+mlx5_2,mlx5_0+mlx5_3,eno6+mlx5_4")) {
+        fprintf(stderr, "  network ndev=2: %s\n", order);
+    }
+    free(order);
+
+    /* one device per proc is not a group, and the order is untouched */
+    opts.map_ndev = 1;
+    order = device_order(node, &opts);
+    CHECK("ndev=1 keeps bus order", NULL != order
+          && 0 == strcmp(order, "mlx5_0,mlx5_3,eno6,mlx5_1,mlx5_2,mlx5_4,mlx5_5"));
+    free(order);
+
+    /* interleave asks for groups that span the level */
+    opts.map_ndev = 2;
+    opts.map_interleave = "numa";
+    order = device_order(node, &opts);
+    CHECK("interleave is not overridden", NULL != order
+          && 0 == strcmp(order, "mlx5_0+mlx5_3,eno6+mlx5_1,mlx5_4+mlx5_5"));
+    if (NULL != order && 0 != strcmp(order, "mlx5_0+mlx5_3,eno6+mlx5_1,mlx5_4+mlx5_5")) {
+        fprintf(stderr, "  network ndev=2 interleave=numa: %s\n", order);
+    }
+    free(order);
+
+    /* the GPUs sit one per complex: nothing to keep together */
+    memset(&opts, 0, sizeof(opts));
+    opts.app_idx = -1;
+    opts.map_device = "gpu";
+    opts.map_ndev = 2;
+    opts.bind = PRTE_BIND_TO_NONE;
+    order = device_order(node, &opts);
+    CHECK("gpu pairs keep bus order", NULL != order
+          && 0 == strcmp(order, "cuda0+cuda1,cuda2+cuda3"));
+    if (NULL != order && 0 != strcmp(order, "cuda0+cuda1,cuda2+cuda3")) {
+        fprintf(stderr, "  gpu ndev=2: %s\n", order);
+    }
+    free(order);
+
+    PMIX_RELEASE(node);
+    PMIX_RELEASE(t);
+}
+
+/* Load a shared test topology with some of its text replaced, or NULL.
+ * Each "from" must occur exactly once - an edit that could land in two
+ * places, or none, is a test that no longer says what it was written to. */
+static prte_topology_t *load_topo_edited(const char *file, const char **from,
+                                         const char **to)
+{
+    hwloc_topology_t topo;
+    prte_topology_t *t;
+    char path[1024], *buf, *hit, *nbuf;
+    size_t flen, tlen, blen;
+    FILE *fp;
+    long len;
+    int n;
+
+    snprintf(path, sizeof(path), "%s/%s", PRTE_TEST_TOPO_DIR, file);
+    fp = fopen(path, "r");
+    if (NULL == fp) {
+        return NULL;
+    }
+    if (0 != fseek(fp, 0, SEEK_END) || 0 > (len = ftell(fp)) || 0 != fseek(fp, 0, SEEK_SET)) {
+        fclose(fp);
+        return NULL;
+    }
+    buf = (char *) malloc(len + 1);
+    if (NULL == buf || (size_t) len != fread(buf, 1, len, fp)) {
+        free(buf);
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    buf[len] = '\0';
+    for (n = 0; NULL != from[n]; n++) {
+        hit = strstr(buf, from[n]);
+        if (NULL == hit || NULL != strstr(hit + 1, from[n])) {
+            free(buf);
+            return NULL;
+        }
+        flen = strlen(from[n]);
+        tlen = strlen(to[n]);
+        blen = strlen(buf);
+        nbuf = (char *) malloc(blen - flen + tlen + 1);
+        if (NULL == nbuf) {
+            free(buf);
+            return NULL;
+        }
+        memcpy(nbuf, buf, hit - buf);
+        memcpy(nbuf + (hit - buf), to[n], tlen);
+        memcpy(nbuf + (hit - buf) + tlen, hit + flen, blen - (hit - buf) - flen + 1);
+        free(buf);
+        buf = nbuf;
+    }
+    if (0 != hwloc_topology_init(&topo)) {
+        free(buf);
+        return NULL;
+    }
+    if (0 != hwloc_topology_set_xmlbuffer(topo, buf, (int) strlen(buf) + 1)
+        || 0 != hwloc_topology_set_io_types_filter(topo, HWLOC_TYPE_FILTER_KEEP_IMPORTANT)
+        || 0 != hwloc_topology_load(topo)) {
+        hwloc_topology_destroy(topo);
+        free(buf);
+        return NULL;
+    }
+    free(buf);
+    t = PMIX_NEW(prte_topology_t);
+    t->topo = topo;
+    return t;
+}
+
+/* A management port beside a GPU is not the GPU's NIC.
+ *
+ * The Slingshot node: the A100 at c1:00.0 shares its host bridge with a
+ * Slingshot NIC (hsn0, a 31.5 GB/s link) and a 1 GbE management port
+ * (nmn0, 0.25 GB/s).  Neither carries an OpenFabrics device and each sits
+ * one root port below the host bridge, so the OpenFabrics and depth rules
+ * cannot tell them apart.  The topology's own bus order happens to put
+ * hsn0 first; here the management port is moved ahead of it, which is what
+ * a different slot assignment would do, and the GPU must still get hsn0.
+ *
+ * That hwloc recorded no GPU backend, so each A100 is given the cuda and
+ * nvml OS devices an hwloc with one would have.  All four need them: PMIx
+ * counts a 3D controller with no OS device as a GPU it cannot name, and a
+ * node holding one is refused for mapping by GPU at all. */
+#define A100_HEAD(bus)                                                                     \
+    "pci_busid=\"0000:" bus "\" pci_type=\"0302 [10de:20b0] [10de:144e] a1\""              \
+    " pci_link_speed=\"31.507692\">\n"
+#define A100_INFO                                                                          \
+    "              <info name=\"PCIVendor\" value=\"NVIDIA Corporation\"/>\n"              \
+    "              <info name=\"PCIDevice\" value=\"GA100 [A100 SXM4 40GB]\"/>\n"
+#define A100_SLOT "              <info name=\"PCISlot\" value=\"6\"/>\n"
+#define A100_OSDEVS(n)                                                                     \
+    "              <object type=\"OSDev\" gp_index=\"900" n "1\" name=\"cuda" n "\""     \
+    " subtype=\"CUDA\" osdev_type=\"5\">\n"                                                \
+    "                <info name=\"Backend\" value=\"CUDA\"/>\n"                            \
+    "              </object>\n"                                                            \
+    "              <object type=\"OSDev\" gp_index=\"900" n "2\" name=\"nvml" n "\""     \
+    " subtype=\"NVML\" osdev_type=\"1\">\n"                                                \
+    "                <info name=\"Backend\" value=\"NVML\"/>\n"                            \
+    "                <info name=\"NVIDIAUUID\""                                            \
+    " value=\"GPU-00000000-0000-0000-0000-00000000000" n "\"/>\n"                          \
+    "              </object>\n"
+static void check_nic_link_speed(void)
+{
+    static const char *from[] = {
+        A100_HEAD("03:00.0") A100_SLOT A100_INFO,
+        A100_HEAD("41:00.0") A100_INFO,
+        A100_HEAD("82:00.0") A100_INFO,
+        A100_HEAD("c1:00.0") A100_INFO,
+        "pci_busid=\"0000:c3:00.0\"",
+        NULL};
+    static const char *to[] = {
+        A100_HEAD("03:00.0") A100_SLOT A100_INFO A100_OSDEVS("0"),
+        A100_HEAD("41:00.0") A100_INFO A100_OSDEVS("1"),
+        A100_HEAD("82:00.0") A100_INFO A100_OSDEVS("2"),
+        A100_HEAD("c1:00.0") A100_INFO A100_OSDEVS("3"),
+        "pci_busid=\"0000:c1:00.1\"",
+        NULL};
+    prte_rmaps_options_t opts;
+    prte_topology_t *t;
+    prte_node_t *node;
+    char *order;
+
+    t = load_topo_edited("slingshot.xml", from, to);
+    if (NULL == t) {
+        fprintf(stdout, "  SKIP test_devices nic link speed (could not load slingshot.xml)\n");
+        failures++;
+        return;
+    }
+    node = build_node("node-lambda", t);
+    memset(&opts, 0, sizeof(opts));
+    opts.app_idx = -1;
+    opts.map_device = "gpu";
+    opts.map_nic = 1;
+    opts.bind = PRTE_BIND_TO_NONE;
+    /* each of the other three complexes holds one GPU and one Slingshot
+     * NIC; the A100 at c1:00.0 is cuda3 */
+    order = device_order(node, &opts);
+    CHECK("the gpu gets the fabric nic, not the management port", NULL != order
+          && 0 == strcmp(order, "cuda0+hsn3,cuda1+hsn2,cuda2+hsn1,cuda3+hsn0"));
+    if (NULL != order && 0 != strcmp(order, "cuda0+hsn3,cuda1+hsn2,cuda2+hsn1,cuda3+hsn0")) {
+        fprintf(stderr, "  slingshot gpu nic: %s\n", order);
+    }
+    free(order);
+
+    /* asked for two, it gets the faster one first and the port second -
+     * what the complex has, in rank order */
+    opts.map_nic = 2;
+    order = device_order(node, &opts);
+    CHECK("nic=2 lists the fabric nic first", NULL != order
+          && 0 == strcmp(order, "cuda0+hsn3,cuda1+hsn2,cuda2+hsn1,cuda3+hsn0+nmn0"));
+    if (NULL != order && 0 != strcmp(order, "cuda0+hsn3,cuda1+hsn2,cuda2+hsn1,cuda3+hsn0+nmn0")) {
+        fprintf(stderr, "  slingshot gpu nic=2: %s\n", order);
+    }
+    free(order);
+    PMIX_RELEASE(node);
+    PMIX_RELEASE(t);
+}
+
+/* The same rule on a node from another pair of vendors.
+ *
+ * mi350-bcm57608.xml is a real node: eight AMD MI350s, which report PCI
+ * class 0x1200 (a processing accelerator) rather than a display class, and
+ * eight dual-port Broadcom BCM57608 RoCE adapters, one GPU and one adapter
+ * under every host bridge.  The GPU and the adapter hang off one PCIe
+ * switch, and the adapter's two ports are at the same depth with the same
+ * link, so nothing but bus order chooses between them: port 0 for nic,
+ * both ports for nic=2.  The RDMA
+ * devices carry rdma-core's PCI-path names (rocep6s0f0), which the device
+ * map uses as it finds them. */
+static void check_mi350_gpu_nic(void)
+{
+    static const char *one =
+        "rsmi0+rocep6s0f0,rsmi1+rocep22s0f0,rsmi2+rocep102s0f0,rsmi3+rocep118s0f0,"
+        "rsmi4+rocep134s0f0,rsmi5+rocep150s0f0,rsmi6+rocep230s0f0,rsmi7+rocep246s0f0";
+    static const char *two =
+        "rsmi0+rocep6s0f0+rocep6s0f1,rsmi1+rocep22s0f0+rocep22s0f1,"
+        "rsmi2+rocep102s0f0+rocep102s0f1,rsmi3+rocep118s0f0+rocep118s0f1,"
+        "rsmi4+rocep134s0f0+rocep134s0f1,rsmi5+rocep150s0f0+rocep150s0f1,"
+        "rsmi6+rocep230s0f0+rocep230s0f1,rsmi7+rocep246s0f0+rocep246s0f1";
+    prte_rmaps_options_t opts;
+    prte_topology_t *t;
+    prte_node_t *node;
+    char *order;
+
+    t = load_topo("mi350-bcm57608.xml");
+    if (NULL == t) {
+        fprintf(stdout, "  SKIP test_devices mi350 gpu nic (could not load mi350-bcm57608.xml)\n");
+        failures++;
+        return;
+    }
+    node = build_node("node-mu", t);
+    memset(&opts, 0, sizeof(opts));
+    opts.app_idx = -1;
+    opts.map_device = "gpu";
+    opts.map_nic = 1;
+    opts.bind = PRTE_BIND_TO_NONE;
+    order = device_order(node, &opts);
+    CHECK("mi350: each accelerator gets port 0 of the adapter on its complex",
+          NULL != order && 0 == strcmp(order, one));
+    if (NULL != order && 0 != strcmp(order, one)) {
+        fprintf(stderr, "  mi350 gpu nic: %s\n", order);
+    }
+    free(order);
+
+    opts.map_nic = 2;
+    order = device_order(node, &opts);
+    CHECK("mi350: nic=2 gets both ports of that adapter",
+          NULL != order && 0 == strcmp(order, two));
+    if (NULL != order && 0 != strcmp(order, two)) {
+        fprintf(stderr, "  mi350 gpu nic=2: %s\n", order);
+    }
+    free(order);
+    PMIX_RELEASE(node);
+    PMIX_RELEASE(t);
+}
+
+/* "nic" gives each GPU the NICs under its own root complex.
+ *
+ * On this machine every GPU shares a host bridge with exactly one HCA, so
+ * the answer is a pairing nobody has to guess at: cuda0 with mlx5_0, cuda1
+ * with mlx5_3, cuda2 with mlx5_4, cuda3 with mlx5_5.  Asking for more NICs
+ * than a complex has gets what is there and never one from elsewhere, and
+ * a GPU whose complex has no NIC keeps its GPU and gets no NIC. */
+static void check_gpu_nic(void)
+{
+    static const char *from[] = {"name=\"ib0\" osdev_type=\"2\"",
+                                 "name=\"mlx5_5\" osdev_type=\"3\"", NULL};
+    static const char *to[] = {"name=\"ib0\" osdev_type=\"0\"",
+                               "name=\"mlx5_5\" osdev_type=\"0\"", NULL};
+    prte_rmaps_options_t opts;
+    prte_topology_t *t;
+    prte_node_t *node;
+    void *ctx = NULL;
+    char *order;
+
+    t = load_topo(TOPO_FILE);
+    if (NULL == t) {
+        fprintf(stdout, "  SKIP test_devices gpu nic (no %s)\n", TOPO_FILE);
+        return;
+    }
+    node = build_node("node-iota", t);
+
+    memset(&opts, 0, sizeof(opts));
+    opts.app_idx = -1;
+    opts.map_device = "gpu";
+    opts.map_nic = 1;
+    opts.bind = PRTE_BIND_TO_NONE;
+    order = device_order(node, &opts);
+    CHECK("each gpu gets the nic on its complex", NULL != order
+          && 0 == strcmp(order, "cuda0+mlx5_0,cuda1+mlx5_3,cuda2+mlx5_4,cuda3+mlx5_5"));
+    if (NULL != order && 0 != strcmp(order, "cuda0+mlx5_0,cuda1+mlx5_3,cuda2+mlx5_4,cuda3+mlx5_5")) {
+        fprintf(stderr, "  gpu nic: %s\n", order);
+    }
+    free(order);
+
+    /* more than the complex has: what is there, nothing from elsewhere */
+    opts.map_nic = 3;
+    order = device_order(node, &opts);
+    CHECK("nic=3 takes only the complex's own", NULL != order
+          && 0 == strcmp(order, "cuda0+mlx5_0,cuda1+mlx5_3,cuda2+mlx5_4,cuda3+mlx5_5"));
+    free(order);
+
+    /* two GPUs per proc: the NICs of both complexes */
+    opts.map_ndev = 2;
+    opts.map_nic = 2;
+    order = device_order(node, &opts);
+    CHECK("ndev=2 nic=2 takes both complexes' nics", NULL != order
+          && 0 == strcmp(order, "cuda0+cuda1+mlx5_0+mlx5_3,cuda2+cuda3+mlx5_4+mlx5_5"));
+    if (NULL != order && 0 != strcmp(order, "cuda0+cuda1+mlx5_0+mlx5_3,cuda2+cuda3+mlx5_4+mlx5_5")) {
+        fprintf(stderr, "  gpu ndev=2 nic=2: %s\n", order);
+    }
+    free(order);
+
+    /* not GPUs: refused, and nothing is left behind */
+    memset(&opts, 0, sizeof(opts));
+    opts.app_idx = -1;
+    opts.map_device = "network";
+    opts.map_nic = 1;
+    opts.bind = PRTE_BIND_TO_NONE;
+    fprintf(stderr, "--- expected error output follows (nic on a nic map) ---\n");
+    CHECK("nic on a nic map: refused",
+          PRTE_SUCCESS != prte_rmaps_base_devices_begin(NULL, node, &opts, &ctx));
+    CHECK("nic on a nic map: no context", NULL == ctx);
+
+    PMIX_RELEASE(node);
+    PMIX_RELEASE(t);
+
+    /* the same machine with the HCA under cuda3's host bridge turned into
+     * something that is not a NIC: cuda3 keeps its GPU and gets no NIC */
+    t = load_topo_edited(TOPO_FILE, from, to);
+    CHECK("edited topology loads", NULL != t);
+    if (NULL == t) {
+        return;
+    }
+    node = build_node("node-kappa", t);
+    memset(&opts, 0, sizeof(opts));
+    opts.app_idx = -1;
+    opts.map_device = "gpu";
+    opts.map_nic = 1;
+    opts.bind = PRTE_BIND_TO_NONE;
+    fprintf(stderr, "--- expected error output follows (no nic near cuda3) ---\n");
+    order = device_order(node, &opts);
+    CHECK("no nic on the complex: gpu only", NULL != order
+          && 0 == strcmp(order, "cuda0+mlx5_0,cuda1+mlx5_3,cuda2+mlx5_4,cuda3"));
+    if (NULL != order && 0 != strcmp(order, "cuda0+mlx5_0,cuda1+mlx5_3,cuda2+mlx5_4,cuda3")) {
+        fprintf(stderr, "  gpu nic, cuda3 bare: %s\n", order);
+    }
+    free(order);
+    PMIX_RELEASE(node);
+    PMIX_RELEASE(t);
+}
+
+/* Two devices with the same locality can be under different root complexes.
+ *
+ * That is why the grouping keys on the host bridge and not on the locality
+ * every other part of the device mapper uses: on this machine both network
+ * cards report the same cpuset and hang off different host bridges, so
+ * nothing on the CPU side of the topology could tell a group holding both
+ * from a group under one complex. */
+static void check_host_bridge_not_locality(void)
+{
+    pmix_hwloc_device_t *devs = NULL, *pci[2] = {NULL, NULL};
+    pmix_topology_t topo;
+    prte_topology_t *t;
+    size_t ndevs = 0, n, npci = 0;
+
+    t = load_topo("test-topo.xml");
+    if (NULL == t) {
+        fprintf(stdout, "  SKIP test_devices host bridge (no test-topo.xml)\n");
+        return;
+    }
+    topo.source = "hwloc";
+    topo.topology = t->topo;
+    CHECK("enumerate", PMIX_SUCCESS == pmix_hwloc_get_devices(&topo, "node-theta",
+                                                              PMIX_DEVTYPE_NETWORK
+                                                                  | PMIX_DEVTYPE_OPENFABRICS,
+                                                              NULL, &devs, &ndevs));
+    /* the two PCI cards; eth0 has no PCI ancestor and no host bridge */
+    for (n = 0; n < ndevs && npci < 2; n++) {
+        if (NULL != devs[n].busid) {
+            pci[npci++] = &devs[n];
+        }
+    }
+    CHECK("two cards", 2 == npci);
+    if (2 == npci) {
+        CHECK("same locality", NULL != pci[0]->locality && NULL != pci[1]->locality
+              && hwloc_bitmap_isequal(pci[0]->locality->cpuset, pci[1]->locality->cpuset));
+        CHECK("each has a host bridge", NULL != prte_hwloc_base_host_bridge(pci[0]->obj)
+              && NULL != prte_hwloc_base_host_bridge(pci[1]->obj));
+        CHECK("different host bridges", prte_hwloc_base_host_bridge(pci[0]->obj)
+              != prte_hwloc_base_host_bridge(pci[1]->obj));
+    }
+    for (n = 0; n < ndevs; n++) {
+        if (NULL == devs[n].busid) {
+            CHECK("no PCI, no host bridge", NULL == prte_hwloc_base_host_bridge(devs[n].obj));
+        }
+    }
+    if (NULL != devs) {
+        pmix_hwloc_release_devices(devs, ndevs);
+    }
     PMIX_RELEASE(t);
 }
 
@@ -451,6 +895,11 @@ int test_devices(bool pmix_up)
     check_named_unnameable_refused();
     check_network_synonyms();
     check_interleave_numa();
+    check_ndev_root_complex();
+    check_host_bridge_not_locality();
+    check_gpu_nic();
+    check_nic_link_speed();
+    check_mi350_gpu_nic();
 
     if (0 == failures) {
         fprintf(stdout, "  PASS test_devices\n");
