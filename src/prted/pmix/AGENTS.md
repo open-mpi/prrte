@@ -347,19 +347,21 @@ not been checked. `pmix_pointer_array_get_item()` bounds-checks and
 returns NULL, so check for NULL — but do not then `return` without
 completing the request, because the requester is still waiting.
 
-**And a *count* arriving on the wire sizes an allocation before anything
-has checked it.** The `PMIX_*_CREATE` macros allocate the count's worth of
-elements and construct every one of them, ahead of the unpack that would
-refuse a buffer too short to hold them. What they do *not* do is wrap: in
-every PMIx PRRTE supports (7.0.0 on) they allocate with `calloc(n, size)`,
-which refuses a product that overflows and returns NULL - so a count chosen
-to wrap gets no array, and the unpack into NULL fails with
-`PMIX_ERR_BAD_PARAM`. Two things follow. NULL-check the allocation, or at
-least let the unpack that follows see the NULL; and do not mistake a screen
-on the count's *range* - the round trip through `int32_t` in
-`pmix_server_query_request()`, say - for a bound on memory: a count just
-under `INT32_MAX` still asks for a terabyte of `pmix_info_t`, which `calloc`
-refuses for want of memory, not of arithmetic.
+**And a *count* arriving on the wire sizes an allocation, so check it with
+`prte_pmix_count_fits()` first.** The `PMIX_*_CREATE` macros allocate the
+count's worth of elements and construct every one of them, ahead of the
+unpack that would refuse a buffer too short to hold them. They do not wrap:
+in every PMIx PRRTE supports (7.0.0 on) they allocate with
+`calloc(n, size)`, which refuses a product that overflows. But a count that
+does not wrap can still be far larger than the message - one just under
+`INT32_MAX` asks for a terabyte of `pmix_info_t` - and a screen on the
+count's *range* says nothing about that. `prte_pmix_count_fits(buf, n)`
+(in `src/pmix/pmix-internal.h`) refuses a count larger than the bytes `buf`
+has left to unpack, since every element takes at least one, and one the
+unpack's `int32_t` count cannot hold. Call it with the buffer the elements
+come from, after unpacking the count and before the allocation; every
+receive in this directory that sizes an array from the wire does. It also
+makes `n + 1` and `n + 2` safe for the handlers that reserve extra slots.
 
 **A relay must answer even a request it cannot parse.** Every `goto reply`
 in `pmix_server_sched()` happens after the requestor's index has been
@@ -1431,7 +1433,8 @@ The parts that matter when editing this file:
 - **Who decides.** A request from the scheduler is a directive *to* this DVM
   and is executed here. One from anybody else is forwarded to the scheduler —
   **unless there is no scheduler**, in which case the DVM master is the
-  authority and answers for itself, gated on `prte_session_is_owned_by`. That
+  authority and answers for itself, gated on
+  `prte_pmix_server_session_permitted`. That
   decision is made in **two** places, `pass_request()` here and
   `pmix_server_sched()` in `pmix_server.c` (the relay from a peer daemon), and
   they must agree: otherwise the same request is served or refused depending
@@ -1493,6 +1496,26 @@ The parts that matter when editing this file:
   branch takes. Without it the last release runs the destructor while the
   object lock is held and the master deadlocks against itself
   (`futex_wait_queue` in `pmix_obj_update`, from `ardes`).
+- **Who a session belongs to** is set once, at instantiation, as a user and
+  group together. The scheduler names them with `PMIX_ALLOC_UID`/`_GID`, and
+  must: an instantiation from the scheduler without them is
+  `PMIX_ERR_BAD_PARAM`. Only the scheduler (`from_scheduler()`) may name
+  them - from anyone else they are `PMIX_ERR_NO_PERMISSIONS`, since they
+  would be a request to own a session as someone else. A session made with
+  no scheduler attached is the requester's, as PMIx identified it
+  (`prte_pmix_server_requester_uid()`/`_gid()`). `PMIX_USERID` cannot carry
+  the scheduler's choice: PMIx stamps it with the caller's own identity. Nor
+  can `PMIX_REQUESTOR`, which names whom to notify, not whom the session is
+  for. The session's apps are the owner's too: `build_session_job()` puts
+  the owner on the job as `PRTE_JOB_OWNER_UID`/`_GID`, which the launch
+  path takes from a job the master built (see `src/mca/plm/base/AGENTS.md`).
+- **An allocation request says whom it is for** with the same two
+  attributes, and there the requester may name them: its own uid (root:
+  any), and any group it is in. The RAS base settles that before a module
+  sees the request (`prte_ras_base_alloc_owner()`, `src/mca/ras/AGENTS.md`).
+  Group membership is `prte_pmix_server_in_group()`, which looks the
+  user's groups up afresh - including our own user's, for which no record
+  is kept.
 - **A session created here is DETACHED by default**, unlike a reservation. A
   reservation dies with the tool that took it; a session is named and
   addressable and must outlive the request that created it, or its own jobs
@@ -1566,6 +1589,44 @@ here that can fail once and be skipped forever needs the same treatment.
 
 ## Who may act on a job, or a session
 
+**The rule in one place.** A request's identity is the `PMIX_USERID` and
+`PMIX_GRPID` - and `PMIX_REQUESTOR_PID`, where the kernel reported one -
+that the PMIx server's psec layer established for the requester's
+connection and stamped into the up-call's info, replacing anything the
+requester supplied. PRRTE takes that as given and judges with it; nothing
+the requester writes (`PMIX_REQUESTOR`, a uid of its own) is identity. A
+daemon that passes a request to the master packs the info array as PMIx
+gave it, so the master reads the same values, and the RML header already
+says which daemon sent it. A request naming no user is one the DVM made of
+itself. `PMIX_ORIGIN_*` exists only for the hops where PRRTE is itself a
+tool of another PMIx server (the scheduler, an external data server): there
+the far server stamps the DVM's identity, so the requester's travels as the
+origin, and it is believed only from a relay that is the same user, root,
+or the receiving DVM's own user (`prte_pmix_server_relay_permitted()`).
+
+Every up-call, and what it is judged by:
+
+| Up-call | What is judged | Where |
+|---|---|---|
+| `spawn` | a parent outside the requester's job; placing the job on a reservation, for its owner; directives naming hosts, and preloading; files it names are read and written as its owner, in a bounded child (`prte_pmix_server_work_as`) | `interim()` (`prte_pmix_server_parent_permitted`); `plm_base_receive.c` (`session_usable`, `grow_directive`, `foreign_directive`) |
+| `allocate` | naming hosts to grow onto or activate; a release, by allocation, node or count; extending a reservation; cancelling a pending request | `prte_ras_base_modify()`, `ras_base_prepare_grow()`, `prte_ras_slurm_pending_req_permitted()` |
+| `session_control` | instantiation and extension (`prte_pmix_server_dvm_permitted`); a `user@host` in a node list, refused from anyone; naming a session's owner, which only the scheduler may do; every other directive (`prte_pmix_server_session_permitted`) | `pmix_server_session.c` (`grant_permitted`) |
+| `job_control` | each target, by its job's rule; untargeted signal and kill reach only permitted jobs; a DVM halt is root's and our user's | `pmix_server_job_ctrl.c` |
+| `query` | a job it names; job listings, resolve and allocation ids leave out what the requester may not access | `pmix_server_queries.c` |
+| `iof_pull`, `push_stdin` | the job whose output or input it is | `pmix_server_gen.c` |
+| `abort` | processes outside the caller's own job, by the owner of the caller's job | `_client_abort()` |
+| `notify_event` | the jobs an event is carried on to; a debugger release must reach only jobs the raiser may access | `pmix_server_notify.c` (`narrow_event`, `release_permitted`) |
+| `publish`, `lookup`, `unpublish` | the item's recorded publisher, its access list, and any relay's claim; an unpublish of everything takes only the requester's own items | `src/runtime/data_server/` (`prte_data_server_owns`, `prte_ds_check_requestor`) |
+| `tool_connected2` | that a user is named at all; foreign tools; the scheduler role; joining a namespace held here | `_toolconn()`, `prte_pmix_server_tool_may_join()` |
+| `direct_modex`, `monitor` | judged by PMIx where the data or the process is, with the requester's info relayed | "Who may have a job's data", below |
+| `fence_nb`, `connect`, `disconnect`, `group` | collectives each participant joins itself | - |
+| `log`, `register_events`, `deregister_events`, `client_connected2`, `client_finalized` | concern only the caller | - |
+
+The judgements themselves are PMIx's access rule - root, the DVM's own
+user, the owner, or a member of the owner's group or access list - applied
+on our side by the functions below. An up-call added to the module needs a
+row here.
+
 A job belongs to its owner, who may allow further users and groups; root and
 the user this DVM runs as may act on any job. That rule is PMIx's
 (`docs/security-plan.rst` in PMIx), and PRRTE applies exactly it: PMIx's
@@ -1623,15 +1684,18 @@ no thread-shift, and no pointer from one side into the other.
   listings and resolve leave out jobs the requester may not access).
   Monitoring needs nothing here: the relayed directives carry the
   requester's `PMIX_USERID`, and each node's PMIx applies the rule to it.
-- **Session operations** - grow, shrink, release, terminate
+- **Session operations** - pause, signal, shrink, release, terminate
   (`pmix_server_session.c`, and extending a reservation in
   `ras_base_allocate.c`) - are decided by who is asking and nothing else
   (`prte_pmix_server_session_permitted`): the scheduler (which identified
   itself when it connected - matched against the requester PMIx names,
   `req->tproc`, never a `PMIX_REQUESTOR` in the request's info), root, our
-  own user, the session's owner, or a member of the owner's group (`session->owner_gid`, from the requester job's recorded
-  gid). Which jobs use a session's *resources* - spawning onto it - is a
-  separate question, still answered by `prte_session_is_owned_by`.
+  own user, the session's owner, or a member of the owner's group when that
+  group was named for it (`PRTE_SESSION_FLAG_GROUP_ACCESS`; a group filled
+  in from the requester's own grants nothing - see `src/runtime/AGENTS.md`)
+  (`session->owner_uid`/`owner_gid` - see "Session control" below for
+  where they come from). Placing a job on a session's nodes is answered by the same rule,
+  for the job's owner (`prte_pmix_server_session_permitted_uid`).
 - **Creating a session** (`PMIX_SESSION_INSTANTIATE`) is a different kind of
   request: there is no session yet to be the owner of, and the new one takes
   nodes - out of the pool, or new ones the DVM grows onto - so it changes
@@ -1646,6 +1710,26 @@ no thread-shift, and no pointer from one side into the other.
   who may signal or kill its daemons. With a scheduler attached, anyone
   else's request goes up to the scheduler and never reaches this check; the
   scheduler's answer comes back down as its own request.
+- **Extending a session** (`PMIX_SESSION_EXTEND`) is held to the same rule
+  as creating one, and that includes the session's owner. The two APIs do
+  different jobs: `PMIx_Allocation_request` is how a user *asks* for
+  resources - including more nodes or time for its own session - and the
+  scheduler decides; `PMIx_Session_control` instantiate and extend are how
+  the scheduler *tells* the DVM what it decided. They exist separately
+  because the DVM may never see an allocation request's answer (it goes to
+  the requester, which may be a tool the DVM knows nothing of), and because
+  a scheduler may change a session for reasons no request asked for. So an
+  extend is the scheduler's directive, or - with no scheduler - that of
+  whoever may change the DVM. The owner's own directives (pause, resume,
+  signal, terminate) are judged by `prte_pmix_server_session_permitted`.
+  Both are judged in `grant_permitted()`, before the session is looked up.
+- **A `user@host`** in a session's node list (`PMIX_ALLOC_NODE_LIST`, on the
+  request or in `PMIX_SESSION_RESOURCES`) names an account to reach the host
+  as. The DVM reaches every node as its own user and runs no daemon as
+  another, so `parse_directives()` refuses it from anyone, root included
+  (`ras-base:user-host`, `PMIX_ERR_BAD_PARAM`), as every host parser does.
+  It is seen in the list as it will be read, after
+  `prte_ras_base_parse_node_list()`, so one inside a regex counts.
 - **A spawn's `PMIX_PARENT_ID`** makes the new job the parent's: it decides
   the session the job lands in, whose allocation it draws on, and the job it
   is connected to. Naming a parent is therefore acting for the parent's job,
@@ -1663,8 +1747,9 @@ no thread-shift, and no pointer from one side into the other.
   comma-separated list of names or numbers, looked up once when the master's
   server starts (a lookup can block, which accepting a connection on the
   progress thread must not), and a name nobody has stops the DVM starting
-  (`scheduler-uid-unknown`). The caddy's `uid` defaults to 0, so the check
-  also requires that PMIx supplied one. A scheduler that departs is forgotten
+  (`scheduler-uid-unknown`). A tool connection whose info names no user is
+  refused before this, and the caddy's `uid` starts as `PRTE_INVALID_UID`,
+  never root. A scheduler that departs is forgotten
   (`prte_pmix_server_tool_departed`), so the DVM stops deferring session
   requests to it and tools may spawn into the default session again.
 
@@ -1740,6 +1825,20 @@ with `PMIX_ERR_EXISTS` (see `src/mca/plm/AGENTS.md`, `TOOL_ATTACHED_CMD`).
 with the sentinel-rank screen, and both the master's own registration
 (`prte_pmix_server_register_tool()`) and its relay for a tool attached
 elsewhere call it, so both refuse the same attaches.
+
+**A tool joins a namespace we hold only as a user permitted on its job.**
+Whatever later asks who a request came from by namespace - the owner a
+spawn inherits from its requester's job, the process a data-server request
+names - takes a tool that joined a job for that job. So
+`prte_pmix_server_tool_may_join()` also takes the uid the tool's PMIx
+server established for its connection, and refuses one that
+`prte_pmix_server_job_permitted()` does not admit to the job, with
+`PMIX_ERR_EXISTS` as for a rank it may not add: a tool that took the name
+from its environment is then connected again under a namespace of its own.
+The relay on the master reads the tool's uid from the reporting daemon's
+message before deciding. A tool connection the PMIx server named no user
+for is refused outright, and `prte_pmix_server_req_t` starts with no user
+(`PRTE_INVALID_UID`) rather than root.
 
 **A tool's rank is a subscript, so it is bounded.** The proc is filed in
 `jdata->procs` at the tool's rank. That array is indexed by `int`, so a rank
@@ -1879,11 +1978,17 @@ codes that has to survive grow, shrink and daemon loss.
   off: `PMIX_SOCKET_MODE` lets anyone connect (PMIx then opens the
   socket's directory to match), and the session directory gains search
   permission but not read, so it can be passed through but not listed.
-  Every directory PRRTE makes inside it stays `0700`. The master does
-  this for tools; every *other* daemon of such a DVM does it too when it
-  runs as root, because it then starts other users' processes as those
-  users (`prte_pmix_server_job_run_as`), and they have to reach it. The
-  swarm's `test_requesters` and `test_run_as` are the cases that reach it.
+  Every directory PRRTE makes inside it stays `0700`. Every daemon of such
+  a DVM does this, not only the master, and every daemon also tells PMIx
+  `PMIX_SERVER_ALLOW_FOREIGN_TOOLS` - without that PMIx refuses another
+  user's tool before `_toolconn()` is asked, which made a multi-user DVM
+  take other users' tools at the master alone: a `prun` in a job script,
+  attached to its own node's daemon, was refused there. A daemon running
+  as root also needs the path for the processes it starts as other users
+  (`prte_pmix_server_job_run_as`). What an attached tool may do is still
+  the master's decision, from the user PMIx established for it here. The
+  swarm's `test_requesters` and `test_run_as` are the cases that reach
+  it.
 - **A client connects as the user its job runs as, not as ours.**
   `_client_conn()` (`pmix_server_gen.c`) compares the uid and gid PMIx
   authenticated for a connecting client against

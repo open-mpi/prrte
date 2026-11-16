@@ -32,6 +32,7 @@
 
 #include "prte_config.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef HAVE_UNISTD_H
@@ -45,6 +46,7 @@
 #include "src/util/name_fns.h"
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_output.h"
+#include "src/util/pmix_runas.h"
 #include "src/util/proc_info.h"
 #include "src/util/prte_show_help.h"
 #    include "src/server/pmix_server_ops.h"
@@ -64,13 +66,11 @@ bool prte_pmix_server_requester_uid(const pmix_info_t *info, size_t ninfo, uid_t
                 return false;
             }
             have_id = true;
-#if PRTE_PMIX_HAVE_ORIGIN_ID
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_ORIGIN_USERID)) {
             /* a claim we cannot read is no claim - the request stays the
              * relay's own */
             have_origin = (PMIX_SUCCESS ==
                            PMIx_Value_get_number(&info[n].value, &origin, PMIX_UINT32));
-#endif
         }
     }
     if (!have_id) {
@@ -93,34 +93,45 @@ bool prte_pmix_server_requester_uid(const pmix_info_t *info, size_t ninfo, uid_t
     return true;
 }
 
-bool prte_pmix_server_relay_permitted(uid_t relay, uid_t origin)
+gid_t prte_pmix_server_requester_gid(const pmix_info_t *info, size_t ninfo)
 {
+    uint32_t id = 0, origin = 0, gid = 0, ogid = 0;
+    bool have_id = false, have_origin = false, have_gid = false, have_ogid = false;
     size_t n;
 
-    if (relay == origin || prte_pmix_server_privileged(relay)) {
-        return true;
-    }
-    for (n = 0; n < prte_pmix_server_globals.nrly_uids; n++) {
-        if ((uint32_t) relay == prte_pmix_server_globals.rly_uids[n]) {
-            return true;
+    for (n = 0; NULL != info && n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], PMIX_USERID)) {
+            have_id = (PMIX_SUCCESS == PMIx_Value_get_number(&info[n].value, &id, PMIX_UINT32));
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_GRPID)) {
+            have_gid = (PMIX_SUCCESS == PMIx_Value_get_number(&info[n].value, &gid, PMIX_UINT32));
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_ORIGIN_USERID)) {
+            have_origin = (PMIX_SUCCESS ==
+                           PMIx_Value_get_number(&info[n].value, &origin, PMIX_UINT32));
+        } else if (PMIX_CHECK_KEY(&info[n], PMIX_ORIGIN_GRPID)) {
+            have_ogid = (PMIX_SUCCESS ==
+                         PMIx_Value_get_number(&info[n].value, &ogid, PMIX_UINT32));
         }
     }
-    return false;
+    /* the group of whichever process prte_pmix_server_requester_uid
+     * attributes the request to - so the two always describe one process */
+    if (have_id && have_origin && prte_pmix_server_relay_permitted((uid_t) id, (uid_t) origin)) {
+        return have_ogid ? (gid_t) ogid : PRTE_INVALID_GID;
+    }
+    return have_gid ? (gid_t) gid : PRTE_INVALID_GID;
+}
+
+bool prte_pmix_server_relay_permitted(uid_t relay, uid_t origin)
+{
+    return (relay == origin || prte_pmix_server_privileged(relay));
 }
 
 bool prte_pmix_server_is_identity_key(const char *key)
 {
-    if (PMIx_Check_key(key, PMIX_USERID) || PMIx_Check_key(key, PMIX_GRPID)) {
-        return true;
-    }
-#if PRTE_PMIX_HAVE_ORIGIN_ID
-    return (PMIx_Check_key(key, PMIX_REQUESTOR_PID) ||
+    return (PMIx_Check_key(key, PMIX_USERID) || PMIx_Check_key(key, PMIX_GRPID) ||
+            PMIx_Check_key(key, PMIX_REQUESTOR_PID) ||
             PMIx_Check_key(key, PMIX_ORIGIN_USERID) || PMIx_Check_key(key, PMIX_ORIGIN_GRPID) ||
             PMIx_Check_key(key, PMIX_ORIGIN_PID) || PMIx_Check_key(key, PMIX_ORIGIN_IS_TOOL) ||
             PMIx_Check_key(key, PMIX_ORIGIN_IS_CLIENT));
-#else
-    return false;
-#endif
 }
 
 bool prte_pmix_server_privileged(uid_t uid)
@@ -192,6 +203,104 @@ int prte_pmix_server_job_run_as(prte_job_t *jdata, uid_t *uid, gid_t *gid, bool 
     }
     *uid = owner;
     return PRTE_SUCCESS;
+}
+
+/* fn(arg) as uid and gid, always in a child (pmix_util_run_as_child), so
+ * that the wait for it is bounded by pmix_util_runas_timeout whoever it
+ * is for: a path a user named can stall on a filesystem that does not
+ * answer as surely opened as ourselves as opened as that user */
+static int run_as_child(uid_t uid, gid_t gid, bool want_fd, int (*fn)(void *arg), void *arg)
+{
+    pmix_data_array_t *groups = NULL;
+    gid_t *gids = NULL;
+    size_t n, ngids = 0;
+    bool change;
+    int rc, err;
+
+    /* asked of the kernel rather than read from prte_process_info: what
+     * matters is whether this process can become uid, and the record is
+     * not made until the process is set up */
+    if (PRTE_SUCCESS != prte_pmix_server_run_as(geteuid(), uid, &change)) {
+        errno = EPERM;
+        return -1;
+    }
+    if (!change) {
+        /* as ourselves - the child changes nothing */
+        return pmix_util_run_as_child(geteuid(), getegid(), NULL, 0, want_fd, fn, arg);
+    }
+    if (PRTE_INVALID_GID == gid) {
+        /* guessing a group could hand the open one the user does not have */
+        errno = EPERM;
+        return -1;
+    }
+    /* looked up here, since the child may not look anything up */
+    if (PMIX_SUCCESS != prte_pmix_server_owner_groups(uid, &groups)) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (NULL != groups && 0 < groups->size) {
+        gids = (gid_t *) malloc(groups->size * sizeof(gid_t));
+        if (NULL == gids) {
+            PMIX_DATA_ARRAY_FREE(groups);
+            errno = ENOMEM;
+            return -1;
+        }
+        for (n = 0; n < groups->size; n++) {
+            gids[n] = (gid_t) ((uint32_t *) groups->array)[n];
+        }
+        ngids = groups->size;
+    }
+    if (NULL != groups) {
+        PMIX_DATA_ARRAY_FREE(groups);
+    }
+    rc = pmix_util_run_as_child(uid, gid, gids, ngids, want_fd, fn, arg);
+    err = errno;
+    free(gids);
+    errno = err;
+    return rc;
+}
+
+int prte_pmix_server_open_as(uid_t uid, gid_t gid, int (*fn)(void *arg), void *arg)
+{
+    return run_as_child(uid, gid, true, fn, arg);
+}
+
+int prte_pmix_server_work_as(uid_t uid, gid_t gid, int (*fn)(void *arg), void *arg)
+{
+    return run_as_child(uid, gid, false, fn, arg);
+}
+
+void prte_pmix_server_job_user(prte_job_t *jdata, uid_t *uid, gid_t *gid)
+{
+    uint32_t id, *idptr = &id;
+
+    *uid = prte_process_info.euid;
+    *gid = prte_process_info.egid;
+    if (NULL == jdata) {
+        return;
+    }
+    *uid = prte_pmix_server_job_owner(jdata);
+    if (*uid == prte_process_info.euid) {
+        return;
+    }
+    if (prte_get_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID, (void **) &idptr,
+                           PMIX_UINT32)) {
+        *gid = (gid_t) id;
+    } else {
+        *gid = jdata->gid;
+    }
+}
+
+void prte_pmix_server_request_user(const pmix_info_t *info, size_t ninfo, uid_t *uid, gid_t *gid)
+{
+    if (!prte_pmix_server_requester_uid(info, ninfo, uid)) {
+        /* a request we made of ourselves */
+        *uid = prte_process_info.euid;
+        *gid = prte_process_info.egid;
+        return;
+    }
+    *gid = (*uid == prte_process_info.euid) ? prte_process_info.egid
+                                            : prte_pmix_server_requester_gid(info, ninfo);
 }
 
 typedef struct {
@@ -314,6 +423,50 @@ pmix_status_t prte_pmix_server_owner_groups(uid_t uid, pmix_data_array_t **out)
         ((uint32_t *) (*out)->array)[n] = (uint32_t) user->gids[n];
     }
     return PMIX_SUCCESS;
+}
+
+bool prte_pmix_server_in_group(uid_t uid, gid_t gid)
+{
+    pmix_user_t *user;
+    bool found = false;
+    uint16_t n;
+
+    if (0 == uid) {
+        return true;
+    }
+    if (PRTE_INVALID_UID == uid || PRTE_INVALID_GID == gid) {
+        return false;
+    }
+    if (prte_process_info.euid == uid) {
+        /* we keep no record of our own user, so look its groups up for
+         * this question alone */
+        if (prte_process_info.egid == gid) {
+            return true;
+        }
+        user = pmix_server_user_create(uid);
+        if (NULL == user) {
+            return false;
+        }
+        (void) pmix_server_user_refresh(user);
+    } else {
+        user = user_get(uid);
+        if (NULL == user) {
+            return false;
+        }
+        /* membership as the system has it now - see
+         * prte_pmix_server_owner_groups */
+        (void) pmix_server_user_refresh(user);
+    }
+    for (n = 0; n < user->ngids; n++) {
+        if (user->gids[n] == gid) {
+            found = true;
+            break;
+        }
+    }
+    if (prte_process_info.euid == uid) {
+        PMIX_RELEASE(user);
+    }
+    return found;
 }
 
 void prte_pmix_server_access_user(uid_t uid)
@@ -451,20 +604,17 @@ bool prte_pmix_server_dvm_permitted_uid(uid_t uid)
             pmix_server_access_check(user, (pmix_access_t *) prte_pmix_server_globals.dvm_access));
 }
 
-bool prte_pmix_server_grow_permitted_uid(uid_t uid, bool files, bool user)
+bool prte_pmix_server_grow_permitted_uid(uid_t uid)
 {
-    /* a file the master reads, or a login it uses, is done as the DVM's own
-     * user - so for root and that user only */
-    if (files || user) {
-        return prte_pmix_server_privileged(uid);
-    }
     /* hosts brought into the DVM change what it consists of, and get the
-     * DVM's key: for whoever may change the DVM, as creating a session is */
+     * DVM's key: for whoever may change the DVM, as creating a session is.
+     * A file of hosts is read as whoever named it, and asks for no more
+     * than the hosts it names */
     return prte_pmix_server_dvm_permitted_uid(uid);
 }
 
 bool prte_pmix_server_grow_permitted(const pmix_proc_t *requestor, const pmix_info_t *info,
-                                     size_t ninfo, bool files, bool user)
+                                     size_t ninfo)
 {
     uid_t uid;
 
@@ -480,7 +630,7 @@ bool prte_pmix_server_grow_permitted(const pmix_proc_t *requestor, const pmix_in
          * prte_pmix_server_request_permitted */
         return (NULL != requestor && PMIX_CHECK_PROCID(requestor, PRTE_PROC_MY_NAME));
     }
-    return prte_pmix_server_grow_permitted_uid(uid, files, user);
+    return prte_pmix_server_grow_permitted_uid(uid);
 }
 
 void prte_pmix_server_access_release_dvm(void)
@@ -605,24 +755,6 @@ int prte_pmix_server_scheduler_uids_resolve(void)
     return rc;
 }
 
-int prte_pmix_server_relay_uids_resolve(void)
-{
-    char *bad = NULL;
-    int rc;
-
-    rc = resolve_uid_list(prte_pmix_server_globals.relay_uids,
-                          &prte_pmix_server_globals.rly_uids,
-                          &prte_pmix_server_globals.nrly_uids, &bad);
-    if (PRTE_ERR_NOT_FOUND == rc) {
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-runtime.txt",
-                       "relay-uid-unknown", true, (NULL == bad) ? "" : bad,
-                       prte_pmix_server_globals.relay_uids);
-        rc = PRTE_ERR_SILENT;
-    }
-    free(bad);
-    return rc;
-}
-
 bool prte_pmix_server_scheduler_permitted(uid_t uid)
 {
     size_t n;
@@ -641,7 +773,7 @@ bool prte_pmix_server_scheduler_permitted(uid_t uid)
 bool prte_pmix_server_session_permitted(prte_session_t *session, const pmix_proc_t *requestor,
                                         const pmix_info_t *info, size_t ninfo)
 {
-    uid_t uid, owner;
+    uid_t uid;
 
     if (NULL == session) {
         return false;
@@ -660,18 +792,38 @@ bool prte_pmix_server_session_permitted(prte_session_t *session, const pmix_proc
          * prte_pmix_server_request_permitted */
         return (NULL != requestor && PMIX_CHECK_PROCID(requestor, PRTE_PROC_MY_NAME));
     }
-    if (prte_pmix_server_privileged(uid)) {
-        return true;
+    return prte_pmix_server_session_permitted_uid(session, uid);
+}
+
+bool prte_pmix_server_session_permitted_uid(prte_session_t *session, uid_t uid)
+{
+    if (NULL == session) {
+        return false;
     }
     /* a session with no recorded owner - the default session among them -
-     * is ours */
-    owner = (PRTE_INVALID_UID == session->owner_uid) ? prte_process_info.euid
-                                                      : session->owner_uid;
-    if (owner == uid) {
+     * is ours. Its group's members may act on it only when the group was
+     * named for it: the requester's own primary group, filled in when it
+     * named none, is often one every user on the system is in, and saying
+     * nothing about groups is not asking to share */
+    return prte_pmix_server_user_permitted(uid,
+                                           (PRTE_INVALID_UID == session->owner_uid)
+                                               ? prte_process_info.euid
+                                               : session->owner_uid,
+                                           PRTE_FLAG_TEST(session, PRTE_SESSION_FLAG_GROUP_ACCESS)
+                                               ? session->owner_gid
+                                               : PRTE_INVALID_GID);
+}
+
+bool prte_pmix_server_user_permitted(uid_t uid, uid_t owner, gid_t group)
+{
+    if (PRTE_INVALID_UID == uid) {
+        return false;
+    }
+    if (prte_pmix_server_privileged(uid) || owner == uid) {
         return true;
     }
     /* or a member of the owner's group */
-    return owner_permitted(uid, owner, session->owner_gid);
+    return owner_permitted(uid, owner, group);
 }
 
 /* ------------------------------------------------------------------ */
@@ -817,7 +969,6 @@ void prte_pmix_server_access_job_done(const pmix_nspace_t nspace)
 size_t prte_pmix_server_relay_copy(pmix_info_t *dst, const pmix_info_t *src, size_t nsrc)
 {
     size_t n, m = 0;
-#if PRTE_PMIX_HAVE_ORIGIN_ID
     /* the process we heard from, as PMIx established it, and what it
      * claims about whoever first asked */
     const pmix_info_t *uid = NULL, *gid = NULL, *pid = NULL, *tool = NULL, *client = NULL;
@@ -892,11 +1043,5 @@ size_t prte_pmix_server_relay_copy(pmix_info_t *dst, const pmix_info_t *src, siz
         PMIX_LOAD_KEY(dst[m].key, PMIX_ORIGIN_IS_CLIENT);
         ++m;
     }
-#else
-    for (n = 0; NULL != src && n < nsrc; n++) {
-        PMIX_INFO_XFER(&dst[m], (pmix_info_t *) &src[n]);
-        ++m;
-    }
-#endif
     return m;
 }

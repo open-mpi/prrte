@@ -1266,6 +1266,15 @@ static void _query(int sd, short args, void *cbdata)
                         if (NULL == session || NULL == session->alloc_refid) {
                             continue;
                         }
+                        /* the general pool, which everyone uses, and of
+                         * the reservations only those the requester may
+                         * operate on - its own, its group's, or any for
+                         * root, our own user and the scheduler */
+                        if (prte_default_session != session &&
+                            !prte_pmix_server_session_permitted(session, &cd->proct,
+                                                                q->qualifiers, q->nqual)) {
+                            continue;
+                        }
                         PMIX_INFO_LIST_ADD(rc, alloclist, PMIX_ALLOC_ID, session->alloc_refid, PMIX_STRING);
                         if (PMIX_SUCCESS != rc) {
                             PMIX_ERROR_LOG(rc);
@@ -1806,14 +1815,12 @@ void pmix_server_query_request(int status, pmix_proc_t *sender,
         goto error;
     }
     /* The count arrives off the wire in a size_t, and the unpack below
-     * consumes it as an int32_t - so one that does not survive the round
-     * trip cannot describe this buffer, and is refused before
-     * PMIX_QUERY_CREATE allocates and constructs that many elements.  (The
-     * allocation itself cannot wrap: PMIx allocates with calloc, which
-     * refuses a product that overflows.)  PMIx screens its own client-facing
-     * query the same way. */
-    cnt = (int32_t) nqueries;
-    if (0 > cnt || (size_t) cnt != nqueries) {
+     * consumes it as an int32_t - so one the unpack cannot hold, or one
+     * larger than the message could carry, cannot describe this buffer, and
+     * is refused before PMIX_QUERY_CREATE allocates and constructs that many
+     * elements.  (The allocation itself cannot wrap: PMIx allocates with
+     * calloc, which refuses a product that overflows.) */
+    if (!prte_pmix_count_fits(buffer, nqueries)) {
         rc = PMIX_ERR_BAD_PARAM;
         goto error;
     }
@@ -1929,6 +1936,13 @@ void pmix_server_query_resp(int status, pmix_proc_t *sender,
     cnt = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &ninfo, &cnt, PMIX_SIZE);
     if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        ret = rc;
+        ninfo = 0;
+        goto complete;
+    }
+    if (!prte_pmix_count_fits(buffer, ninfo)) {
+        rc = PMIX_ERR_BAD_PARAM;
         PMIX_ERROR_LOG(rc);
         ret = rc;
         ninfo = 0;

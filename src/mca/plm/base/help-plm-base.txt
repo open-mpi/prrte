@@ -138,6 +138,18 @@ decimal number of slots to apply to every node.
 Nodes that arrived without slot information will be sized by the number
 of cores instead.  Please correct the value and try again.
 #
+[requester-unknown]
+A job was refused because the job of the process that asked for it is not
+known to the DVM:
+
+  Job:           %s
+  Requested by:  %s
+
+A job belongs to the user whose process or tool asked for it, and runs as
+that user. With the requester's job no longer known - a tool that left
+before its request was served, for example - there is no user to run the
+job as.
+#
 [foreign-directive]
 A job was refused because it asked for something PRRTE would have to do
 with the DVM's own privileges:
@@ -146,7 +158,8 @@ with the DVM's own privileges:
   Job's user:  %lu
   Asked for:   %s
 
-PRRTE opens the files these directives name as the user the DVM runs
-as - not as the user the job belongs to. They are accepted only from root and from the DVM's own
-user. Start the job without the directive, or have it started by the
-DVM's own user.
+PRRTE reads the files to preload as the user the DVM runs as, and its
+daemons write the copies on every node as that user - not as the user
+the job belongs to. Preloading is accepted only from root and from the
+DVM's own user. Start the job without the directive, or have it started
+by the DVM's own user.

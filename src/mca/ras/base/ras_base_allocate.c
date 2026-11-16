@@ -734,6 +734,8 @@ static void ras_base_activate_request(prte_pmix_server_req_t *req)
     const char *hosts = NULL, *hostfile = NULL, *req_id = NULL;
     int rc, nactivated = 0;
     size_t n;
+    uid_t uid;
+    gid_t gid;
 
     for (n = 0; n < req->ninfo; n++) {
         if (PMIx_Check_key(req->info[n].key, PMIX_HOST)) {
@@ -767,7 +769,9 @@ static void ras_base_activate_request(prte_pmix_server_req_t *req)
         return;
     }
 
-    rc = prte_ras_base_activate_nodes(hosts, hostfile, &nactivated);
+    /* a hostfile it names is read as whoever asked */
+    prte_pmix_server_request_user(req->info, req->ninfo, &uid, &gid);
+    rc = prte_ras_base_activate_nodes(hosts, hostfile, uid, gid, &nactivated);
     if (PRTE_SUCCESS != rc) {
         /* the resolver reports what it refused, and why, through show_help;
          * a refusal is always the specification's fault (a host this DVM
@@ -866,9 +870,11 @@ static bool ras_base_session_has_daemons(prte_session_t *session)
 }
 
 /* Does this request bring hosts into the DVM, or start daemons on hosts it
- * holds, by naming them - and does it name a file the master reads for
- * that (`files`), or a user to reach a host as (`user`)? A node list is
- * looked at as it will be read, so a user hidden in a regex is seen. */
+ * holds, by naming them - and does it name them in a file (`files`, which
+ * only changes what a refusal says), or name an account to reach a host as
+ * (`user`, "user@host", which is refused from anyone)? A node list is looked
+ * at as it will be read, so an account hidden in a regex is seen. One
+ * inside a file is found when the file is read. */
 static bool ras_base_names_hosts(prte_pmix_server_req_t *req, bool *files, bool *user)
 {
     bool named = false, activate = false;
@@ -922,6 +928,195 @@ static bool ras_base_scheduler_decides(void)
             0 == strcmp(mod->component->pmix_mca_component_name, "pmix"));
 }
 
+/* May the requester take what this release names out of the DVM? A release
+ * naming an allocation is its owner's to make (prte_pmix_server_session_permitted).
+ * One naming nodes is, node by node, the owner's of the reservation holding
+ * the node, and for a node of the general pool - which every user's jobs run
+ * on - whoever may change what the DVM consists of
+ * (prte_pmix_server_dvm_permitted), as bringing a node in is. So is a node we
+ * cannot find, since we cannot say whose it is. One naming neither leaves the
+ * DVM to choose which nodes go, which is a change to the DVM. *what is set to
+ * what was refused. */
+static bool ras_base_release_permitted(prte_pmix_server_req_t *req, const char **what)
+{
+    prte_session_t *session;
+    prte_node_t *node;
+    char *ndstring = NULL, **nodes;
+    bool named = false, ok = true;
+    size_t n;
+    int k;
+
+    for (n = 0; ok && n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_ID)) {
+            named = true;
+            if (PMIX_STRING != req->info[n].value.type ||
+                NULL == req->info[n].value.data.string) {
+                /* refused as malformed where it is read */
+                continue;
+            }
+            session = prte_get_session_object_from_id(req->info[n].value.data.string);
+            if (NULL == session) {
+                /* nothing to release - answered as such where it is read */
+                continue;
+            }
+            *what = "an allocation";
+            ok = (prte_default_session == session)
+                     ? prte_pmix_server_dvm_permitted(&req->tproc, req->info, req->ninfo)
+                     : prte_pmix_server_session_permitted(session, &req->tproc, req->info,
+                                                          req->ninfo);
+        } else if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_NODE_LIST)) {
+            named = true;
+            if (PMIX_SUCCESS != prte_ras_base_parse_node_list(&req->info[n], &ndstring)) {
+                /* refused as malformed where it is read */
+                continue;
+            }
+            nodes = PMIx_Argv_split(ndstring, ',');
+            free(ndstring);
+            ndstring = NULL;
+            *what = "nodes";
+            for (k = 0; ok && NULL != nodes && NULL != nodes[k]; k++) {
+                node = prte_node_match(NULL, nodes[k]);
+                session = (NULL == node) ? NULL : node->session;
+                ok = (NULL == session || prte_default_session == session)
+                         ? prte_pmix_server_dvm_permitted(&req->tproc, req->info, req->ninfo)
+                         : prte_pmix_server_session_permitted(session, &req->tproc, req->info,
+                                                              req->ninfo);
+            }
+            PMIx_Argv_free(nodes);
+        }
+    }
+    if (ok && !named) {
+        *what = "a number of nodes the DVM chooses";
+        ok = prte_pmix_server_dvm_permitted(&req->tproc, req->info, req->ninfo);
+    }
+    return ok;
+}
+
+/* Does this request grow the DVM's general pool from --add-host or
+ * --add-hostfile, rather than ask for an allocation? */
+static bool ras_base_is_add_host(prte_pmix_server_req_t *req)
+{
+    size_t n;
+
+    for (n = 0; n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_ADD_HOST) ||
+            PMIx_Check_key(req->info[n].key, PMIX_ADD_HOSTFILE)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Read a request's PMIX_ALLOC_UID and PMIX_ALLOC_GID. A value that is not
+ * a number is an error; one that is absent leaves its have_ flag false. */
+static pmix_status_t ras_base_get_alloc_owner(const pmix_info_t *info, size_t ninfo,
+                                              uint32_t *uid, bool *have_uid,
+                                              uint32_t *gid, bool *have_gid)
+{
+    size_t n;
+
+    *have_uid = false;
+    *have_gid = false;
+    for (n = 0; NULL != info && n < ninfo; n++) {
+        if (PMIx_Check_key(info[n].key, PMIX_ALLOC_UID)) {
+            if (PMIX_SUCCESS != PMIx_Value_get_number(&info[n].value, uid, PMIX_UINT32)) {
+                return PMIX_ERR_BAD_PARAM;
+            }
+            *have_uid = true;
+        } else if (PMIx_Check_key(info[n].key, PMIX_ALLOC_GID)) {
+            if (PMIX_SUCCESS != PMIx_Value_get_number(&info[n].value, gid, PMIX_UINT32)) {
+                return PMIX_ERR_BAD_PARAM;
+            }
+            *have_gid = true;
+        }
+    }
+    return PMIX_SUCCESS;
+}
+
+pmix_status_t prte_ras_base_alloc_owner(prte_pmix_server_req_t *req)
+{
+    uid_t ruid;
+    gid_t rgid;
+    uint32_t uid = 0, gid = 0;
+    bool have_uid, have_gid;
+    pmix_info_t *xfer;
+    size_t n, nadd;
+    pmix_status_t rc;
+
+    if ((PMIX_ALLOC_NEW != req->allocdir && PMIX_ALLOC_EXTEND != req->allocdir) ||
+        ras_base_is_add_host(req)) {
+        return PMIX_SUCCESS;
+    }
+    rc = ras_base_get_alloc_owner(req->info, req->ninfo, &uid, &have_uid, &gid, &have_gid);
+    if (PMIX_SUCCESS != rc) {
+        return rc;
+    }
+    /* whether a reservation made for it is shared with its group - only if
+     * the group was asked for (PRTE_SESSION_FLAG_GROUP_ACCESS) */
+    req->alloc_gid_named = have_gid;
+
+    /* who is asking. PMIx names the requester of every request a client or
+     * tool makes, so a request naming none is one we made ourselves */
+    if (prte_pmix_server_requester_uid(req->info, req->ninfo, &ruid)) {
+        rgid = prte_pmix_server_requester_gid(req->info, req->ninfo);
+    } else {
+        ruid = prte_process_info.euid;
+        rgid = prte_process_info.egid;
+    }
+
+    /* Root may ask on behalf of any user; anyone else only for themselves,
+     * as they could not act as another user in any case. A group may be
+     * any the requester belongs to */
+    if (have_uid && 0 != ruid && (uid_t) uid != ruid) {
+        return PMIX_ERR_NO_PERMISSIONS;
+    }
+    if (have_gid && !prte_pmix_server_in_group(ruid, (gid_t) gid)) {
+        return PMIX_ERR_NO_PERMISSIONS;
+    }
+    /* a user other than the requester comes with its group: the
+     * requester's own would be one that user need not belong to */
+    if (have_uid && !have_gid && (uid_t) uid != ruid) {
+        return PMIX_ERR_BAD_PARAM;
+    }
+
+    /* the component, and any scheduler behind it, is always told whom the
+     * allocation is for - the requester, unless it said otherwise */
+    nadd = (have_uid ? 0 : 1) + (have_gid ? 0 : 1);
+    if (0 == nadd) {
+        return PMIX_SUCCESS;
+    }
+    if (!have_gid && PRTE_INVALID_GID == rgid) {
+        /* nothing says which group to ask for */
+        return PMIX_ERR_BAD_PARAM;
+    }
+    PMIX_INFO_CREATE(xfer, req->ninfo + nadd);
+    if (NULL == xfer) {
+        return PMIX_ERR_NOMEM;
+    }
+    for (n = 0; n < req->ninfo; n++) {
+        PMIX_INFO_XFER(&xfer[n], &req->info[n]);
+    }
+    if (!have_uid) {
+        uid = (uint32_t) ruid;
+        PMIX_INFO_LOAD(&xfer[n], PMIX_ALLOC_UID, &uid, PMIX_UINT32);
+        ++n;
+    }
+    if (!have_gid) {
+        gid = (uint32_t) rgid;
+        PMIX_INFO_LOAD(&xfer[n], PMIX_ALLOC_GID, &gid, PMIX_UINT32);
+        ++n;
+    }
+    /* the original array is the caller's unless the request already owned
+     * it - see ras/pmix's modify */
+    if (req->copy && NULL != req->info) {
+        PMIX_INFO_FREE(req->info, req->ninfo);
+    }
+    req->info = xfer;
+    req->ninfo = n;
+    req->copy = true;
+    return PMIX_SUCCESS;
+}
+
 void prte_ras_base_modify(int fd, short args, void *cbdata)
 {
     prte_pmix_server_req_t *req = (prte_pmix_server_req_t*)cbdata;
@@ -964,22 +1159,24 @@ void prte_ras_base_modify(int fd, short args, void *cbdata)
     /* Refuse a size change outside elastic mode before any module acts on
      * it: the scheduler-owned ones ask their scheduler first, and an
      * allocation granted to a request we then refuse would be stranded.
-     * EXTEND and ACTIVATE always grow the DVM.  Under a scheduler, so do NEW
-     * (it is served by asking for nodes) and RELEASE (the nodes go back).
-     * Without one, a NEW that names no nodes reserves nodes the DVM already
-     * has, and a release shrinks only if its nodes carry daemons - those two
-     * are decided where the nodes are known, below. */
+     * ACTIVATE always grows the DVM.  Under a scheduler, so do NEW and EXTEND
+     * (they are served by asking for nodes) and RELEASE (the nodes go back).
+     * Without one, a NEW or EXTEND that names no nodes asks for nothing the
+     * DVM does not already have - an EXTEND of that kind changes only the
+     * time limit or the disposition - and a release shrinks only if its
+     * nodes carry daemons, which is decided where the nodes are known,
+     * below. */
     if (!prte_elastic_mode) {
         bool resize = false;
 
         switch (req->allocdir) {
-        case PMIX_ALLOC_EXTEND:
 #if defined(PMIX_ALLOC_ACTIVATE)
         case PMIX_ALLOC_ACTIVATE:
-#endif
             resize = true;
             break;
+#endif
         case PMIX_ALLOC_NEW:
+        case PMIX_ALLOC_EXTEND:
             resize = prte_ras_base.scheduler_owned || ras_base_request_names_nodes(req);
             break;
         case PMIX_ALLOC_RELEASE:
@@ -995,28 +1192,58 @@ void prte_ras_base_modify(int fd, short args, void *cbdata)
     }
 
     /* Naming hosts to bring into the DVM, or to start daemons on, is for
-     * whoever may change the DVM - and naming a file the master reads, or a
-     * user to reach a host as, for root and our own user alone
-     * (prte_pmix_server_grow_permitted). Activation is served here, so it
-     * is always judged here; a grow is judged here unless a scheduler is to
-     * decide it. */
+     * whoever may change the DVM - whether named directly or in a file of
+     * them, which is read as the requester (prte_pmix_server_grow_permitted).
+     * Activation is served here, so it is always judged here; a grow is
+     * judged here unless a scheduler is to decide it. A host naming an
+     * account to reach it as is refused from anyone, and before a scheduler
+     * is asked: the DVM runs no daemon as another user, so it would only
+     * refuse the grant once the scheduler had made it. */
     {
-        bool files, user, activate = false;
+        bool files, user, named, activate = false;
 
 #if defined(PMIX_ALLOC_ACTIVATE)
         activate = (PMIX_ALLOC_ACTIVATE == req->allocdir);
 #endif
-        if (ras_base_names_hosts(req, &files, &user) &&
-            (activate || !ras_base_scheduler_decides()) &&
-            !prte_pmix_server_grow_permitted(&req->tproc, req->info, req->ninfo, files, user)) {
+        named = ras_base_names_hosts(req, &files, &user);
+        if (user) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
+                           "ras-base:user-host", true,
+                           PMIx_Alloc_directive_string(req->allocdir));
+            req->pstatus = PMIX_ERR_BAD_PARAM;
+            goto respond;
+        }
+        if (named && (activate || !ras_base_scheduler_decides()) &&
+            !prte_pmix_server_grow_permitted(&req->tproc, req->info, req->ninfo)) {
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
                            "ras-base:grow-not-permitted", true,
                            PMIx_Alloc_directive_string(req->allocdir),
-                           files ? "a file of hosts"
-                                 : (user ? "a user to reach a host as" : "hosts"));
+                           files ? "a file of hosts" : "hosts");
             req->pstatus = PMIX_ERR_NO_PERMISSIONS;
             goto respond;
         }
+    }
+
+    /* Taking nodes out of the DVM is judged the same way, unless a
+     * scheduler is to decide it */
+    if (PMIX_ALLOC_RELEASE == req->allocdir && !ras_base_scheduler_decides()) {
+        const char *what = "nodes";
+
+        if (!ras_base_release_permitted(req, &what)) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
+                           "ras-base:release-not-permitted", true, what);
+            req->pstatus = PMIX_ERR_NO_PERMISSIONS;
+            goto respond;
+        }
+    }
+
+    /* Whom an allocation is for: what the requester may name, and the
+     * requester itself where it names nothing. Settled before any module
+     * sees the request, since a module passes it on to its scheduler */
+    rc = prte_ras_base_alloc_owner(req);
+    if (PMIX_SUCCESS != rc) {
+        req->pstatus = rc;
+        goto respond;
     }
 
 #if defined(PMIX_ALLOC_ACTIVATE)
@@ -1308,12 +1535,15 @@ static void shrink_xcast_complete(void *cbdata)
  * the host (rather than a scheduler) must identify on its own. */
 static uint32_t prte_ras_reservation_counter = 0;
 
-/* Create a new reservation owned by the given namespace. Returns NULL on
- * failure. alloc_id (scheduler-assigned PMIX_ALLOC_ID) and req_id
- * (requester PMIX_ALLOC_REQ_ID) are optional. */
+/* Create a new reservation owned by the given namespace, and belonging to
+ * owner_uid/owner_gid - the PMIX_ALLOC_UID/GID the allocation was granted
+ * for. The group's members may use it only if the request named the group
+ * (group_named). Returns NULL on failure. alloc_id (scheduler-assigned
+ * PMIX_ALLOC_ID) and req_id (requester PMIX_ALLOC_REQ_ID) are optional. */
 static prte_session_t *create_reservation(const char *nspace, uint8_t inherit,
                                           pmix_proc_t *requestor,
-                                          const char *alloc_id, const char *req_id)
+                                          const char *alloc_id, const char *req_id,
+                                          uid_t owner_uid, gid_t owner_gid, bool group_named)
 {
     prte_session_t *s;
     prte_job_t *ownerjob;
@@ -1350,16 +1580,15 @@ static prte_session_t *create_reservation(const char *nspace, uint8_t inherit,
     if (NULL != ownerjob) {
         PMIX_RETAIN(ownerjob);
         s->owner_job = ownerjob;
-        /* Record the user as well as the namespace. A tool's namespace lives
-         * only as long as the command that made it, so a reservation
-         * identified by namespace alone becomes unusable - by anyone - the
-         * moment the requester exits. See prte_session_is_owned_by. */
-        s->owner_uid = ownerjob->uid;
-        s->owner_gid = ownerjob->gid;
     }
-    /* seed the owner set with the owning namespace */
-    prte_session_add_owner(s, nspace);
-
+    /* The user owns the reservation: who may use or change it is decided by
+     * uid (prte_pmix_server_session_permitted_uid), since a tool's namespace
+     * lives only as long as the command that made it */
+    s->owner_uid = owner_uid;
+    s->owner_gid = owner_gid;
+    if (group_named) {
+        PRTE_FLAG_SET(s, PRTE_SESSION_FLAG_GROUP_ACCESS);
+    }
     rc = prte_set_session_object(s);
     if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
@@ -1423,6 +1652,24 @@ void prte_ras_base_teardown_reservation(prte_session_t *session,
         return;
     }
 
+    /* Returning the nodes means shrinking their daemons out of the DVM, so
+     * that whoever holds the allocation - the scheduler, or the resource
+     * manager - has them back. That needs both someone to return them to
+     * and a DVM that can change size. Without a scheduler the nodes are the
+     * DVM's own and there is nobody to hand them to, and a DVM that is not
+     * elastic cannot shed a daemon: either way the nodes go back to the
+     * DVM's general pool, as any other teardown sends them. Taking nodes out
+     * of a DVM with no scheduler is for whoever may change the DVM, by
+     * releasing them from the general pool (ras_base_release_permitted). */
+    if (return_to_scheduler && !(prte_ras_base.scheduler_owned && prte_elastic_mode)) {
+        pmix_output_verbose(2, prte_ras_base_framework.framework_output,
+                            "%s ras:base: session %u returns its nodes to the general pool: %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), session->session_id,
+                            prte_ras_base.scheduler_owned ? "the DVM is not elastic"
+                                                          : "there is no scheduler");
+        return_to_scheduler = false;
+    }
+
     /* The session is over: drop what the jobs that ran in it published to
      * last exactly this long.  It has to happen here rather than at any
      * job's end, because that is the whole meaning of PMIX_PERSIST_SESSION
@@ -1477,10 +1724,6 @@ void prte_ras_base_teardown_reservation(prte_session_t *session,
 
     /* the reservation no longer withholds nodes */
     session->flags &= ~PRTE_SESSION_FLAG_RESERVED;
-    if (NULL != session->owners) {
-        PMIx_Argv_free(session->owners);
-        session->owners = NULL;
-    }
     /* drop the retained owning-job reference taken in create_reservation */
     if (NULL != session->owner_job) {
         PMIX_RELEASE(session->owner_job);
@@ -1751,7 +1994,39 @@ static bool ras_base_get_string(const pmix_info_t *info, char **value)
     return true;
 }
 
+/* The time limit a request asks for (PMIX_ALLOC_TIME), in seconds, or -1 if
+ * it names none. */
+static pmix_status_t ras_base_get_limit(prte_pmix_server_req_t *req, long *limit)
+{
+    char *str;
+
+    *limit = -1;
+    for (size_t n = 0; n < req->ninfo; n++) {
+        if (!PMIx_Check_key(req->info[n].key, PMIX_ALLOC_TIME)) {
+            continue;
+        }
+        if (!ras_base_get_string(&req->info[n], &str)) {
+            return PMIX_ERR_BAD_PARAM;
+        }
+        *limit = prte_pmix_server_parse_session_time(str);
+        if (0 > *limit) {
+            return PMIX_ERR_BAD_PARAM;
+        }
+    }
+    return PMIX_SUCCESS;
+}
+
+/* Resolve the session a NEW or EXTEND is for, creating it for a NEW.
+ *
+ * `limit` is the time limit the request asks for (-1 for none). Without a
+ * scheduler the DVM serves it - see ras_base_complete_grow_request - and a
+ * limit the scheduler or a user who may change the DVM set
+ * (PRTE_SESSION_FLAG_LIMIT_HELD) is changed only by them, which is judged
+ * here, before anything about the session is changed. Under a scheduler the
+ * scheduler decided the time, and tells us by session control. */
 static pmix_status_t ras_base_prepare_grow(prte_pmix_server_req_t *req,
+                                           uid_t owner_uid, gid_t owner_gid,
+                                           long limit,
                                            prte_session_t **dest_out,
                                            bool *created)
 {
@@ -1832,6 +2107,10 @@ static pmix_status_t ras_base_prepare_grow(prte_pmix_server_req_t *req,
     owner_nspace = (NULL != target) ? target : req->tproc.nspace;
 
     if (have_share && share) {
+        /* the general pool has no time limit for anyone to set */
+        if (0 <= limit && !prte_ras_base.scheduler_owned) {
+            return PMIX_ERR_BAD_PARAM;
+        }
         dest = prte_default_session;            /* general use */
     } else if (NULL != target && !is_tool) {
         return PMIX_ERR_NO_PERMISSIONS;         /* app may not retarget */
@@ -1851,6 +2130,23 @@ static pmix_status_t ras_base_prepare_grow(prte_pmix_server_req_t *req,
             !prte_pmix_server_session_permitted(dest, &req->tproc, req->info, req->ninfo)) {
             return (NULL == dest) ? PMIX_ERR_NOT_FOUND : PMIX_ERR_NO_PERMISSIONS;
         }
+        if (!prte_ras_base.scheduler_owned) {
+            /* with nothing to add, no time and no disposition, an extend
+             * extends nothing - which is an error, as it is for session
+             * control, not a success that did nothing */
+            if (0 > limit && !have_inherit && !ras_base_request_names_nodes(req)) {
+                return PMIX_ERR_BAD_PARAM;
+            }
+            /* the owner may change a limit it set, but not one set by those
+             * who decide what the DVM's sessions hold */
+            if (0 <= limit && PRTE_FLAG_TEST(dest, PRTE_SESSION_FLAG_LIMIT_HELD) &&
+                !prte_pmix_server_dvm_permitted(&req->tproc, req->info, req->ninfo)) {
+                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
+                               "ras-base:limit-not-permitted", true,
+                               (NULL != dest->alloc_refid) ? dest->alloc_refid : "(none)");
+                return PMIX_ERR_NO_PERMISSIONS;
+            }
+        }
         /* a new inheritance value on EXTEND updates the disposition */
         if (have_inherit) {
             dest->inheritance = inherit;
@@ -1860,7 +2156,7 @@ static pmix_status_t ras_base_prepare_grow(prte_pmix_server_req_t *req,
         PMIX_XFER_PROCID(&dest->requestor, &req->tproc);
     } else {                                    /* PMIX_ALLOC_NEW */
         dest = create_reservation(owner_nspace, inherit, &req->tproc,
-                                  alloc_id, req_id);
+                                  alloc_id, req_id, owner_uid, owner_gid, req->alloc_gid_named);
         if (NULL == dest) {
             return PMIX_ERR_OUT_OF_RESOURCE;
         }
@@ -2002,6 +2298,9 @@ static void ras_base_complete_grow_request(prte_pmix_server_req_t *req)
     size_t n;
     bool found = false;
     bool created = false;
+    uint32_t auid = 0, agid = 0;
+    bool have_uid, have_gid;
+    long limit = -1;
 
     /* an add-host/add-hostfile request (from the --add-host and
      * --add-hostfile cmd line options) grows the DVM's general pool.
@@ -2014,15 +2313,31 @@ static void ras_base_complete_grow_request(prte_pmix_server_req_t *req)
      * it is the VM_READY re-entry at the end of the (possibly empty)
      * daemon launch that marks the DVM ready again and releases the
      * cached jobs */
-    for (n = 0; n < req->ninfo; n++) {
-        if (PMIx_Check_key(req->info[n].key, PMIX_ADD_HOST) ||
-            PMIx_Check_key(req->info[n].key, PMIX_ADD_HOSTFILE)) {
-            prte_ras_base_activate_dvm_grow();
-            return;
-        }
+    if (ras_base_is_add_host(req)) {
+        prte_ras_base_activate_dvm_grow();
+        return;
     }
 
-    rc = ras_base_prepare_grow(req, &dest, &created);
+    /* The answer says whom the allocation was granted for - every module
+     * that serves one returns it, having checked it against what it asked
+     * for (prte_ras_base_alloc_owner). Without it there is no owner to
+     * record, and guessing one could be wrong */
+    rc = ras_base_get_alloc_owner(req->info, req->ninfo, &auid, &have_uid, &agid, &have_gid);
+    if (PMIX_SUCCESS != rc || !have_uid || !have_gid) {
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
+                       "ras-base:alloc-owner-missing", true,
+                       PMIx_Alloc_directive_string(req->allocdir));
+        req->pstatus = (PMIX_SUCCESS != rc) ? rc : PMIX_ERROR;
+        return;
+    }
+
+    rc = ras_base_get_limit(req, &limit);
+    if (PMIX_SUCCESS != rc) {
+        req->pstatus = rc;
+        return;
+    }
+
+    rc = ras_base_prepare_grow(req, (uid_t) auid, (gid_t) agid, limit, &dest, &created);
     if (PMIX_SUCCESS != rc) {
         req->pstatus = rc;
         return;
@@ -2054,6 +2369,16 @@ static void ras_base_complete_grow_request(prte_pmix_server_req_t *req)
     if (found) {
         prte_ras_base_activate_dvm_grow();
     }
+    /* With no scheduler, we are what serves the time a request asks for:
+     * the session is terminated when it runs out, as a session control
+     * PMIX_SESSION_TERMINATE would. Whoever may change the DVM sets a limit
+     * the owner may not then change. Under a scheduler the scheduler decided
+     * the time, and tells us so with session control. */
+    if (0 <= limit && !prte_ras_base.scheduler_owned) {
+        prte_pmix_server_session_set_limit(dest, limit,
+                                           prte_pmix_server_dvm_permitted(&req->tproc, req->info,
+                                                                          req->ninfo));
+    }
     ras_base_set_alloc_response(req, dest);
     return;
 
@@ -2079,6 +2404,35 @@ unwind:
     }
 }
 
+/* Take a node out of the reservation holding it, back into the general
+ * pool. */
+static void ras_base_unreserve_node(prte_node_t *node)
+{
+    prte_session_t *session = node->session;
+    prte_node_t *nd;
+    int k;
+
+    if (NULL == session || prte_default_session == session) {
+        return;
+    }
+    for (k = 0; k < session->nodes->size; k++) {
+        nd = (prte_node_t *) pmix_pointer_array_get_item(session->nodes, k);
+        if (nd == node) {
+            pmix_pointer_array_set_item(session->nodes, k, NULL);
+            PMIX_RELEASE(nd);
+            break;
+        }
+    }
+    node->session = NULL;
+}
+
+/* The daemons to shrink out for a release naming these nodes. With no
+ * scheduler a node a reservation holds is not shrunk: there is nobody to
+ * return it to, so it goes back to the general pool, as it would when the
+ * reservation ended (prte_ras_base_teardown_reservation) - and a node of the
+ * general pool is shrunk, which is for whoever may change the DVM
+ * (ras_base_release_permitted). Every node is found before any is acted on,
+ * so a name we do not know changes nothing. */
 static int ras_base_find_shrink_targets(char **nodes, pmix_rank_t **ranks_out,
                                         int32_t *nranks_out)
 {
@@ -2090,6 +2444,11 @@ static int ras_base_find_shrink_targets(char **nodes, pmix_rank_t **ranks_out,
     if (0 == cnt) {
         return PRTE_ERR_NOT_FOUND;
     }
+    for (int32_t n = 0; NULL != nodes[n]; n++) {
+        if (NULL == prte_node_match(NULL, nodes[n])) {
+            return PRTE_ERR_NOT_FOUND;
+        }
+    }
 
     ranks = (pmix_rank_t *) malloc(cnt * sizeof(pmix_rank_t));
     if (NULL == ranks) {
@@ -2100,9 +2459,10 @@ static int ras_base_find_shrink_targets(char **nodes, pmix_rank_t **ranks_out,
     for (int32_t n = 0; NULL != nodes[n]; n++) {
         /* find this node in our global resource pool */
         node = prte_node_match(NULL, nodes[n]);
-        if (NULL == node) {
-            free(ranks);
-            return PRTE_ERR_NOT_FOUND;
+        if (!prte_ras_base.scheduler_owned && NULL != node->session &&
+            prte_default_session != node->session) {
+            ras_base_unreserve_node(node);
+            continue;
         }
         if (NULL == node->daemon) {
             /* node doesn't have a daemon yet */
@@ -2349,19 +2709,20 @@ static bool ras_base_teardown_by_alloc_id(prte_pmix_server_req_t *req)
 
     /* a release naming an allocation id tears down that whole reservation:
      * any owner may release it, the scheduler may release any. The nodes
-     * are returned to the scheduler (the legacy disposition for an explicit
-     * release). */
+     * are returned to the scheduler, where there is one, and otherwise go
+     * back to the DVM's general pool (prte_ras_base_teardown_reservation). */
     rsession = prte_get_session_object_from_id(rel_alloc_id);
     if (NULL == rsession || rsession == prte_default_session) {
         req->pstatus = PMIX_ERR_NOT_FOUND;
         return true;
     }
-    if (!prte_session_is_owned_by(rsession, req->tproc.nspace)) {
+    if (!prte_pmix_server_session_permitted(rsession, &req->tproc, req->info, req->ninfo)) {
         req->pstatus = PMIX_ERR_NO_PERMISSIONS;
         return true;
     }
-    /* returning the nodes shrinks their daemons out of the DVM */
-    if (ras_base_session_has_daemons(rsession) &&
+    /* returning the nodes to a scheduler shrinks their daemons out of the
+     * DVM; with none, nothing shrinks */
+    if (prte_ras_base.scheduler_owned && ras_base_session_has_daemons(rsession) &&
         !ras_base_resize_allowed(PMIx_Alloc_directive_string(req->allocdir))) {
         req->pstatus = PMIX_ERR_NOT_SUPPORTED;
         return true;
@@ -2674,11 +3035,11 @@ int prte_ras_base_spawn_alloc(prte_job_t *jdata, bool *posted)
      * what says who asked: the array is the client's own, and the only
      * PMIX_USERID a request may carry is one PMIx or the spawn's admission
      * established, so the job owner's is put in its place below. The array
-     * is sized for the whole thing and filled short by at least the
-     * directive, which leaves room for the owner; the tail stays as
-     * PMIX_INFO_CREATE left it, which destructs to nothing, so the request
-     * may carry the filled count. */
-    PMIX_INFO_CREATE(info, nalloc);
+     * is sized for the whole thing plus one, and filled short by at least
+     * the directive, which leaves room for the owner's user and group; the
+     * tail stays as PMIX_INFO_CREATE left it, which destructs to nothing, so
+     * the request may carry the filled count. */
+    PMIX_INFO_CREATE(info, nalloc + 1);
     if (NULL == info) {
         PMIX_DATA_ARRAY_FREE(darray);
         return PRTE_ERR_OUT_OF_RESOURCE;
@@ -2686,7 +3047,7 @@ int prte_ras_base_spawn_alloc(prte_job_t *jdata, bool *posted)
     for (n = 0; n < nalloc; n++) {
         if (PMIx_Check_key(src[n].key, PMIX_ALLOC_REQ_DIRECTIVE)) {
             if (PMIX_ALLOC_DIRECTIVE != src[n].value.type) {
-                PMIX_INFO_FREE(info, nalloc);
+                PMIX_INFO_FREE(info, nalloc + 1);
                 PMIX_DATA_ARRAY_FREE(darray);
                 return PRTE_ERR_BAD_PARAM;
             }
@@ -2705,7 +3066,7 @@ int prte_ras_base_spawn_alloc(prte_job_t *jdata, bool *posted)
         /* the one element that cannot be defaulted: a request whose directive
          * we had to guess would ask for something nobody asked for */
         prte_show_help(PRTE_JOB_NSPACE(jdata), "help-ras-base.txt", "ras-base:spawn-alloc-nodirective", true);
-        PMIX_INFO_FREE(info, nalloc);
+        PMIX_INFO_FREE(info, nalloc + 1);
         return PRTE_ERR_BAD_PARAM;
     }
     /* the request is the spawn's, so it is judged as the user the spawn was
@@ -2713,11 +3074,24 @@ int prte_ras_base_spawn_alloc(prte_job_t *jdata, bool *posted)
      * user - as an allocation request is judged and told as its client */
     owner = (uint32_t) prte_pmix_server_job_owner(jdata);
     PMIX_INFO_LOAD(&info[idx++], PMIX_USERID, &owner, PMIX_UINT32);
+    {
+        uint32_t ogid, *ogidptr = &ogid;
+
+        /* and the owner's group, which the allocation is for unless the
+         * request names another (prte_ras_base_alloc_owner) */
+        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID,
+                               (void **) &ogidptr, PMIX_UINT32)) {
+            PMIX_INFO_LOAD(&info[idx++], PMIX_GRPID, &ogid, PMIX_UINT32);
+        } else if (PRTE_INVALID_GID != jdata->gid) {
+            ogid = (uint32_t) jdata->gid;
+            PMIX_INFO_LOAD(&info[idx++], PMIX_GRPID, &ogid, PMIX_UINT32);
+        }
+    }
     ninfo = idx;
 
     req = PMIX_NEW(prte_pmix_server_req_t);
     if (NULL == req) {
-        PMIX_INFO_FREE(info, nalloc);
+        PMIX_INFO_FREE(info, nalloc + 1);
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
     pmix_asprintf(&req->operation, "SPAWN-ALLOC: %s",
@@ -2814,7 +3188,7 @@ int prte_ras_base_release_spawn_alloc(prte_job_t *jdata, const char *alloc_id)
     }
     req->operation = strdup("SPAWN-ALLOC-RELEASE");
     req->allocdir = PMIX_ALLOC_RELEASE;
-    req->ninfo = 1;
+    req->ninfo = 2;
     PMIX_INFO_CREATE(req->info, req->ninfo);
     if (NULL == req->info) {
         PMIX_RELEASE(req);
@@ -2822,8 +3196,15 @@ int prte_ras_base_release_spawn_alloc(prte_job_t *jdata, const char *alloc_id)
     }
     req->copy = true;
     PMIX_INFO_LOAD(&req->info[0], PMIX_ALLOC_ID, (void *) alloc_id, PMIX_STRING);
-    /* release in the same name it was obtained in, or the ownership check
-     * refuses us our own allocation */
+    {
+        /* released as the user it was obtained for - the job's owner, as
+         * prte_ras_base_spawn_alloc() requested it - or the release check
+         * refuses the owner its own allocation */
+        uint32_t owner = (uint32_t) prte_pmix_server_job_owner(jdata);
+
+        PMIX_INFO_LOAD(&req->info[1], PMIX_USERID, &owner, PMIX_UINT32);
+    }
+    /* and in the same name, which is where the outcome is reported */
     if (prte_get_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY,
                            (void **) &proxy, PMIX_PROC) &&
         NULL != proxy) {
@@ -2951,7 +3332,8 @@ static int ras_base_activate_select(pmix_pointer_array_t *sel, prte_node_t *node
  * what the file said; what goes into the selection is the pool's own entry
  * for each, which is the only thing a grow can act on.
  */
-static int ras_base_activate_hostfile(const char *hostfile, pmix_pointer_array_t *sel)
+static int ras_base_activate_hostfile(const char *hostfile, pmix_pointer_array_t *sel, uid_t uid,
+                                      gid_t gid)
 {
     pmix_list_t nodes;
     prte_node_t *nd, *node;
@@ -2965,7 +3347,7 @@ static int ras_base_activate_hostfile(const char *hostfile, pmix_pointer_array_t
     PMIX_CONSTRUCT(&nodes, pmix_list_t);
     /* the parser reports its own failures - a file it cannot open, a bad
      * line, relative syntax inside a file - through show_help */
-    rc = prte_util_add_hostfile_nodes(&nodes, (char *) hostfile);
+    rc = prte_util_add_hostfile_nodes(&nodes, (char *) hostfile, uid, gid);
     if (PRTE_SUCCESS != rc) {
         PMIX_LIST_DESTRUCT(&nodes);
         return (PRTE_ERR_SILENT == rc) ? rc : PRTE_ERR_SILENT;
@@ -3004,7 +3386,8 @@ static int ras_base_activate_hostfile(const char *hostfile, pmix_pointer_array_t
  * A ":<slots>" modifier is refused rather than ignored (see below), and so
  * is "+e" - see there for why it cannot mean anything useful here.
  */
-static int ras_base_activate_spec(const char *spec, pmix_pointer_array_t *sel)
+static int ras_base_activate_spec(const char *spec, pmix_pointer_array_t *sel, uid_t uid,
+                                  gid_t gid)
 {
     char **tokens;
     int rc = PRTE_SUCCESS;
@@ -3028,7 +3411,7 @@ static int ras_base_activate_spec(const char *spec, pmix_pointer_array_t *sel)
              *
              * The parser is the real one, so ^exclusion, aliases and its
              * refusal of relative syntax inside a file all come along. */
-            rc = ras_base_activate_hostfile(&tokens[k][5], sel);
+            rc = ras_base_activate_hostfile(&tokens[k][5], sel, uid, gid);
             if (PRTE_SUCCESS != rc) {
                 goto done;
             }
@@ -3137,13 +3520,13 @@ done:
  * every other hostfile attribute may.
  */
 static int ras_base_activate_resolve(const char *hosts, const char *hostfile,
-                                     pmix_pointer_array_t *sel)
+                                     pmix_pointer_array_t *sel, uid_t uid, gid_t gid)
 {
     char **files;
     int k, rc = PRTE_SUCCESS;
 
     if (NULL != hosts && '\0' != *hosts) {
-        rc = ras_base_activate_spec(hosts, sel);
+        rc = ras_base_activate_spec(hosts, sel, uid, gid);
         if (PRTE_SUCCESS != rc) {
             return rc;
         }
@@ -3157,7 +3540,7 @@ static int ras_base_activate_resolve(const char *hosts, const char *hostfile,
         return PRTE_SUCCESS;
     }
     for (k = 0; NULL != files[k]; k++) {
-        rc = ras_base_activate_hostfile(files[k], sel);
+        rc = ras_base_activate_hostfile(files[k], sel, uid, gid);
         if (PRTE_SUCCESS != rc) {
             break;
         }
@@ -3198,7 +3581,7 @@ static int ras_base_activate_commit(pmix_pointer_array_t *sel)
     return nactivated;
 }
 
-int prte_ras_base_activate_nodes(const char *hosts, const char *hostfile,
+int prte_ras_base_activate_nodes(const char *hosts, const char *hostfile, uid_t uid, gid_t gid,
                                  int *nactivated)
 {
     pmix_pointer_array_t sel;
@@ -3215,7 +3598,7 @@ int prte_ras_base_activate_nodes(const char *hosts, const char *hostfile,
     PMIX_CONSTRUCT(&sel, pmix_pointer_array_t);
     pmix_pointer_array_init(&sel, 8, INT_MAX, 8);
 
-    rc = ras_base_activate_resolve(hosts, hostfile, &sel);
+    rc = ras_base_activate_resolve(hosts, hostfile, &sel, uid, gid);
     if (PRTE_SUCCESS == rc) {
         *nactivated = ras_base_activate_commit(&sel);
     }
@@ -3231,7 +3614,11 @@ int prte_ras_base_activate_hosts(prte_job_t *jdata)
     char *spec;
     pmix_pointer_array_t sel;
     bool found = false, adding = false;
+    uid_t uid;
+    gid_t gid;
 
+    /* a "file=" the spec names is read as the job's owner */
+    prte_pmix_server_job_user(jdata, &uid, &gid);
     PMIX_CONSTRUCT(&sel, pmix_pointer_array_t);
     pmix_pointer_array_init(&sel, 8, INT_MAX, 8);
 
@@ -3253,7 +3640,7 @@ int prte_ras_base_activate_hosts(prte_job_t *jdata)
             continue;
         }
         found = true;
-        rc = ras_base_activate_resolve(spec, NULL, &sel);
+        rc = ras_base_activate_resolve(spec, NULL, &sel, uid, gid);
         free(spec);
         if (PRTE_SUCCESS != rc) {
             PMIX_DESTRUCT(&sel);

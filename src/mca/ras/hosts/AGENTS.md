@@ -79,12 +79,26 @@ when it is selected and its scheduler is out of touch.) It serves:
   because it must accept `slots=+N`/`-N` adjustment syntax). Matches
   existing pool nodes by name/alias and adjusts slots, or appends new
   `PRTE_NODE_STATE_ADDED` nodes. Rejects a new node given negative slots.
+  The file is opened with `prte_textfile_open()` (non-blocking, regular
+  files only, decided on the descriptor, and opened and read in a child
+  the master waits for no longer than `pmix_runas_timeout`) because this
+  runs on the master's progress thread, where a bare `fopen()` of a FIFO
+  never returned - and it is opened as whoever named it: the owner of the job a
+  spawn's `--add-hostfile` came with (`req->jdata`), or the requester of
+  an allocation. Each name must pass `prte_util_host_name_ok()` - the
+  `--host` rule - and a `user@host`, naming an account to reach the host as,
+  is refused from anyone (`ras-base:addhost-user-host`,
+  `PMIX_ERR_BAD_PARAM`), as it is in `--host`: the DVM reaches every node as
+  its own user and runs no daemon as another.
 - `PMIX_ADD_HOST` — comma-list of hosts via
   `prte_util_add_dash_host_nodes`.
 - It also claims `PMIX_ALLOC_NEW`/`EXTEND`/`RELEASE` so the base's
   `prte_ras_base_complete_request` runs with the original request info
   intact (preserving the node list and allocation ids for reservation
-  routing).
+  routing). That also makes its answer say whom the allocation is for:
+  there is no scheduler to ask, so it is granted for exactly the
+  `PMIX_ALLOC_UID`/`GID` the request carries, which
+  `prte_ras_base_alloc_owner()` checked or filled in first.
 
 New nodes clear `prte_nidmap_communicated` and are inserted via
 `prte_ras_base_node_insert`. Returns `PMIX_OPERATION_SUCCEEDED` when it

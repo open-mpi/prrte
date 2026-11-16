@@ -43,6 +43,34 @@ file could not be opened for reading:
 
 Please check the filename and try again.
 #
+[ras-base:addhost-not-a-file]
+A request was made to add hosts from a hostfile, but the
+path given is not a regular file:
+
+  File: %s
+
+A directory, FIFO, device or socket cannot be read as a hostfile.
+Please check the filename and try again.
+#
+[ras-base:addhost-bad-name]
+A host in an add-hostfile is not a name a host can have:
+
+  Host: %s
+  File: %s
+
+A host's name is made of letters, digits, ".", "-" and "_", and does
+not begin with "-".
+#
+[ras-base:addhost-user-host]
+A host in an add-hostfile names an account to reach it as:
+
+  Host: %s
+  File: %s
+
+The DVM reaches every node as the user it runs as, and runs no daemon as
+any other user, so a host may not be given as "user@host". Remove the
+account and try again.
+#
 [negative-slots]
 A host was provided in an add-hostfile that is unknown
 to the DVM but was given a negative number of slots:
@@ -200,6 +228,16 @@ A request named a node that another session holds:
 A session keeps its nodes until it ends or releases them, so they cannot
 be given to another session or reservation. The request was refused.
 #
+[ras-base:user-host]
+A request naming hosts was refused, because a host in it names an account
+to reach it as ("user@host"):
+
+  Request:  %s
+
+The DVM reaches every node as the user it runs as, and runs no daemon as
+any other user, so a host may not name an account. Remove it and try
+again.
+#
 [ras-base:grow-not-permitted]
 A request to bring hosts into the DVM was refused, because the user
 who made it may not ask for what it named:
@@ -209,7 +247,55 @@ who made it may not ask for what it named:
 
 Bringing hosts into a DVM changes what it consists of, and is for root,
 the user the DVM runs as, and the users and groups the DVM was started
-with ("--rtos users=..." and "groups=..."). A file of hosts the DVM is
-to read, or a user to reach a host as ("user@host"), is accepted only
-from root and the user the DVM runs as, since the DVM reads the file,
-and logs in, as that user.
+with ("--rtos users=..." and "groups=..."). A file of hosts is read as
+the user who named it, and its hosts are judged the same way. A session
+control directive to instantiate
+or extend a session is held to the same rules, including when it comes
+from the session's owner: a user asks for more resources with an
+allocation request, which the scheduler decides.
+#
+[ras-base:limit-not-permitted]
+A request to change an allocation's time limit was refused:
+
+  Allocation:  %s
+
+The limit was set by the scheduler, or by a user who may change the DVM
+(root, the user the DVM runs as, and the users and groups the DVM was
+started with), and only they may change it. A limit the allocation's
+owner set on its own request may be changed by the owner.
+#
+[ras-base:release-not-permitted]
+A request to take nodes out of the DVM was refused, because the user who
+made it may not release what it named:
+
+  Named:  %s
+
+An allocation, and a node of a reservation, may be released by the
+reservation's owner, root and the user the DVM runs as - and by members of
+its group, when that group was named for it. A node of the DVM's general pool, or a number of nodes the
+DVM is to choose, may be released only by those who may change what the
+DVM consists of: root, the user the DVM runs as, and the users and groups
+the DVM was started with ("--rtos users=..." and "groups=...").
+#
+[ras-base:alloc-owner-missing]
+An allocation request was answered without saying whom the allocation
+belongs to:
+
+  Request:  %s
+
+The component that served the request must return the user and group the
+allocation was granted for, as PMIX_ALLOC_UID and PMIX_ALLOC_GID. Without
+them there is no owner to record for the allocation, so the request was
+treated as failed.
+#
+[ras-base:alloc-owner-mismatch]
+A scheduler answered an allocation request for a different user or group
+than the one it was asked for:
+
+  Request:   %s
+  Asked for: uid %u, gid %u
+  Answered:  %s
+
+The allocation was refused and returned to the scheduler. A scheduler must
+grant an allocation for the user and group named in the request
+(PMIX_ALLOC_UID and PMIX_ALLOC_GID), and say so in its answer.

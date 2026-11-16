@@ -211,16 +211,11 @@ int prte_util_dash_host_compute_slots(prte_node_t *node, char *hosts)
     return slots;
 }
 
-/* Add the nodes named by a -host/--host specification to an allocation
- * being built. Every caller is doing exactly that - selecting nodes for a
- * job from an allocation that already exists goes through
- * prte_util_filter_dash_host_nodes instead.
- */
 /* Is this a name a host, or the user to reach it as, may have? Letters,
  * digits, '.', '-' and '_', not starting with '-'. Anything else - a quote,
  * a '$', a space - is no name, and the launcher puts these on a command
  * line. */
-static bool dash_host_name_ok(const char *s)
+bool prte_util_host_name_ok(const char *s)
 {
     if (NULL == s || '\0' == *s || '-' == *s) {
         return false;
@@ -233,6 +228,11 @@ static bool dash_host_name_ok(const char *s)
     return true;
 }
 
+/* Add the nodes named by a -host/--host specification to an allocation
+ * being built. Every caller is doing exactly that - selecting nodes for a
+ * job from an allocation that already exists goes through
+ * prte_util_filter_dash_host_nodes instead.
+ */
 int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts)
 {
     pmix_list_item_t *item;
@@ -245,7 +245,7 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts)
     bool needcheck;
     int slots;
     bool slots_given;
-    char *cptr, *username, *entry, *given;
+    char *cptr, *entry, *given;
     bool add_slots;
 
     PMIX_OUTPUT_VERBOSE((1, prte_ras_base_framework.framework_output,
@@ -326,7 +326,6 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts)
         slots = 0;
         add_slots = false;
         slots_given = false;
-        username = NULL;
         /* as given, for a refusal to quote */
         entry = strdup(mini_map[i]);
         if (NULL == entry) {
@@ -358,17 +357,21 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts)
             }
         }
 
-        /* "user@host" names the user to reach the host as - as a hostfile
-         * entry does - and the user is kept apart from the host's name. Left
-         * in it, the name is one no daemon reports, and the launch agent
-         * reads the part before the '@' as a login. */
+        /* "user@host" used to name an account to reach the host as, and the
+         * launcher logged in to it as that account, so the daemon there ran
+         * as a user other than the DVM's own. Nothing in the DVM is built for
+         * that, so an entry naming an account is refused - not reached as our
+         * own user instead, which is not what it asked for. */
         ndname = mini_map[i];
-        if (NULL != (cptr = strchr(mini_map[i], '@'))) {
-            *cptr = '\0';
-            username = mini_map[i];
-            ndname = cptr + 1;
+        if (NULL != strchr(ndname, '@')) {
+            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt",
+                           "dash-host:user-host", true, entry);
+            free(entry);
+            PMIx_Argv_free(mini_map);
+            rc = PRTE_ERR_SILENT;
+            goto cleanup;
         }
-        if (!dash_host_name_ok(ndname) || (NULL != username && !dash_host_name_ok(username))) {
+        if (!prte_util_host_name_ok(ndname)) {
             prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-dash-host.txt",
                            "dash-host:invalid-name", true, entry);
             free(entry);
@@ -431,11 +434,6 @@ int prte_util_add_dash_host_nodes(pmix_list_t *nodes, char *hosts)
                 PRTE_FLAG_SET(node, PRTE_NODE_FLAG_SLOTS_GIVEN);
             }
             pmix_list_append(&adds, &node->super);
-        }
-        if (NULL != username &&
-            !prte_get_attribute(&node->attributes, PRTE_NODE_USERNAME, NULL, PMIX_STRING)) {
-            prte_set_attribute(&node->attributes, PRTE_NODE_USERNAME, PRTE_ATTR_LOCAL, username,
-                               PMIX_STRING);
         }
         if (0 != strcmp(node->name, given)) {
             // add the name as given as an alias if it differs from the resolved name

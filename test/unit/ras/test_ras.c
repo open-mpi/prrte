@@ -53,6 +53,10 @@
  *      that needs no scheduler to exercise. The modify surface belongs to
  *      the multi-node harness in contrib/dockerswarm, which builds
  *      --with-jansson deliberately.
+ *
+ *   7. prte_ras_base_alloc_owner, which settles whom an allocation request
+ *      is for before any module sees it: what a requester may name as
+ *      PMIX_ALLOC_UID/GID, and the requester's own where it names none.
  */
 
 #include "prte_config.h"
@@ -60,6 +64,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "constants.h"
 #include "src/class/pmix_pointer_array.h"
@@ -1070,6 +1075,167 @@ static int test_hosts_empty_hostfile(void)
 }
 
 /*
+ * ras/hosts modify(): the hostfile an allocation request names with
+ * PMIX_ADD_HOSTFILE.
+ *
+ * It is read on the master's progress thread, so it is opened the way the
+ * other hostfile readers open one - non-blocking, and only a regular file
+ * is read. A bare fopen() of a FIFO with no writer never returned, which
+ * left the progress thread blocked; the alarm turns a regression of that
+ * into a failure rather than a hang. Each host's name, and the user before
+ * an '@', must be a name a host or user can have, as on a --host list.
+ */
+/* An add-hostfile request: one of our own when uid is PRTE_INVALID_UID,
+ * otherwise from a requester PMIx says is uid */
+static pmix_status_t hosts_add_hostfile_as(prte_ras_base_module_t *mod, const char *path,
+                                           uid_t uid)
+{
+    prte_pmix_server_req_t *req;
+    pmix_status_t rc;
+    uint32_t id = (uint32_t) uid;
+
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    req->ninfo = (PRTE_INVALID_UID == uid) ? 1 : 2;
+    req->info = PMIx_Info_create(req->ninfo);
+    PMIX_INFO_LOAD(&req->info[0], PMIX_ADD_HOSTFILE, path, PMIX_STRING);
+    if (PRTE_INVALID_UID == uid) {
+        PMIX_LOAD_PROCID(&req->tproc, PRTE_PROC_MY_NAME->nspace, PRTE_PROC_MY_NAME->rank);
+    } else {
+        PMIX_LOAD_PROCID(&req->tproc, "unit-test-addhf-tool", 0);
+        PMIX_INFO_LOAD(&req->info[1], PMIX_USERID, &id, PMIX_UINT32);
+    }
+    rc = mod->modify(req);
+    PMIX_RELEASE(req);
+    return rc;
+}
+
+static pmix_status_t hosts_add_hostfile(prte_ras_base_module_t *mod, const char *path)
+{
+    return hosts_add_hostfile_as(mod, path, PRTE_INVALID_UID);
+}
+
+static int write_hostfile(const char *path, const char *content)
+{
+    FILE *fp = fopen(path, "w");
+
+    if (NULL == fp) {
+        return -1;
+    }
+    fputs(content, fp);
+    return fclose(fp);
+}
+
+static int test_hosts_add_hostfile(void)
+{
+    int failures = 0;
+    pmix_mca_base_component_t *comp;
+    pmix_mca_base_module_t *module = NULL;
+    prte_ras_base_module_t *mod;
+    int pri = -1;
+    char dir[] = "/tmp/prte-ras-addhf-XXXXXX";
+    char *path = NULL;
+    size_t n;
+    struct {
+        const char *content;
+        bool accepted;
+    } cases[] = {
+        {"prte-unit-test-hnp\n", true},
+        {"prte-unit-test-hnp slots=1\n", true},
+        /* an account to reach the host as is refused, from anyone */
+        {"someuser@prte-unit-test-hnp\n", false},
+        {"# a comment\n\n  prte-unit-test-hnp\n", true},
+        {"bad$name\n", false},
+        {"-oops\n", false},
+        {"\"quoted\"\n", false},
+        {"someuser@\n", false},
+        {"@prte-unit-test-hnp\n", false},
+        {"bad;user@prte-unit-test-hnp\n", false},
+        {"-l@prte-unit-test-hnp\n", false},
+        {"prte-unit-test-hnp\nok-host\nnot`ok\n", false},
+    };
+
+    comp = find_ras_component("hosts");
+    if (NULL == comp || NULL == comp->pmix_mca_query_component ||
+        PRTE_SUCCESS != comp->pmix_mca_query_component(&module, &pri) || NULL == module) {
+        fprintf(stdout, "SKIP test_hosts_add_hostfile: ras/hosts not found\n");
+        return 0;
+    }
+    mod = (prte_ras_base_module_t *) module;
+    CHECK("addhf: has a modify", NULL != mod->modify);
+    if (NULL == mod->modify || NULL == mkdtemp(dir)) {
+        return failures + 1;
+    }
+
+    /* a FIFO with no writer: refused, and at once */
+    pmix_asprintf(&path, "%s/fifo", dir);
+    CHECK("addhf: mkfifo", 0 == mkfifo(path, 0600));
+    alarm(30);
+    CHECK("addhf: a FIFO is refused",
+          PMIX_OPERATION_SUCCEEDED != hosts_add_hostfile(mod, path));
+    alarm(0);
+    unlink(path);
+    free(path);
+
+    /* a directory */
+    CHECK("addhf: a directory is refused",
+          PMIX_OPERATION_SUCCEEDED != hosts_add_hostfile(mod, dir));
+
+    /* a path that is not there */
+    pmix_asprintf(&path, "%s/nosuch", dir);
+    CHECK("addhf: a missing file is refused",
+          PMIX_OPERATION_SUCCEEDED != hosts_add_hostfile(mod, path));
+    free(path);
+
+    /* the names in the file. Every accepted case names only the HNP's node,
+     * which is already in the pool, so nothing is inserted */
+    pmix_asprintf(&path, "%s/hostfile", dir);
+    for (n = 0; n < sizeof(cases) / sizeof(cases[0]); n++) {
+        char label[128];
+        pmix_status_t rc;
+
+        if (0 != write_hostfile(path, cases[n].content)) {
+            CHECK("addhf: write hostfile", false);
+            continue;
+        }
+        rc = hosts_add_hostfile(mod, path);
+        snprintf(label, sizeof(label), "addhf: %s %s", cases[n].accepted ? "accepts" : "refuses",
+                 cases[n].content);
+        if (cases[n].accepted) {
+            CHECK(label, PMIX_OPERATION_SUCCEEDED == rc);
+        } else {
+            CHECK(label, PMIX_OPERATION_SUCCEEDED != rc);
+        }
+    }
+    /* A file of hosts is read as whoever named it - and an account to reach
+     * a host as is refused even from our own user, who may otherwise name
+     * any host */
+    CHECK("addhf: write hostfile", 0 == write_hostfile(path, "someuser@prte-unit-test-hnp\n"));
+    CHECK("addhf: not even our own user may name an account",
+          PMIX_ERR_BAD_PARAM == hosts_add_hostfile_as(mod, path, prte_process_info.euid));
+    CHECK("addhf: write hostfile", 0 == write_hostfile(path, "prte-unit-test-hnp\n"));
+    CHECK("addhf: our own user may name the host",
+          PMIX_OPERATION_SUCCEEDED == hosts_add_hostfile_as(mod, path, prte_process_info.euid));
+    /* another user's request is read as that user, which a process not
+     * running as root cannot become - so here the file cannot be opened
+     * for it at all, login or not */
+    if (0 != prte_process_info.euid) {
+        CHECK("addhf: write hostfile", 0 == write_hostfile(path, "prte-unit-test-hnp\n"));
+        CHECK("addhf: another user's file is not read as us",
+              PMIX_OPERATION_SUCCEEDED
+                  != hosts_add_hostfile_as(mod, path, prte_process_info.euid + 1));
+    }
+    unlink(path);
+    free(path);
+    rmdir(dir);
+
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_hosts_add_hostfile\n");
+    }
+    return failures;
+}
+
+/*
  * ras/slurm, exercised the way the base exercises it: query the component
  * for a module, then drive that module's allocate().
  *
@@ -1242,6 +1408,15 @@ static int test_slurm_allocation(void)
             i++;
         }
         PMIX_LIST_DESTRUCT(&nodes);
+        /* the job is the user salloc/prte ran as, and its session says so */
+        {
+            prte_session_t *ss = prte_get_session_object(20010);
+
+            CHECK("slurm allocate: the job's session is recorded", NULL != ss);
+            CHECK("slurm allocate: ...as our own user's",
+                  NULL != ss && prte_process_info.euid == ss->owner_uid &&
+                  prte_process_info.egid == ss->owner_gid);
+        }
     }
 
     /* The jobid reaches scontrol/sbatch command lines, so it is a taint
@@ -1843,21 +2018,21 @@ static int test_activate_nodes(void)
     /* naming nothing at all is a bad request, not an empty success: a
      * requester that meant "everything" says so with "+all" */
     CHECK("activate_nodes: nothing named is refused",
-          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes(NULL, NULL, &n));
+          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes(NULL, NULL, prte_process_info.euid, prte_process_info.egid, &n));
     CHECK("activate_nodes: refusal reports no activation", 0 == n);
     CHECK("activate_nodes: an empty spec is the same as none",
-          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes("", "", &n));
+          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes("", "", prte_process_info.euid, prte_process_info.egid, &n));
 
     /* the host specification alone */
     CHECK("activate_nodes: host spec accepted",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, prte_process_info.euid, prte_process_info.egid, &n));
     CHECK("activate_nodes: it marked the node", PRTE_NODE_STATE_ADDED == idle1->state);
     CHECK("activate_nodes: and counted it", 1 == n);
 
     /* a node already marked is met, and counts for nothing: there is no
      * second daemon to launch, so no completion to wait for */
     CHECK("activate_nodes: re-naming a marked node succeeds",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, prte_process_info.euid, prte_process_info.egid, &n));
     CHECK("activate_nodes: with nothing left to activate", 0 == n);
 
     /* the hostfile as its own argument - the form only the PMIx directive
@@ -1868,7 +2043,7 @@ static int test_activate_nodes(void)
         return failures + 1;
     }
     CHECK("activate_nodes: hostfile argument accepted",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, hf1, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, hf1, prte_process_info.euid, prte_process_info.egid, &n));
     CHECK("activate_nodes: the file's node was marked",
           PRTE_NODE_STATE_ADDED == idle1->state);
     CHECK("activate_nodes: and counted", 1 == n);
@@ -1876,7 +2051,7 @@ static int test_activate_nodes(void)
     /* both arguments together, each naming a different node */
     idle1->state = PRTE_NODE_STATE_UP;
     CHECK("activate_nodes: host spec and hostfile together",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle2", hf1, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle2", hf1, prte_process_info.euid, prte_process_info.egid, &n));
     CHECK("activate_nodes: both nodes marked",
           PRTE_NODE_STATE_ADDED == idle1->state &&
           PRTE_NODE_STATE_ADDED == idle2->state);
@@ -1892,7 +2067,7 @@ static int test_activate_nodes(void)
     }
     pmix_asprintf(&both, "%s,%s", hf1, hf2);
     CHECK("activate_nodes: a comma-delimited hostfile list",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, both, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, both, prte_process_info.euid, prte_process_info.egid, &n));
     CHECK("activate_nodes: every file's node marked",
           PRTE_NODE_STATE_ADDED == idle1->state &&
           PRTE_NODE_STATE_ADDED == idle2->state);
@@ -1903,8 +2078,9 @@ static int test_activate_nodes(void)
     idle1->state = PRTE_NODE_STATE_UP;
     idle2->state = PRTE_NODE_STATE_UP;
     CHECK("activate_nodes: an unknown host is refused",
-          PRTE_ERR_SILENT == prte_ras_base_activate_nodes("actn-idle1,actn-nosuch",
-                                                          NULL, &n));
+          PRTE_ERR_SILENT == prte_ras_base_activate_nodes("actn-idle1,actn-nosuch", NULL,
+                                                          prte_process_info.euid,
+                                                          prte_process_info.egid, &n));
     CHECK("activate_nodes: nothing was marked by the refused spec",
           PRTE_NODE_STATE_UP == idle1->state);
     CHECK("activate_nodes: and nothing counted", 0 == n);
@@ -1915,7 +2091,7 @@ static int test_activate_nodes(void)
         return failures + 1;
     }
     CHECK("activate_nodes: an unknown host in the hostfile is refused",
-          PRTE_ERR_SILENT == prte_ras_base_activate_nodes("actn-idle1", hf2, &n));
+          PRTE_ERR_SILENT == prte_ras_base_activate_nodes("actn-idle1", hf2, prte_process_info.euid, prte_process_info.egid, &n));
     CHECK("activate_nodes: the host spec's node was not marked either",
           PRTE_NODE_STATE_UP == idle1->state);
 
@@ -2152,6 +2328,391 @@ static int test_teardown_reservation(void)
     return failures;
 }
 
+/* An allocation request as prte_ras_base_modify receives it: the info
+ * array is the request's own, as one relayed from a peer is. uid/gid of
+ * UINT32_MAX leave PMIX_USERID/PMIX_GRPID out. */
+static prte_pmix_server_req_t *mkalloc_req(pmix_alloc_directive_t dir,
+                                           uint32_t ruid, uint32_t rgid,
+                                           const pmix_info_t *extra, size_t nextra)
+{
+    prte_pmix_server_req_t *req = PMIX_NEW(prte_pmix_server_req_t);
+    size_t n = 0, k;
+
+    req->allocdir = dir;
+    PMIX_INFO_CREATE(req->info, nextra + 2);
+    if (UINT32_MAX != ruid) {
+        PMIX_INFO_LOAD(&req->info[n++], PMIX_USERID, &ruid, PMIX_UINT32);
+    }
+    if (UINT32_MAX != rgid) {
+        PMIX_INFO_LOAD(&req->info[n++], PMIX_GRPID, &rgid, PMIX_UINT32);
+    }
+    for (k = 0; k < nextra; k++) {
+        PMIX_INFO_XFER(&req->info[n++], &extra[k]);
+    }
+    req->ninfo = n;
+    req->copy = true;
+    return req;
+}
+
+/* the PMIX_ALLOC_UID/GID the request now carries, or false if either is
+ * missing */
+static bool req_owner(prte_pmix_server_req_t *req, uint32_t *uid, uint32_t *gid)
+{
+    size_t n;
+    bool hu = false, hg = false;
+
+    for (n = 0; n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_UID) &&
+            PMIX_UINT32 == req->info[n].value.type) {
+            *uid = req->info[n].value.data.uint32;
+            hu = true;
+        } else if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_GID) &&
+                   PMIX_UINT32 == req->info[n].value.type) {
+            *gid = req->info[n].value.data.uint32;
+            hg = true;
+        }
+    }
+    return hu && hg;
+}
+
+static int test_alloc_owner(void)
+{
+    int failures = 0;
+    prte_pmix_server_req_t *req;
+    pmix_info_t x[3];
+    uint32_t me = (uint32_t) prte_process_info.euid;
+    uint32_t mygrp = (uint32_t) prte_process_info.egid;
+    uint32_t other = me + 1, root = 0;
+    /* a group no user is in: no system assigns one this high */
+    uint32_t nogrp = 3999999;
+    uint32_t uid, gid;
+    pmix_status_t rc;
+
+    /* naming nothing: the request is for its requester */
+    req = mkalloc_req(PMIX_ALLOC_NEW, me, mygrp, NULL, 0);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: a request naming no owner is accepted", PMIX_SUCCESS == rc);
+    CHECK("alloc_owner: and is for its requester",
+          req_owner(req, &uid, &gid) && me == uid && mygrp == gid);
+    /* the group was filled in, not asked for, so it is not shared with -
+     * see PRTE_SESSION_FLAG_GROUP_ACCESS */
+    CHECK("alloc_owner: a group filled in is not one named", !req->alloc_gid_named);
+    PMIX_RELEASE(req);
+
+    /* naming oneself */
+    PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_UID, &me, PMIX_UINT32);
+    PMIX_INFO_LOAD(&x[1], PMIX_ALLOC_GID, &mygrp, PMIX_UINT32);
+    req = mkalloc_req(PMIX_ALLOC_EXTEND, me, mygrp, x, 2);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: a requester may name itself", PMIX_SUCCESS == rc);
+    CHECK("alloc_owner: and is left as named",
+          req_owner(req, &uid, &gid) && me == uid && mygrp == gid);
+    CHECK("alloc_owner: a group asked for is one named", req->alloc_gid_named);
+    PMIX_RELEASE(req);
+    PMIX_INFO_DESTRUCT(&x[0]);
+    PMIX_INFO_DESTRUCT(&x[1]);
+
+    /* a group it is not in */
+    PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_GID, &nogrp, PMIX_UINT32);
+    req = mkalloc_req(PMIX_ALLOC_NEW, me, mygrp, x, 1);
+    rc = prte_ras_base_alloc_owner(req);
+    if (0 == me) {
+        CHECK("alloc_owner: root may name any group", PMIX_SUCCESS == rc);
+    } else {
+        CHECK("alloc_owner: a group the requester is not in is refused",
+              PMIX_ERR_NO_PERMISSIONS == rc);
+    }
+    PMIX_RELEASE(req);
+    PMIX_INFO_DESTRUCT(&x[0]);
+
+    /* another user */
+    if (0 != me) {
+        PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_UID, &other, PMIX_UINT32);
+        PMIX_INFO_LOAD(&x[1], PMIX_ALLOC_GID, &mygrp, PMIX_UINT32);
+        req = mkalloc_req(PMIX_ALLOC_NEW, me, mygrp, x, 2);
+        rc = prte_ras_base_alloc_owner(req);
+        CHECK("alloc_owner: anyone but root may not name another user, "
+              "even the DVM's own", PMIX_ERR_NO_PERMISSIONS == rc);
+        PMIX_RELEASE(req);
+        PMIX_INFO_DESTRUCT(&x[0]);
+        PMIX_INFO_DESTRUCT(&x[1]);
+    }
+
+    /* root, on behalf of another user */
+    PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_UID, &other, PMIX_UINT32);
+    PMIX_INFO_LOAD(&x[1], PMIX_ALLOC_GID, &nogrp, PMIX_UINT32);
+    req = mkalloc_req(PMIX_ALLOC_NEW, root, root, x, 2);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: root may name any user and group", PMIX_SUCCESS == rc);
+    CHECK("alloc_owner: and is left as named",
+          req_owner(req, &uid, &gid) && other == uid && nogrp == gid);
+    PMIX_RELEASE(req);
+    PMIX_INFO_DESTRUCT(&x[1]);
+    /* another user without a group would get root's */
+    req = mkalloc_req(PMIX_ALLOC_NEW, root, root, x, 1);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: another user named without a group is refused",
+          PMIX_ERR_BAD_PARAM == rc);
+    PMIX_RELEASE(req);
+    PMIX_INFO_DESTRUCT(&x[0]);
+
+    /* a value that is not a number */
+    PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_UID, "me", PMIX_STRING);
+    req = mkalloc_req(PMIX_ALLOC_NEW, me, mygrp, x, 1);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: a mistyped owner is refused", PMIX_ERR_BAD_PARAM == rc);
+    PMIX_RELEASE(req);
+    PMIX_INFO_DESTRUCT(&x[0]);
+
+    /* a requester whose group is not known, naming none */
+    req = mkalloc_req(PMIX_ALLOC_NEW, me, UINT32_MAX, NULL, 0);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: no group to ask for is refused", PMIX_ERR_BAD_PARAM == rc);
+    PMIX_RELEASE(req);
+
+    /* a request we made ourselves names no requester: it is ours */
+    req = mkalloc_req(PMIX_ALLOC_NEW, UINT32_MAX, UINT32_MAX, NULL, 0);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: our own request is accepted", PMIX_SUCCESS == rc);
+    CHECK("alloc_owner: and is for our own user",
+          req_owner(req, &uid, &gid) && me == uid && mygrp == gid);
+    PMIX_RELEASE(req);
+
+    /* what allocates nothing is left alone */
+    req = mkalloc_req(PMIX_ALLOC_RELEASE, me, mygrp, NULL, 0);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: a release is left alone",
+          PMIX_SUCCESS == rc && !req_owner(req, &uid, &gid));
+    PMIX_RELEASE(req);
+    PMIX_INFO_LOAD(&x[0], PMIX_ADD_HOST, "node01", PMIX_STRING);
+    req = mkalloc_req(PMIX_ALLOC_EXTEND, me, mygrp, x, 1);
+    rc = prte_ras_base_alloc_owner(req);
+    CHECK("alloc_owner: an --add-host request is left alone",
+          PMIX_SUCCESS == rc && !req_owner(req, &uid, &gid));
+    PMIX_RELEASE(req);
+    PMIX_INFO_DESTRUCT(&x[0]);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_alloc_owner\n");
+    }
+    return failures;
+}
+
+/* The time an allocation request asks for, with no scheduler to decide it.
+ *
+ * Nothing on the allocation path used to read PMIX_ALLOC_TIME, so an EXTEND
+ * that asked only for time found no node list, grew nothing and answered
+ * success - and the session's limit was what it had been. The DVM now serves
+ * the time itself, and a limit set by those who decide what the DVM's
+ * sessions hold (PRTE_SESSION_FLAG_LIMIT_HELD) is not the owner's to change,
+ * while one the owner set is. An extend that asks for nothing is an error. */
+static pmix_status_t time_extend(uint32_t ruid, uint32_t rgid, uint32_t ouid, uint32_t ogid,
+                                 const char *aid, const char *time)
+{
+    prte_pmix_server_req_t *req;
+    pmix_info_t x[4];
+    size_t nx = 0, k;
+    pmix_status_t rc;
+
+    PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_UID, &ouid, PMIX_UINT32);
+    PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_GID, &ogid, PMIX_UINT32);
+    PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_ID, aid, PMIX_STRING);
+    if (NULL != time) {
+        PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_TIME, time, PMIX_STRING);
+    }
+    req = mkalloc_req(PMIX_ALLOC_EXTEND, ruid, rgid, x, nx);
+    req->pstatus = PMIX_SUCCESS;
+    prte_ras_base_complete_request(req);
+    rc = req->pstatus;
+    PMIX_RELEASE(req);
+    for (k = 0; k < nx; k++) {
+        PMIX_INFO_DESTRUCT(&x[k]);
+    }
+    return rc;
+}
+
+static int test_alloc_time(void)
+{
+    int failures = 0;
+    prte_session_t *s;
+    uint32_t me = (uint32_t) prte_process_info.euid;
+    uint32_t mygrp = (uint32_t) prte_process_info.egid;
+    /* an ordinary user: not root, not us */
+    uint32_t user = (0 == me) ? 4242 : me + 1;
+    uint32_t ugrp = 4242;
+    bool saved_owned = prte_ras_base.scheduler_owned;
+    const char *aid = "prte-unit-test.4343";
+
+    prte_ras_base.scheduler_owned = false;
+    s = PMIX_NEW(prte_session_t);
+    s->session_id = 4343;
+    s->alloc_refid = strdup(aid);
+    s->flags |= PRTE_SESSION_FLAG_RESERVED;
+    s->owner_uid = (uid_t) user;
+    s->owner_gid = (gid_t) ugrp;
+    CHECK("alloc_time/register", PRTE_SUCCESS == prte_set_session_object(s));
+    PMIX_RETAIN(s);
+
+    CHECK("alloc_time: the owner may set a time limit",
+          PMIX_SUCCESS == time_extend(user, ugrp, user, ugrp, aid, "60"));
+    CHECK("alloc_time: ...and it is in force",
+          NULL != s->timer && 60 == s->timeout.tv_sec);
+    CHECK("alloc_time: ...as the owner's own",
+          !PRTE_FLAG_TEST(s, PRTE_SESSION_FLAG_LIMIT_HELD));
+    CHECK("alloc_time: the owner may change its own limit",
+          PMIX_SUCCESS == time_extend(user, ugrp, user, ugrp, aid, "90") &&
+          90 == s->timeout.tv_sec);
+
+    CHECK("alloc_time: an extend asking for nothing is refused",
+          PMIX_ERR_BAD_PARAM == time_extend(user, ugrp, user, ugrp, aid, NULL));
+    CHECK("alloc_time: a time that is not one is refused",
+          PMIX_ERR_BAD_PARAM == time_extend(user, ugrp, user, ugrp, aid, "soon"));
+    CHECK("alloc_time: ...and changes nothing", 90 == s->timeout.tv_sec);
+
+    /* our own user is one who may change the DVM */
+    CHECK("alloc_time: the DVM's user may set the limit",
+          PMIX_SUCCESS == time_extend(me, mygrp, user, ugrp, aid, "120"));
+    CHECK("alloc_time: ...which the owner then does not hold",
+          PRTE_FLAG_TEST(s, PRTE_SESSION_FLAG_LIMIT_HELD) && 120 == s->timeout.tv_sec);
+    fprintf(stdout, "-- the next case refuses an owner's change to a held limit;"
+                    " the message it prints is expected --\n");
+    CHECK("alloc_time: the owner may not change a limit it does not hold",
+          PMIX_ERR_NO_PERMISSIONS == time_extend(user, ugrp, user, ugrp, aid, "999"));
+    CHECK("alloc_time: ...which stays as it was", 120 == s->timeout.tv_sec);
+    CHECK("alloc_time: the DVM's user may change it again",
+          PMIX_SUCCESS == time_extend(me, mygrp, user, ugrp, aid, "30") &&
+          30 == s->timeout.tv_sec);
+
+    /* under a scheduler the scheduler decided the time, and says so with
+     * session control - the request's own value is not ours to apply */
+    prte_ras_base.scheduler_owned = true;
+    (void) time_extend(user, ugrp, user, ugrp, aid, "999");
+    CHECK("alloc_time: under a scheduler the request's time is not applied",
+          30 == s->timeout.tv_sec);
+    prte_ras_base.scheduler_owned = false;
+
+    prte_ras_base_teardown_reservation(s, false);
+    CHECK("alloc_time: teardown disarms the limit", NULL == s->timer);
+    PMIX_RELEASE(s);
+    prte_ras_base.scheduler_owned = saved_owned;
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_alloc_time\n");
+    }
+    return failures;
+}
+
+/* Returning a reservation's nodes shrinks their daemons out of the DVM, for
+ * the scheduler or resource manager holding the allocation to have them back.
+ * With no scheduler there is nobody to give them to, and a DVM that is not
+ * elastic cannot shed a daemon: in either case the nodes go back to the
+ * general pool, with their daemons, whatever the teardown was asked to do.
+ * A release naming a reserved node, with no scheduler, likewise takes the
+ * node out of its reservation and leaves it in the DVM. */
+static prte_session_t *pool_resv(uint32_t id, const char *aid, prte_node_t **nd_out)
+{
+    prte_session_t *s;
+    prte_node_t *nd;
+    prte_proc_t *d;
+
+    s = PMIX_NEW(prte_session_t);
+    s->session_id = id;
+    s->alloc_refid = strdup(aid);
+    s->flags |= PRTE_SESSION_FLAG_RESERVED;
+    s->owner_uid = (uid_t) prte_process_info.euid;
+    s->owner_gid = (gid_t) prte_process_info.egid;
+    prte_set_session_object(s);
+
+    nd = PMIX_NEW(prte_node_t);
+    pmix_asprintf(&nd->name, "prte-unit-test-rtp-%u", (unsigned) id);
+    nd->state = PRTE_NODE_STATE_UP;
+    nd->slots = 1;
+    nd->index = pmix_pointer_array_add(prte_node_pool, nd);
+    /* a daemon of ours, not the master's own */
+    d = PMIX_NEW(prte_proc_t);
+    PMIX_LOAD_PROCID(&d->name, PRTE_PROC_MY_NAME->nspace, 7);
+    nd->daemon = d;
+    nd->session = s;
+    PMIX_RETAIN(nd);
+    pmix_pointer_array_add(s->nodes, nd);
+    *nd_out = nd;
+    return s;
+}
+
+static void pool_resv_done(prte_node_t *nd)
+{
+    pmix_pointer_array_set_item(prte_node_pool, nd->index, NULL);
+    PMIX_RELEASE(nd);
+}
+
+static int test_return_to_pool(void)
+{
+    int failures = 0;
+    bool saved_owned = prte_ras_base.scheduler_owned;
+    bool saved_elastic = prte_elastic_mode;
+    size_t ncamp = pmix_list_get_size(&prte_shrink_campaigns);
+    int fence = prte_dvm_launch_fence;
+    prte_session_t *s;
+    prte_node_t *nd;
+
+    /* no scheduler, elastic: nothing to return the nodes to */
+    prte_ras_base.scheduler_owned = false;
+    prte_elastic_mode = true;
+    s = pool_resv(4401, "prte-unit-test.4401", &nd);
+    prte_ras_base_teardown_reservation(s, true);
+    CHECK("return_to_pool: with no scheduler the node is unreserved", NULL == nd->session);
+    CHECK("return_to_pool: ...and keeps its daemon", NULL != nd->daemon);
+    CHECK("return_to_pool: ...and nothing is shrunk",
+          ncamp == pmix_list_get_size(&prte_shrink_campaigns) && fence == prte_dvm_launch_fence);
+    pool_resv_done(nd);
+
+    /* a scheduler, but a DVM that cannot change size */
+    prte_ras_base.scheduler_owned = true;
+    prte_elastic_mode = false;
+    s = pool_resv(4402, "prte-unit-test.4402", &nd);
+    prte_ras_base_teardown_reservation(s, true);
+    CHECK("return_to_pool: a fixed-size DVM unreserves the node", NULL == nd->session);
+    CHECK("return_to_pool: ...and keeps its daemon", NULL != nd->daemon);
+    CHECK("return_to_pool: ...and nothing is shrunk",
+          ncamp == pmix_list_get_size(&prte_shrink_campaigns) && fence == prte_dvm_launch_fence);
+    pool_resv_done(nd);
+
+    /* no scheduler: a release naming a reserved node unreserves it */
+    prte_ras_base.scheduler_owned = false;
+    prte_elastic_mode = true;
+    {
+        prte_pmix_server_req_t *req;
+        uint32_t me = (uint32_t) prte_process_info.euid;
+        uint32_t mygrp = (uint32_t) prte_process_info.egid;
+        pmix_info_t x[1];
+
+        s = pool_resv(4403, "prte-unit-test.4403", &nd);
+        PMIX_RETAIN(s);
+        PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_NODE_LIST, nd->name, PMIX_STRING);
+        req = mkalloc_req(PMIX_ALLOC_RELEASE, me, mygrp, x, 1);
+        req->pstatus = PMIX_SUCCESS;
+        prte_ras_base_complete_request(req);
+        CHECK("return_to_pool: releasing a reserved node succeeds", PMIX_SUCCESS == req->pstatus);
+        CHECK("return_to_pool: ...takes it out of its reservation",
+              NULL == nd->session && NULL == pmix_pointer_array_get_item(s->nodes, 0));
+        CHECK("return_to_pool: ...and leaves it in the DVM",
+              NULL != nd->daemon && ncamp == pmix_list_get_size(&prte_shrink_campaigns) &&
+                  fence == prte_dvm_launch_fence);
+        PMIX_RELEASE(req);
+        PMIX_INFO_DESTRUCT(&x[0]);
+        prte_ras_base_teardown_reservation(s, false);
+        PMIX_RELEASE(s);
+        pool_resv_done(nd);
+    }
+
+    prte_ras_base.scheduler_owned = saved_owned;
+    prte_elastic_mode = saved_elastic;
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_return_to_pool\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -2205,13 +2766,17 @@ int main(void)
     failures += test_activate_hosts();
     failures += test_activate_nodes();
     failures += test_spawn_alloc();
+    failures += test_alloc_owner();
     failures += test_teardown_reservation();
+    failures += test_return_to_pool();
+    failures += test_alloc_time();
     failures += test_hnp_locality_match();
     /* after test_select(), which opens the framework and latches a
      * selection made with no SLURM allocation in the environment -- so
      * nothing has called slurm's init() before this does */
     failures += test_pmix_gate();
     failures += test_hosts_empty_hostfile();
+    failures += test_hosts_add_hostfile();
     failures += test_slurm_allocation();
 
     /* PMIx last, and after the frameworks are closed: finalizing it unloads

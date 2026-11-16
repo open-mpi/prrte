@@ -27,9 +27,13 @@
 
 #include "src/mca/rmaps/rmaps_types.h"
 #include "src/mca/state/state.h"
+#include "src/prted/pmix/pmix_server_internal.h"
 #include "src/runtime/prte_globals.h"
+#include "src/runtime/prte_node_index.h"
+#include "src/util/proc_info.h"
 #include "src/util/dash_host/dash_host.h"
 #include "src/util/hostfile/hostfile.h"
+#include "src/util/textfile.h"
 #include "ras_hosts.h"
 
 /*
@@ -65,6 +69,8 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     char *hosts, **hostlist = NULL;
     bool check;
     prte_app_context_t *app;
+    uid_t uid;
+    gid_t gid;
 
     /* We first see if we were given a rank/seqfile - if so, use it
      * as the hosts will be taken from the mapping */
@@ -75,8 +81,9 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
                              "%s ras:hosts:allocate parsing rank/seqfile %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), hosts));
 
-        /* a rank/seqfile was provided - parse it */
-        rc = prte_util_add_hostfile_nodes(nodes, hosts);
+        /* a rank/seqfile was provided - parse it, as the job's owner */
+        prte_pmix_server_job_user(jdata, &uid, &gid);
+        rc = prte_util_add_hostfile_nodes(nodes, hosts, uid, gid);
         if (PRTE_SUCCESS != rc) {
             free(hosts);
             return rc;
@@ -178,8 +185,10 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
                 return PRTE_ERR_SILENT;
             }
             free(hosts);
+            /* read as the job's owner, who named them */
+            prte_pmix_server_job_user(jdata, &uid, &gid);
             for (j=0; NULL != hostlist[j]; j++) {
-                if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(nodes, hostlist[j]))) {
+                if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(nodes, hostlist[j], uid, gid))) {
                     PMIx_Argv_free(hostlist);
                     return rc;
                 }
@@ -200,8 +209,11 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
                              "%s ras:base:allocate parsing default hostfile %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), prte_default_hostfile));
 
-        /* a default hostfile was provided - parse it */
-        if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(nodes, prte_default_hostfile))) {
+        /* a default hostfile was provided - parse it. It is the DVM's own
+         * configuration, so read as ourselves */
+        if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(nodes, prte_default_hostfile,
+                                                               prte_process_info.euid,
+                                                               prte_process_info.egid))) {
             return rc;
         }
     }
@@ -294,24 +306,38 @@ static bool parse_slots(const char *value, int *result)
     return true;
 }
 
-static pmix_status_t process_hostfile(char *hostfile, pmix_list_t *nodes)
+/* Read the hosts a request adds from hostfile, as uid/gid - whoever named
+ * it. What is wrong with the file is said to nspace: the job a spawn's
+ * --add-hostfile came with, whose tool is waiting on it. */
+static pmix_status_t read_hostfile(const char *nspace, char *hostfile, pmix_list_t *nodes,
+                                   uid_t uid, gid_t gid, prte_node_index_t *pidx)
 {
-    FILE *fp;
-    char *line, *cptr, *ptr;
+    prte_textfile_t tf;
+    char *line, *cptr, *ptr, *ndname;
     bool addslots, failed = false;
-    int slots;
+    int slots, rc;
     prte_node_t *nptr, *node;
 
     /* We don't use the hostfile parsing code in src/util because it
      * has a stricter idea of the range of allowed
-     * syntax here */
-    fp = fopen(hostfile, "r");
-    if (NULL == fp) {
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt", "ras-base:addhost-not-found", true, hostfile);
+     * syntax here. The file is still opened the way that code opens
+     * one: this runs on the master's progress thread, and a bare fopen()
+     * of a FIFO with no writer would block that thread for good, so the
+     * open is non-blocking and only a regular file is read - and it is
+     * made as whoever named the file */
+    rc = prte_textfile_open(&tf, hostfile, uid, gid);
+    if (PRTE_ERR_BAD_PARAM == rc) {
+        prte_show_help(nspace, "help-ras-base.txt",
+                       "ras-base:addhost-not-a-file", true, hostfile);
         return PMIX_ERR_SILENT;
     }
-
-    while (NULL != (line = pmix_getline(fp, &failed))) {
+    if (PRTE_SUCCESS != rc) {
+        prte_show_help(nspace, "help-ras-base.txt", "ras-base:addhost-not-found", true, hostfile);
+        return PMIX_ERR_SILENT;
+    }
+    /* a line at a time, within the limits every file we read is held to
+     * (prte_textfile_getline) */
+    while (NULL != (line = prte_textfile_getline(&tf))) {
         // ignore comments and blank lines
         if (0 == strlen(line)) {
             free(line);
@@ -360,7 +386,7 @@ static pmix_status_t process_hostfile(char *hostfile, pmix_list_t *nodes)
         if ('\0' == *ptr) {
             // bad syntax
             PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
-            fclose(fp);
+            prte_textfile_close(&tf);
             free(line);
             return PMIX_ERR_SILENT;
         }
@@ -370,14 +396,37 @@ static pmix_status_t process_hostfile(char *hostfile, pmix_list_t *nodes)
             addslots = true;
         }
         if (!parse_slots(ptr, &slots)) {
-            prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt", "ras-base:bad-slots", true,
+            prte_show_help(nspace, "help-ras-base.txt", "ras-base:bad-slots", true,
                            cptr, hostfile, ptr);
-            fclose(fp);
+            prte_textfile_close(&tf);
             free(line);
             return PMIX_ERR_BAD_PARAM;
         }
 
 process:
+        /* "user@host" used to name an account to reach the host as, and
+         * the launcher logged in to it as that account. The DVM reaches
+         * every node as its own user and runs no daemon as another, so such
+         * an entry is refused, as it is in a --host list - not reached as
+         * our own user instead, which is not what the file asked for. The
+         * name goes on the launch agent's command line, so it must be one
+         * a host can have. */
+        ndname = cptr;
+        if (NULL != strchr(ndname, '@')) {
+            prte_show_help(nspace, "help-ras-base.txt",
+                           "ras-base:addhost-user-host", true, cptr, hostfile);
+            prte_textfile_close(&tf);
+            free(line);
+            return PMIX_ERR_BAD_PARAM;
+        }
+        if (!prte_util_host_name_ok(ndname)) {
+            prte_show_help(nspace, "help-ras-base.txt",
+                           "ras-base:addhost-bad-name", true, cptr, hostfile);
+            prte_textfile_close(&tf);
+            free(line);
+            return PMIX_ERR_SILENT;
+        }
+
         /* See if we already have this node.
          *
          * prte_node_match() is the one place that knows how a name reaches a
@@ -387,7 +436,7 @@ process:
          * out for itself and had already drifted from it - it compared
          * nptr->name with no NULL check, which is the same drift the framework
          * guide records for --display-cpus. */
-        nptr = prte_node_match(NULL, cptr);
+        nptr = prte_node_index_match_name(pidx, ndname);
         if (NULL != nptr) {
             if (addslots) {
                 adjust_slots(nptr, slots);
@@ -395,7 +444,7 @@ process:
         } else {
             // this is a new node - add it
             node = PMIX_NEW(prte_node_t);
-            node->name = strdup(cptr);
+            node->name = strdup(ndname);
             node->state = PRTE_NODE_STATE_ADDED;
             if (0 <= slots) {
                 /* they gave us the number of slots, so set it - including an
@@ -408,23 +457,46 @@ process:
             } else if (0 > slots && -1 != slots) {
                 // cannot have a new node with negative slots - the -1
                 // is a marker for a node without slots being specified
-                prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt", "negative-slots", true,
-                               hostfile, cptr);
+                prte_show_help(nspace, "help-ras-base.txt", "negative-slots", true,
+                               ndname, slots);
                 PMIX_RELEASE(node);
                 free(line);
-                fclose(fp);
+                prte_textfile_close(&tf);
                 return PMIX_ERR_BAD_PARAM;
             }
             pmix_list_append(nodes, &node->super);
         }
         free(line);
     }
-    fclose(fp);
+    failed = tf.failed;
+    prte_textfile_close(&tf);
     if (failed) {
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-util.txt", "file-read-failed", true, hostfile);
+        if (!prte_textfile_report_limit(&tf, nspace, hostfile)) {
+            prte_show_help(nspace, "help-prte-util.txt", "file-read-failed", true, hostfile);
+        }
         return PMIX_ERR_SILENT;
     }
     return PMIX_SUCCESS;
+}
+
+/* Each line is looked up in the node pool, so look it up in an index of
+ * the pool (prte_node_index_t) rather than walking the pool once per line,
+ * which made a long file quadratic. Nothing here changes the pool: new
+ * nodes go on the caller's list, for prte_ras_base_node_insert(). */
+static pmix_status_t process_hostfile(const char *nspace, char *hostfile, pmix_list_t *nodes,
+                                      uid_t uid, gid_t gid)
+{
+    prte_node_index_t pidx;
+    pmix_status_t rc;
+
+    prte_node_index_construct(&pidx);
+    if (PRTE_SUCCESS != prte_node_index_add_pool(&pidx)) {
+        prte_node_index_destruct(&pidx);
+        return PMIX_ERR_OUT_OF_RESOURCE;
+    }
+    rc = read_hostfile(nspace, hostfile, nodes, uid, gid, &pidx);
+    prte_node_index_destruct(&pidx);
+    return rc;
 }
 
 static pmix_status_t modify(prte_pmix_server_req_t *req)
@@ -434,8 +506,20 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
     size_t n, k;
     char **hostfiles;
     bool handled = false;
+    uid_t uid;
+    gid_t gid;
+    const char *nspace = PRTE_PROC_MY_NAME->nspace;
 
     PMIX_CONSTRUCT(&nodes, pmix_list_t);
+
+    /* A file of hosts is read as whoever named it: the owner of the job a
+     * spawn's add-hostfile came with, or the requester of an allocation. */
+    if (NULL != req->jdata) {
+        prte_pmix_server_job_user(req->jdata, &uid, &gid);
+        nspace = PRTE_JOB_NSPACE(req->jdata);
+    } else {
+        prte_pmix_server_request_user(req->info, req->ninfo, &uid, &gid);
+    }
 
     // look for applicable directives
     for (n=0; n < req->ninfo; n++) {
@@ -454,7 +538,7 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
                 continue;
             }
             for (k=0; NULL != hostfiles[k]; k++) {
-                rc = process_hostfile(hostfiles[k], &nodes);
+                rc = process_hostfile(nspace, hostfiles[k], &nodes, uid, gid);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_LIST_DESTRUCT(&nodes);
                     PMIx_Argv_free(hostfiles);
@@ -522,7 +606,12 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
      *   - PMIX_ALLOC_RELEASE removes the named nodes (PMIX_ALLOC_NODE_LIST) or
      *     tears down a whole reservation (PMIX_ALLOC_ID).
      * Keeping the original request info intact preserves the node list and the
-     * allocation ids, so a release can target a specific reservation. */
+     * allocation ids, so a release can target a specific reservation.
+     *
+     * It also makes our answer say whom the allocation is for, as every
+     * module's must: there is no scheduler here to ask, so the allocation is
+     * granted for exactly the PMIX_ALLOC_UID/GID the request carries, which
+     * prte_ras_base_alloc_owner checked or filled in before we were called. */
     switch (req->allocdir) {
     case PMIX_ALLOC_NEW:
     case PMIX_ALLOC_EXTEND:

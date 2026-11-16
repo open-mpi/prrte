@@ -2856,12 +2856,13 @@ static int test_tool_registration(void)
      * In a tool's own namespace the rank is also how far the array grows,
      * so it is held below prte_pmix_tool_rank_limit. */
     CHECK("a rank above INT_MAX is refused",
-          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, (pmix_rank_t) INT_MAX + 1));
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, (pmix_rank_t) INT_MAX + 1,
+                                                                 prte_process_info.euid));
     prte_pmix_server_globals.tool_rank_limit = 16;
     CHECK("a tool rank at the limit is refused",
-          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, 16));
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, 16, prte_process_info.euid));
     CHECK("...and one below it accepted",
-          PRTE_SUCCESS == prte_pmix_server_tool_may_join(NULL, 15));
+          PRTE_SUCCESS == prte_pmix_server_tool_may_join(NULL, 15, prte_process_info.euid));
     req = PMIX_NEW(prte_pmix_server_req_t);
     PMIX_LOAD_PROCID(&req->target, "unit-test-tool@9", (pmix_rank_t) INT_MAX - 1);
     rc = prte_pmix_server_register_tool(req);
@@ -2910,12 +2911,34 @@ static int test_tool_registration(void)
     }
     req = PMIX_NEW(prte_pmix_server_req_t);
     PMIX_LOAD_PROCID(&req->target, "unit-test-tool@2", 0);
+    req->uid = prte_process_info.euid;
     rc = prte_pmix_server_register_tool(req);
     CHECK("a namespace already known is accepted without rebuilding it",
           PRTE_SUCCESS == rc);
     CHECK("...and the job object we had is the one still there",
           jdata == prte_get_job_data_object(req->target.nspace));
     PMIX_RELEASE(req);
+
+    /* ...but only from a user permitted on the job that holds it: a tool
+     * taking a namespace is taken for that job by whatever later asks by
+     * namespace. A tool the PMIx server named no user for, and one of a
+     * user the job does not admit, are told the name exists */
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.users, pmix_list_t);
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    PMIX_LOAD_PROCID(&req->target, "unit-test-tool@2", 0);
+    CHECK("a tool naming no user may not join a namespace we hold",
+          PRTE_EXISTS == prte_pmix_server_register_tool(req));
+    req->uid = (uid_t) 4343;
+    CHECK("a tool of a user the job does not admit may not join it",
+          PRTE_EXISTS == prte_pmix_server_register_tool(req));
+    CHECK("...and the relay on the master asks the same question",
+          PRTE_EXISTS == prte_pmix_server_tool_may_join(jdata, 0, (uid_t) 4343));
+    jdata->uid = (uid_t) 4343;
+    CHECK("a tool of the job's own user may join it",
+          PRTE_SUCCESS == prte_pmix_server_register_tool(req));
+    jdata->uid = PRTE_INVALID_UID;
+    PMIX_RELEASE(req);
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.users);
 
     /* An application job: a tool may take a rank the job has, as one started
      * from a job script does, but may not add one - the rank would never
@@ -2924,6 +2947,7 @@ static int test_tool_registration(void)
     PRTE_FLAG_UNSET(jdata, PRTE_JOB_FLAG_TOOL);
     req = PMIX_NEW(prte_pmix_server_req_t);
     PMIX_LOAD_PROCID(&req->target, "unit-test-tool@2", 0);
+    req->uid = prte_process_info.euid;
     CHECK("a tool may not add a rank to an application job",
           PRTE_EXISTS == prte_pmix_server_register_tool(req));
     proc = PMIX_NEW(prte_proc_t);
@@ -2935,7 +2959,8 @@ static int test_tool_registration(void)
     CHECK("...and a sentinel rank is refused for a known namespace too",
           PRTE_ERR_BAD_PARAM == prte_pmix_server_register_tool(req));
     CHECK("the may-join check refuses the same sentinel on the relay's behalf",
-          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, PMIX_RANK_WILDCARD));
+          PRTE_ERR_BAD_PARAM == prte_pmix_server_tool_may_join(NULL, PMIX_RANK_WILDCARD,
+                                                                 prte_process_info.euid));
     PMIX_RELEASE(req);
 
     pmix_pointer_array_set_item(prte_job_data, jdata->index, NULL);
@@ -4302,9 +4327,20 @@ static int test_access(void)
         CHECK("access/record-groups", PMIX_SUCCESS == record_cached(jdata));
         CHECK("access/group-member", prte_pmix_server_job_permitted(pw->pw_uid, jdata));
         CHECK("access/users-kept", prte_pmix_server_job_permitted(ACC_LISTED, jdata));
+        /* a user's groups, as an allocation request may name them */
+        CHECK("access/in-own-group", prte_pmix_server_in_group(pw->pw_uid, pw->pw_gid));
+        CHECK("access/not-in-group", !prte_pmix_server_in_group(pw->pw_uid, 3999999));
     } else {
         pw = NULL;
     }
+    CHECK("access/root-in-any-group", prte_pmix_server_in_group(0, 3999999));
+    CHECK("access/our-user-in-own-group",
+          prte_pmix_server_in_group(prte_process_info.euid, prte_process_info.egid));
+    if (0 != prte_process_info.euid) {
+        CHECK("access/our-user-not-in-group",
+              !prte_pmix_server_in_group(prte_process_info.euid, 3999999));
+    }
+    CHECK("access/no-user-in-no-group", !prte_pmix_server_in_group(PRTE_INVALID_UID, 0));
     PMIX_RELEASE(jdata);
 
     /* a spawn's PMIX_ACCESS_PERMISSIONS travels with the job's info; the
@@ -4357,14 +4393,22 @@ static int test_access(void)
     CHECK("session/stranger", !prte_pmix_server_session_permitted(session, &other, info, 1));
     /* naming the owner's namespace changes nothing - only who is asking */
     PMIX_LOAD_PROCID(&other, "unit-test-access-owner-ns", 0);
-    prte_session_add_owner(session, other.nspace);
+    PMIX_LOAD_NSPACE(session->owner, other.nspace);
     CHECK("session/namespace-irrelevant",
           !prte_pmix_server_session_permitted(session, &other, info, 1));
     PMIX_INFO_DESTRUCT(&info[0]);
     if (NULL != pw) {
+        /* a member of the owner's group is admitted only when the group was
+         * named for the session (PRTE_SESSION_FLAG_GROUP_ACCESS) - not when
+         * it was filled in from the requester's own primary group */
         id = (uint32_t) pw->pw_uid;
         PMIX_INFO_LOAD(&info[0], PMIX_USERID, &id, PMIX_UINT32);
-        CHECK("session/owner-group", prte_pmix_server_session_permitted(session, &other, info, 1));
+        CHECK("session/owner-group-not-named",
+              !prte_pmix_server_session_permitted(session, &other, info, 1));
+        PRTE_FLAG_SET(session, PRTE_SESSION_FLAG_GROUP_ACCESS);
+        CHECK("session/owner-group-named",
+              prte_pmix_server_session_permitted(session, &other, info, 1));
+        PRTE_FLAG_UNSET(session, PRTE_SESSION_FLAG_GROUP_ACCESS);
         PMIX_INFO_DESTRUCT(&info[0]);
     }
     CHECK("session/ourselves",
@@ -4429,25 +4473,21 @@ static int test_access(void)
         PMIX_INFO_LOAD(&info[0], PMIX_USERID, &id, PMIX_UINT32);
         CHECK("dvm/listed", prte_pmix_server_dvm_permitted(&other, info, 1));
         CHECK("dvm/listed-not-job-member", !prte_pmix_server_job_permitted(ACC_LISTED, dvm));
-        /* bringing hosts in (P02): a listed user may name hosts, as it may
-         * create a session - but not a file the master reads for it, nor a
-         * user to reach a host as, which the master does as itself */
-        CHECK("grow/listed names hosts",
-              prte_pmix_server_grow_permitted(&other, info, 1, false, false));
-        CHECK("grow/listed may not name a file",
-              !prte_pmix_server_grow_permitted(&other, info, 1, true, false));
-        CHECK("grow/listed may not name a user",
-              !prte_pmix_server_grow_permitted(&other, info, 1, false, true));
+        /* bringing hosts in: a listed user may name hosts, as it may create
+         * a session, directly or in a file of them (which is read as that
+         * user). Naming an account to reach a host as is refused from
+         * anyone, by the parsers, so it is no part of this rule */
+        CHECK("grow/listed names hosts", prte_pmix_server_grow_permitted(&other, info, 1));
         PMIX_INFO_DESTRUCT(&info[0]);
-        CHECK("grow/root may name all three", prte_pmix_server_grow_permitted_uid(0, true, true));
-        CHECK("grow/our user may name all three",
-              prte_pmix_server_grow_permitted_uid(prte_process_info.euid, true, true));
+        CHECK("grow/root names hosts", prte_pmix_server_grow_permitted_uid(0));
+        CHECK("grow/our user names hosts",
+              prte_pmix_server_grow_permitted_uid(prte_process_info.euid));
         CHECK("grow/a stranger may not name hosts",
-              !prte_pmix_server_grow_permitted_uid(ACC_STRANGER, false, false));
-        CHECK("grow/a request of our own may name all three",
-              prte_pmix_server_grow_permitted(PRTE_PROC_MY_NAME, NULL, 0, true, true));
+              !prte_pmix_server_grow_permitted_uid(ACC_STRANGER));
+        CHECK("grow/a request of our own names hosts",
+              prte_pmix_server_grow_permitted(PRTE_PROC_MY_NAME, NULL, 0));
         CHECK("grow/an unnamed request may not",
-              !prte_pmix_server_grow_permitted(&other, NULL, 0, false, false));
+              !prte_pmix_server_grow_permitted(&other, NULL, 0));
         id = ACC_STRANGER;
         PMIX_INFO_LOAD(&info[0], PMIX_USERID, &id, PMIX_UINT32);
         CHECK("dvm/unlisted", !prte_pmix_server_dvm_permitted(&other, info, 1));
@@ -4573,7 +4613,6 @@ static int test_access(void)
         PMIX_RELEASE(prte_job_data);
         prte_job_data = NULL;
     }
-#if PRTE_PMIX_HAVE_ORIGIN_ID
     /* relaying a request: whom a relay may speak for, whom we attribute
      * its request to, and whom we say we act for when we pass it on */
     {
@@ -4588,11 +4627,6 @@ static int test_access(void)
         CHECK("relay/own-user-permitted",
               prte_pmix_server_relay_permitted(prte_process_info.euid, 4242));
         CHECK("relay/other-user-refused", !prte_pmix_server_relay_permitted(ACC_LISTED, 4242));
-        prte_pmix_server_globals.rly_uids = &ruid;
-        prte_pmix_server_globals.nrly_uids = 1;
-        CHECK("relay/listed-user-permitted", prte_pmix_server_relay_permitted(ACC_LISTED, 4242));
-        prte_pmix_server_globals.rly_uids = NULL;
-        prte_pmix_server_globals.nrly_uids = 0;
 
         /* a claim from a relay that may not make it is not believed */
         PMIX_INFO_LOAD(&rel[0], PMIX_USERID, &ruid, PMIX_UINT32);
@@ -4605,6 +4639,27 @@ static int test_access(void)
               prte_pmix_server_requester_uid(rel, 2, &got) && 4242 == got);
         PMIX_INFO_DESTRUCT(&rel[0]);
         PMIX_INFO_DESTRUCT(&rel[1]);
+
+        /* the group is always that of the process the request is
+         * attributed to - never one process's user with another's group */
+        PMIX_INFO_LOAD(&rel[0], PMIX_USERID, &ruid, PMIX_UINT32);
+        PMIX_INFO_LOAD(&rel[1], PMIX_GRPID, &rgid, PMIX_UINT32);
+        PMIX_INFO_LOAD(&rel[2], PMIX_ORIGIN_USERID, &claim, PMIX_UINT32);
+        PMIX_INFO_LOAD(&rel[3], PMIX_ORIGIN_GRPID, &reqg, PMIX_UINT32);
+        CHECK("relay/unpermitted-claim-group-is-the-relays",
+              (gid_t) ACC_OWNGRP == prte_pmix_server_requester_gid(rel, 4));
+        PMIX_INFO_DESTRUCT(&rel[0]);
+        PMIX_INFO_LOAD(&rel[0], PMIX_USERID, &myuid, PMIX_UINT32);
+        CHECK("relay/trusted-claim-group-believed",
+              (gid_t) 77 == prte_pmix_server_requester_gid(rel, 4));
+        CHECK("relay/trusted-claim-without-group-has-none",
+              PRTE_INVALID_GID == prte_pmix_server_requester_gid(rel, 3));
+        CHECK("relay/no-group-given",
+              PRTE_INVALID_GID == prte_pmix_server_requester_gid(rel, 1));
+        PMIX_INFO_DESTRUCT(&rel[0]);
+        PMIX_INFO_DESTRUCT(&rel[1]);
+        PMIX_INFO_DESTRUCT(&rel[2]);
+        PMIX_INFO_DESTRUCT(&rel[3]);
 
         /* passing one on: our own stamped identity does not travel, the
          * process we heard from goes as the origin, the rest as it was */
@@ -4654,7 +4709,6 @@ static int test_access(void)
             PMIX_INFO_DESTRUCT(&rel[k]);
         }
     }
-#endif
     PMIX_RELEASE(jdata);
     PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.users);
     /* PMIx is finalized in main(), after the frameworks are closed: in an

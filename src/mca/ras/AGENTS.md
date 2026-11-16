@@ -210,11 +210,11 @@ can still be refused cleanly:
   scheduler first and an allocation granted to a request refused afterwards
   would be stranded;
 - without a scheduler, a release by node list in
-  `ras_base_complete_release_request()` only when it has shrink targets, and
-  a release by allocation id in `ras_base_teardown_by_alloc_id()` only when
-  the reservation's nodes carry daemons. A NEW that names no nodes reserves
-  nodes the DVM already has, and a release of daemon-less nodes shrinks
-  nothing; both stay legal.
+  `ras_base_complete_release_request()` only when it has shrink targets -
+  nodes of the general pool, since a node a reservation holds is not shrunk
+  there (see below). A release by allocation id shrinks nothing without a
+  scheduler, so it is not refused. A NEW that names no nodes reserves none,
+  and a release of daemon-less nodes shrinks nothing; both stay legal.
 - a session's nodes (`PMIX_SESSION_INSTANTIATE`, `PMIX_SESSION_EXTEND`) in
   `prte_ras_base_insert_node_string()`, per node, before any is inserted:
   a node with no daemon of ours is refused on a non-elastic DVM, while a node
@@ -228,16 +228,15 @@ daemons on hosts it holds - changes what it consists of, and the daemons
 started there are given the DVM's key, so it is held to
 `prte_pmix_server_grow_permitted()` (`src/prted/pmix/pmix_server_access.c`),
 the rule creating a session follows: root, the DVM's own user, and the users
-and groups `--rtos users=`/`groups=` named when it started. Two things the
-master does *as itself* are narrower - reading a file of hosts
-(`PMIX_ADD_HOSTFILE`, an activation's `PMIX_HOSTFILE`) and logging in as a
-named user (`user@host`) - and are for root and the DVM's own user alone.
-It is judged in two places, with the same rule:
+and groups `--rtos users=`/`groups=` named when it started. A file of hosts
+(`PMIX_ADD_HOSTFILE`, an activation's `PMIX_HOSTFILE`) is held to the same
+rule as the hosts it names, since it is read as whoever named it - a job's
+owner (`prte_pmix_server_job_user()`) or the request's requester
+(`prte_pmix_server_request_user()`) - through `prte_textfile_open()`. It
+is judged in three places, with the same rule:
 
 - `prte_ras_base_modify()`, for an allocation request: a NEW or EXTEND that
-  names nodes (`ras_base_names_hosts()`, which reads a node list through
-  `prte_ras_base_parse_node_list()` so a user inside a regex is seen), and
-  every ACTIVATE. A grow is not judged there when `ras/pmix` is the
+  names nodes (`ras_base_names_hosts()`), and every ACTIVATE. A grow is not judged there when `ras/pmix` is the
   selected module: its scheduler decides, and is told who asked
   (`PMIX_REQUESTOR`). Every other module acts on the names itself.
   An allocation a spawn carries (`PMIX_SPAWN_ALLOC`) comes here too, built
@@ -246,17 +245,48 @@ It is judged in two places, with the same rule:
   (`prte_pmix_server_is_identity_key()`) and puts in the owner's
   `PMIX_USERID`, since the array is the client's own and only PMIx or the
   spawn's admission may say who asked.
-- spawn admission (`plm_base_receive.c`): `--add-host` and `--activate`
-  (`grow_directive()`), and `--add-hostfile` among the files the master
-  reads (`foreign_directive()`). The request `prte_ras_base_add_hosts()`
-  then builds names the master as its requester, since the job was judged
-  already.
+- session control (`pmix_server_session.c`, `grant_permitted()`):
+  `PMIX_SESSION_INSTANTIATE` and `PMIX_SESSION_EXTEND`. These are the
+  scheduler's directives to the DVM, not requests for resources - a user
+  asks for those through `prte_ras_base_modify()` - so with no scheduler
+  both are for whoever may change the DVM, the session's owner included.
+  These requests reach `prte_ras_base_insert_node_string()` directly and
+  never pass through `prte_ras_base_modify()`.
+- spawn admission (`plm_base_receive.c`): `--add-host`, `--add-hostfile`
+  and `--activate` (`grow_directive()`). The request
+  `prte_ras_base_add_hosts()` then builds names the master as its
+  requester, since the job was judged already, and carries the job, so
+  `ras/hosts` reads its hostfile as the job's owner.
 
-`user@host` in a list of hosts (`prte_util_add_dash_host_nodes()`) is split
-the way a hostfile entry is: the node is named for the host, and the user is
-kept as `PRTE_NODE_USERNAME` for the launch agent. A name with any character
-other than letters, digits, `.`, `-` and `_` is refused
-(`dash-host:invalid-name`), since it goes on that agent's command line.
+**Taking nodes out is judged the same way.** `prte_ras_base_modify()`
+judges every `PMIX_ALLOC_RELEASE` before any module acts on it - the base's
+own release and ras/slurm's alike - unless `ras/pmix`'s scheduler is to
+decide (`ras_base_release_permitted()`). A release naming an allocation is
+for whoever `prte_pmix_server_session_permitted()` admits to it. One naming
+nodes is judged node by node: a node of a reservation by the same rule
+against that reservation, and a node of the general pool - or one we cannot
+find - by `prte_pmix_server_dvm_permitted()`, since every user's jobs run
+on the general pool. A release naming neither (ras/slurm's by-count) lets
+the DVM choose which nodes go, so it is held to
+`prte_pmix_server_dvm_permitted()` as well. A refusal shows
+`ras-base:release-not-permitted`.
+
+**No host may name an account to reach it as.** `user@host`, and a
+hostfile's `username=`, used to set `PRTE_NODE_USERNAME`, which `plm/ssh`
+put on the launch agent's command line - so the daemon on that node ran as
+some other user than the DVM's, with the DVM's key like any other. Nothing
+in the DVM is built for that, and the attribute is gone: every parser
+refuses such an entry, from anyone - `prte_util_add_dash_host_nodes()`
+(`dash-host:user-host`, which covers `--host`, `PMIX_HOST`/`PMIX_ADD_HOST`
+and every allocation and session node list), the hostfile parser
+(`user-host`), the rankfile parser, and `ras/hosts`' add-hostfile reader.
+Refused, not dropped: reaching the host as our own user instead is not what
+was asked for. An allocation request naming one is refused in
+`prte_ras_base_modify()` (`ras-base:user-host`, `PMIX_ERR_BAD_PARAM`) before
+a scheduler is asked, and a session directive in `parse_directives()`, so
+neither is granted and then refused. A name with any other character than
+letters, digits, `.`, `-` and `_` is refused (`dash-host:invalid-name`),
+since it goes on the launch agent's command line.
 
 A non-elastic DVM used to serve these. An `--add-host` launched its daemon,
 and when that daemon failed to start the requester waited forever on a daemon
@@ -466,8 +496,12 @@ input list.** Walk it carefully before touching allocation code:
   `launch_orted_on_hn` + `NO_USE_LOCAL` handling can instead rename the
   HNP node to `"prte"`, flag it `PRTE_NODE_NON_USABLE`, and skip the
   dedup so the head node is left out of mapping.
-- **General dedup.** For every other node, an exhaustive `prte_nptr_match`
-  scan of the pool decides add-vs-update. `PRTE_NODE_ADD_SLOTS` means
+- **General dedup.** For every other node, the first pool entry
+  `prte_nptr_match` accepts decides add-vs-update - found in a
+  `prte_node_index_t` of the pool built for the insert (`insert_list()`),
+  not by walking the pool per node, which made inserting a large allocation
+  quadratic. The index is built after the HNP rename below and grows with
+  every node inserted, copies included. `PRTE_NODE_ADD_SLOTS` means
   "adjust the existing slot count" (clamped to `[0, slots_max]`) rather
   than replace it. **On a match the incoming object is released and the
   loop moves on**: the pool entry is authoritative, so the duplicate must
@@ -561,6 +595,7 @@ elastic-DVM or PMIx_Allocation code:
 | Base function | Role |
 |---------------|------|
 | `prte_ras_base_modify()` | The `modify` driver (also a state callback). Cycles modules (keyed by `req->key`) to serve a `prte_pmix_server_req_t`; on `PMIX_SUCCESS` calls `prte_ras_base_complete_request`, then invokes the requester's `infocbfunc`. |
+| `prte_ras_base_alloc_owner()` | Called by `prte_ras_base_modify()` before any module: settle whom a `PMIX_ALLOC_NEW`/`EXTEND` is for (`PMIX_ALLOC_UID`/`GID`). See "Whom an allocation is for" below. |
 | `prte_ras_base_add_hosts()` | Collect `PRTE_APP_ADD_HOSTFILE`/`PRTE_APP_ADD_HOST` directives across apps into a `PMIX_ALLOC_EXTEND` request and hand it to `prte_ras_base_modify`. Sets `prte_dvm_ready = false` until processed. |
 | `prte_ras_base_activate_hosts()` | Collect `PRTE_APP_ACTIVATE_HOSTS` directives across apps, resolve them against the node pool, mark the resolved entries `PRTE_NODE_STATE_ADDED` and activate a grow. Adds nothing to the allocation, so it is permitted under a scheduler; must run after `prte_ras_base_add_hosts()`. Sets `prte_dvm_ready = false` when it activates a grow of its own. |
 | `prte_ras_base_spawn_alloc()` | Serve the allocation request carried by a spawn (`PMIX_SPAWN_ALLOC`), in the name of the spawn's requester. Sets `*posted` when one is in flight - the request then holds the job, and the outcome arrives at `prte_plm_base_spawn_alloc_granted()`/`_failed()`. |
@@ -569,8 +604,88 @@ elastic-DVM or PMIx_Allocation code:
 | `prte_ras_base_complete_request()` | The heavy reservation router. For `PMIX_ALLOC_NEW`/`EXTEND` it resolves the destination `prte_session_t` (honoring `PMIX_ALLOC_TARGET`/`SHARE`/`INHERITANCE`/`ID`/`REQ_ID`), parses `PMIX_ALLOC_NODE_LIST`, inserts the nodes, and attaches them to the reservation (`add_nodes_to_session`). For `PMIX_ALLOC_RELEASE` it tears down a named reservation or xcasts a `PRTE_DAEMON_SHRINK_CMD`. Marks `PRTE_JOB_EXTEND_DVM` and re-launches daemons for grows. |
 | `prte_ras_base_release_allocation()` | Session-destruct hook: cycles modules whose `release_allocation` matches `session->alloc_module`. |
 | `prte_ras_base_shrink_complete()` | Offers a drained `prte_shrink_campaign_t` to every module's `shrink_complete`. |
-| `prte_ras_base_teardown_reservation()` | Drop a reservation's hold on its nodes (clear `node->session` back to the default pool), deregister it, release the registry's reference on it, and — if `return_to_scheduler` — shrink its daemon-carrying nodes out of the DVM. |
+| `prte_ras_base_teardown_reservation()` | Drop a reservation's hold on its nodes (clear `node->session` back to the default pool), deregister it, release the registry's reference on it, and — if `return_to_scheduler`, and there is a scheduler holding the allocation (`prte_ras_base.scheduler_owned`) and the DVM is elastic — shrink its daemon-carrying nodes out of the DVM. Otherwise the nodes stay, in the general pool. |
 | `prte_ras_base_check_reservations_on_term()` | On namespace termination, fire each reservation's inheritance disposition (`PMIX_ALLOC_INHERIT_NONE`/`CHILD`/`CHILD_DEFAULT`/`DEFAULT`). |
+
+### Whom an allocation is for
+
+Every `PMIX_ALLOC_NEW` or `PMIX_ALLOC_EXTEND` a module is handed carries
+`PMIX_ALLOC_UID` and `PMIX_ALLOC_GID`, the user and group the allocation is
+for. `prte_ras_base_alloc_owner()` puts them there before any module is
+called:
+
+- a requester may name its own uid, and root any uid - no one else may name
+  another user, the DVM's own user included, since none of them could act
+  as one;
+- a requester may name any group it belongs to
+  (`prte_pmix_server_in_group()`, which looks the membership up afresh);
+- anything else is refused with `PMIX_ERR_NO_PERMISSIONS`, and a uid other
+  than the requester's named without a group with `PMIX_ERR_BAD_PARAM`;
+- a requester that names neither gets its own, as PMIx stamped them on the
+  request (`prte_pmix_server_requester_uid`/`_gid`). A spawn's allocation
+  request carries the spawn owner's `PMIX_USERID` and `PMIX_GRPID` for this.
+  A group filled in this way is still the group charged, but the
+  reservation does not share with it: only a group the request named
+  (`req->alloc_gid_named`, which `create_reservation()` turns into
+  `PRTE_SESSION_FLAG_GROUP_ACCESS`) lets its members use the reservation.
+
+Requests that grow the general pool by `--add-host`/`--add-hostfile` ask
+for no allocation and are left alone.
+
+**The module that serves the request owns the rest**, because only it knows
+what it actually asked its scheduler for. It passes the uid/gid on, checks
+that the scheduler's answer names the same ones - an answer naming another
+user or group, or none, is the scheduler's error: fail the request and hand
+back what was granted - and returns them in its answer. The base does not
+repeat that check. What it does do, in `ras_base_complete_grow_request()`,
+is refuse an answer that carries no `PMIX_ALLOC_UID`/`GID` at all
+(`ras-base:alloc-owner-missing`), and record them as a new reservation's
+`owner_uid`/`owner_gid` - never assumed from the requesting job. An
+EXTEND's reservation keeps the owner it has.
+
+- `ras/hosts` asks no one, so the allocation is for exactly what the
+  request carries, and its answer is the request.
+- `ras/pmix` sends them in the request and compares the scheduler's answer
+  in `owner_answered()`, **before** `merge_answer()` - which would fill the
+  keys in from the request and hide an answer that left them out. On a
+  mismatch it returns the grant with a `PMIX_ALLOC_RELEASE`
+  (`giveback()`): the allocation id for a NEW, the id and granted nodes for
+  an EXTEND, since releasing the id alone would take back what was held
+  before.
+- `ras/slurm` completes its requests itself. It answers with the DVM's
+  own uid and gid, since `salloc` runs as that user and the job Slurm
+  creates is that user's, and records them as the session's owner. Asking
+  Slurm for the requested user and group is not done; the note on
+  `prte_ras_slurm_serve_extend_req()` says what it would take.
+
+### The time an allocation is for
+
+With no scheduler (`!prte_ras_base.scheduler_owned`), the DVM serves a
+request's `PMIX_ALLOC_TIME` itself: `ras_base_complete_grow_request()` sets
+the session's limit to that long from now
+(`prte_pmix_server_session_set_limit()`, the same timer session control
+uses), on a NEW and on an EXTEND, and the session is terminated when it
+expires. Nothing on this path read the key before, so an EXTEND asking only
+for time found no node list, grew nothing and answered success.
+
+Who may change a limit depends on who set it. One set by the scheduler, by
+session control, or by a requester who may change the DVM
+(`prte_pmix_server_dvm_permitted()`) carries `PRTE_SESSION_FLAG_LIMIT_HELD`,
+and an owner's EXTEND naming a time is then refused
+(`ras-base:limit-not-permitted`); a limit the owner set on its own request it
+may change. That is judged in `ras_base_prepare_grow()`, before anything
+about the session is changed. A time on a request for the general pool
+(`PMIX_ALLOC_SHARE`) is refused - the pool has no lifetime to limit - and an
+EXTEND that names no nodes, no time and no disposition extends nothing and
+is refused with `PMIX_ERR_BAD_PARAM`, as session control refuses one.
+
+Such an EXTEND is also not a resize: outside elastic mode,
+`prte_ras_base_modify()` refuses an EXTEND only when it names nodes or a
+scheduler serves it, as it does a NEW.
+
+Under a scheduler none of this applies. The scheduler decided the time, and
+tells the DVM with session control; the value in the request is not the
+DVM's to apply.
 
 ### A request's directives arrive from a client and are typed by a client
 
@@ -634,6 +749,21 @@ types; a PMIx older than that refuses the documented spelling.
   The guard lives in `ras_base_send_dvm_shrink`, which is the one place every
   caller passes through.
 
+### Returning a reservation's nodes needs someone to return them to
+
+"Return the nodes to the scheduler" - `PMIX_ALLOC_INHERIT_NONE`/`_CHILD`,
+an explicit release - means shrinking their daemons out of the DVM. That
+takes a scheduler or resource manager holding the allocation, to have them
+back, and an elastic DVM, which can shed a daemon. Without either,
+`prte_ras_base_teardown_reservation()` sends the nodes to the general pool
+instead, whatever it was asked: with no scheduler the nodes are the DVM's
+own, and a reservation's owner is not one who may take nodes out of the
+DVM; a fixed-size DVM cannot, and used to broadcast the shrink anyway. A
+release by node list follows the same rule (`ras_base_find_shrink_targets()`
+takes a node a reservation holds back into the general pool). Taking a node
+out of a DVM with no scheduler is a release of a general-pool node, which
+`ras_base_release_permitted()` holds to `prte_pmix_server_dvm_permitted()`.
+
 ### Tearing a reservation down releases it — which is why the job side counts
 
 `prte_ras_base_teardown_reservation()` gives the nodes back, drops the owners
@@ -675,9 +805,8 @@ turns it into `PRTE_PROC_STATE_TERMINATED` for a job flagged
 `PRTE_JOB_FLAG_TOOL`, which is what eventually walks the table above.
 Without that the disposition never runs at all, and a grow driven from a
 command line strands its nodes for the life of the DVM: out of the general
-pool, and unreachable through the reservation as well, since
-`prte_session_is_owned_by` will only admit a namespace that no longer
-exists.
+pool, and held by a reservation its owner's later commands can use but
+nothing returns.
 
 Elastic shrink is a two-phase collective: `PMIX_ALLOC_RELEASE` records a
 `prte_shrink_campaign_t`, xcasts the shrink command with a completion

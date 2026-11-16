@@ -596,19 +596,6 @@ void pmix_server_register_params(void)
                                       PMIX_MCA_BASE_VAR_TYPE_STRING,
                                       &prte_pmix_server_globals.scheduler_uids);
 
-    /* the users, besides root and our own, trusted to relay for another */
-    prte_pmix_server_globals.relay_uids = NULL;
-    (void) pmix_mca_base_var_register("prte", "pmix", NULL, "relay_uids",
-                                      "Comma-separated list of the users (names or numeric "
-                                      "uids) trusted to pass on a request for a process of "
-                                      "another user - a privileged DVM relaying its users' "
-                                      "requests, say. A request a relay makes for its own "
-                                      "user, and one relayed by root or by the user the DVM "
-                                      "runs as, needs no entry. Any other relay's claim is "
-                                      "ignored, and the request treated as the relay's own",
-                                      PMIX_MCA_BASE_VAR_TYPE_STRING,
-                                      &prte_pmix_server_globals.relay_uids);
-
     /* whether or not to generate device distances */
     (void) pmix_mca_base_var_register("prte", "pmix", NULL, "generate_distances",
                                       "Device types whose distances are to be provided (default=fabric,gpu,network)",
@@ -1044,8 +1031,6 @@ int pmix_server_init(void)
     prte_pmix_server_globals.primary_server_set = false;
     prte_pmix_server_globals.sched_uids = NULL;
     prte_pmix_server_globals.nsched_uids = 0;
-    prte_pmix_server_globals.rly_uids = NULL;
-    prte_pmix_server_globals.nrly_uids = 0;
     prte_pmix_server_globals.dvm_access = NULL;
 
     /* only the master accepts a scheduler. Its users are looked up now -
@@ -1057,12 +1042,6 @@ int pmix_server_init(void)
             return rc;
         }
     }
-    /* every daemon judges the relays it hears from */
-    rc = prte_pmix_server_relay_uids_resolve();
-    if (PRTE_SUCCESS != rc) {
-        return rc;
-    }
-
     PMIX_INFO_LIST_START(ilist);
 
     /* tell the server our hostname so we agree on it */
@@ -1272,15 +1251,28 @@ int pmix_server_init(void)
             rc = prte_pmix_convert_status(prc);
             return rc;
         }
+        /* A DVM that takes other users' tools takes them at every daemon,
+         * not just at the master: a tool attaches to the daemon on its own
+         * node - a prun in a job script, the one its environment names -
+         * and the master decides what it may do, from the user PMIx
+         * establishes for its connection here (_toolconn, and the
+         * PRTE_PLM_TOOL_ATTACHED_CMD relay). Without saying so to PMIx, it
+         * refuses every tool not of our user before we are asked. */
+        flag = !prte_pmix_server_globals.no_foreign_tools;
+        PMIX_INFO_LIST_ADD(prc, ilist, PMIX_SERVER_ALLOW_FOREIGN_TOOLS,
+                           (void*)&flag, PMIX_BOOL);
+        if (PMIX_SUCCESS != prc) {
+            PMIX_INFO_LIST_RELEASE(ilist);
+            rc = prte_pmix_convert_status(prc);
+            return rc;
+        }
 #if defined(PMIX_SOCKET_MODE)
-        /* A DVM that takes other users' tools takes their jobs too, and a
-         * daemon running as root starts those jobs' processes as the users
-         * they belong to (prte_pmix_server_job_run_as) - which must then
-         * reach this daemon's socket, by the same path the master opens to
-         * tools. PMIx still lets in only the processes it was told of, as
-         * the user it was told. A daemon not running as root starts no other
-         * user's processes, so has nothing to open. */
-        if (!prte_pmix_server_globals.no_foreign_tools && 0 == prte_process_info.euid) {
+        /* ...and those tools, and - for a daemon running as root - the
+         * processes it starts as other users (prte_pmix_server_job_run_as),
+         * must reach this daemon's socket, by the same path the master
+         * opens. PMIx still lets in only the processes it was told of, as
+         * the user it was told. */
+        if (flag) {
             rc = open_to_foreign_tools(ilist);
             if (PRTE_SUCCESS != rc) {
                 PMIX_INFO_LIST_RELEASE(ilist);
@@ -1588,9 +1580,6 @@ void pmix_server_finalize(void)
     free(prte_pmix_server_globals.sched_uids);
     prte_pmix_server_globals.sched_uids = NULL;
     prte_pmix_server_globals.nsched_uids = 0;
-    free(prte_pmix_server_globals.rly_uids);
-    prte_pmix_server_globals.rly_uids = NULL;
-    prte_pmix_server_globals.nrly_uids = 0;
     prte_pmix_server_access_release_dvm();
 
     /* and the users we judged access for */
@@ -2117,6 +2106,11 @@ static void pmix_server_dmdx_recv(int status, pmix_proc_t *sender,
         PMIX_ERROR_LOG(prc);
         return;
     }
+    if (!prte_pmix_count_fits(buffer, ninfo)) {
+        prc = PMIX_ERR_BAD_PARAM;
+        PMIX_ERROR_LOG(prc);
+        return;
+    }
     if (0 < ninfo) {
         PMIX_INFO_CREATE(info, ninfo);
         cnt = ninfo;
@@ -2485,6 +2479,11 @@ static void pmix_server_dmdx_resp(int status, pmix_proc_t *sender,
             pret = prc;
             psz = 0;
         }
+        if (PMIX_SUCCESS == pret && !prte_pmix_count_fits(buffer, psz)) {
+            PMIX_ERROR_LOG(PMIX_ERR_BAD_PARAM);
+            pret = PMIX_ERR_BAD_PARAM;
+            psz = 0;
+        }
         if (PMIX_SUCCESS == pret && 0 < psz) {
             d->data = (char *) malloc(psz);
             if (NULL == d->data) {
@@ -2695,6 +2694,11 @@ static void pmix_server_log(int status, pmix_proc_t *sender,
         PMIX_ERROR_LOG(rc);
         goto respond;
     }
+    if (!prte_pmix_count_fits(buffer, req->ninfo)) {
+        rc = PMIX_ERR_BAD_PARAM;
+        PMIX_ERROR_LOG(rc);
+        goto respond;
+    }
     if (0 < req->ninfo) {
         req->copy = true;
         PMIX_INFO_CREATE(req->info, req->ninfo);
@@ -2710,6 +2714,11 @@ static void pmix_server_log(int status, pmix_proc_t *sender,
     cnt = 1;
     rc = PMIx_Data_unpack(NULL, buffer, &ndirs, &cnt, PMIX_SIZE);
     if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        goto respond;
+    }
+    if (!prte_pmix_count_fits(buffer, ndirs)) {
+        rc = PMIX_ERR_BAD_PARAM;
         PMIX_ERROR_LOG(rc);
         goto respond;
     }
@@ -3035,6 +3044,11 @@ static void pmix_server_sched(int status, pmix_proc_t *sender,
         PMIX_ERROR_LOG(rc);
         goto reply;
     }
+    if (!prte_pmix_count_fits(buffer, ninfo)) {
+        rc = PMIX_ERR_BAD_PARAM;
+        PMIX_ERROR_LOG(rc);
+        goto reply;
+    }
 
     /* Need to add the requestor's ID to the info array, so allocate one
      * extra slot for it.  Note that ninfo must then be advanced to cover
@@ -3311,10 +3325,12 @@ static void rqcon(prte_pmix_server_req_t *p)
     p->dvm_held = false;
     p->moncopy = false;
     p->dircopy = false;
+    p->alloc_gid_named = false;
     p->local_index = -1;
     p->remote_index = -1;
-    p->uid = 0;
-    p->gid = 0;
+    /* nobody, until the PMIx server says who - not root */
+    p->uid = PRTE_INVALID_UID;
+    p->gid = PRTE_INVALID_GID;
     p->pid = 0;
     p->allocdir = 0;
     p->sessionID = UINT32_MAX;

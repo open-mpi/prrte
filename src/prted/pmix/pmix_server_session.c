@@ -83,10 +83,16 @@ typedef struct {
     size_t napps;
     pmix_info_t *personality;
     char **nodelists;           /* rendered PMIX_ALLOC_NODE_LIST strings */
+    bool names_login;           /* one of them names an account (user@host) */
     char *alloc_refid;          /* PMIX_ALLOC_ID */
     char *user_refid;           /* PMIX_ALLOC_REQ_ID */
-    uid_t uid;
+    uid_t uid;                  /* the requester's user and group */
+    gid_t gid;
     bool have_uid;
+    uid_t alloc_uid;            /* PMIX_ALLOC_UID/GID - the scheduler's word */
+    gid_t alloc_gid;            /* on whom the session belongs to */
+    bool have_alloc_uid;
+    bool have_alloc_gid;
     uint8_t inheritance;        /* PMIX_ALLOC_INHERITANCE disposition */
     bool have_inheritance;
     long timelimit;             /* seconds; -1 if not specified */
@@ -101,6 +107,9 @@ static void sessctrl_construct(prte_sessctrl_t *ctl)
     PMIX_LOAD_PROCID(&ctl->requestor, NULL, PMIX_RANK_INVALID);
     ctl->timelimit = -1;
     ctl->uid = PRTE_INVALID_UID;
+    ctl->gid = PRTE_INVALID_GID;
+    ctl->alloc_uid = PRTE_INVALID_UID;
+    ctl->alloc_gid = PRTE_INVALID_GID;
     ctl->inheritance = PRTE_INHERIT_DEFAULT_VALUE;
 }
 
@@ -231,6 +240,19 @@ static void set_op(prte_sessctrl_t *ctl, prte_sessctrl_op_t op, bool flag)
     ctl->nops++;
 }
 
+/* Record one rendered node list, and whether it names an account to reach a
+ * host as ("user@host"), which is refused (parse_directives). The list is
+ * looked at as it will be read, so one written inside a regex is seen.
+ * Takes ownership of the string. */
+static void add_nodelist(prte_sessctrl_t *ctl, char *ndstring)
+{
+    if (NULL != strchr(ndstring, '@')) {
+        ctl->names_login = true;
+    }
+    PMIx_Argv_append_nosize(&ctl->nodelists, ndstring);
+    free(ndstring);
+}
+
 /* Scan the resource description carried by PMIX_SESSION_RESOURCES. Only the
  * node-naming forms mean anything to PRRTE: it does not select machines, it is
  * told which ones it has. A request that asks PRRTE to choose (a node COUNT, a
@@ -249,8 +271,7 @@ static pmix_status_t scan_resources(prte_sessctrl_t *ctl,
             if (PMIX_SUCCESS != rc) {
                 return rc;
             }
-            PMIx_Argv_append_nosize(&ctl->nodelists, ndstring);
-            free(ndstring);
+            add_nodelist(ctl, ndstring);
 
         } else if (PMIX_CHECK_KEY(&info[n], PMIX_ALLOC_ID)) {
             rc = get_string_directive(&info[n], &ctl->alloc_refid);
@@ -304,6 +325,15 @@ static pmix_status_t scan_resources(prte_sessctrl_t *ctl,
     return PMIX_SUCCESS;
 }
 
+/* True if the request came from the scheduler attached to us. The
+ * scheduler's name is empty until one attaches, and an empty nspace
+ * matches anything, so that is checked first. */
+static bool from_scheduler(const prte_pmix_server_req_t *req)
+{
+    return (!PMIX_NSPACE_INVALID(prte_pmix_server_globals.scheduler.nspace) &&
+            PMIX_CHECK_PROCID_STRICT(&prte_pmix_server_globals.scheduler, &req->tproc));
+}
+
 /* Walk the request once, recording everything. Nothing is acted on here: an
  * info array has no defined order, and the operations below depend on values
  * that may appear after them (the whole reason the previous single-pass
@@ -315,8 +345,13 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
     pmix_status_t rc;
     char *ndstring, *tstr = NULL;
     pmix_data_array_t *darray;
+    uint32_t id;
 
-    /* the caller is the requestor unless a relaying daemon named the original */
+    /* The caller is the requestor. The PMIx server named it, and a daemon
+     * that passed the request on to us named it as the request's source,
+     * which is req->tproc either way. Only the scheduler names someone
+     * else: it calls down to carry out a request it took from one of our
+     * processes, and says which in PMIX_REQUESTOR. */
     PMIX_XFER_PROCID(&ctl->requestor, &req->tproc);
 
     for (n = 0; n < req->ninfo; n++) {
@@ -332,7 +367,9 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
             if (PMIX_PROC != info->value.type || NULL == info->value.data.proc) {
                 return PMIX_ERR_BAD_PARAM;
             }
-            PMIX_XFER_PROCID(&ctl->requestor, info->value.data.proc);
+            if (from_scheduler(req)) {
+                PMIX_XFER_PROCID(&ctl->requestor, info->value.data.proc);
+            }
 
             /***   INSTANTIATION   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_SESSION_INSTANTIATE)) {
@@ -390,14 +427,32 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
             if (!prte_pmix_server_requester_uid(req->info, req->ninfo, &ctl->uid)) {
                 return PMIX_ERR_BAD_PARAM;
             }
+            ctl->gid = prte_pmix_server_requester_gid(req->info, req->ninfo);
             ctl->have_uid = true;
 
         } else if (PMIX_CHECK_KEY(info, PMIX_GRPID)) {
-            /* Accepted and ignored. PRRTE never changes credentials - every
-             * process it starts runs as the user running the DVM - so a group
-             * id is not something it can act on. The user id IS recorded,
-             * because reservation ownership is checked against it. */
+            /* read with PMIX_USERID above, so the two describe one process */
             continue;
+
+        } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_UID) ||
+                   PMIX_CHECK_KEY(info, PMIX_ALLOC_GID)) {
+            /* Whom the session belongs to. Only the scheduler says so: it
+             * instantiates sessions on users' behalf, and PMIX_USERID names
+             * the scheduler. From anyone else it would be a request to own
+             * a session as another user, which is not theirs to make. */
+            if (!from_scheduler(req)) {
+                return PMIX_ERR_NO_PERMISSIONS;
+            }
+            if (PMIX_SUCCESS != PMIx_Value_get_number(&info->value, &id, PMIX_UINT32)) {
+                return PMIX_ERR_BAD_PARAM;
+            }
+            if (PMIX_CHECK_KEY(info, PMIX_ALLOC_UID)) {
+                ctl->alloc_uid = (uid_t) id;
+                ctl->have_alloc_uid = true;
+            } else {
+                ctl->alloc_gid = (gid_t) id;
+                ctl->have_alloc_gid = true;
+            }
 
             /***   RESOURCES NAMED DIRECTLY ON THE REQUEST   ***/
         } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_NODE_LIST)) {
@@ -405,8 +460,7 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
             if (PMIX_SUCCESS != rc) {
                 return rc;
             }
-            PMIx_Argv_append_nosize(&ctl->nodelists, ndstring);
-            free(ndstring);
+            add_nodelist(ctl, ndstring);
 
         } else if (PMIX_CHECK_KEY(info, PMIX_ALLOC_ID)) {
             rc = get_string_directive(info, &ctl->alloc_refid);
@@ -521,6 +575,14 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
          * have no opinion about would break a caller we otherwise serve */
     }
 
+    if (ctl->names_login) {
+        /* A host naming an account to reach it as: the DVM reaches every
+         * node as its own user and runs no daemon as another, so this is
+         * refused from anyone, as it is in every other list of hosts */
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt", "ras-base:user-host",
+                       true, "SESSION CONTROL");
+        return PMIX_ERR_BAD_PARAM;
+    }
     if (1 < ctl->nops) {
         /* the operations are alternatives, not a program - "pause and
          * terminate" has no meaning and no safe interpretation */
@@ -542,6 +604,20 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
         PRTE_SESSCTRL_INSTANTIATE != ctl->op) {
         /* apps are only launched as part of instantiating the session that is
          * to hold them */
+        return PMIX_ERR_BAD_PARAM;
+    }
+    /* An owner is named when a session is made, and as a user and group
+     * together - the user from one source and the group from another would
+     * describe nobody */
+    if (ctl->have_alloc_uid != ctl->have_alloc_gid ||
+        (ctl->have_alloc_uid && PRTE_SESSCTRL_INSTANTIATE != ctl->op)) {
+        return PMIX_ERR_BAD_PARAM;
+    }
+    /* and the scheduler must name one. It makes sessions for users, and
+     * its own identity is the only other one in the request - a session
+     * recorded as the scheduler's would be usable by nobody it was for */
+    if (PRTE_SESSCTRL_INSTANTIATE == ctl->op && !ctl->have_alloc_uid &&
+        from_scheduler(req)) {
         return PMIX_ERR_BAD_PARAM;
     }
     return PMIX_SUCCESS;
@@ -651,6 +727,14 @@ static void arm_session_timer(prte_session_t *session, long seconds)
                         "%s session ctrl: session %u time limit set to %ld sec",
                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
                         session->session_id, seconds);
+}
+
+void prte_pmix_server_session_set_limit(prte_session_t *session, long seconds, bool held)
+{
+    arm_session_timer(session, seconds);
+    if (held) {
+        PRTE_FLAG_SET(session, PRTE_SESSION_FLAG_LIMIT_HELD);
+    }
 }
 
 /* True when the session's disposition says its nodes go back to the scheduler
@@ -796,7 +880,7 @@ static pmix_status_t session_extend(prte_session_t *session, prte_sessctrl_t *ct
         }
     }
     if (0 <= ctl->timelimit) {
-        arm_session_timer(session, ctl->timelimit);
+        prte_pmix_server_session_set_limit(session, ctl->timelimit, true);
     }
     if (ctl->have_inheritance) {
         /* an extend may also revise what becomes of the nodes at the end */
@@ -917,6 +1001,17 @@ static prte_job_t *build_session_job(prte_sessctrl_t *ctl, prte_session_t *sessi
     /* identifies the proc whose ownership and bookmark the launch path uses */
     prte_set_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY, PRTE_ATTR_GLOBAL,
                        &jdata->originator, PMIX_PROC);
+    /* The session's apps are its owner's: they run as the user the
+     * scheduler named, not as whoever passed the request along. The launch
+     * path takes an owner already on a job only from a job built here. */
+    if (ctl->have_alloc_uid) {
+        uint32_t id = (uint32_t) ctl->alloc_uid;
+        prte_set_attribute(&jdata->attributes, PRTE_JOB_OWNER_UID, PRTE_ATTR_GLOBAL,
+                           &id, PMIX_UINT32);
+        id = (uint32_t) ctl->alloc_gid;
+        prte_set_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID, PRTE_ATTR_GLOBAL,
+                           &id, PMIX_UINT32);
+    }
     PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_FORWARD_OUTPUT);
 
     return jdata;
@@ -1158,19 +1253,24 @@ static pmix_status_t session_instantiate(prte_pmix_server_req_t *req,
     session->inheritance = ctl->inheritance;
     PMIX_LOAD_NSPACE(session->owner, ctl->requestor.nspace);
     PMIX_XFER_PROCID(&session->requestor, &ctl->requestor);
-    prte_session_add_owner(session, ctl->requestor.nspace);
     {
         prte_job_t *reqjob = prte_get_job_data_object(ctl->requestor.nspace);
 
-        if (ctl->have_uid) {
+        /* The owner the scheduler named (it must name one); else whoever
+         * asked, as PMIx identified it - a request made of a DVM with no
+         * scheduler attached. User and group come from the same source
+         * either way. Only a group the scheduler named is shared with
+         * (PRTE_SESSION_FLAG_GROUP_ACCESS): the requester's own primary
+         * group is recorded but grants its members nothing. */
+        if (ctl->have_alloc_uid) {
+            session->owner_uid = ctl->alloc_uid;
+            session->owner_gid = ctl->alloc_gid;
+            PRTE_FLAG_SET(session, PRTE_SESSION_FLAG_GROUP_ACCESS);
+        } else if (ctl->have_uid) {
             session->owner_uid = ctl->uid;
+            session->owner_gid = ctl->gid;
         } else if (NULL != reqjob) {
             session->owner_uid = reqjob->uid;
-        }
-        /* the group recorded for the requester's job - the one its tool
-         * connected with. Not the up-call's PMIX_GRPID, which is whatever
-         * group the requester chose to name */
-        if (NULL != reqjob) {
             session->owner_gid = reqjob->gid;
         }
     }
@@ -1197,7 +1297,7 @@ static pmix_status_t session_instantiate(prte_pmix_server_req_t *req,
     }
 
     if (0 < ctl->timelimit) {
-        arm_session_timer(session, ctl->timelimit);
+        prte_pmix_server_session_set_limit(session, ctl->timelimit, true);
     }
 
     if (NULL != ctl->apps) {
@@ -1397,6 +1497,30 @@ static pmix_status_t apply_to_all(prte_pmix_server_req_t *req,
     return ret;
 }
 
+/* May the requester direct us to make a session, or to change what one
+ * holds? Instantiate and extend are not requests for resources - a user
+ * asks for those with PMIx_Allocation_request, and the scheduler decides.
+ * They are how the scheduler tells the DVM what it has decided: the nodes a
+ * session holds, possibly new ones the DVM grows onto, and for how long. So
+ * they are for the scheduler, or - with no scheduler - for whoever may change
+ * the DVM itself (prte_pmix_server_dvm_permitted), the session's owner
+ * included. The owner's own directives to its session - pause, resume,
+ * signal, terminate - are judged in apply_to_session(). */
+static bool grant_permitted(prte_pmix_server_req_t *req, prte_sessctrl_t *ctl)
+{
+    bool ok;
+
+    ok = prte_pmix_server_dvm_permitted(&req->tproc, req->info, req->ninfo);
+    if (!ok && NULL != ctl->nodelists) {
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
+                       "ras-base:grow-not-permitted", true,
+                       (PRTE_SESSCTRL_INSTANTIATE == ctl->op) ? "SESSION INSTANTIATE"
+                                                         : "SESSION EXTEND",
+                       "hosts");
+    }
+    return ok;
+}
+
 /* Process a session control directive addressed to this DVM.
  *
  * Returns a pmix_status_t - NOT a PRRTE return code. The result is handed to
@@ -1430,16 +1554,16 @@ static pmix_status_t process_directive(prte_pmix_server_req_t *req)
         goto done;
     }
 
+    /* a directive to make a session, or to change what one holds, is judged
+     * before anything is looked up. With a scheduler attached, a request
+     * from anyone else went up to it rather than coming here. */
+    if ((PRTE_SESSCTRL_INSTANTIATE == ctl.op || PRTE_SESSCTRL_EXTEND == ctl.op) &&
+        !grant_permitted(req, &ctl)) {
+        rc = PMIX_ERR_NO_PERMISSIONS;
+        goto done;
+    }
+
     if (PRTE_SESSCTRL_INSTANTIATE == ctl.op) {
-        /* a new session takes nodes - from the pool, or new ones the DVM
-         * grows onto - so creating one changes what the DVM consists of,
-         * which is for the scheduler, or for whoever may act on the DVM
-         * itself. (With a scheduler attached, anyone else's request went
-         * up to it rather than coming here.) */
-        if (!prte_pmix_server_dvm_permitted(&req->tproc, req->info, req->ninfo)) {
-            rc = PMIX_ERR_NO_PERMISSIONS;
-            goto done;
-        }
         rc = session_instantiate(req, &ctl);
         if (PMIX_SUCCESS == rc) {
             session = prte_get_session_object(req->sessionID);

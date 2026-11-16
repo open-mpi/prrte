@@ -100,27 +100,39 @@ server (`init_server()` in `../../prted/pmix/pmix_server_pub.c`) and reissues
 the operation as an ordinary `PMIx_Publish`/`Lookup`/`Unpublish`, which the
 remote DVM's own upcalls deliver to its data server.
 
+When `prte_data_server_uri` is `file:<path>`, that file decides where every
+publish and lookup goes, so `init_server()` reads it only if the descriptor
+it opened (`O_NOFOLLOW`, non-blocking) is a regular file with one link that
+neither group nor others can write, owned by the DVM's user or root - the
+test PMIx applies to a rendezvous file it is given, made in PRRTE because
+PMIx v7.0 does not export its own. A server's `--report-uri` file passes:
+PMIx writes it 0644. Anything else fails the attach, with
+`prun:ompi-server-file-unsound` naming the test it failed.
+
 Three things follow, and each is load-bearing:
 
 - **Only the master attaches.** Every other daemon relays to it over the RML
   exactly as it does for a local store, so a DVM holds one connection however
   many daemons it has. At the master itself the RML send is a send to self.
 - **The requesting process is carried in `PMIX_REQUESTOR`, and its uid and
-  gid in `prte.pub.ruid` / `prte.pub.rgid`.** Otherwise the far end
+  gid in `PMIX_ORIGIN_USERID` / `PMIX_ORIGIN_GRPID`.** Otherwise the far end
   attributes the operation to the relaying daemon's *tool* identity, and
   every ownership rule — who may unpublish, what `PMIX_RANGE_NAMESPACE`
   admits, what a job-end purge takes — is answered about the wrong process.
-  The uid half matters for the same reason and is newer: PMIx appends the
-  *relay's* `PMIX_USERID` and `PMIX_GRPID` to the call the relay makes, so
-  without a separate claim the far end would store the item under the
-  relaying daemon's user and test every later removal against it. They are
-  PRRTE-private keys rather than a second `PMIX_USERID` precisely because
-  PMIx adds its own, and two entries under one key make the answer depend on
-  array order. `prte_ds_check_requestor()` reads all three in one pass and
-  honors them **only from a tool**; an application process making the claim
-  is trying to act under a peer's identity, and it is dropped. Call it
-  *after* your own directive scan, or the relay's `PMIX_USERID` lands on top
-  of the claim.
+  The far end's PMIx stamps the *relay's* `PMIX_USERID` and `PMIX_GRPID` on
+  the call the relay makes and passes the `PMIX_ORIGIN_*` pair to its host
+  untouched beside them, so without the pair the far end would store the
+  item under the relaying daemon's user and test every later removal against
+  it. `prte_ds_check_requestor()` reads all three in one pass and
+  honors them **only from a tool**, and only when the tool's own uid - the
+  `PMIX_USERID` its PMIx server stamped - may speak for the user named
+  (`prte_pmix_server_relay_permitted()`: the same user, root, or the DVM's
+  own user). A request naming no user is held to nothing, so its claim is
+  dropped; naming no `PMIX_ORIGIN_USERID` names the tool's own user; and a
+  process named of a job this DVM holds is held to the same rule against
+  that job's owner. An application process making the claim is dropped as
+  well. Call it *after* your own directive scan, or the relay's
+  `PMIX_USERID` lands on top of the claim.
 - **A relay can be relaying for a relay**, and the claim it received is the
   one it passes on. A DVM that is the external server for one DVM and points
   at another in turn receives requests from the first DVM's master *as a
@@ -136,6 +148,16 @@ Three things follow, and each is load-bearing:
   master may also be attached to a scheduler. `prte_pmix_set_primary_server()`
   is the one place that designates one; call it immediately before the PMIx
   call, never once at startup.
+
+**A purge a user asks for takes only that user's data.** `PMIx_Unpublish`
+naming no keys arrives as a purge carrying the requester's stamped
+`PMIX_USERID`/`PMIX_GRPID`, and `purge_store()` then removes only items
+`prte_data_server_owns()` gives that user, and drops only that user's parked
+lookups. The process the purge names says which lifetime ended, not whose
+data may go. A purge the DVM makes of its own store as a lifetime ends names
+no user and takes what the target owns, as does one from root or the DVM's
+own user; relayed to an external server, it goes as the DVM's own user
+(`prte_ds_relay_directives()`), since that is who is asking.
 
 The purge command carries a directive array for this reason — it is the only
 way `PMIX_REQUESTOR` can reach `ds_purge`. Two senders pack it

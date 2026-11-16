@@ -156,12 +156,34 @@ int prte_plm_base_pack_state_update(pmix_data_buffer_t *alert, prte_job_t *jobda
     return PRTE_SUCCESS;
 }
 
+/* May a job owned by uid, asked for by requester, be placed on session's
+ * nodes? The default session is for everyone and the scheduler may use any;
+ * otherwise it is for whoever may operate on the session - root, our own
+ * user, its owner and the members of the owner's group
+ * (prte_pmix_server_session_permitted_uid). The job's owner is the user
+ * recorded for the requester's job, so this is a question about who asked,
+ * never about which namespace did. */
+static bool session_usable(prte_session_t *session, const pmix_proc_t *requestor, uid_t uid)
+{
+    if (NULL == session || prte_default_session == session) {
+        return true;
+    }
+    /* only if there IS a scheduler: an empty nspace is PMIX_CHECK_NSPACE's
+     * wildcard */
+    if (NULL != requestor &&
+        !PMIX_NSPACE_INVALID(prte_pmix_server_globals.scheduler.nspace) &&
+        PMIX_CHECK_NSPACE(prte_pmix_server_globals.scheduler.nspace, requestor->nspace)) {
+        return true;
+    }
+    return prte_pmix_server_session_permitted_uid(session, uid);
+}
+
 /* Resolve the PRTE_JOB_SPAWN_TARGET list (a comma-delimited list of
  * PMIX_ALLOC_ID strings, with an empty token denoting the default session)
- * into the job's validated target_sessions set. The requester must own every
- * named reservation. On success the spawned job becomes an owner of each
- * targeted reservation and jdata->session is set to the primary (first)
- * targeted session. Returns a PRTE error code on failure. */
+ * into the job's validated target_sessions set. The job's owner must be
+ * permitted on every named reservation (session_usable). On success
+ * jdata->session is set to the primary (first) targeted session. Returns a
+ * PRTE error code on failure. */
 static int resolve_spawn_targets(prte_job_t *jdata, pmix_proc_t *requestor,
                                  char *target_str)
 {
@@ -191,8 +213,8 @@ static int resolve_spawn_targets(prte_job_t *jdata, pmix_proc_t *requestor,
             }
         }
         /* the requester may target only the default session and reservations
-         * its namespace owns (the scheduler excepted) */
-        if (!prte_session_is_owned_by(s, requestor->nspace)) {
+         * its user may use (the scheduler excepted) */
+        if (!session_usable(s, requestor, prte_pmix_server_job_owner(jdata))) {
             free(tlist);
             return PRTE_ERR_PERM;
         }
@@ -432,41 +454,28 @@ int prte_plm_base_comm_stop(void)
  * NOTE: THIS OCCURS INSIDE OF AN EVENT AND IS
  * THEREFORE THREAD-SAFE
  */
-/* The first directive of jdata's that has the master open a file it names
- * - NULL if it has none. The master reads these as itself, whoever asked,
- * so for anybody but root and our own user they are refused
- * (prte_plm_base_recv). Running the job as its owner does not cover them:
- * they are not the job's processes. */
+/* The first directive of jdata's that has the master act on files as
+ * itself - NULL if it has none - which for anybody but root and our own
+ * user is refused (prte_plm_base_recv). Running the job as its owner does
+ * not cover them: they are not the job's processes.
+ *
+ * What is left here is preloading: the master reads the files and the
+ * binary, and the copies are written on every node by its daemons. The
+ * files the master only reads or writes for a job - a hostfile, a hostfile
+ * to add, a rankfile or sequence file, the proctable - are opened as the
+ * job's owner (prte_pmix_server_open_as) and are not refused. */
 static const char *foreign_directive(prte_job_t *jdata)
 {
-    static const struct {
-        prte_attribute_key_t key;
-        const char *name;
-    } app_keys[] = {
-        {PRTE_APP_HOSTFILE, "a hostfile"},
-        {PRTE_APP_ADD_HOSTFILE, "a hostfile to add"},
-        {PRTE_APP_MAP_FILE, "a rankfile or sequential mapping file"},
-        {PRTE_APP_PRELOAD_FILES, "files to preload"},
-    };
     prte_app_context_t *app;
-    size_t k;
     int n;
 
-    if (NULL != prte_fetch_attribute(&jdata->attributes, NULL, PRTE_JOB_FILE)) {
-        return "a rankfile or sequential mapping file";
-    }
-    if (NULL != prte_fetch_attribute(&jdata->attributes, NULL, PRTE_JOB_OUTPUT_PROCTABLE)) {
-        return "a file for the process table";
-    }
     for (n = 0; n < jdata->apps->size; n++) {
         app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, n);
         if (NULL == app) {
             continue;
         }
-        for (k = 0; k < sizeof(app_keys) / sizeof(app_keys[0]); k++) {
-            if (NULL != prte_fetch_attribute(&app->attributes, NULL, app_keys[k].key)) {
-                return app_keys[k].name;
-            }
+        if (NULL != prte_fetch_attribute(&app->attributes, NULL, PRTE_APP_PRELOAD_FILES)) {
+            return "files to preload";
         }
         /* the master reads the binary to copy it out */
         if (PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_PRELOAD_BIN)) {
@@ -478,10 +487,8 @@ static const char *foreign_directive(prte_job_t *jdata)
 
 /* The first of jdata's directives that names hosts to bring into the DVM, or
  * to start daemons on, which its owner may not ask for - NULL if none. That
- * is for whoever may change the DVM, and a user to reach a host as
- * ("user@host") for root and our own user alone
- * (prte_pmix_server_grow_permitted_uid) - the same rule an allocation
- * request naming hosts is held to. */
+ * is for whoever may change the DVM (prte_pmix_server_grow_permitted_uid) -
+ * the same rule an allocation request naming hosts is held to. */
 static const char *grow_directive(prte_job_t *jdata, uid_t owner)
 {
     static const struct {
@@ -489,11 +496,10 @@ static const char *grow_directive(prte_job_t *jdata, uid_t owner)
         const char *name;
     } keys[] = {
         {PRTE_APP_ADD_HOST, "hosts to add"},
+        {PRTE_APP_ADD_HOSTFILE, "a hostfile to add"},
         {PRTE_APP_ACTIVATE_HOSTS, "hosts to activate"},
     };
     prte_app_context_t *app;
-    char *hosts;
-    bool user;
     size_t k;
     int n;
 
@@ -503,19 +509,75 @@ static const char *grow_directive(prte_job_t *jdata, uid_t owner)
             continue;
         }
         for (k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
-            hosts = NULL;
-            if (!prte_get_attribute(&app->attributes, keys[k].key, (void **) &hosts,
-                                    PMIX_STRING)) {
+            if (!prte_get_attribute(&app->attributes, keys[k].key, NULL, PMIX_STRING)) {
                 continue;
             }
-            user = (NULL != hosts && NULL != strchr(hosts, '@'));
-            free(hosts);
-            if (!prte_pmix_server_grow_permitted_uid(owner, false, user)) {
-                return user ? "a user to reach a host as" : keys[k].name;
+            if (!prte_pmix_server_grow_permitted_uid(owner)) {
+                return keys[k].name;
             }
         }
     }
     return NULL;
+}
+
+/* Decide whom a job arriving in a launch request belongs to.
+ *
+ * The job belongs to whoever asked for it (proxy, the PRTE_JOB_LAUNCH_PROXY).
+ * Identity descends the job tree from the tool that started it, so a job an
+ * application spawns is recorded against the user who launched that
+ * application - not left anonymous because the job itself never presented
+ * credentials.
+ *
+ * The one job that arrives already naming its owner is one built here in
+ * the master: the apps of a session the scheduler created for a user, which
+ * are that user's. An owner on a job from any other sender is not ours to
+ * take, and is dropped. A job the DVM asks for itself - prterun's own - is
+ * our user's, and our daemon job records no identity to inherit.
+ *
+ * Anything else whose requester's job we do not hold is refused. The owner
+ * would otherwise be left unset, and an unset owner is read as our own user
+ * (prte_pmix_server_job_owner) - so the job would run as our own user
+ * rather than as its requester's. That can only happen when the requester's
+ * job has gone before its request was served, and answering the request
+ * with an error is all that is left to do. */
+int prte_plm_base_job_owner(prte_job_t *jdata, const pmix_proc_t *sender,
+                            const pmix_proc_t *proxy)
+{
+    uint32_t oid, *oidptr = &oid;
+    prte_job_t *parent;
+
+    if (PMIX_CHECK_PROCID_STRICT(sender, PRTE_PROC_MY_NAME) &&
+        prte_get_attribute(&jdata->attributes, PRTE_JOB_OWNER_UID,
+                           (void **) &oidptr, PMIX_UINT32)) {
+        jdata->uid = (uid_t) oid;
+        jdata->gid = PRTE_INVALID_GID;
+        if (prte_get_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID,
+                               (void **) &oidptr, PMIX_UINT32)) {
+            jdata->gid = (gid_t) oid;
+        }
+        return PRTE_SUCCESS;
+    }
+    prte_remove_attribute(&jdata->attributes, PRTE_JOB_OWNER_UID);
+    prte_remove_attribute(&jdata->attributes, PRTE_JOB_OWNER_GID);
+
+    if (NULL == proxy) {
+        return PRTE_ERR_NOT_FOUND;
+    }
+    /* strictly: an empty namespace matches anything otherwise */
+    if (PMIX_CHECK_NSPACE_STRICT(proxy->nspace, PRTE_PROC_MY_NAME->nspace)) {
+        jdata->uid = prte_process_info.euid;
+        jdata->gid = prte_process_info.egid;
+        return PRTE_SUCCESS;
+    }
+    parent = prte_get_job_data_object(proxy->nspace);
+    if (NULL == parent) {
+        return PRTE_ERR_NOT_FOUND;
+    }
+    /* which may itself be unset - a singleton's job records none - and is
+     * then our own user's, as that job is */
+    jdata->uid = parent->uid;
+    jdata->gid = parent->gid;
+    return PRTE_SUCCESS;
 }
 
 void prte_plm_base_recv(int status, pmix_proc_t *sender,
@@ -608,14 +670,35 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
              * tool that named itself may have taken the next in line */
             rc = prte_plm_base_next_jobid(name.nspace);
         }
+        /* what the reporting daemon says of the tool: its command line,
+         * pid, and the user and group its PMIx server established for its
+         * connection - which decide whether it may join a job we hold */
+        tmp = NULL;
+        count = 1;
+        if (PMIX_SUCCESS != PMIx_Data_unpack(NULL, buffer, &tmp, &count, PMIX_STRING) ||
+            (count = 1, PMIX_SUCCESS != PMIx_Data_unpack(NULL, buffer, &pid, &count, PMIX_PID)) ||
+            (count = 1, PMIX_SUCCESS != PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32))) {
+            PMIX_ERROR_LOG(PMIX_ERR_UNPACK_FAILURE);
+            free(tmp);
+            goto CLEANUP;
+        }
+        tooluid = (uid_t) ui32;
+        count = 1;
+        if (PMIX_SUCCESS != PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32)) {
+            PMIX_ERROR_LOG(PMIX_ERR_UNPACK_FAILURE);
+            free(tmp);
+            goto CLEANUP;
+        }
+        toolgid = (gid_t) ui32;
         // see if we already have this job - a name we could not find
         // the tool is refused below, as one it may not join is
         jdata = NULL;
         if (PRTE_SUCCESS == rc) {
             jdata = prte_get_job_data_object(name.nspace);
-            rc = prte_pmix_server_tool_may_join(jdata, name.rank);
+            rc = prte_pmix_server_tool_may_join(jdata, name.rank, tooluid);
         }
         if (PRTE_SUCCESS != rc) {
+            free(tmp);
             PMIX_OUTPUT_VERBOSE((2, prte_plm_base_framework.framework_output,
                                  "%s refusing tool %s: %s",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&name),
@@ -623,6 +706,7 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             ret = prte_pmix_convert_rc(rc);
 
         } else if (NULL != jdata) {
+            free(tmp);
             // we do - check if we already have this proc
             proc = (prte_proc_t*)pmix_pointer_array_get_item(jdata->procs, name.rank);
             if (NULL == proc) {
@@ -640,44 +724,12 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             ret = PMIX_SUCCESS;
 
         } else {
-            // unpack the cmd line
-            count = 1;
-            rc = PMIx_Data_unpack(NULL, buffer, &tmp, &count, PMIX_STRING);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                goto CLEANUP;
-            }
-            // and the pid
-            count = 1;
-            rc = PMIx_Data_unpack(NULL, buffer, &pid, &count, PMIX_PID);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                free(tmp);
-                goto CLEANUP;
-            }
-            // and who is running it
-            count = 1;
-            rc = PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                free(tmp);
-                goto CLEANUP;
-            }
-            tooluid = (uid_t) ui32;
-            count = 1;
-            rc = PMIx_Data_unpack(NULL, buffer, &ui32, &count, PMIX_UINT32);
-            if (PMIX_SUCCESS != rc) {
-                PMIX_ERROR_LOG(rc);
-                free(tmp);
-                goto CLEANUP;
-            }
-            toolgid = (gid_t) ui32;
-
             // need to add the tool job
             jdata = PMIX_NEW(prte_job_t);
             PMIX_LOAD_NSPACE(jdata->nspace, name.nspace);
             PRTE_FLAG_SET(jdata, PRTE_JOB_FLAG_TOOL);
-            /* record who is running the tool - see prte_session_is_owned_by */
+            /* record who is running the tool - every job it starts is that
+             * user's (see the job owner set at PRTE_PLM_LAUNCH_JOB_CMD) */
             jdata->uid = tooluid;
             jdata->gid = toolgid;
             rc = prte_set_job_data_object(jdata);
@@ -844,22 +896,14 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender,
             goto ANSWER_LAUNCH;
         }
 
-        /* The job belongs to whoever asked for it. Identity descends the job
-         * tree from the tool that started it, so an allocation an application
-         * requests is recorded against the user who launched that application
-         * - not left anonymous because the job itself never presented
-         * credentials. */
-        parent = prte_get_job_data_object(nptr->nspace);
-        if (NULL != parent) {
-            jdata->uid = parent->uid;
-            jdata->gid = parent->gid;
-        }
-        /* a job we launch ourselves - prterun's own - is our user's, and
-         * our daemon job records no identity to inherit */
-        if (PRTE_INVALID_UID == jdata->uid &&
-            PMIX_CHECK_NSPACE(nptr->nspace, PRTE_PROC_MY_NAME->nspace)) {
-            jdata->uid = prte_process_info.euid;
-            jdata->gid = prte_process_info.egid;
+        /* The job belongs to whoever asked for it - see
+         * prte_plm_base_job_owner. A job whose requester's job we do not
+         * hold has no owner to run as, and must not run as us instead. */
+        rc = prte_plm_base_job_owner(jdata, sender, nptr);
+        if (PRTE_SUCCESS != rc) {
+            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-plm-base.txt", "requester-unknown",
+                           true, PRTE_JOB_NSPACE(jdata), PRTE_NAME_PRINT(nptr));
+            goto ANSWER_LAUNCH;
         }
         /* and every daemon tells its PMIx server who owns the job when it
          * registers it - PMIx decides who may access a job's data by that */
@@ -1014,19 +1058,11 @@ moveon:
          * rejected request that has already been added to session->jobs
          * stays there for the life of the session (that array borrows its
          * entries, so nothing ever removes or releases it), leaving a
-         * phantom job the session teardown will walk.
-         *
-         * The matching GRANT - the spawned job becoming an owner itself, so
-         * it can spawn onto those nodes in turn - happens in
-         * prte_plm_base_setup_job.  The job has a name by now, but nothing
-         * ever removes an owner, so the grant waits until the request is
-         * known to be going ahead: a job rejected below this point (a failed
-         * add-hosts, a malformed spawn allocation) must not leave itself
-         * recorded as an owner of a reservation on its way out. */
+         * phantom job the session teardown will walk. */
         if (NULL == jdata->target_sessions && NULL != session &&
             session != prte_default_session &&
             (PRTE_SESSION_FLAG_RESERVED & session->flags)) {
-            if (!prte_session_is_owned_by(session, nptr->nspace)) {
+            if (!session_usable(session, nptr, prte_pmix_server_job_owner(jdata))) {
                 rc = PRTE_ERR_PERM;
                 goto ANSWER_LAUNCH;
             }

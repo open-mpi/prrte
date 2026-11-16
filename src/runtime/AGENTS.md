@@ -143,6 +143,23 @@ you were handed can be handed to somebody else later.
 The lookups are linear scans over the whole array. That is fine at DVM
 scale, but do not put one inside a per-proc loop on a launch path.
 
+The same goes for finding a node by name. `prte_node_match()` and
+`prte_nptr_match()` walk a list or the pool, which is right for one lookup
+and quadratic for one lookup per line of input - a hostfile of 40000 lines
+took 27 s to read when each line was looked up against the lines before
+it. A pass that looks up many names builds a **`prte_node_index_t`**
+(`prte_node_index.[ch]`) instead: a hash from every name and alias to the
+nodes carrying it, with each node's position (its place on the list, or its
+pool index), so `prte_node_index_match_name()` and
+`prte_node_index_match_node()` return exactly the node the walks would
+have reached first. The index borrows its nodes and is built for one pass;
+a caller that appends, renames or removes a node while it holds one says so
+(`_append`, `_add_alias`, `_remove`), and nothing keeps a global index in
+step with the pool. The hostfile parser and filter, `ras/hosts`'
+add-hostfile reader and `prte_ras_base_node_insert()` use one.
+`test_runtime`'s `test_node_index` checks it against the walks over
+randomized lists and pools, aliases, our own nodename and `localhost`.
+
 ### What a registry holds is not what it is authoritative for
 
 A `prted` has all three registries, and parts of all three are stale on it
@@ -187,30 +204,38 @@ unreserved pool; it is special-cased everywhere:
 
 - its `nodes` array **is** `prte_node_pool` (`prte_init` releases the array
   the constructor made and substitutes the global one);
-- it is owned by everyone — `prte_session_is_owned_by` and
-  `prte_session_add_owner` both short-circuit on it;
+- it is usable by everyone — spawning onto it needs no permission;
 - `prte_ras_base_release_allocation` returns immediately for it.
 
-`prte_session_is_owned_by` is the ownership gate for spawning into a
-reservation, and it answers on **two** identities. The namespace test — the
-`owners[]` array, seeded with the requester and extended with each job
-spawned in — is what keeps other jobs in the DVM out of somebody else's
-allocation, and for a job it is the whole answer. It cannot be the whole
-answer for a **tool**: a tool namespace is minted per invocation, so the
-reservation a user's first command created could never be named by their
-second, and once the first exited its namespace was gone and the allocation
-was unreachable by anyone. So a reservation also records `owner_uid`, and a
-job flagged `PRTE_JOB_FLAG_TOOL` carrying that uid passes. `prte_job_t.uid`
-is recorded when a tool connects (from the `PMIX_USERID` it presents) and
-descends the job tree from there, so an allocation an *application* requests
-is attributed to the user who launched it rather than to nobody.
+**A reservation belongs to a user, not to a namespace.** It records
+`owner_uid` and `owner_gid`, and every question about it - may a job be
+placed on its nodes, may it be extended, released or terminated - is
+answered by `prte_pmix_server_session_permitted_uid()`: root, the DVM's own
+user, the owner, or a member of the owner's group (the scheduler, when one
+is attached, may use any). The group counts only when it was **named** for
+the session - `PMIX_ALLOC_GID` on the allocation request, or the
+scheduler's on an instantiate - which `PRTE_SESSION_FLAG_GROUP_ACCESS`
+records. One filled in from the requester's own primary group
+(`prte_ras_base_alloc_owner()`, which notes it in
+`prte_pmix_server_req_t.alloc_gid_named`) is kept as `owner_gid` and sent
+to any scheduler as the group charged, but grants its members nothing: that
+group is often one every user on the system is in, and saying nothing about
+groups is not asking to share. `prte_job_t.uid` is recorded when a tool
+connects, from the `PMIX_USERID` its PMIx server established, and descends
+the job tree from there, so a job's owner is always the user who asked for
+it - which is what is compared. `session->owner` (a namespace) says where
+the reservation's notifications go and whose subtree drains it; it grants
+nothing. There used to be an `owners[]` list of namespaces that granted the
+right to spawn onto the reservation, extended with each job spawned in; a
+namespace says nothing about who is asking that its job's uid does not, and
+the list never shrank.
 
-Note the trap this function stepped in: **`PMIX_CHECK_NSPACE` answers
-"true" when either side is an empty nspace** — that is its wildcard rule.
+Note the trap any comparison with the scheduler's name has stepped in:
+**`PMIX_CHECK_NSPACE` answers "true" when either side is an empty
+nspace** — that is its wildcard rule.
 `prte_pmix_server_globals.scheduler.nspace` is empty until a scheduler
-connects, so testing it unguarded declared every namespace to be the
-scheduler on every DVM running without one, and the whole check collapsed
-into an unconditional yes. Guard any such comparison with
+connects, so testing it unguarded declares every namespace to be the
+scheduler on every DVM running without one. Guard any such comparison with
 `PMIX_NSPACE_INVALID` first.
 
 ---

@@ -104,6 +104,7 @@ typedef uint8_t prte_app_context_flags_t;
 /* this app's "--membind": the prte_hwloc_base_memattr_t to bind its procs'
  * memory by. Takes precedence over the job's PRTE_JOB_MEMBIND. */
 #define PRTE_APP_MEMBIND            43 /* uint16_t memory binding attribute */
+#define PRTE_APP_MAP_NIC            44 /* uint16_t: NICs from its GPU's root complex given to each proc */
 
 #define PRTE_APP_MAX_KEY 100
 
@@ -123,7 +124,7 @@ typedef uint8_t prte_node_flags_t;
 /*** NODE ATTRIBUTE KEYS - never sent anywhere ***/
 #define PRTE_NODE_START_KEY PRTE_APP_MAX_KEY
 
-#define PRTE_NODE_USERNAME      (PRTE_NODE_START_KEY + 1)
+// PRTE_NODE_START_KEY + 1 RETIRED (was PRTE_NODE_USERNAME - the DVM reaches every node as its own user) - do not reuse
 // PRTE_NODE_START_KEY + 2 RETIRED (was PRTE_NODE_LAUNCH_ID) - do not reuse
 #define PRTE_NODE_HOSTID        (PRTE_NODE_START_KEY + 3) // pmix_rank_t - if this "node" is a coprocessor being hosted on a different node, then
                                                           // we need to know the id of our "host" to help any procs on us to determine locality
@@ -340,6 +341,7 @@ typedef uint16_t prte_job_flags_t;
                                                                        // process's identity, as a prun in a job script does. Not
                                                                        // linked into its requester's spawn tree, connected to it,
                                                                        // or told it has a PMIX_PARENT_ID
+#define PRTE_JOB_MAP_NIC                    (PRTE_JOB_START_KEY + 140) // uint16_t - NICs from its GPU's root complex given to each proc
 
 #define PRTE_JOB_MAX_KEY (PRTE_JOB_START_KEY + 200)
 
@@ -417,6 +419,12 @@ typedef uint16_t prte_session_flags_t;
                                                // instantiated with, so it is reclaimed when the
                                                // last of them retires rather than persisting
                                                // until an explicit terminate
+#define PRTE_SESSION_FLAG_GROUP_ACCESS  0x0100 // the members of owner_gid may use and change the
+                                               // session: its group was named for it, not filled
+                                               // in from the requester's own
+#define PRTE_SESSION_FLAG_LIMIT_HELD    0x0080 // the session's time limit was set by the scheduler
+                                               // or by a user who may change the DVM, so only they
+                                               // may change it (prte_pmix_server_session_set_limit)
 
 
 /*** FLAG OPS ***/

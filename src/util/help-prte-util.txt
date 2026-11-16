@@ -82,6 +82,37 @@ The %s option was given "%s" without the value it requires:
 
 Please write it as %s=<value>.
 #
+[file-too-large]
+A file was not read because it is larger than PRRTE accepts:
+
+  File:   %s
+  Limit:  %d MiB
+
+Files named for a job - a hostfile, a rankfile - are read by the DVM
+master itself, so what one may hold is bounded. The file was not used.
+#
+[file-not-answered]
+A file was not read because reading it did not finish in time:
+
+  File:     %s
+  Waited:   %d seconds
+
+Files named for a job - a hostfile, a rankfile - are read by the DVM
+master itself, so how long one may take is bounded; the file system it
+is on may not be responding. The limit is PMIx's MCA parameter
+"pmix_runas_timeout". The file was not used.
+#
+[file-line-too-long]
+A file was not read because one of its lines is longer than PRRTE
+accepts:
+
+  File:   %s
+  Line:   %d
+  Limit:  %d KiB
+
+Files named for a job - a hostfile, a rankfile - are read by the DVM
+master itself, so what one may hold is bounded. The file was not used.
+#
 [file-read-failed]
 A file could not be read to its end:
 

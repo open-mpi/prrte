@@ -41,6 +41,7 @@
 #endif /* HAVE_SYS_TIME_H */
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <string.h>
 
@@ -814,7 +815,6 @@ void prte_plm_base_setup_job(int fd, short args, void *cbdata)
     prte_state_caddy_t *caddy = (prte_state_caddy_t *) cbdata;
     prte_timer_t *timer = NULL;
     int time, *tp;
-    size_t n;
     PRTE_HIDE_UNUSED_PARAMS(fd, args);
 
     PMIX_ACQUIRE_OBJECT(caddy);
@@ -873,30 +873,6 @@ void prte_plm_base_setup_job(int fd, short args, void *cbdata)
      * catch-up has gone out) would reach every daemon as a procless copy and
      * launch nowhere but here.  Cleared by prte_plm_base_send_launch_msg. */
     PRTE_FLAG_SET(caddy->jdata, PRTE_JOB_FLAG_LAUNCH_PENDING);
-
-    /* Now - and only now - is the job recorded as an owner of the
-     * reservation(s) it was cleared to run in.  That grant is what lets it
-     * spawn further jobs onto those nodes, and nothing ever removes an
-     * owner, so it waits until the job is known to be launching: a request
-     * rejected in the command processor (a failed add-hosts, a malformed
-     * spawn allocation) must not have made itself an owner on its way out.
-     *
-     * It also has to be a real namespace.  Granting it at request-vetting
-     * time, back when the job was not named until this function ran,
-     * recorded an EMPTY namespace as an owner - and an empty namespace
-     * matches every other one (PMIx_Check_nspace treats it as a wildcard),
-     * so the first job spawned into a reservation quietly opened that
-     * reservation to every namespace in the DVM.  The job is named at the
-     * DVM's door now, and prte_session_add_owner refuses an empty namespace
-     * outright.  Both calls are no-ops for the default session, which
-     * everyone may use. */
-    if (NULL != caddy->jdata->target_sessions) {
-        for (n = 0; n < caddy->jdata->num_target_sessions; n++) {
-            prte_session_add_owner(caddy->jdata->target_sessions[n], caddy->jdata->nspace);
-        }
-    } else if (NULL != caddy->jdata->session) {
-        prte_session_add_owner(caddy->jdata->session, caddy->jdata->nspace);
-    }
 
     /* if the spawn operation has a timeout assigned to it, setup the timer for it */
     tp = &time;
@@ -1603,13 +1579,18 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
         } else if (0 == strcmp(file, "+")) {
             fp = stderr;
         } else {
-            /* attempt to open the specified file */
-            fp = prte_output_file_open(file, 0666, NULL);
+            /* written here into a temporary file of ours, and then copied to
+             * the file named by a child acting as the job's owner, who named
+             * it - so neither the open nor the write of a path on a
+             * filesystem that has stopped answering can hold the master for
+             * longer than PMIx's pmix_runas_timeout (prte_output_file_write_as) */
+            fp = tmpfile();
             if (NULL == fp) {
                 pmix_output(0, "Unable to open file %s for output of proctable: %s", file,
                             strerror(errno));
                 goto next;
             }
+            (void) fcntl(fileno(fp), F_SETFD, FD_CLOEXEC);
         }
         for (n=0; n < jdata->procs->size; n++) {
             proc = (prte_proc_t*)pmix_pointer_array_get_item(jdata->procs, n);
@@ -1628,6 +1609,15 @@ void prte_plm_base_post_launch(int fd, short args, void *cbdata)
                     proc->name.rank, proc->node->name, app->app, (long) proc->pid);
         }
         if (stdout != fp && stderr != fp) {
+            uid_t fuid;
+            gid_t fgid;
+
+            prte_pmix_server_job_user(jdata, &fuid, &fgid);
+            if (0 != prte_output_file_write_as(file, 0666, fuid, fgid, fp)) {
+                pmix_output(0, "Unable to write file %s for output of proctable: %s", file,
+                            (ETIMEDOUT == errno) ? "the write did not finish in time"
+                                                 : strerror(errno));
+            }
             fclose(fp);
         }
     }
@@ -2438,24 +2428,6 @@ int prte_plm_base_prted_append_basic_args(int *argc, char ***argv, char *ess, in
         pmix_argv_append(argc, argv, "1");
     }
 
-    /* Tell the daemon if connections between daemons are NOT to be
-     * authenticated - it would otherwise wait for a key nobody sends it, and
-     * refuse every peer that does not prove it holds one.  The key itself
-     * never goes here: a command line is visible to anything on the node
-     * (see src/util/prte_dvm_key.h for how it does travel). */
-    if (!prte_oob_authenticate) {
-        pmix_argv_append(argc, argv, "--prtemca");
-        pmix_argv_append(argc, argv, "prte_oob_authenticate");
-        pmix_argv_append(argc, argv, "0");
-    }
-    /* ...and if their messages are to be tagged: a daemon that did not tag
-     * would be refused by every peer that does */
-    if (prte_oob_authenticate_messages) {
-        pmix_argv_append(argc, argv, "--prtemca");
-        pmix_argv_append(argc, argv, "prte_oob_authenticate_messages");
-        pmix_argv_append(argc, argv, "1");
-    }
-
     /* look for any envars that relate to us and pass
      * them along on the cmd line - unless we were told not to */
     offset = strlen("PRTE_MCA_");
@@ -3133,7 +3105,7 @@ static int setup_virtual_machine(prte_job_t *jdata)
         if (NULL == (app = (prte_app_context_t *) pmix_pointer_array_get_item(jdata->apps, i))) {
             continue;
         }
-        if (PRTE_SUCCESS != (rc = prte_rmaps_base_filter_nodes(app, &nodes, false))
+        if (PRTE_SUCCESS != (rc = prte_rmaps_base_filter_nodes(jdata, app, &nodes, false))
             && rc != PRTE_ERR_TAKE_NEXT_OPTION) {
             PRTE_ERROR_LOG(rc);
             PMIX_LIST_DESTRUCT(&nodes);

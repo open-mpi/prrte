@@ -6,7 +6,7 @@ Sharing a DVM between users
 By default a DVM serves one user: the user it runs as. Tools of any other
 user are refused when they connect. The ``prte_pmix_no_foreign_tools``
 MCA parameter (default ``true``) controls this; setting it to ``0`` lets
-other users' tools connect::
+other users' tools connect, to the daemon on any node of the DVM::
 
    prte --prtemca prte_pmix_no_foreign_tools 0 ...
 
@@ -39,33 +39,77 @@ that user, with that user's groups:
 
 So a DVM meant to run several users' jobs runs as root.
 
-What the DVM does not do for another user
------------------------------------------
+Files the DVM opens for a job
+-----------------------------
 
 Some directives ask the DVM itself, rather than the job's processes, to
-open a file. The DVM does that as the user it runs as, so they are
-accepted only from root and from the DVM's own user:
+open a file:
 
 * a hostfile, or a hostfile of hosts to add to the DVM;
 * a rankfile or sequential-mapping file;
-* a file for the process table (``--output-proctable``);
-* binaries or files to preload.
+* a file for the process table (``--rtos output-proctable=<file>``).
 
-A job of any other user that asks for one of them is refused, naming the
-directive. Output files a job's ``--output`` directive names are not on
-this list: they are opened as the job's own user.
+The DVM opens each of these as the job's own user, with that user's
+groups, so a job may name only files its user could open itself. A file
+it may not read is reported as one that cannot be opened, and a process
+table is created, or replaced, only where the job's user may write. An
+allocation request that names a hostfile has it read as the requester in
+the same way. Output files a job's ``--output`` directive names are
+opened as the job's own user too.
+
+Preloading binaries or files (``--preload-files``, ``--preload-binary``)
+is the exception: the DVM reads them, and its daemons write the copies on
+every node, as the user the DVM runs as. Preloading is therefore accepted
+only from root and from the DVM's own user, and a job of any other user
+that asks for it is refused, naming the directive.
 
 Who may grow the DVM
 --------------------
 
-Bringing hosts into an elastic DVM - with ``--add-host`` or
-``--activate`` on a job, or with an allocation request
-(``PMIx_Allocation_request``) that names nodes - changes what the DVM
-consists of. It is accepted from root, the DVM's own user, and the users
+Bringing hosts into an elastic DVM - with ``--add-host``,
+``--add-hostfile`` or ``--activate`` on a job, or with an allocation
+request (``PMIx_Allocation_request``) that names nodes or a hostfile -
+changes what the DVM consists of. It is accepted from root, the DVM's own user, and the users
 and groups the DVM was started with (``prte --rtos users=...,groups=...``),
 as creating a session is. When the DVM hands such requests to a PMIx
 scheduler, the scheduler decides instead.
 
-A host may be given as ``user@host`` to name the user the DVM logs in to
-it as. That is accepted only from root and the DVM's own user, and a host
-name may contain only letters, digits, ``.``, ``-`` and ``_``.
+A user asks for resources - a new allocation, or more nodes or time for one
+of its own - with ``PMIx_Allocation_request``, and the scheduler decides.
+``PMIx_Session_control`` with ``PMIX_SESSION_INSTANTIATE`` or
+``PMIX_SESSION_EXTEND`` is not such a request: it is how the scheduler tells
+the DVM what it has decided. With no scheduler attached, those two
+directives are accepted only from the same users who may grow the DVM, and
+that includes the user the session is for. The user a session is for may
+still pause, resume, signal and terminate it.
+
+The DVM reaches every node as the user it runs as, and does not start a
+daemon as any other user. A host may therefore not name an account to
+reach it as - ``user@host``, or ``username=`` in a hostfile - on the
+command line, in a hostfile, a rankfile, a hostfile of hosts to add, or
+the node list of an allocation or session; such a request is refused,
+whoever makes it. A host name may contain only letters, digits, ``.``,
+``-`` and ``_``.
+
+Whom an allocation is for
+-------------------------
+
+An allocation request (``PMIx_Allocation_request``) for new or extended
+resources is for the user who makes it, and that user's group, unless it
+says otherwise with ``PMIX_ALLOC_UID`` and ``PMIX_ALLOC_GID``. A user may
+name only itself; root may name any user. Any user may name a group it
+belongs to. Anything else is refused with ``PMIX_ERR_NO_PERMISSIONS``.
+The allocation belongs to the user it is for, who may use, extend or
+release it. Members of its group may too, but only when the request named
+the group with ``PMIX_ALLOC_GID``: a group filled in from the requester's
+own is recorded and passed to any scheduler, and grants its members
+nothing. A user who wants to share an allocation with a group names it.
+
+With no scheduler attached, the DVM applies the time an allocation request
+asks for (``PMIX_ALLOC_TIME``): the allocation ends that long after the
+request is granted. A later ``PMIX_ALLOC_EXTEND`` naming a time sets a new
+limit, that long from then. The user an allocation is for may change a limit
+it set itself; a limit set by root, the DVM's own user, a user named by
+``prte --rtos users=...,groups=...``, or a scheduler may be changed only by
+one of them, and an attempt by the allocation's user is refused with
+``PMIX_ERR_NO_PERMISSIONS``.

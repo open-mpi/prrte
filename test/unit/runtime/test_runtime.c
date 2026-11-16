@@ -73,6 +73,7 @@
 #include "src/rml/oob/oob.h"
 #include "src/rml/rml.h"
 #include "src/runtime/prte_globals.h"
+#include "src/runtime/prte_node_index.h"
 #include "src/runtime/prte_progress_threads.h"
 #include "src/runtime/prte_worker_pool.h"
 #include "src/runtime/runtime.h"
@@ -400,62 +401,31 @@ static int test_session_job_backref(void)
 static int test_session_ownership(void)
 {
     int failures = 0;
-    prte_session_t *s, *s2;
-    prte_session_t *saved_default;
+    prte_session_t *s;
+    uid_t owner = 4711, other = 4712;
 
     reset_globals();
-    saved_default = prte_default_session;
+    PMIX_CONSTRUCT(&prte_pmix_server_globals.users, pmix_list_t);
 
     s = PMIX_NEW(prte_session_t);
     s->session_id = 7;
     CHECK("owner: insert succeeds", PRTE_SUCCESS == prte_set_session_object(s));
 
-    /* a fresh reservation has no owners, so nobody may spawn into it */
-    CHECK("owner: an unowned reservation admits nobody", !prte_session_is_owned_by(s, NS("nsA")));
+    /* A reservation is its user's: whether a job may be placed on it, or
+     * the reservation changed, is a question about who asked, never about
+     * which namespace did. One whose requester presented no identity is
+     * root's and our own user's alone. */
+    CHECK("owner: an unowned reservation admits root", prte_pmix_server_session_permitted_uid(s, 0));
+    CHECK("owner: ...and our own user",
+          prte_pmix_server_session_permitted_uid(s, prte_process_info.euid));
+    CHECK("owner: ...and nobody else", !prte_pmix_server_session_permitted_uid(s, other));
+    s->owner_uid = owner;
+    CHECK("owner: its owner is admitted", prte_pmix_server_session_permitted_uid(s, owner));
+    CHECK("owner: another user is not", !prte_pmix_server_session_permitted_uid(s, other));
+    CHECK("owner: root still is", prte_pmix_server_session_permitted_uid(s, 0));
+    CHECK("owner: no session admits nobody", !prte_pmix_server_session_permitted_uid(NULL, 0));
 
-    prte_session_add_owner(s, NS("nsA"));
-    CHECK("owner: the added namespace is admitted", prte_session_is_owned_by(s, NS("nsA")));
-    CHECK("owner: others are still refused", !prte_session_is_owned_by(s, NS("nsB")));
-
-    /* adding twice must not grow the list - owners accumulates one entry per
-     * namespace spawned into the session, and a job can be spawned into the
-     * same session repeatedly */
-    prte_session_add_owner(s, NS("nsA"));
-    CHECK("owner: re-adding is a no-op", 1 == PMIx_Argv_count(s->owners));
-    prte_session_add_owner(s, NS("nsB"));
-    CHECK("owner: a second namespace appends", 2 == PMIx_Argv_count(s->owners));
-    CHECK("owner: and is admitted", prte_session_is_owned_by(s, NS("nsB")));
-
-    /* the default session belongs to everyone and records no owners */
-    prte_default_session = s;
-    CHECK("owner: the default session admits anyone", prte_session_is_owned_by(s, NS("nsZ")));
-    prte_session_add_owner(s, NS("nsZ"));
-    CHECK("owner: the default session records nothing", 2 == PMIx_Argv_count(s->owners));
-    prte_default_session = saved_default;
-
-    /* a NULL session is the default pool */
-    CHECK("owner: NULL session admits anyone", prte_session_is_owned_by(NULL, NS("nsZ")));
-
-    /* An EMPTY namespace must never be recorded as an owner, and the case
-     * that matters is a reservation whose owner list is still empty - with
-     * entries present, the wildcard below makes the empty one look like a
-     * duplicate and it is dropped by accident rather than on purpose.
-     *
-     * This is not hypothetical: a spawn request arrives with no namespace at
-     * all (the HNP names the job later, in prte_plm_base_setup_job), so the
-     * code that granted the spawned job ownership at request-vetting time
-     * handed in exactly this.  An empty entry does not merely fail to
-     * identify anybody - PMIx_Check_nspace treats an empty side as a
-     * wildcard, so it matches EVERY namespace and retires the reservation's
-     * ownership gate for good. */
-    s2 = PMIX_NEW(prte_session_t);
-    s2->session_id = 8;
-    CHECK("owner: second insert succeeds", PRTE_SUCCESS == prte_set_session_object(s2));
-    prte_session_add_owner(s2, NS(""));
-    CHECK("owner: an empty namespace is not recorded", 0 == PMIx_Argv_count(s2->owners));
-    CHECK("owner: an empty owner does not admit everybody",
-          !prte_session_is_owned_by(s2, NS("nsC")));
-
+    PMIX_LIST_DESTRUCT(&prte_pmix_server_globals.users);
     reset_globals();
     return failures;
 }
@@ -688,6 +658,161 @@ static int test_node_matching(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* the node index                                                     */
+/* ------------------------------------------------------------------ */
+
+/* prte_node_index_t answers what the walks over a list or the pool answer,
+ * so it is checked against them: nodes are drawn from a handful of names,
+ * so that names and aliases collide and more than one node can match,
+ * including our own nodename and "localhost" (which prte_node_match()
+ * resolves to our nodename for node names but not for aliases). Every
+ * index answer must be the node the walk would have reached first, before
+ * and after nodes are taken out. */
+static const char *ni_names[] = {"n0", "n1", "n2", "n3", "n4", "n5", "localhost", NULL, NULL};
+
+static prte_node_t *ni_walk_node(pmix_list_t *list, prte_node_t *q)
+{
+    prte_node_t *nd;
+    int i;
+
+    if (NULL != list) {
+        PMIX_LIST_FOREACH(nd, list, prte_node_t) {
+            if (prte_nptr_match(q, nd)) {
+                return nd;
+            }
+        }
+        return NULL;
+    }
+    for (i = 0; i < prte_node_pool->size; i++) {
+        nd = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, i);
+        if (NULL != nd && NULL != nd->name && prte_nptr_match(q, nd)) {
+            return nd;
+        }
+    }
+    return NULL;
+}
+
+static prte_node_t *ni_make(unsigned *seed)
+{
+    prte_node_t *nd;
+    int k, nal;
+
+    nd = make_node(ni_names[rand_r(seed) % 8]);
+    nal = rand_r(seed) % 3;
+    for (k = 0; k < nal; k++) {
+        PMIx_Argv_append_unique_nosize(&nd->aliases, ni_names[rand_r(seed) % 8]);
+    }
+    return nd;
+}
+
+static int ni_compare(prte_node_index_t *idx, pmix_list_t *list, unsigned *seed, const char *what)
+{
+    int failures = 0, q;
+    prte_node_t *probe;
+    char label[128];
+
+    for (q = 0; q < 8; q++) {
+        if (NULL == ni_names[q]) {
+            continue;
+        }
+        snprintf(label, sizeof(label), "node_index %s: name %s as prte_node_match", what,
+                 ni_names[q]);
+        CHECK(label, prte_node_index_match_name(idx, ni_names[q]) ==
+                         prte_node_match(list, ni_names[q]));
+    }
+    for (q = 0; q < 40; q++) {
+        probe = ni_make(seed);
+        snprintf(label, sizeof(label), "node_index %s: node %s as prte_nptr_match", what,
+                 probe->name);
+        CHECK(label, prte_node_index_match_node(idx, probe) == ni_walk_node(list, probe));
+        PMIX_RELEASE(probe);
+    }
+    return failures;
+}
+
+static int test_node_index(void)
+{
+    int failures = 0, round, i, n;
+    unsigned seed = 42;
+    prte_node_index_t idx;
+    pmix_list_t list;
+    prte_node_t *nd, *nodes[24];
+    pmix_list_item_t *item;
+
+    reset_globals();
+    ni_names[7] = prte_process_info.nodename;
+
+    for (round = 0; round < 20; round++) {
+        /* a list, in list order */
+        PMIX_CONSTRUCT(&list, pmix_list_t);
+        prte_node_index_construct(&idx);
+        n = 1 + rand_r(&seed) % 12;
+        for (i = 0; i < n; i++) {
+            nd = ni_make(&seed);
+            pmix_list_append(&list, &nd->super);
+        }
+        CHECK("node_index: index a list", PRTE_SUCCESS == prte_node_index_add_list(&idx, &list));
+        failures += ni_compare(&idx, &list, &seed, "list");
+        /* take some out - from the list and from the index */
+        for (i = 0; i < n / 2; i++) {
+            item = pmix_list_get_first(&list);
+            for (int k = rand_r(&seed) % (int) pmix_list_get_size(&list); 0 < k; k--) {
+                item = pmix_list_get_next(item);
+            }
+            prte_node_index_remove(&idx, (prte_node_t *) item);
+            pmix_list_remove_item(&list, item);
+            PMIX_RELEASE(item);
+        }
+        failures += ni_compare(&idx, &list, &seed, "list after removal");
+        /* a node appended, and another name given to one already there */
+        nd = ni_make(&seed);
+        pmix_list_append(&list, &nd->super);
+        prte_node_index_append(&idx, nd);
+        nd = (prte_node_t *) pmix_list_get_first(&list);
+        PMIx_Argv_append_unique_nosize(&nd->aliases, "n9");
+        prte_node_index_add_alias(&idx, nd, "n9");
+        CHECK("node_index list: an added alias is found",
+              prte_node_index_match_name(&idx, "n9") == prte_node_match(&list, "n9"));
+        failures += ni_compare(&idx, &list, &seed, "list after additions");
+        prte_node_index_destruct(&idx);
+        PMIX_LIST_DESTRUCT(&list);
+
+        /* the pool, in index order, with gaps */
+        n = 1 + rand_r(&seed) % 20;
+        for (i = 0; i < n; i++) {
+            nodes[i] = ni_make(&seed);
+            nodes[i]->index = pmix_pointer_array_add(prte_node_pool, nodes[i]);
+        }
+        for (i = 0; i < n; i += 3) {
+            pmix_pointer_array_set_item(prte_node_pool, nodes[i]->index, NULL);
+            PMIX_RELEASE(nodes[i]);
+        }
+        prte_node_index_construct(&idx);
+        CHECK("node_index: index the pool", PRTE_SUCCESS == prte_node_index_add_pool(&idx));
+        failures += ni_compare(&idx, NULL, &seed, "pool");
+        prte_node_index_destruct(&idx);
+        reset_globals();
+    }
+
+    /* a node with no name answers to nothing, aliases or not */
+    prte_node_index_construct(&idx);
+    nd = PMIX_NEW(prte_node_t);
+    PMIx_Argv_append_nosize(&nd->aliases, "n1");
+    prte_node_index_add(&idx, nd, 0);
+    CHECK("node_index: a nameless node is not found by its alias",
+          NULL == prte_node_index_match_name(&idx, "n1"));
+    CHECK("node_index: a NULL name misses", NULL == prte_node_index_match_name(&idx, NULL));
+    PMIX_RELEASE(nd);
+    prte_node_index_destruct(&idx);
+
+    ni_names[7] = NULL;
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_node_index\n");
+    }
+    return failures;
+}
+
+/* ------------------------------------------------------------------ */
 /* copy functions                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -710,7 +835,7 @@ static int test_node_copy(void)
     src->slots_max = 128;
     src->slots_available = 60;
     src->session = sess;
-    prte_set_attribute(&src->attributes, PRTE_NODE_USERNAME, PRTE_ATTR_LOCAL,
+    prte_set_attribute(&src->attributes, PRTE_NODE_SERIAL_NUMBER, PRTE_ATTR_LOCAL,
                        "operator", PMIX_STRING);
 
     CHECK("nodecopy: copy succeeds", PRTE_SUCCESS == prte_node_copy(&cpy, src));
@@ -731,7 +856,8 @@ static int test_node_copy(void)
     CHECK("nodecopy: the copy answers to the alias too", prte_quickmatch(cpy, "bm07"));
     CHECK("nodecopy: session carried", sess == cpy->session);
     CHECK("nodecopy: attributes carried",
-          prte_get_attribute(&cpy->attributes, PRTE_NODE_USERNAME, (void **) &user, PMIX_STRING)
+          prte_get_attribute(&cpy->attributes, PRTE_NODE_SERIAL_NUMBER, (void **) &user,
+                             PMIX_STRING)
               && NULL != user && 0 == strcmp("operator", user));
     free(user);
 
@@ -1152,9 +1278,12 @@ static int test_node_pack_roundtrip(void)
     src->num_procs = 0xbeef;
     src->state = PRTE_NODE_STATE_UP;
     PRTE_FLAG_SET(src, PRTE_NODE_FLAG_OVERSUBSCRIBED);
-    prte_set_attribute(&src->attributes, PRTE_NODE_USERNAME, PRTE_ATTR_GLOBAL,
+    prte_set_attribute(&src->attributes, PRTE_NODE_SERIAL_NUMBER, PRTE_ATTR_GLOBAL,
                        "svc", PMIX_STRING);
-    prte_set_attribute(&src->attributes, PRTE_NODE_SERIAL_NUMBER, PRTE_ATTR_LOCAL, "wn", PMIX_STRING);
+    {
+        int port = 4242;
+        prte_set_attribute(&src->attributes, PRTE_NODE_PORT, PRTE_ATTR_LOCAL, &port, PMIX_INT);
+    }
 
     PMIX_DATA_BUFFER_CONSTRUCT(&buf);
     rc = prte_node_pack(&buf, src);
@@ -1174,12 +1303,12 @@ static int test_node_pack_roundtrip(void)
         CHECK("wire: the oversubscribed flag round-trips",
               PRTE_FLAG_TEST(dst, PRTE_NODE_FLAG_OVERSUBSCRIBED));
         CHECK("wire: a GLOBAL node attribute crosses",
-              prte_get_attribute(&dst->attributes, PRTE_NODE_USERNAME, (void **) &sval,
+              prte_get_attribute(&dst->attributes, PRTE_NODE_SERIAL_NUMBER, (void **) &sval,
                                  PMIX_STRING)
                   && NULL != sval && 0 == strcmp("svc", sval));
         free(sval);
         CHECK("wire: a LOCAL node attribute does not cross",
-              !prte_get_attribute(&dst->attributes, PRTE_NODE_SERIAL_NUMBER, NULL, PMIX_STRING));
+              !prte_get_attribute(&dst->attributes, PRTE_NODE_PORT, NULL, PMIX_INT));
         PMIX_RELEASE(dst);
     }
 
@@ -1241,7 +1370,6 @@ static int test_object_lifetimes(void)
     {
         prte_session_t *s = PMIX_NEW(prte_session_t);
 
-        CHECK("lifetime: a fresh session has no owners", NULL == s->owners);
         CHECK("lifetime: a fresh session has no index", -1 == s->index);
         CHECK("lifetime: a fresh session has the default inheritance",
               PRTE_INHERIT_DEFAULT_VALUE == s->inheritance);
@@ -1747,6 +1875,8 @@ static void ds_purge_msg(const char *nspace, pmix_rank_t rank,
     PMIX_DATA_BUFFER_DESTRUCT(&buf);
 }
 
+static bool ds_stored(prte_data_object_t *data, int index);
+
 static int test_data_server_purge_parked(void)
 {
     int failures = 0;
@@ -1808,6 +1938,60 @@ static int test_data_server_purge_parked(void)
     ds_purge_msg("purge.job2", 0, info, 1);
     PMIX_INFO_DESTRUCT(&info[0]);
     CHECK("purge: an int-typed PROC horizon drops the parked lookup", !ds_parked(c));
+
+    /* A purge a user asks for - PMIx_Unpublish naming no keys - takes only
+     * what that user owns, however the process it names is spelled: the
+     * PMIx server names the requester's user on every request, and that is
+     * the user the purge is held to.  Its own parked lookups go with it,
+     * nobody else's. */
+    {
+        prte_data_object_t *mine, *theirs;
+        prte_data_req_t *pm, *pt;
+        int imine, itheirs;
+        uint32_t me = 501, them = 502, grp = 20;
+
+        mine = ds_store_item("prte.test.purge.mine", "v", me, PMIX_PERSIST_NSPACE);
+        PMIX_LOAD_PROCID(&mine->owner, "purge.shared", 0);
+        theirs = ds_store_item("prte.test.purge.theirs", "v", them, PMIX_PERSIST_NSPACE);
+        PMIX_LOAD_PROCID(&theirs->owner, "purge.shared", 0);
+        imine = mine->index;
+        itheirs = theirs->index;
+        pm = ds_park("purge.shared", 0);
+        pm->uid = me;
+        pt = ds_park("purge.shared", 0);
+        pt->uid = them;
+
+        persist = PMIX_PERSIST_NSPACE;
+        PMIX_INFO_LOAD(&info[0], PMIX_USERID, &me, PMIX_UINT32);
+        PMIX_INFO_LOAD(&info[1], PMIX_GRPID, &grp, PMIX_UINT32);
+        {
+            pmix_info_t uinfo[3];
+
+            PMIX_INFO_XFER(&uinfo[0], &info[0]);
+            PMIX_INFO_XFER(&uinfo[1], &info[1]);
+            PMIX_INFO_LOAD(&uinfo[2], PMIX_PERSISTENCE, &persist, PMIX_PERSIST);
+            ds_purge_msg("purge.shared", PMIX_RANK_WILDCARD, uinfo, 3);
+            PMIX_INFO_DESTRUCT(&uinfo[0]);
+            PMIX_INFO_DESTRUCT(&uinfo[1]);
+            PMIX_INFO_DESTRUCT(&uinfo[2]);
+        }
+        PMIX_INFO_DESTRUCT(&info[0]);
+        PMIX_INFO_DESTRUCT(&info[1]);
+        CHECK("purge: a user's purge takes its own item", !ds_stored(mine, imine));
+        CHECK("purge: ...and leaves another user's", ds_stored(theirs, itheirs));
+        CHECK("purge: a user's purge drops its own parked lookup", !ds_parked(pm));
+        CHECK("purge: ...and leaves another user's", ds_parked(pt));
+
+        /* the DVM's own user may take what any user published */
+        me = (uint32_t) prte_process_info.euid;
+        PMIX_INFO_LOAD(&info[0], PMIX_USERID, &me, PMIX_UINT32);
+        PMIX_INFO_LOAD(&info[1], PMIX_PERSISTENCE, &persist, PMIX_PERSIST);
+        ds_purge_msg("purge.shared", PMIX_RANK_WILDCARD, info, 2);
+        PMIX_INFO_DESTRUCT(&info[0]);
+        PMIX_INFO_DESTRUCT(&info[1]);
+        CHECK("purge: the DVM's own user takes another user's item", !ds_stored(theirs, itheirs));
+        CHECK("purge: ...and its parked lookup", !ds_parked(pt));
+    }
 
     ds_store_close();
     return failures;
@@ -1897,6 +2081,69 @@ static int test_data_server_wire_count(void)
 
     if (0 == failures) {
         fprintf(stdout, "PASSED test_data_server_wire_count\n");
+    }
+    return failures;
+}
+
+/* A count unpacked from a buffer is accepted only if the buffer still has at
+ * least that many bytes to unpack, and only if the int32_t count the unpack
+ * takes can hold it. */
+static int test_count_fits(void)
+{
+    int failures = 0;
+    pmix_data_buffer_t buf, empty;
+    pmix_info_t info[3];
+    size_t n = 3, got;
+    int32_t cnt = 1;
+    uint32_t u = 7;
+    int k;
+
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    PMIX_DATA_BUFFER_CONSTRUCT(&empty);
+    for (k = 0; k < 3; k++) {
+        PMIX_INFO_LOAD(&info[k], "prte.test.key", &u, PMIX_UINT32);
+    }
+    PMIx_Data_pack(NULL, &buf, &n, 1, PMIX_SIZE);
+    PMIx_Data_pack(NULL, &buf, info, 3, PMIX_INFO);
+    for (k = 0; k < 3; k++) {
+        PMIX_INFO_DESTRUCT(&info[k]);
+    }
+
+    CHECK("zero always fits, even in no buffer", prte_pmix_count_fits(NULL, 0));
+    CHECK("zero fits an empty buffer", prte_pmix_count_fits(&empty, 0));
+    CHECK("one does not fit an empty buffer", !prte_pmix_count_fits(&empty, 1));
+    CHECK("no buffer holds anything", !prte_pmix_count_fits(NULL, 1));
+
+    CHECK("unpack the count", PMIX_SUCCESS == PMIx_Data_unpack(NULL, &buf, &got, &cnt, PMIX_SIZE));
+    CHECK("the packed count fits", prte_pmix_count_fits(&buf, got));
+    {
+        size_t left = buf.bytes_used - (size_t) (buf.unpack_ptr - buf.base_ptr);
+        CHECK("as many as the bytes left fits", prte_pmix_count_fits(&buf, left));
+        CHECK("one more than the bytes left does not", !prte_pmix_count_fits(&buf, left + 1));
+    }
+    CHECK("just under INT32_MAX does not fit a small message",
+          !prte_pmix_count_fits(&buf, (size_t) INT32_MAX - 1));
+    CHECK("SIZE_MAX does not fit", !prte_pmix_count_fits(&buf, SIZE_MAX));
+    CHECK("a negative int32_t count does not fit",
+          !prte_pmix_count_fits(&buf, (size_t) (int32_t) -1));
+
+    /* once the elements are unpacked, nothing is left */
+    {
+        pmix_info_t out[3];
+        cnt = 3;
+        CHECK("unpack the elements",
+              PMIX_SUCCESS == PMIx_Data_unpack(NULL, &buf, out, &cnt, PMIX_INFO));
+        for (k = 0; k < 3; k++) {
+            PMIX_INFO_DESTRUCT(&out[k]);
+        }
+    }
+    CHECK("nothing fits a drained buffer", !prte_pmix_count_fits(&buf, 1));
+
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
+    PMIX_DATA_BUFFER_DESTRUCT(&empty);
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_count_fits\n");
     }
     return failures;
 }
@@ -2351,17 +2598,31 @@ static int test_data_server_requestor(void)
 
     PMIX_LOAD_PROCID(&behalf, "far.away.job", 3);
 
-    /* a tool may act for somebody else */
+    /* a tool may act for a process of its own user. The uid is the one
+     * PMIx established for the tool, which naming no other user keeps */
+    PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
+    uid = 7; gid = 9;
+    PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
+    prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
+    CHECK("requestor: a tool's claim is honored", PMIX_CHECK_PROCID(&owner, &behalf));
+    CHECK("requestor: ...as its own user", 7 == uid && 9 == gid);
+    PMIX_INFO_DESTRUCT(&info[0]);
+
+    /* a claim from a request that names no user at all is not one anybody
+     * may make - the PMIx server names the user of every request a tool
+     * sends, so there is nobody to hold it to */
     PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
     PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
     prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
-    CHECK("requestor: a tool's claim is honored", PMIX_CHECK_PROCID(&owner, &behalf));
+    CHECK("requestor: a claim naming no user is refused",
+          PMIX_CHECK_NSPACE(owner.nspace, "relay.tool"));
     PMIX_INFO_DESTRUCT(&info[0]);
 
     /* an application process may not */
     PMIX_LOAD_PROCID(&owner, "some.app", 1);
+    uid = 7; gid = 9;
     PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
+    prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
     CHECK("requestor: an application's claim is refused",
           PMIX_CHECK_NSPACE(owner.nspace, "some.app") && 1 == owner.rank);
     PMIX_INFO_DESTRUCT(&info[0]);
@@ -2369,19 +2630,54 @@ static int test_data_server_requestor(void)
     /* neither may a namespace we have never heard of - a job object is what
      * says what the caller is, and without one there is nothing to trust */
     PMIX_LOAD_PROCID(&owner, "unknown.job", 4);
+    uid = 7; gid = 9;
     PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
+    prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
     CHECK("requestor: an unknown namespace's claim is refused",
           PMIX_CHECK_NSPACE(owner.nspace, "unknown.job"));
     PMIX_INFO_DESTRUCT(&info[0]);
 
     /* a directive of the wrong type is ignored rather than dereferenced */
     PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
+    uid = 7; gid = 9;
     PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, "not-a-procid", PMIX_STRING);
-    prte_ds_check_requestor(&owner, NULL, NULL, info, 1);
+    prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
     CHECK("requestor: a mistyped directive is ignored",
           PMIX_CHECK_NSPACE(owner.nspace, "relay.tool"));
     PMIX_INFO_DESTRUCT(&info[0]);
+
+    /* a process of a job we hold is the job's owner's to name: a tool of
+     * one user naming a process of another's is refused, even naming no
+     * other uid; one naming a process of its own user's job is not */
+    {
+        prte_job_t *heldj = make_job("held.job");
+        pmix_proc_t held;
+        uint32_t heldowner = 8;
+
+        prte_set_attribute(&heldj->attributes, PRTE_JOB_OWNER_UID, PRTE_ATTR_GLOBAL,
+                           &heldowner, PMIX_UINT32);
+        CHECK("requestor: held job registered", PRTE_SUCCESS == prte_set_job_data_object(heldj));
+        PMIX_LOAD_PROCID(&held, "held.job", 2);
+        PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
+        uid = 7; gid = 9;
+        PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &held, PMIX_PROC);
+        prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
+        CHECK("requestor: a process of a job a different user owns may not be named",
+              PMIX_CHECK_NSPACE(owner.nspace, "relay.tool") && 7 == uid);
+        PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
+        uid = 8; gid = 9;
+        prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
+        CHECK("requestor: a process of the tool's own user's job may be named",
+              PMIX_CHECK_PROCID(&owner, &held) && 8 == uid);
+        PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
+        uid = (uint32_t) prte_process_info.euid; gid = 9;
+        prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
+        CHECK("requestor: the DVM's own user may name any job's process",
+              PMIX_CHECK_PROCID(&owner, &held));
+        PMIX_INFO_DESTRUCT(&info[0]);
+        pmix_pointer_array_set_item(prte_job_data, heldj->index, NULL);
+        PMIX_RELEASE(heldj);
+    }
 
     /* The identity a relay claims includes the uid and gid, and has to:
      * ownership is decided by the publishing user, and what PMIx appends to
@@ -2392,8 +2688,8 @@ static int test_data_server_requestor(void)
     PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
     uid = (uint32_t) prte_process_info.euid; gid = 9;
     PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    PMIX_INFO_LOAD(&info[1], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
-    PMIX_INFO_LOAD(&info[2], PRTE_PUBLISH_REQ_GID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[1], PMIX_ORIGIN_USERID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[2], PMIX_ORIGIN_GRPID, &claim, PMIX_UINT32);
     prte_ds_check_requestor(&owner, &uid, &gid, info, 3);
     CHECK("requestor: a privileged tool's claimed uid is honored", 4242 == uid);
     CHECK("requestor: a privileged tool's claimed gid is honored", 4242 == gid);
@@ -2408,8 +2704,8 @@ static int test_data_server_requestor(void)
     PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
     uid = other; gid = 9;
     PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    PMIX_INFO_LOAD(&info[1], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
-    PMIX_INFO_LOAD(&info[2], PRTE_PUBLISH_REQ_GID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[1], PMIX_ORIGIN_USERID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[2], PMIX_ORIGIN_GRPID, &claim, PMIX_UINT32);
     prte_ds_check_requestor(&owner, &uid, &gid, info, 3);
     CHECK("requestor: another user's tool may not claim a third user", other == uid && 9 == gid);
     CHECK("requestor: ...nor the process it names", PMIX_CHECK_NSPACE(owner.nspace, "relay.tool"));
@@ -2421,8 +2717,8 @@ static int test_data_server_requestor(void)
     PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
     uid = other; gid = 9;
     PMIX_INFO_LOAD(&info[0], PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    PMIX_INFO_LOAD(&info[1], PRTE_PUBLISH_REQ_UID, &other, PMIX_UINT32);
-    PMIX_INFO_LOAD(&info[2], PRTE_PUBLISH_REQ_GID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[1], PMIX_ORIGIN_USERID, &other, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[2], PMIX_ORIGIN_GRPID, &claim, PMIX_UINT32);
     prte_ds_check_requestor(&owner, &uid, &gid, info, 3);
     CHECK("requestor: a tool may act for a process of its own user",
           other == uid && 4242 == gid && PMIX_CHECK_PROCID(&owner, &behalf));
@@ -2430,39 +2726,13 @@ static int test_data_server_requestor(void)
     PMIX_INFO_DESTRUCT(&info[1]);
     PMIX_INFO_DESTRUCT(&info[2]);
 
-    /* and a user prte_pmix_relay_uids names may claim anyone */
-    prte_pmix_server_globals.rly_uids = &other;
-    prte_pmix_server_globals.nrly_uids = 1;
-    PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
-    uid = other; gid = 9;
-    PMIX_INFO_LOAD(&info[0], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
-    prte_ds_check_requestor(&owner, &uid, &gid, info, 1);
-    CHECK("requestor: a listed relay's claim is honored", 4242 == uid);
-    PMIX_INFO_DESTRUCT(&info[0]);
-    prte_pmix_server_globals.rly_uids = NULL;
-    prte_pmix_server_globals.nrly_uids = 0;
-
-#if PRTE_PMIX_HAVE_ORIGIN_ID
-    /* the claim a relay makes through PMIx, which wins over our own keys */
-    PMIX_LOAD_PROCID(&owner, "relay.tool", 0);
-    uid = (uint32_t) prte_process_info.euid; gid = 9;
-    PMIX_INFO_LOAD(&info[0], PMIX_ORIGIN_USERID, &claim, PMIX_UINT32);
-    PMIX_INFO_LOAD(&info[1], PRTE_PUBLISH_REQ_UID, &other, PMIX_UINT32);
-    PMIX_INFO_LOAD(&info[2], PMIX_ORIGIN_GRPID, &claim, PMIX_UINT32);
-    prte_ds_check_requestor(&owner, &uid, &gid, info, 3);
-    CHECK("requestor: PMIX_ORIGIN_* is the claim read first", 4242 == uid && 4242 == gid);
-    PMIX_INFO_DESTRUCT(&info[0]);
-    PMIX_INFO_DESTRUCT(&info[1]);
-    PMIX_INFO_DESTRUCT(&info[2]);
-#endif
-
     /* ...and an application process claiming a uid is refused it, which is
      * the half that matters: a uid it could assert is a uid whose published
      * data it could remove */
     PMIX_LOAD_PROCID(&owner, "some.app", 1);
     uid = 7; gid = 9;
-    PMIX_INFO_LOAD(&info[0], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
-    PMIX_INFO_LOAD(&info[1], PRTE_PUBLISH_REQ_GID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[0], PMIX_ORIGIN_USERID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&info[1], PMIX_ORIGIN_GRPID, &claim, PMIX_UINT32);
     prte_ds_check_requestor(&owner, &uid, &gid, info, 2);
     CHECK("requestor: an application's claimed uid is refused", 7 == uid);
     CHECK("requestor: an application's claimed gid is refused", 9 == gid);
@@ -2520,7 +2790,7 @@ static int test_data_server_relay_directives(void)
      * own PMIx server appended after the claim */
     PMIX_INFO_LOAD(&in[0], "prte.test.relay.key", "v", PMIX_STRING);
     PMIX_INFO_LOAD(&in[1], PMIX_REQUESTOR, &behalf, PMIX_PROC);
-    PMIX_INFO_LOAD(&in[2], PRTE_PUBLISH_REQ_UID, &claim, PMIX_UINT32);
+    PMIX_INFO_LOAD(&in[2], PMIX_ORIGIN_USERID, &claim, PMIX_UINT32);
     PMIX_INFO_LOAD(&in[3], PMIX_USERID, &reluid, PMIX_UINT32);
     PMIX_INFO_LOAD(&in[4], PMIX_GRPID, &relgid, PMIX_UINT32);
     PMIX_LOAD_PROCID(&requestor, "relay.tool", 0);
@@ -2532,21 +2802,22 @@ static int test_data_server_relay_directives(void)
     CHECK("relay: ...naming the process the tool acted for",
           NULL != hit && PMIX_PROC == hit->value.type &&
           PMIX_CHECK_PROCID(hit->value.data.proc, &behalf));
-    hit = relay_find(out, nout, PRTE_PUBLISH_REQ_UID, &count);
+    hit = relay_find(out, nout, PMIX_ORIGIN_USERID, &count);
     CHECK("relay: one claimed uid goes out, the tool's claim",
           1 == count && NULL != hit && claim == hit->value.data.uint32);
-    hit = relay_find(out, nout, PRTE_PUBLISH_REQ_GID, &count);
+    hit = relay_find(out, nout, PMIX_ORIGIN_GRPID, &count);
     CHECK("relay: absent a claimed gid, the requester's own goes out",
           1 == count && NULL != hit && relgid == hit->value.data.uint32);
     hit = relay_find(out, nout, "prte.test.relay.key", &count);
     CHECK("relay: the published data goes out", 1 == count);
     hit = relay_find(out, nout, PMIX_USERID, &count);
     CHECK("relay: the identity PMIx stamped on the request does not go out", 0 == count);
-#if PRTE_PMIX_HAVE_ORIGIN_ID
-    hit = relay_find(out, nout, PMIX_ORIGIN_USERID, &count);
-    CHECK("relay: one PMIX_ORIGIN_USERID goes out, the tool's claim",
-          1 == count && NULL != hit && claim == hit->value.data.uint32);
-#endif
+    /* and every entry that goes out is one that was filled: the raiser's
+     * data and the three claims, nothing left blank */
+    CHECK("relay: exactly the data and one claim go out", 4 == nout);
+    for (size_t e = 0; e < nout; e++) {
+        CHECK("relay: no entry goes out without a key", '\0' != out[e].key[0]);
+    }
     PMIX_INFO_FREE(out, nout);
 
     /* an application process claiming to act for somebody is named as
@@ -2559,7 +2830,7 @@ static int test_data_server_relay_directives(void)
           1 == count && NULL != hit && PMIX_PROC == hit->value.type &&
           PMIX_CHECK_NSPACE(hit->value.data.proc->nspace, "some.app") &&
           1 == hit->value.data.proc->rank);
-    hit = relay_find(out, nout, PRTE_PUBLISH_REQ_UID, &count);
+    hit = relay_find(out, nout, PMIX_ORIGIN_USERID, &count);
     CHECK("relay: ...under the uid its server gave",
           1 == count && NULL != hit && reluid == hit->value.data.uint32);
     PMIX_INFO_FREE(out, nout);
@@ -2857,6 +3128,7 @@ int main(void)
     failures += test_proc_lookups();
     failures += test_proc_runtime_authority();
     failures += test_node_matching();
+    failures += test_node_index();
     failures += test_node_copy();
     failures += test_app_copy();
     failures += test_map_copy();
@@ -2877,6 +3149,7 @@ int main(void)
     failures += test_data_server_cap();
     failures += test_data_server_purge_parked();
     failures += test_data_server_wire_count();
+    failures += test_count_fits();
     failures += test_data_server_unpublish_reach();
     failures += test_data_server_same_range();
     failures += test_data_server_named_uint8();

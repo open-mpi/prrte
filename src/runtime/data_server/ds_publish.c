@@ -354,8 +354,9 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
         return ret;
     }
 
-    /* if it isn't at least one, then that's an error */
-    if (1 > ninfo) {
+    /* if it isn't at least one, or is more than the message holds, then
+     * that's an error */
+    if (1 > ninfo || !prte_pmix_count_fits(buffer, ninfo)) {
         ret = PMIX_ERR_BAD_PARAM;
         PMIX_ERROR_LOG(ret);
         PMIX_RELEASE(data);
@@ -403,8 +404,6 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
         } else if (PMIx_Check_key(info[n].key, PMIX_ACCESS_GRPIDS)) {
             ret = load_ids(&info[n].value, &data->agids, &data->nagids);
         } else if (PMIx_Check_key(info[n].key, PMIX_REQUESTOR) ||
-                   PMIx_Check_key(info[n].key, PRTE_PUBLISH_REQ_UID) ||
-                   PMIx_Check_key(info[n].key, PRTE_PUBLISH_REQ_GID) ||
                    prte_pmix_server_is_identity_key(info[n].key)) {
             /* a relay publishing on behalf of a process in its own DVM.
              * Applied below, once this scan has finished - see
@@ -412,12 +411,10 @@ pmix_status_t prte_ds_publish(pmix_proc_t *sender,
              * as published data - and so is the rest of who asked, which
              * PMIx adds to every request (the pid it saw) */
             continue;
-#if PRTE_PMIX_HAVE_ORIGIN_ID
         } else if (PMIx_Check_key(info[n].key, PMIX_REQUESTED_GRPID)) {
             /* a group to charge the work to - nothing to charge here, and
              * not the publisher's data */
             continue;
-#endif
         } else if (PMIx_Check_key(info[n].key, PRTE_PUBLISH_REPLACE)) {
             /* the publisher is updating something it published itself */
             replace = PMIX_INFO_TRUE(&info[n]);

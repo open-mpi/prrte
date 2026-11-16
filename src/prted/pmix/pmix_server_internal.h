@@ -88,6 +88,11 @@ typedef struct {
     bool dvm_held;
     bool moncopy;  // monitor was allocated and must be released
     bool dircopy;   // directives array has been copied and must be released
+    /* the request itself named the group its allocation is for
+     * (PMIX_ALLOC_GID), rather than having the requester's own filled in
+     * (prte_ras_base_alloc_owner) - which decides whether that group's
+     * members may use the reservation (PRTE_SESSION_FLAG_GROUP_ACCESS) */
+    bool alloc_gid_named;
     uid_t uid;
     gid_t gid;
     pid_t pid;
@@ -442,7 +447,8 @@ PRTE_EXPORT extern void pmix_server_query_resp(int status, pmix_proc_t *sender,
                                                pmix_data_buffer_t *buffer, prte_rml_tag_t tg,
                                                void *cbdata);
 
-PRTE_EXPORT extern int prte_pmix_server_tool_may_join(prte_job_t *jdata, pmix_rank_t rank);
+PRTE_EXPORT extern int prte_pmix_server_tool_may_join(prte_job_t *jdata, pmix_rank_t rank,
+                                                      uid_t uid);
 PRTE_EXPORT extern int prte_pmix_server_register_tool(prte_pmix_server_req_t *cd);
 
 PRTE_EXPORT extern int pmix_server_cache_job_info(prte_job_t *jdata, pmix_info_t *info);
@@ -527,6 +533,16 @@ PRTE_EXPORT extern void prte_pmix_server_group_member_left(pmix_status_t code,
  * "[[[[months:]days:]hours:]minutes:]seconds", scanned from the right - and
  * return it in seconds, or -1 if the string is not a well-formed time. */
 PRTE_EXPORT extern long prte_pmix_server_parse_session_time(const char *str);
+
+/* Set a session's time limit to `seconds` from now - 0 removes it - and
+ * record whether whoever set it holds the authority to (`held`): the
+ * scheduler, by session control, or a user who may change the DVM. A limit so
+ * set may be changed only by them; one a session's owner set on its own
+ * allocation request may be changed by the owner too. When the limit expires
+ * the session is terminated as PMIX_SESSION_TERMINATE would. MUST be called on
+ * the PRRTE progress thread. */
+PRTE_EXPORT void prte_pmix_server_session_set_limit(prte_session_t *session, long seconds,
+                                                    bool held);
 
 /* Execute a session control directive against this DVM's own sessions, and
  * answer the request. Used when the directive came from the scheduler (a
@@ -698,11 +714,6 @@ typedef struct {
     char *scheduler_uids;
     uint32_t *sched_uids;
     size_t nsched_uids;
-    /* the users, besides root and our own, trusted to relay a request for
-     * a process of another user: the MCA list, and what it resolved to */
-    char *relay_uids;
-    uint32_t *rly_uids;
-    size_t nrly_uids;
     /* who may act on the DVM itself - a pmix_access_t, made from the
      * --rtos users=/groups= the DVM was started with */
     void *dvm_access;
@@ -775,15 +786,16 @@ PRTE_EXPORT extern prte_pmix_server_globals_t prte_pmix_server_globals;
  * false when the info names no requester at all. */
 PRTE_EXPORT bool prte_pmix_server_requester_uid(const pmix_info_t *info, size_t ninfo, uid_t *uid);
 
-/* May a process running as relay speak for one running as origin? Always
- * when they are the same user - that claims nothing more than the relay
- * has. Otherwise only root, the user this DVM runs as, and the users
- * prte_pmix_relay_uids names. */
-PRTE_EXPORT bool prte_pmix_server_relay_permitted(uid_t relay, uid_t origin);
+/* prte_pmix_server_requester_gid: the group of the process
+ * prte_pmix_server_requester_uid attributes the up-call to - PMIX_GRPID,
+ * or PMIX_ORIGIN_GRPID where the relay's claim is taken. PRTE_INVALID_GID
+ * when that process's group is not given. */
+PRTE_EXPORT gid_t prte_pmix_server_requester_gid(const pmix_info_t *info, size_t ninfo);
 
-/* Look up the users prte_pmix_relay_uids names, once; a name nobody has is
- * reported and refused. */
-PRTE_EXPORT int prte_pmix_server_relay_uids_resolve(void);
+/* May a process running as relay speak for one running as origin? When
+ * they are the same user - that claims nothing more than the relay has -
+ * and when the relay is root or the user this DVM runs as. */
+PRTE_EXPORT bool prte_pmix_server_relay_permitted(uid_t relay, uid_t origin);
 
 /* The most entries prte_pmix_server_relay_copy adds */
 #define PRTE_PMIX_ORIGIN_MAX 5
@@ -795,6 +807,11 @@ PRTE_EXPORT bool prte_pmix_server_is_identity_key(const char *key);
 /* root, or the user this DVM runs as */
 PRTE_EXPORT bool prte_pmix_server_privileged(uid_t uid);
 
+/* Does uid belong to group gid - its primary group or one the system lists
+ * it in, looked up afresh? Always true for root, which may act as any
+ * group. */
+PRTE_EXPORT bool prte_pmix_server_in_group(uid_t uid, gid_t gid);
+
 /* the user jdata belongs to - our own user when none is known */
 PRTE_EXPORT uid_t prte_pmix_server_job_owner(prte_job_t *jdata);
 
@@ -804,15 +821,15 @@ PRTE_EXPORT uid_t prte_pmix_server_job_owner(prte_job_t *jdata);
 PRTE_EXPORT bool prte_pmix_server_dvm_permitted_uid(uid_t uid);
 
 /* May a requester have the DVM bring hosts in, or start daemons on hosts
- * it holds, naming them itself? Naming hosts is for whoever may change the
- * DVM (prte_pmix_server_dvm_permitted_uid). Naming a file the master reads
- * for it (`files`), or a user to reach a host as (`user` - "user@host"), is
- * for root and our own user alone: the master does both as itself. The
- * scheduler, and a request we made of ourselves, may do all three. */
+ * it holds, naming them itself? Naming hosts - directly, or in a file of
+ * them, which is read as the requester (prte_pmix_server_open_as) - is for
+ * whoever may change the DVM (prte_pmix_server_dvm_permitted_uid), the
+ * scheduler, and a request we made of ourselves. A host may not name an
+ * account to reach it as ("user@host"): every parser refuses that, from
+ * anyone, since the DVM runs no daemon as another user. */
 PRTE_EXPORT bool prte_pmix_server_grow_permitted(const pmix_proc_t *requestor,
-                                                 const pmix_info_t *info, size_t ninfo,
-                                                 bool files, bool user);
-PRTE_EXPORT bool prte_pmix_server_grow_permitted_uid(uid_t uid, bool files, bool user);
+                                                 const pmix_info_t *info, size_t ninfo);
+PRTE_EXPORT bool prte_pmix_server_grow_permitted_uid(uid_t uid);
 
 /* Who a job owned by `owner` may be started as by a process running as
  * `me`. PRTE_SUCCESS with *change false: as `me`, because it is ours or
@@ -829,6 +846,44 @@ PRTE_EXPORT int prte_pmix_server_run_as(uid_t me, uid_t owner, bool *change);
  * since PMIx refuses a client that connects as anyone else. */
 PRTE_EXPORT int prte_pmix_server_job_run_as(prte_job_t *jdata, uid_t *uid, gid_t *gid,
                                             bool *change);
+
+/* Open whatever fn(arg) opens as uid and group gid, so that the kernel -
+ * not a check of ours racing the filesystem - decides what that user may
+ * reach. For the files a job or a request names that the master reads or
+ * writes on its behalf: a hostfile, a rankfile, the proctable.
+ *
+ * Who may be acted as is prte_pmix_server_run_as's rule. fn always runs
+ * in a child (pmix_util_run_as_child): one that has become that user, with
+ * its groups, when we are root acting for another, and one that is simply
+ * us when that rule comes out as ourselves. Either way the master waits
+ * for it no longer than pmix_util_runas_timeout (PMIx's pmix_runas_timeout),
+ * since a path someone named may be on a filesystem that does not answer -
+ * and that is as true of a file opened as ourselves as of one opened as
+ * the user. The child passes back the descriptor fn opened.
+ *
+ * Returns that descriptor, or -1 with errno set: EPERM when we may not act
+ * as uid at all, or do not know its group, and ETIMEDOUT when the child did
+ * not answer in time. fn is held to pmix_util_run_as's rules - no lock, no
+ * stdio, no output. Progress thread only: the groups come from our records
+ * of each user. */
+PRTE_EXPORT int prte_pmix_server_open_as(uid_t uid, gid_t gid, int (*fn)(void *arg), void *arg);
+
+/* The same, for work that is not an open: fn(arg) returns 0 if it
+ * succeeded, -1 if not, and so does this. What the work produces has to
+ * reach us through something the child inherited - a descriptor it writes
+ * to, as prte_textfile_open() does - since the child's memory is its own.
+ * Nothing it does after the open is then left for the master to wait on:
+ * a descriptor handed back is read here, with no bound. */
+PRTE_EXPORT int prte_pmix_server_work_as(uid_t uid, gid_t gid, int (*fn)(void *arg), void *arg);
+
+/* Who a file jdata names is opened as: its owner and the owner's group
+ * (PRTE_INVALID_GID when that is not known). Ourselves for a NULL jdata. */
+PRTE_EXPORT void prte_pmix_server_job_user(prte_job_t *jdata, uid_t *uid, gid_t *gid);
+
+/* Who a file an up-call's info names is opened as: the requester it names
+ * (prte_pmix_server_requester_uid), or ourselves for a request we made. */
+PRTE_EXPORT void prte_pmix_server_request_user(const pmix_info_t *info, size_t ninfo, uid_t *uid,
+                                               gid_t *gid);
 
 /* May uid act on jdata? PMIx's rule (pmix_server_access_check) over our
  * copy of the job's owner and access list and our record of the user. A
@@ -886,6 +941,15 @@ PRTE_EXPORT bool prte_pmix_server_scheduler_permitted(uid_t uid);
 PRTE_EXPORT bool prte_pmix_server_session_permitted(prte_session_t *session,
                                                     const pmix_proc_t *requestor,
                                                     const pmix_info_t *info, size_t ninfo);
+/* The same once the requester's uid is known: root, our own user, the
+ * session's owner, or a member of the owner's group */
+PRTE_EXPORT bool prte_pmix_server_session_permitted_uid(prte_session_t *session, uid_t uid);
+
+/* May uid act on something owned by owner (and, where one is known, owned
+ * by the group group)? Root, our own user, the owner, or a member of the
+ * owner's group - pmix_server_access_check's rule. An unknown uid may
+ * not. */
+PRTE_EXPORT bool prte_pmix_server_user_permitted(uid_t uid, uid_t owner, gid_t group);
 
 /* Add to a job's info the further users (or, with group, groups) the
  * --rtos users= / groups= directives name - a ':'-separated list of names
@@ -909,9 +973,7 @@ PRTE_EXPORT void prte_pmix_server_access_release_job(prte_job_t *jdata);
  * otherwise the identity PMIx gave us for the process we heard from.
  * Everything else, a PMIX_REQUESTED_GRPID among it, is copied as is. dst
  * must have room for nsrc + PRTE_PMIX_ORIGIN_MAX entries; returns how
- * many were written. Against a PMIx without PMIX_CAP_ORIGIN_ID, which puts
- * the relay's identity in place of whatever we send, it copies all of
- * src. */
+ * many were written. */
 PRTE_EXPORT size_t prte_pmix_server_relay_copy(pmix_info_t *dst, const pmix_info_t *src,
                                                size_t nsrc);
 
