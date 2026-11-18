@@ -60,11 +60,17 @@
  */
 
 #include "prte_config.h"
+#include <limits.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifdef HAVE_DLFCN_H
+#    include <dlfcn.h>
+#endif
 
 #include "constants.h"
 #include "src/class/pmix_pointer_array.h"
@@ -74,6 +80,7 @@
 #include "src/util/pmix_argv.h"
 #include "src/util/pmix_printf.h"
 #include "src/util/prte_bootstrap.h"
+#include "src/util/prte_config_file.h"
 #include "src/util/proc_info.h"
 
 #include "src/mca/base/pmix_mca_base_var.h"
@@ -361,14 +368,223 @@ static int boot_nodes(const char *dir, const char *nodes, prte_bootstrap_config_
         return PRTE_ERR_OUT_OF_RESOURCE;
     }
     fp = fopen(path, "w");
-    free(path);
     if (NULL == fp) {
+        free(path);
         return PRTE_ERROR;
     }
     fprintf(fp, "DVMControllerHost=ctrl\nDVMNodes=%s\n", nodes);
     fclose(fp);
+    /* writable by its owner only, whatever the umask: anything more is
+     * refused (prte_open_config_file) */
+    chmod(path, 0644);
+    free(path);
     rc = prte_bootstrap_parse(cfg);
     return rc;
+}
+
+/*
+ * prte.conf names the DVM's key, its controller and its nodes, and a
+ * DVMNodes "file:" list names the nodes too, so each is read only if
+ * nobody but root or the user we run as could have written it - the file
+ * and the directory holding it. Either was read with a plain fopen(), so
+ * whoever could write it decided which key a bootstrapped daemon trusts
+ * and which controller it joins.
+ */
+static bool nodes_are(prte_bootstrap_config_t *cfg, const char *expected);
+
+/* The first owner, from the file holding the PRRTE library this test runs
+ * upward, who is not root - found the way prte_open_config_file() finds
+ * it - or 0 if there is none or the library cannot be found. */
+static uid_t library_owner(void)
+{
+    char lib[PATH_MAX];
+    struct stat st;
+    char *slash;
+    uid_t owner = 0;
+    bool found = false;
+#if defined(__linux__)
+    FILE *fp = fopen("/proc/self/maps", "r");
+    char line[PATH_MAX + 128];
+    unsigned long start, end, inode;
+    uintptr_t addr = (uintptr_t) &prte_open_config_file;
+    char *name, *nl;
+    int n;
+
+    if (NULL == fp) {
+        return 0;
+    }
+    while (NULL != fgets(line, sizeof(line), fp)) {
+        n = 0;
+        if (3 != sscanf(line, "%lx-%lx %*s %*s %*s %lu %n", &start, &end, &inode, &n) ||
+            0 == n || addr < start || addr >= end) {
+            continue;
+        }
+        name = line + n;
+        if (NULL != (nl = strchr(name, '\n'))) {
+            *nl = '\0';
+        }
+        if (0 != inode && '/' == name[0] && sizeof(lib) > strlen(name)) {
+            strcpy(lib, name);
+            found = true;
+        }
+        break;
+    }
+    fclose(fp);
+#elif defined(HAVE_DLFCN_H) && defined(HAVE_DLADDR)
+    Dl_info info;
+
+    found = 0 != dladdr((const void *) (uintptr_t) &prte_open_config_file, &info) &&
+            NULL != info.dli_fname && NULL != realpath(info.dli_fname, lib);
+#endif
+    if (!found) {
+        return 0;
+    }
+    while (0 == owner && 0 == lstat(lib, &st)) {
+        owner = st.st_uid;
+        if (NULL == (slash = strrchr(lib, '/')) || slash == lib) {
+            break;
+        }
+        *slash = '\0';
+    }
+    return owner;
+}
+
+static int test_bootstrap_file_refused(void)
+{
+    int failures = 0;
+    char dir[] = "/tmp/prte_boot_file_XXXXXX";
+    char *savedir = prte_install_dirs.sysconfdir;
+    char *conf = NULL, *list = NULL, *spec = NULL, *real = NULL;
+    prte_bootstrap_config_t cfg;
+    FILE *fp;
+
+    if (NULL == mkdtemp(dir)) {
+        fprintf(stderr, "FAIL [bootfile]: mkdtemp\n");
+        return 1;
+    }
+    prte_install_dirs.sysconfdir = dir;
+    pmix_asprintf(&conf, "%s/prte.conf", dir);
+    pmix_asprintf(&list, "%s/nodes.txt", dir);
+    pmix_asprintf(&spec, "file:%s", list);
+    pmix_asprintf(&real, "%s/real.conf", dir);
+    fprintf(stdout, "-- the next cases refuse configuration files; the messages they print "
+                    "are expected --\n");
+
+    CHECK("bootfile: a file only its owner can write is read",
+          PRTE_SUCCESS == boot_nodes(dir, "bn[2:1-2]", &cfg) && nodes_are(&cfg, "bn01,bn02"));
+    prte_bootstrap_config_free(&cfg);
+
+    /* our own group may write it - unless we are root, which takes no
+     * group write. Given our group explicitly: on the BSDs a new file
+     * takes its directory's, and /tmp's is wheel */
+    CHECK("bootfile: our group given", 0 == chown(conf, (uid_t) -1, getegid()));
+    chmod(conf, 0664);
+    if (0 == geteuid()) {
+        CHECK("bootfile: as root, one its group can write is refused",
+              PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+    } else {
+        CHECK("bootfile: one a group we are in can write is read",
+              PRTE_SUCCESS == prte_bootstrap_parse(&cfg));
+    }
+    prte_bootstrap_config_free(&cfg);
+    chmod(conf, 0646);
+    CHECK("bootfile: one others can write is refused", PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+    prte_bootstrap_config_free(&cfg);
+    chmod(conf, 0644);
+
+    /* a symbolic link at the name, to a file that would pass */
+    rename(conf, real);
+    CHECK("bootfile: a symlink is refused",
+          0 == symlink(real, conf) && PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+    prte_bootstrap_config_free(&cfg);
+    unlink(conf);
+    /* ...and a second name for it */
+    CHECK("bootfile: a file with another name is refused",
+          0 == link(real, conf) && PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+    prte_bootstrap_config_free(&cfg);
+    unlink(real);
+
+    /* the directory holding it */
+    chmod(dir, 0777);
+    CHECK("bootfile: a directory anyone can write is refused",
+          PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+    prte_bootstrap_config_free(&cfg);
+    CHECK("bootfile: our group given to the directory", 0 == chown(dir, (uid_t) -1, getegid()));
+    chmod(dir, 0770);
+    if (0 == geteuid()) {
+        CHECK("bootfile: as root, a directory its group can write is refused",
+              PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+    } else {
+        CHECK("bootfile: a directory a group we are in can write is read",
+              PRTE_SUCCESS == prte_bootstrap_parse(&cfg));
+    }
+    prte_bootstrap_config_free(&cfg);
+    chmod(dir, 01777);
+    CHECK("bootfile: ...unless it is sticky", PRTE_SUCCESS == prte_bootstrap_parse(&cfg));
+    prte_bootstrap_config_free(&cfg);
+    chmod(dir, 0700);
+
+    /* a node list in a file of its own */
+    fp = fopen(list, "w");
+    if (NULL != fp) {
+        fprintf(fp, "ln1\nln2\n");
+        fclose(fp);
+    }
+    chmod(list, 0644);
+    CHECK("bootfile: a node list file only its owner can write is read",
+          PRTE_SUCCESS == boot_nodes(dir, spec, &cfg) && nodes_are(&cfg, "ln1,ln2"));
+    prte_bootstrap_config_free(&cfg);
+    chmod(list, 0666);
+    CHECK("bootfile: one anyone can write is refused", PRTE_SUCCESS != boot_nodes(dir, spec, &cfg));
+    prte_bootstrap_config_free(&cfg);
+    chmod(list, 0644);
+
+    /* owned by another user - only root can make one */
+    if (0 == geteuid()) {
+        CHECK("bootfile: prte.conf owned by another user is refused",
+              0 == chown(conf, 1, 1) && PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+        prte_bootstrap_config_free(&cfg);
+        CHECK("bootfile: prte.conf given back", 0 == chown(conf, 0, 0));
+        CHECK("bootfile: a directory owned by another user is refused",
+              0 == chown(dir, 1, 1) && PRTE_SUCCESS != prte_bootstrap_parse(&cfg));
+        prte_bootstrap_config_free(&cfg);
+        CHECK("bootfile: the directory given back", 0 == chown(dir, 0, 0));
+        /* the owner of the library we run, or of a directory above it,
+         * could have replaced it: an install one user made for others, a
+         * build tree root runs */
+        {
+            uid_t lowner = library_owner();
+
+            if (0 != lowner) {
+                CHECK("bootfile: as root, prte.conf and its directory owned by the library's "
+                      "owner are read",
+                      0 == chown(conf, lowner, (gid_t) -1) &&
+                          0 == chown(dir, lowner, (gid_t) -1) &&
+                          PRTE_SUCCESS == prte_bootstrap_parse(&cfg));
+                prte_bootstrap_config_free(&cfg);
+                CHECK("bootfile: given back to root",
+                      0 == chown(conf, 0, 0) && 0 == chown(dir, 0, 0));
+            } else {
+                fprintf(stdout, "  SKIP bootfile: the library owner's files (everything above "
+                                "the library is root's)\n");
+            }
+        }
+    } else {
+        fprintf(stdout, "  SKIP bootfile: another user's files (needs root)\n");
+    }
+
+    prte_install_dirs.sysconfdir = savedir;
+    unlink(conf);
+    unlink(list);
+    rmdir(dir);
+    free(conf);
+    free(list);
+    free(spec);
+    free(real);
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_bootstrap_file_refused\n");
+    }
+    return failures;
 }
 
 static bool nodes_are(prte_bootstrap_config_t *cfg, const char *expected)
@@ -2018,21 +2234,21 @@ static int test_activate_nodes(void)
     /* naming nothing at all is a bad request, not an empty success: a
      * requester that meant "everything" says so with "+all" */
     CHECK("activate_nodes: nothing named is refused",
-          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes(NULL, NULL, prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes(NULL, NULL, NULL, 0, &n));
     CHECK("activate_nodes: refusal reports no activation", 0 == n);
     CHECK("activate_nodes: an empty spec is the same as none",
-          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes("", "", prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_ERR_BAD_PARAM == prte_ras_base_activate_nodes("", "", NULL, 0, &n));
 
     /* the host specification alone */
     CHECK("activate_nodes: host spec accepted",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, NULL, 0, &n));
     CHECK("activate_nodes: it marked the node", PRTE_NODE_STATE_ADDED == idle1->state);
     CHECK("activate_nodes: and counted it", 1 == n);
 
     /* a node already marked is met, and counts for nothing: there is no
      * second daemon to launch, so no completion to wait for */
     CHECK("activate_nodes: re-naming a marked node succeeds",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle1", NULL, NULL, 0, &n));
     CHECK("activate_nodes: with nothing left to activate", 0 == n);
 
     /* the hostfile as its own argument - the form only the PMIx directive
@@ -2043,7 +2259,7 @@ static int test_activate_nodes(void)
         return failures + 1;
     }
     CHECK("activate_nodes: hostfile argument accepted",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, hf1, prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, hf1, NULL, 0, &n));
     CHECK("activate_nodes: the file's node was marked",
           PRTE_NODE_STATE_ADDED == idle1->state);
     CHECK("activate_nodes: and counted", 1 == n);
@@ -2051,7 +2267,7 @@ static int test_activate_nodes(void)
     /* both arguments together, each naming a different node */
     idle1->state = PRTE_NODE_STATE_UP;
     CHECK("activate_nodes: host spec and hostfile together",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle2", hf1, prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes("actn-idle2", hf1, NULL, 0, &n));
     CHECK("activate_nodes: both nodes marked",
           PRTE_NODE_STATE_ADDED == idle1->state &&
           PRTE_NODE_STATE_ADDED == idle2->state);
@@ -2067,7 +2283,7 @@ static int test_activate_nodes(void)
     }
     pmix_asprintf(&both, "%s,%s", hf1, hf2);
     CHECK("activate_nodes: a comma-delimited hostfile list",
-          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, both, prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_SUCCESS == prte_ras_base_activate_nodes(NULL, both, NULL, 0, &n));
     CHECK("activate_nodes: every file's node marked",
           PRTE_NODE_STATE_ADDED == idle1->state &&
           PRTE_NODE_STATE_ADDED == idle2->state);
@@ -2079,8 +2295,7 @@ static int test_activate_nodes(void)
     idle2->state = PRTE_NODE_STATE_UP;
     CHECK("activate_nodes: an unknown host is refused",
           PRTE_ERR_SILENT == prte_ras_base_activate_nodes("actn-idle1,actn-nosuch", NULL,
-                                                          prte_process_info.euid,
-                                                          prte_process_info.egid, &n));
+                                                          NULL, 0, &n));
     CHECK("activate_nodes: nothing was marked by the refused spec",
           PRTE_NODE_STATE_UP == idle1->state);
     CHECK("activate_nodes: and nothing counted", 0 == n);
@@ -2091,7 +2306,7 @@ static int test_activate_nodes(void)
         return failures + 1;
     }
     CHECK("activate_nodes: an unknown host in the hostfile is refused",
-          PRTE_ERR_SILENT == prte_ras_base_activate_nodes("actn-idle1", hf2, prte_process_info.euid, prte_process_info.egid, &n));
+          PRTE_ERR_SILENT == prte_ras_base_activate_nodes("actn-idle1", hf2, NULL, 0, &n));
     CHECK("activate_nodes: the host spec's node was not marked either",
           PRTE_NODE_STATE_UP == idle1->state);
 
@@ -2713,6 +2928,354 @@ static int test_return_to_pool(void)
     return failures;
 }
 
+/* An allocation's PMIX_ALLOC_ID is assigned by what grants it - the
+ * scheduler, or ras/hosts when there is none - never by the requester, and
+ * never made up by the base. */
+static const char *info_string(prte_pmix_server_req_t *req, const char *key)
+{
+    size_t n;
+
+    for (n = 0; NULL != req->info && n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, key) &&
+            PMIX_STRING == req->info[n].value.type) {
+            return req->info[n].value.data.string;
+        }
+    }
+    return NULL;
+}
+
+static int count_sessions(void)
+{
+    int k, count = 0;
+
+    for (k = 0; k < prte_sessions->size; k++) {
+        if (NULL != pmix_pointer_array_get_item(prte_sessions, k)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+/* a PMIX_ALLOC_NEW of no nodes as the module's answer leaves it: the
+ * owner, and the id when one is given */
+static prte_pmix_server_req_t *mknew_answer(const char *aid, const char *reqid)
+{
+    uint32_t me = (uint32_t) prte_process_info.euid;
+    uint32_t mygrp = (uint32_t) prte_process_info.egid;
+    pmix_info_t x[4];
+    size_t nx = 0, k;
+    prte_pmix_server_req_t *req;
+
+    PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_UID, &me, PMIX_UINT32);
+    PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_GID, &mygrp, PMIX_UINT32);
+    if (NULL != aid) {
+        PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_ID, aid, PMIX_STRING);
+    }
+    if (NULL != reqid) {
+        PMIX_INFO_LOAD(&x[nx++], PMIX_ALLOC_REQ_ID, reqid, PMIX_STRING);
+    }
+    req = mkalloc_req(PMIX_ALLOC_NEW, me, mygrp, x, nx);
+    for (k = 0; k < nx; k++) {
+        PMIX_INFO_DESTRUCT(&x[k]);
+    }
+    return req;
+}
+
+static int test_alloc_id(void)
+{
+    int failures = 0;
+    bool saved_owned = prte_ras_base.scheduler_owned;
+    bool saved_elastic = prte_elastic_mode;
+    prte_pmix_server_req_t *req, *req2;
+    prte_session_t *s, *held;
+    pmix_mca_base_component_t *comp;
+    pmix_mca_base_module_t *module = NULL;
+    prte_ras_base_module_t *mod;
+    int before, pri = -1;
+    char *first = NULL;
+
+    prte_ras_base.scheduler_owned = false;
+    prte_elastic_mode = true;
+    fprintf(stdout, "-- the next test refuses allocation ids; the messages it "
+                    "prints are expected --\n");
+
+    /* a requester may not supply the id of a new allocation */
+    before = count_sessions();
+    req = PMIX_NEW(prte_pmix_server_req_t);
+    req->allocdir = PMIX_ALLOC_NEW;
+    req->ninfo = 1;
+    req->info = PMIx_Info_create(1);
+    req->copy = true;
+    PMIX_INFO_LOAD(&req->info[0], PMIX_ALLOC_ID, "prte-unit-test-mine", PMIX_STRING);
+    req->infocbfunc = resize_cb;
+    resize_answered = false;
+    resize_status = PMIX_SUCCESS;
+    prte_ras_base_modify(0, 0, req);
+    CHECK("alloc_id: a NEW carrying PMIX_ALLOC_ID is refused",
+          resize_answered && PMIX_ERR_BAD_PARAM == resize_status);
+    CHECK("alloc_id: ...and creates nothing",
+          before == count_sessions() &&
+              NULL == prte_get_session_object_from_id("prte-unit-test-mine"));
+
+    /* an answer that gives no id creates no reservation */
+    req = mknew_answer(NULL, "prte-unit-test-req");
+    req->pstatus = PMIX_SUCCESS;
+    prte_ras_base_complete_request(req);
+    CHECK("alloc_id: a NEW answered with no id fails",
+          PMIX_ERR_BAD_PARAM == req->pstatus);
+    CHECK("alloc_id: ...and creates nothing", before == count_sessions());
+    PMIX_RELEASE(req);
+
+    /* the id the answer gives is the reservation's, returned with the
+     * requester's own */
+    req = mknew_answer("prte-unit-test-sched.1", "prte-unit-test-req");
+    req->pstatus = PMIX_SUCCESS;
+    prte_ras_base_complete_request(req);
+    s = prte_get_session_object_from_id("prte-unit-test-sched.1");
+    CHECK("alloc_id: a NEW answered with an id succeeds", PMIX_SUCCESS == req->pstatus);
+    CHECK("alloc_id: ...creating the reservation under that id",
+          NULL != s && NULL != s->user_refid &&
+              0 == strcmp("prte-unit-test-req", s->user_refid));
+    CHECK("alloc_id: ...and returning both ids",
+          NULL != info_string(req, PMIX_ALLOC_ID) &&
+              0 == strcmp("prte-unit-test-sched.1", info_string(req, PMIX_ALLOC_ID)) &&
+              NULL != info_string(req, PMIX_ALLOC_REQ_ID) &&
+              0 == strcmp("prte-unit-test-req", info_string(req, PMIX_ALLOC_REQ_ID)));
+    PMIX_RELEASE(req);
+
+    /* an id that already names a reservation is refused, and that
+     * reservation is left as it was */
+    before = count_sessions();
+    req = mknew_answer("prte-unit-test-sched.1", "prte-unit-test-other");
+    req->pstatus = PMIX_SUCCESS;
+    prte_ras_base_complete_request(req);
+    CHECK("alloc_id: a NEW answered with an id in use fails",
+          PMIX_ERR_EXISTS == req->pstatus);
+    CHECK("alloc_id: ...creating nothing", before == count_sessions());
+    CHECK("alloc_id: ...and leaving the holder as it was",
+          s == prte_get_session_object_from_id("prte-unit-test-sched.1") &&
+              0 == strcmp("prte-unit-test-req", s->user_refid));
+    PMIX_RELEASE(req);
+    if (NULL != s) {
+        prte_ras_base_teardown_reservation(s, false);
+    }
+
+    /* with no scheduler, ras/hosts assigns the id */
+    comp = find_ras_component("hosts");
+    if (NULL == comp || NULL == comp->pmix_mca_query_component ||
+        PRTE_SUCCESS != comp->pmix_mca_query_component(&module, &pri) || NULL == module) {
+        fprintf(stdout, "SKIP test_alloc_id ras/hosts cases: ras/hosts not found\n");
+    } else {
+        mod = (prte_ras_base_module_t *) module;
+        req = mknew_answer(NULL, "prte-unit-test-req");
+        CHECK("alloc_id: ras/hosts serves a NEW",
+              PMIX_OPERATION_SUCCEEDED == mod->modify(req));
+        CHECK("alloc_id: ...giving it an id", NULL != info_string(req, PMIX_ALLOC_ID));
+        CHECK("alloc_id: ...and keeping the request's own",
+              NULL != info_string(req, PMIX_ALLOC_REQ_ID) &&
+                  0 == strcmp("prte-unit-test-req", info_string(req, PMIX_ALLOC_REQ_ID)));
+        if (NULL != info_string(req, PMIX_ALLOC_ID)) {
+            first = strdup(info_string(req, PMIX_ALLOC_ID));
+        }
+        req->pstatus = PMIX_SUCCESS;
+        prte_ras_base_complete_request(req);
+        held = (NULL == first) ? NULL : prte_get_session_object_from_id(first);
+        CHECK("alloc_id: ...which the reservation is created under",
+              PMIX_SUCCESS == req->pstatus && NULL != held);
+        PMIX_RELEASE(req);
+
+        /* the next is given another, as the first is still held */
+        req2 = mknew_answer(NULL, NULL);
+        CHECK("alloc_id: ras/hosts serves a second NEW",
+              PMIX_OPERATION_SUCCEEDED == mod->modify(req2));
+        CHECK("alloc_id: ...with a different id",
+              NULL != first && NULL != info_string(req2, PMIX_ALLOC_ID) &&
+                  0 != strcmp(first, info_string(req2, PMIX_ALLOC_ID)));
+        PMIX_RELEASE(req2);
+
+#if defined(PMIX_ALLOC_SHARE)
+        /* nodes for the general pool make no reservation, so need no id */
+        {
+            bool share = true;
+            pmix_info_t x[1];
+
+            PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_SHARE, &share, PMIX_BOOL);
+            req2 = mkalloc_req(PMIX_ALLOC_NEW, (uint32_t) prte_process_info.euid,
+                               (uint32_t) prte_process_info.egid, x, 1);
+            PMIX_INFO_DESTRUCT(&x[0]);
+            CHECK("alloc_id: ras/hosts gives a shared NEW no id",
+                  PMIX_OPERATION_SUCCEEDED == mod->modify(req2) &&
+                      NULL == info_string(req2, PMIX_ALLOC_ID));
+            PMIX_RELEASE(req2);
+        }
+#endif
+        if (NULL != held) {
+            prte_ras_base_teardown_reservation(held, false);
+        }
+        free(first);
+    }
+
+    prte_ras_base.scheduler_owned = saved_owned;
+    prte_elastic_mode = saved_elastic;
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_alloc_id\n");
+    }
+    return failures;
+}
+
+/* A PMIX_ALLOC_REQ_ID need not be unique, so it names an allocation only to
+ * the job that requested it, and only if that job made one request under it.
+ * An EXTEND naming one is given the allocation's PMIX_ALLOC_ID on the way in,
+ * and everything after works by that. */
+static prte_session_t *reqid_resv(uint32_t id, const char *aid, const char *nspace,
+                                  const char *reqid)
+{
+    prte_session_t *s = PMIX_NEW(prte_session_t);
+    pmix_proc_t who;
+
+    s->session_id = id;
+    s->alloc_refid = strdup(aid);
+    s->user_refid = strdup(reqid);
+    s->flags |= PRTE_SESSION_FLAG_RESERVED;
+    s->owner_uid = (uid_t) prte_process_info.euid;
+    s->owner_gid = (gid_t) prte_process_info.egid;
+    PMIX_LOAD_PROCID(&who, nspace, 0);
+    prte_session_set_requested_by(s, &who);
+    prte_set_session_object(s);
+    return s;
+}
+
+static bool reqid_answered;
+static pmix_status_t reqid_status;
+static char *reqid_alloc_id;
+
+static void reqid_cb(pmix_status_t status, pmix_info_t *info, size_t ninfo,
+                     void *cbdata, pmix_release_cbfunc_t release_fn,
+                     void *release_cbdata)
+{
+    prte_pmix_server_req_t *req = (prte_pmix_server_req_t *) release_cbdata;
+    size_t n;
+    PRTE_HIDE_UNUSED_PARAMS(cbdata, release_fn);
+
+    reqid_answered = true;
+    reqid_status = status;
+    for (n = 0; n < ninfo; n++) {
+        if (PMIx_Check_key(info[n].key, PMIX_ALLOC_ID) &&
+            PMIX_STRING == info[n].value.type && NULL == reqid_alloc_id) {
+            reqid_alloc_id = strdup(info[n].value.data.string);
+        }
+    }
+    /* nothing runs the event base release_fn would post to */
+    PMIX_RELEASE(req);
+}
+
+/* an EXTEND from rank 0 of nspace naming reqid alone, through
+ * prte_ras_base_modify: the status it is answered with, and the
+ * PMIX_ALLOC_ID the request then carries in *aid (NULL if none) */
+static pmix_status_t reqid_extend(const char *nspace, const char *reqid, char **aid)
+{
+    prte_pmix_server_req_t *req = PMIX_NEW(prte_pmix_server_req_t);
+
+    req->allocdir = PMIX_ALLOC_EXTEND;
+    PMIX_LOAD_PROCID(&req->tproc, nspace, 0);
+    req->ninfo = 1;
+    req->info = PMIx_Info_create(1);
+    req->copy = true;
+    PMIX_INFO_LOAD(&req->info[0], PMIX_ALLOC_REQ_ID, reqid, PMIX_STRING);
+    req->infocbfunc = reqid_cb;
+    reqid_answered = false;
+    reqid_status = PMIX_SUCCESS;
+    reqid_alloc_id = NULL;
+    prte_ras_base_modify(0, 0, req);
+    *aid = reqid_alloc_id;
+    return reqid_answered ? reqid_status : PMIX_ERR_TIMEOUT;
+}
+
+static int test_req_id_scope(void)
+{
+    int failures = 0, rc;
+    bool saved_owned = prte_ras_base.scheduler_owned;
+    bool saved_elastic = prte_elastic_mode;
+    prte_session_t *a1, *b1, *a2, *a2b, *found;
+    char *aid = NULL;
+    pmix_status_t st;
+
+    prte_ras_base.scheduler_owned = false;
+    prte_elastic_mode = true;
+    a1 = reqid_resv(4501, "prte-unit-test.4501", "prte-unit-test-ns-a", "r1");
+    b1 = reqid_resv(4502, "prte-unit-test.4502", "prte-unit-test-ns-b", "r1");
+    a2 = reqid_resv(4503, "prte-unit-test.4503", "prte-unit-test-ns-a", "r2");
+    a2b = reqid_resv(4504, "prte-unit-test.4504", "prte-unit-test-ns-a", "r2");
+
+    rc = prte_get_session_object_from_refid("prte-unit-test-ns-a", "r1", &found);
+    CHECK("req_id: a job's request id names its own allocation",
+          PRTE_SUCCESS == rc && a1 == found);
+    rc = prte_get_session_object_from_refid("prte-unit-test-ns-b", "r1", &found);
+    CHECK("req_id: ...and another job's same id names that job's",
+          PRTE_SUCCESS == rc && b1 == found);
+    rc = prte_get_session_object_from_refid("prte-unit-test-ns-c", "r1", &found);
+    CHECK("req_id: a job that made no request under it finds none",
+          PRTE_ERR_NOT_FOUND == rc && NULL == found);
+    rc = prte_get_session_object_from_refid("prte-unit-test-ns-a", "r2", &found);
+    CHECK("req_id: one a job used twice names neither",
+          PRTE_ERR_BAD_PARAM == rc && NULL == found);
+
+    fprintf(stdout, "-- the next cases name allocations by request id; the messages "
+                    "they print are expected --\n");
+    st = reqid_extend("prte-unit-test-ns-b", "r1", &aid);
+    CHECK("req_id: an EXTEND by request id is given the allocation's id",
+          reqid_answered && NULL != aid && 0 == strcmp("prte-unit-test.4502", aid));
+    (void) st;
+    free(aid);
+    st = reqid_extend("prte-unit-test-ns-c", "r1", &aid);
+    CHECK("req_id: ...but not when its job made no request under it",
+          reqid_answered && NULL == aid);
+    free(aid);
+    st = reqid_extend("prte-unit-test-ns-a", "r2", &aid);
+    CHECK("req_id: an EXTEND by a request id its job used twice is refused",
+          PMIX_ERR_BAD_PARAM == st && NULL == aid);
+    free(aid);
+
+    /* past the way in, a request id alone names nothing */
+    {
+        uint32_t me = (uint32_t) prte_process_info.euid;
+        uint32_t mygrp = (uint32_t) prte_process_info.egid;
+        pmix_info_t x[4];
+        prte_pmix_server_req_t *req;
+        size_t k;
+
+        PMIX_INFO_LOAD(&x[0], PMIX_ALLOC_UID, &me, PMIX_UINT32);
+        PMIX_INFO_LOAD(&x[1], PMIX_ALLOC_GID, &mygrp, PMIX_UINT32);
+        PMIX_INFO_LOAD(&x[2], PMIX_ALLOC_REQ_ID, "r1", PMIX_STRING);
+        PMIX_INFO_LOAD(&x[3], PMIX_ALLOC_TIME, "60", PMIX_STRING);
+        req = mkalloc_req(PMIX_ALLOC_EXTEND, me, mygrp, x, 4);
+        PMIX_LOAD_PROCID(&req->tproc, "prte-unit-test-ns-a", 0);
+        req->pstatus = PMIX_SUCCESS;
+        prte_ras_base_complete_request(req);
+        CHECK("req_id: an EXTEND reaching the base by request id alone is not found",
+              PMIX_ERR_NOT_FOUND == req->pstatus && NULL == a1->timer);
+        PMIX_RELEASE(req);
+        for (k = 0; k < 4; k++) {
+            PMIX_INFO_DESTRUCT(&x[k]);
+        }
+    }
+
+    CHECK("req_id: the requester is recorded",
+          PMIX_CHECK_NSPACE(a1->requested_by.nspace, "prte-unit-test-ns-a") &&
+              0 == a1->requested_by.rank);
+
+    prte_ras_base_teardown_reservation(a1, false);
+    prte_ras_base_teardown_reservation(b1, false);
+    prte_ras_base_teardown_reservation(a2, false);
+    prte_ras_base_teardown_reservation(a2b, false);
+    prte_ras_base.scheduler_owned = saved_owned;
+    prte_elastic_mode = saved_elastic;
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_req_id_scope\n");
+    }
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -2758,6 +3321,7 @@ int main(void)
     failures += test_node_insert();
     failures += test_bootstrap_ranks();
     failures += test_bootstrap_nodelist();
+    failures += test_bootstrap_file_refused();
     failures += test_preassigned_index();
     failures += test_hnp_dedup();
     failures += test_flag_string();
@@ -2770,6 +3334,8 @@ int main(void)
     failures += test_teardown_reservation();
     failures += test_return_to_pool();
     failures += test_alloc_time();
+    failures += test_alloc_id();
+    failures += test_req_id_scope();
     failures += test_hnp_locality_match();
     /* after test_select(), which opens the framework and latches a
      * selection made with no SLURM allocation in the environment -- so

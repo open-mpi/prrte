@@ -326,6 +326,16 @@ typedef struct{
     /* The process that requested this allocation (req->tproc). Target of the
      * relayed PMIX_ALLOC_TIMEOUT_WARNING. Refreshed on EXTEND. */
     pmix_proc_t requestor;
+    /* The process that made the request this allocation was created for,
+     * and its command line - kept as they were, unlike requestor. A
+     * PMIX_ALLOC_REQ_ID names the allocation only to processes of this
+     * namespace (prte_get_session_object_from_refid), and both are returned
+     * by PMIX_QUERY_ALLOC_PROPERTIES so a user can tell its allocations
+     * apart. Set by prte_session_set_requested_by(); an invalid rank, and a
+     * NULL command line, when there was no such request (an allocation
+     * found at startup) or the command line was not known. */
+    pmix_proc_t requested_by;
+    char *requested_cmd;
     /* The user the reservation was granted to, taken from the requesting
      * tool's connection. The USER owns the reservation: spawning onto it and
      * operating on it are decided by uid
@@ -633,10 +643,36 @@ struct prte_proc_t {
 typedef struct prte_proc_t prte_proc_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_proc_t);
 
-/** Get session object */
+/** Get session object.
+ *
+ * None of the lookups below returns a session flagged
+ * PRTE_SESSION_FLAG_PENDING: that is an allocation the scheduler has queued
+ * and not granted, so there is nothing in it to spawn onto, extend, release
+ * or control, and naming it is "not found" as it was before the scheduler
+ * answered. Only the cancel path and the allocation queries want one, and
+ * they ask for it with prte_get_pending_session(). A check that an id is
+ * free asks prte_session_id_in_use() or prte_session_alloc_id_in_use(),
+ * which do count pending sessions - the id is taken. */
 PRTE_EXPORT prte_session_t *prte_get_session_object(const uint32_t session_id);
 PRTE_EXPORT prte_session_t *prte_get_session_object_from_id(const char *id);
-PRTE_EXPORT prte_session_t *prte_get_session_object_from_refid(const char *refid);
+/* The pending session (PRTE_SESSION_FLAG_PENDING) whose PMIX_ALLOC_ID is id,
+ * or NULL */
+PRTE_EXPORT prte_session_t *prte_get_pending_session(const char *id);
+/* Whether a registered session, pending or not, has this session id or
+ * this PMIX_ALLOC_ID */
+PRTE_EXPORT bool prte_session_id_in_use(const uint32_t session_id);
+PRTE_EXPORT bool prte_session_alloc_id_in_use(const char *id);
+/* The allocation that the processes of namespace nspace requested under
+ * PMIX_ALLOC_REQ_ID refid. A req_id need not be unique, so it names an
+ * allocation only to the job that made the request: PRTE_ERR_NOT_FOUND when
+ * that job made none under refid, and PRTE_ERR_BAD_PARAM when it made more
+ * than one - those can only be named by their PMIX_ALLOC_ID. */
+PRTE_EXPORT int prte_get_session_object_from_refid(const char *nspace, const char *refid,
+                                                   prte_session_t **session);
+/* Record proc as the process whose request created the session, with its
+ * command line where the DVM knows it (see prte_session_t.requested_by). */
+PRTE_EXPORT void prte_session_set_requested_by(prte_session_t *session,
+                                               const pmix_proc_t *proc);
 
 PRTE_EXPORT int prte_set_session_object(prte_session_t *session);
 
@@ -659,6 +695,11 @@ PRTE_EXPORT int prte_set_session_object(prte_session_t *session);
  * from a list of "keys that need the master" is deliberate: the set of such
  * keys is not knowable in advance, but the set of *reads* that cannot be
  * satisfied locally is exactly this, and it is enforced at the point of use.
+ *
+ * prte_get_allocation_session() finds a pending session
+ * (PRTE_SESSION_FLAG_PENDING) as well as a granted one, since the allocation
+ * queries report both; prte_get_allocated_nodes() finds only a granted one,
+ * since a pending one holds no nodes.
  *
  * A NULL allocid means the DVM-wide allocation.  Do not reach past these to
  * prte_node_pool or prte_sessions for capacity or session state - a checker

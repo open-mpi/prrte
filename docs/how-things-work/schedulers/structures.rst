@@ -47,12 +47,18 @@ with the following fields:
 
 * user_refid: the user's string ID provided to the allocation request
   that generated this session via the ``PMIX_ALLOC_REQ_ID``. This will
-  be ``NULL`` if the user chose not to provide the ID.
+  be ``NULL`` if the user chose not to provide the ID. The ID need not be
+  unique, so it names the session only to the job that made the request,
+  and only if that job made one request under it; anything else names
+  the session by its ``alloc_refid``.
 
 * alloc_refid: the string ID assigned by the scheduler to the session.
-  Note that a scheduler is not required to assign such an ID. It is
-  communicated in the ``PMIx_Session_control`` directive to the RTE
-  via the ``PMIX_ALLOC_ID`` attribute.
+  It is communicated in the ``PMIx_Session_control`` directive to the RTE
+  via the ``PMIX_ALLOC_ID`` attribute, which an instantiation must carry,
+  or in the scheduler's answer to an allocation request. With no
+  scheduler, the ``hosts`` RAS component assigns it. A requester cannot
+  supply it: a new allocation request carrying ``PMIX_ALLOC_ID`` is
+  refused.
 
 * nodes: a pointer array containing pointers to `prte_node_t` objects
   describing the individual nodes included in this session. Nodes can

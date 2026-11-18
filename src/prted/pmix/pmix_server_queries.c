@@ -267,6 +267,122 @@ static bool query_permitted(prte_pmix_server_op_caddy_t *cd, pmix_query_t *q, pr
     return prte_pmix_server_request_permitted(&cd->proct, q->qualifiers, q->nqual, jdata);
 }
 
+/* ==================================================================== *
+ * Which nodes a query may tell its caller about.
+ *
+ * Every node in the pool came either with the DVM's own allocation, or
+ * with nodes added to the general pool, which anyone may use - those
+ * belong to no reservation, or to the default session - or with a
+ * reservation granted to a user, whose nodes no one else may use. So a
+ * reservation, and the nodes in it, are told only to those who may
+ * operate on it (prte_pmix_server_session_permitted: its owner, its
+ * group's members where the group was named, root, our own user and the
+ * scheduler), whether or not the query names it. Anyone else naming one
+ * is refused with PMIX_ERR_NO_PERMISSIONS.
+ *
+ * Whether a caller may operate on a session can take a group lookup, so it
+ * is decided once per session for the query (visible_build), not once per
+ * node. Master-only, as the session table is.
+ * ==================================================================== */
+typedef struct {
+    /* ok[i]: the session whose index is i in the session table */
+    bool *ok;
+    int size;
+} prte_query_visible_t;
+
+static bool session_visible(prte_pmix_server_op_caddy_t *cd, pmix_query_t *q,
+                            prte_session_t *session)
+{
+    return (NULL == session || prte_default_session == session ||
+            prte_pmix_server_session_permitted(session, &cd->proct, q->qualifiers, q->nqual));
+}
+
+static int visible_build(prte_pmix_server_op_caddy_t *cd, pmix_query_t *q,
+                         prte_query_visible_t *v)
+{
+    pmix_pointer_array_t *sessions;
+    prte_session_t *session;
+    int k, prc;
+
+    v->ok = NULL;
+    v->size = 0;
+    prc = prte_get_allocation_sessions(&sessions);
+    if (PRTE_SUCCESS != prc) {
+        return prc;
+    }
+    if (NULL == sessions || 0 == sessions->size) {
+        return PRTE_SUCCESS;
+    }
+    v->ok = (bool *) calloc((size_t) sessions->size, sizeof(bool));
+    if (NULL == v->ok) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    v->size = sessions->size;
+    for (k = 0; k < sessions->size; k++) {
+        session = (prte_session_t *) pmix_pointer_array_get_item(sessions, k);
+        if (NULL != session) {
+            v->ok[k] = session_visible(cd, q, session);
+        }
+    }
+    return PRTE_SUCCESS;
+}
+
+static bool visible_node(const prte_query_visible_t *v, const prte_node_t *node)
+{
+    prte_session_t *s = node->session;
+
+    if (NULL == s || prte_default_session == s) {
+        return true;
+    }
+    return 0 <= s->index && s->index < v->size && v->ok[s->index];
+}
+
+static void visible_free(prte_query_visible_t *v)
+{
+    free(v->ok);
+    v->ok = NULL;
+    v->size = 0;
+}
+
+/* The nodes allocid names (the whole pool when it names none), as
+ * prte_get_allocated_nodes() gives them, with what the caller may be told
+ * about in *v. PMIX_ERR_NO_PERMISSIONS for an allocation the caller may not
+ * operate on; PRTE_ERR_NOT_AUTHORITATIVE, as a PRRTE code, off the master,
+ * where the caller defers. Any other failure is converted. */
+static int visible_alloc_nodes(prte_pmix_server_op_caddy_t *cd, pmix_query_t *q,
+                               const char *allocid, pmix_pointer_array_t **nodes,
+                               prte_query_visible_t *v, pmix_status_t *ret)
+{
+    prte_session_t *session;
+    int prc;
+
+    v->ok = NULL;
+    v->size = 0;
+    prc = prte_get_allocated_nodes(allocid, nodes);
+    if (PRTE_SUCCESS != prc) {
+        if (PRTE_ERR_NOT_AUTHORITATIVE != prc) {
+            *ret = prte_pmix_convert_rc(prc);
+        }
+        return prc;
+    }
+    if (NULL != allocid) {
+        prc = prte_get_allocation_session(allocid, &session);
+        if (PRTE_SUCCESS != prc) {
+            *ret = prte_pmix_convert_rc(prc);
+            return prc;
+        }
+        if (!session_visible(cd, q, session)) {
+            *ret = PMIX_ERR_NO_PERMISSIONS;
+            return PRTE_ERR_PERM;
+        }
+    }
+    prc = visible_build(cd, q, v);
+    if (PRTE_SUCCESS != prc) {
+        *ret = prte_pmix_convert_rc(prc);
+    }
+    return prc;
+}
+
 static void _query(int sd, short args, void *cbdata)
 {
     prte_pmix_server_op_caddy_t *cd = (prte_pmix_server_op_caddy_t *) cbdata;
@@ -290,6 +406,9 @@ static void _query(int sd, short args, void *cbdata)
 #ifdef PMIX_ALLOC_PROPERTY
     const char *allocprop;
 #endif
+    /* what the caller may be told about, for the arm answering a key -
+     * built by visible_alloc_nodes() and freed when the key is done */
+    prte_query_visible_t visible = {NULL, 0};
     char **ans, *tmp;
     size_t nkeys = 0;
     char *psetname;
@@ -1160,19 +1279,19 @@ static void _query(int sd, short args, void *cbdata)
                 prte_topology_t *topo;
                 int len;
 
-                /* slot counts and node state live only on the master */
-                prc = prte_get_allocated_nodes(allocid, &alloc_nodes);
+                /* slot counts and node state live only on the master; and
+                 * only the nodes the caller may use are told to it */
+                prc = visible_alloc_nodes(cd, q, allocid, &alloc_nodes, &visible, &ret);
                 if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
                     goto defer;
                 }
                 if (PRTE_SUCCESS != prc) {
-                    ret = prte_pmix_convert_rc(prc);
                     goto done;
                 }
                 PMIX_INFO_LIST_START(nodelist);
                 for (k=0; k < alloc_nodes->size; k++) {
                     node = (prte_node_t*)pmix_pointer_array_get_item(alloc_nodes, k);
-                    if (NULL == node) {
+                    if (NULL == node || !visible_node(&visible, node)) {
                         continue;
                     }
                     // ignore nodes that are down
@@ -1270,9 +1389,7 @@ static void _query(int sd, short args, void *cbdata)
                          * the reservations only those the requester may
                          * operate on - its own, its group's, or any for
                          * root, our own user and the scheduler */
-                        if (prte_default_session != session &&
-                            !prte_pmix_server_session_permitted(session, &cd->proct,
-                                                                q->qualifiers, q->nqual)) {
+                        if (!session_visible(cd, q, session)) {
                             continue;
                         }
                         PMIX_INFO_LIST_ADD(rc, alloclist, PMIX_ALLOC_ID, session->alloc_refid, PMIX_STRING);
@@ -1312,18 +1429,69 @@ static void _query(int sd, short args, void *cbdata)
                     ret = prte_pmix_convert_rc(prc);
                     goto done;
                 }
+                /* an allocation's properties are told to those who may
+                 * operate on it - as PMIX_QUERY_ALLOC_IDS lists it to them */
+                if (!session_visible(cd, q, session)) {
+                    ret = PMIX_ERR_NO_PERMISSIONS;
+                    goto done;
+                }
                 PMIX_INFO_LIST_START(proplist);
                 rc = PMIX_SUCCESS;
                 /* a named property selects it; naming none returns all */
                 if (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_ALLOC_RELEASABLE)) {
-                    /* If we added the session dynamically to extend the DVM, we can release it fully */
-                    releasable = PRTE_FLAG_TEST(session, PRTE_SESSION_FLAG_DYNAMIC);
+                    /* If we added the session dynamically to extend the DVM, we
+                     * can release it fully - once it is granted: a pending one
+                     * is cancelled (PMIX_ALLOC_REQ_CANCEL), not released */
+                    releasable = PRTE_FLAG_TEST(session, PRTE_SESSION_FLAG_DYNAMIC) &&
+                                 !PRTE_FLAG_TEST(session, PRTE_SESSION_FLAG_PENDING);
                     PMIX_INFO_LIST_ADD(rc, proplist, PMIX_ALLOC_RELEASABLE, &releasable, PMIX_BOOL);
+                }
+                /* Whether the scheduler has granted it yet: in progress while
+                 * it is queued (PRTE_SESSION_FLAG_PENDING), success once it
+                 * is granted. A pending allocation holds no nodes, so this is
+                 * what tells one apart from an allocation that has been
+                 * granted and emptied. */
+                if (PMIX_SUCCESS == rc &&
+                    (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_ALLOC_STATUS))) {
+                    pmix_status_t astatus = PRTE_FLAG_TEST(session, PRTE_SESSION_FLAG_PENDING)
+                                                ? PMIX_OPERATION_IN_PROGRESS : PMIX_SUCCESS;
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_ALLOC_STATUS, &astatus, PMIX_STATUS);
                 }
                 if (PMIX_SUCCESS == rc &&
                     (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_ALLOC_SEQUENCE))) {
                     PMIX_INFO_LIST_ADD(rc, proplist, PMIX_ALLOC_SEQUENCE,
                                        &session->acquisition, PMIX_UINT32);
+                }
+                /* What lets a user tell its allocations apart: the
+                 * PMIX_ALLOC_REQ_ID it was requested under, the process that
+                 * requested it and that process's command line, and whose
+                 * it is. Each only where it is known. */
+                if (PMIX_SUCCESS == rc && NULL != session->user_refid &&
+                    (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_ALLOC_REQ_ID))) {
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_ALLOC_REQ_ID,
+                                       session->user_refid, PMIX_STRING);
+                }
+                if (PMIX_SUCCESS == rc && '\0' != session->requested_by.nspace[0] &&
+                    (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_REQUESTOR))) {
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_REQUESTOR,
+                                       &session->requested_by, PMIX_PROC);
+                }
+                if (PMIX_SUCCESS == rc && NULL != session->requested_cmd &&
+                    (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_CMD_LINE))) {
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_CMD_LINE,
+                                       session->requested_cmd, PMIX_STRING);
+                }
+                if (PMIX_SUCCESS == rc && PRTE_INVALID_UID != session->owner_uid &&
+                    (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_USERID))) {
+                    uint32_t ouid = (uint32_t) session->owner_uid;
+
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_USERID, &ouid, PMIX_UINT32);
+                }
+                if (PMIX_SUCCESS == rc && PRTE_INVALID_GID != session->owner_gid &&
+                    (NULL == allocprop || PMIx_Check_key(allocprop, PMIX_GRPID))) {
+                    uint32_t ogid = (uint32_t) session->owner_gid;
+
+                    PMIX_INFO_LIST_ADD(rc, proplist, PMIX_GRPID, &ogid, PMIX_UINT32);
                 }
                 if (PMIX_SUCCESS != rc) {
                     PMIX_ERROR_LOG(rc);
@@ -1353,19 +1521,23 @@ static void _query(int sd, short args, void *cbdata)
                  * otherwise the total across the allocation
                  */
                 /* every arm below reads node->slots, which the nidmap does
-                 * not ship - so settle authority once, before any of them */
-                prc = prte_get_allocated_nodes(allocid, &alloc_nodes);
+                 * not ship - so settle authority once, before any of them.
+                 * Only the nodes the caller may use are counted, or named */
+                prc = visible_alloc_nodes(cd, q, allocid, &alloc_nodes, &visible, &ret);
                 if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
                     goto defer;
                 }
                 if (PRTE_SUCCESS != prc) {
-                    ret = prte_pmix_convert_rc(prc);
                     goto done;
                 }
                 if (NULL != hostname) {
                     node = prte_node_match(NULL, hostname);
                     if (NULL == node) {
                         ret = PMIX_ERR_NOT_FOUND;
+                        goto done;
+                    }
+                    if (!visible_node(&visible, node)) {
+                        ret = PMIX_ERR_NO_PERMISSIONS;
                         goto done;
                     }
                     nslots = (uint32_t) node->slots;
@@ -1382,12 +1554,16 @@ static void _query(int sd, short args, void *cbdata)
                         ret = PMIX_ERR_NOT_FOUND;
                         goto done;
                     }
+                    if (!visible_node(&visible, node)) {
+                        ret = PMIX_ERR_NO_PERMISSIONS;
+                        goto done;
+                    }
                     nslots = (uint32_t) node->slots;
                 } else {
                     nslots = 0;
                     for (k = 0; k < alloc_nodes->size; k++) {
                         node = (prte_node_t *) pmix_pointer_array_get_item(alloc_nodes, k);
-                        if (NULL == node) {
+                        if (NULL == node || !visible_node(&visible, node)) {
                             continue;
                         }
                         nslots += (uint32_t) node->slots;
@@ -1408,18 +1584,19 @@ static void _query(int sd, short args, void *cbdata)
                 /* slots, slots_inuse, slots_max and node state are all
                  * master-only - a daemon would report every node as empty
                  * and every filter as inert */
-                prc = prte_get_allocated_nodes(NULL, &alloc_nodes);
+                /* and a node in a reservation the caller may not use has no
+                 * slot available to it */
+                prc = visible_alloc_nodes(cd, q, NULL, &alloc_nodes, &visible, &ret);
                 if (PRTE_ERR_NOT_AUTHORITATIVE == prc) {
                     goto defer;
                 }
                 if (PRTE_SUCCESS != prc) {
-                    ret = prte_pmix_convert_rc(prc);
                     goto done;
                 }
                 nslots = 0;
                 for (k=0; k < alloc_nodes->size; k++) {
                     node = (prte_node_t*)pmix_pointer_array_get_item(alloc_nodes, k);
-                    if (NULL == node) {
+                    if (NULL == node || !visible_node(&visible, node)) {
                         continue;
                     }
                     /* ignore nodes that are non-usable */
@@ -1640,9 +1817,11 @@ static void _query(int sd, short args, void *cbdata)
                 ret = PMIX_ERR_NOT_SUPPORTED;
                 goto done;
             }
+            visible_free(&visible);
             continue;
 
         defer:
+            visible_free(&visible);
             /* this key wants state only the master holds - see the block
              * comment above query_complete().  The array was sized to hold
              * every key, so this cannot overrun. */
@@ -1654,6 +1833,7 @@ static void _query(int sd, short args, void *cbdata)
     }     // for
 
 done:
+    visible_free(&visible);
     if (0 < ndq) {
         if (PMIX_SUCCESS == ret) {
             rc = relay_query(cd, results, nkeys, dq, ndq);

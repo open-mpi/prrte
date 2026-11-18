@@ -149,6 +149,10 @@ int main(int argc, char **argv)
     const char *grpid;
     int seconds = 0;
     int delay = 0;
+    int holdlast = 0;
+    int tmo = 0;
+    int delayothers = 0;
+
     int failures = 0;
     int i, npos = 0;
     bool idassigned = false;
@@ -171,6 +175,20 @@ int main(int argc, char **argv)
             dofence = true;
         } else if (0 == strcmp(argv[i], "--delay") && (i + 1) < argc) {
             delay = atoi(argv[++i]);
+        } else if (0 == strcmp(argv[i], "--delay-others") && (i + 1) < argc) {
+            /* every rank but rank 0 and the last waits before constructing,
+             * so rank 0's node starts its PMIx timer well before the rest */
+            delayothers = atoi(argv[++i]);
+        } else if (0 == strcmp(argv[i], "--timeout") && (i + 1) < argc) {
+            /* PMIX_TIMEOUT on the construct */
+            tmo = atoi(argv[++i]);
+        } else if (0 == strcmp(argv[i], "--hold-last") && (i + 1) < argc) {
+            /* only the last rank waits before constructing, so the
+             * construct is in flight - its other members already in - for
+             * that long */
+            holdlast = atoi(argv[++i]);
+
+
         } else if (0 == npos) {
             grpid = argv[i];
             ++npos;
@@ -181,7 +199,8 @@ int main(int argc, char **argv)
     }
     if (NULL == grpid) {
         fprintf(stderr,
-                "usage: %s [--ft] [--fence] [--reverse] [--delay <s>] <groupID> [seconds]\n",
+                "usage: %s [--ft] [--fence] [--reverse] [--delay <s>] [--hold-last <s>] "
+                "[--timeout <s>] [--delay-others <s>] <groupID> [seconds]\n",
                 argv[0]);
         return 2;
     }
@@ -258,11 +277,14 @@ int main(int argc, char **argv)
         }
         printf("GRP %u FENCING\n", myproc.rank);
         fflush(stdout);
-        PMIX_INFO_CREATE(info, 1);
-        ninfo = 1;
+        ninfo = (0 < tmo) ? 2 : 1;
+        PMIX_INFO_CREATE(info, ninfo);
         /* collect the data each rank put, so this is a real allgather and
          * not just a barrier */
         PMIX_INFO_LOAD(&info[0], PMIX_COLLECT_DATA, &dofence, PMIX_BOOL);
+        if (0 < tmo) {
+            PMIX_INFO_LOAD(&info[1], PMIX_TIMEOUT, &tmo, PMIX_INT);
+        }
         rc = PMIx_Fence(procs, nprocs, info, ninfo);
         PMIX_INFO_FREE(info, ninfo);
         info = NULL;
@@ -281,6 +303,13 @@ int main(int argc, char **argv)
     if (PMIX_SUCCESS != rc) {
         fprintf(stderr, "ERROR list_add ctxid: %s\n", PMIx_Error_string(rc));
         goto done;
+    }
+    if (0 < tmo) {
+        rc = PMIx_Info_list_add(grpinfo, PMIX_TIMEOUT, &tmo, PMIX_INT);
+        if (PMIX_SUCCESS != rc) {
+            fprintf(stderr, "ERROR list_add timeout: %s\n", PMIx_Error_string(rc));
+            goto done;
+        }
     }
 #ifdef PMIX_GROUP_FT_COLLECTIVE
     if (ft) {
@@ -327,11 +356,41 @@ int main(int argc, char **argv)
         fflush(stdout);
         sleep(delay);
     }
+    if (0 < delayothers && 0 != myproc.rank && myproc.rank != (nprocs - 1)) {
+        printf("GRP %u DELAYING %d\n", myproc.rank, delayothers);
+        fflush(stdout);
+        sleep(delayothers);
+    }
+    if (0 < holdlast && myproc.rank == (nprocs - 1)) {
+        printf("GRP %u DELAYING %d\n", myproc.rank, holdlast);
+        fflush(stdout);
+        sleep(holdlast);
+    }
 
     rc = PMIx_Group_construct(grpid, procs, nprocs, info, ninfo, &results, &nresults);
     PMIX_DATA_ARRAY_DESTRUCT(&darray);
     if (PMIX_SUCCESS != rc) {
         printf("GRP %u CONSTRUCT %s CID 0 ASSIGNED F\n", myproc.rank, PMIx_Error_string(rc));
+        /* a construct that timed out names the members that never took
+         * part - "NONPART <count> <rank,...>" */
+        for (m = 0; NULL != results && m < nresults; m++) {
+            if (PMIX_CHECK_KEY(&results[m], PMIX_COLLECTIVE_NONPARTICIPANTS) &&
+                PMIX_DATA_ARRAY == results[m].value.type &&
+                NULL != results[m].value.data.darray) {
+                pmix_proc_t *np = (pmix_proc_t *) results[m].value.data.darray->array;
+                size_t k, nnp = results[m].value.data.darray->size;
+
+                printf("GRP %u NONPART %lu", myproc.rank, (unsigned long) nnp);
+                for (k = 0; k < nnp; k++) {
+                    printf("%s%s:%u", (0 == k) ? " " : ",", np[k].nspace, (unsigned) np[k].rank);
+                }
+                printf("\n");
+            }
+        }
+        if (NULL != results) {
+            PMIX_INFO_FREE(results, nresults);
+            results = NULL;
+        }
         fflush(stdout);
         failures++;
         goto done;

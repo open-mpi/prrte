@@ -179,8 +179,10 @@ PRTE_EXPORT int prte_ras_base_release_spawn_alloc(prte_job_t *jdata,
  * specification is "--host" syntax, including the "file=<path>" form, and is
  * parsed by the same code that parses "--activate".
  *
- * A hostfile named, directly or by a "file=" token, is read as uid/gid -
- * whoever named it (see prte_textfile_open).
+ * A hostfile named, directly or by a "file=" token, is read for the
+ * requester req describes (prte_requester_info_proc()), and what is refused
+ * is reported to them; NULL, 0 is our own user and everyone (see
+ * prte_textfile_open and prte_show_help_info).
  *
  * This resolves and marks only: activating the grow is the caller's, since
  * only the caller knows whether another request is already about to launch
@@ -188,7 +190,7 @@ PRTE_EXPORT int prte_ras_base_release_spawn_alloc(prte_job_t *jdata,
  * PRTE_ERR_SILENT. */
 PRTE_EXPORT int prte_ras_base_activate_nodes(const char *hosts,
                                              const char *hostfile,
-                                             uid_t uid, gid_t gid,
+                                             const pmix_info_t *req, size_t nreq,
                                              int *nactivated);
 
 /* Render the node specification carried by a PMIX_ALLOC_NODE_LIST-style info
@@ -200,9 +202,10 @@ PRTE_EXPORT pmix_status_t prte_ras_base_parse_node_list(pmix_info_t *info,
 /* Add the named nodes to the global pool, marking each PRTE_NODE_STATE_ADDED,
  * and register them with the destination reservation (which withholds them
  * from general use). Pass NULL or the default session to leave them in the
- * general pool. Returns a PRRTE code. */
-PRTE_EXPORT int prte_ras_base_insert_node_string(char *ndstring,
-                                                 prte_session_t *dest);
+ * general pool. What is refused is told to requester, the process that asked
+ * (NULL for the DVM itself). Returns a PRRTE code. */
+PRTE_EXPORT int prte_ras_base_insert_node_string(char *ndstring, prte_session_t *dest,
+                                                 const pmix_proc_t *requester);
 
 PRTE_EXPORT char *prte_ras_base_flag_string(prte_node_t *node);
 
@@ -229,6 +232,12 @@ PRTE_EXPORT void prte_ras_base_complete_request(prte_pmix_server_req_t *req);
  * Requests that grow the general pool by --add-host/--add-hostfile ask for
  * no allocation and are left alone. */
 PRTE_EXPORT pmix_status_t prte_ras_base_alloc_owner(prte_pmix_server_req_t *req);
+
+/* Add PMIX_ALLOC_ID id to a request's info, taking ownership of the array
+ * (the original is borrowed from the caller unless req->copy says it is the
+ * request's own). PMIX_ERR_NOMEM if it could not. */
+PRTE_EXPORT pmix_status_t prte_ras_base_add_alloc_id(prte_pmix_server_req_t *req,
+                                                     const char *id);
 
 END_C_DECLS
 

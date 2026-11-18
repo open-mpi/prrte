@@ -130,7 +130,6 @@ BEGIN_C_DECLS
 #define PRTE_CLI_MEM_ALLOC_KIND			"memory-alloc-kinds"        // required
 #define PRTE_CLI_GPU_SUPPORT			"gpu-support"				// required
 #define PRTE_CLI_TARGET_ALLOC           "alloc-id"                  // required
-#define PRTE_CLI_ALLOC_REFID            "alloc-refid"               // required
 #define PRTE_CLI_SESSION_ID             "session-id"                // required
 
 // Placement options
@@ -504,7 +503,8 @@ PRTE_EXPORT extern const pmix_cli_choice_t prte_cli_rtos_directives[];
  * message for that listing what it does accept, and the caller is the one
  * that knows which.
  *
- * @param nspace   the job the command line belongs to, for show_help
+ * @param jdata    the job the command line belongs to, for show_help - NULL
+ *                 for a tool's own command line or the DVM's
  * @param option   the option being parsed ("map-by"), for the message
  * @param input    the word as the user wrote it, with any "=value"
  * @param choices  the vocabulary
@@ -514,7 +514,8 @@ PRTE_EXPORT extern const pmix_cli_choice_t prte_cli_rtos_directives[];
  * @retval PRTE_ERR_NOT_FOUND  matches nothing - not yet reported
  * @retval PRTE_ERR_SILENT     reported
  */
-PRTE_EXPORT int prte_cli_match(const pmix_nspace_t nspace, const char *option,
+struct prte_job_t;
+PRTE_EXPORT int prte_cli_match(const struct prte_job_t *jdata, const char *option,
                                const char *input, const pmix_cli_choice_t *choices,
                                int *tag);
 

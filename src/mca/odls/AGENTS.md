@@ -421,6 +421,28 @@ to `prte_event_base`.
   those two calls is load-bearing), checks the executable, and applies
   resource limits.
 
+  **The working directory and the executable are judged as the job's
+  owner.** `pmix_util_check_context_cwd()` and `_app()` decide where a job
+  runs and what it runs - `chdir()`, a fall back to the home directory
+  when the directory was not one the user asked for, a `PATH` search for a
+  naked name, `access(X_OK)` - as whoever calls them. For a job whose owner
+  is not the daemon's own user (`prte_pmix_server_job_run_as()` says
+  `change`), each is made in a child that is the owner
+  (`prte_odls_base_check_as_owner()`, through `prte_pmix_server_work_as()`)
+  and the daemon reads the answers back: the daemon itself goes into no
+  directory the user named, and the fallback is the *owner's* home, looked
+  up before the fork. Made as root, a directory or program only root could
+  reach passed, a naked name could resolve to a copy the owner cannot run,
+  and the fallback went to root's own home. **They are two children, at
+  the two places the checks have always been**: the directory in
+  `setup_path` (`check_cwd`), and the executable where `launch_local`
+  checks everyone's (`check_app`), once `prte_launch_environ`, the env
+  directives and `setup_fork` have made the job's environment complete.
+  Folding the executable into the first child searched for it before the
+  env directives were applied, so a `PATH` given with `-x` was not the one
+  searched. A job of the daemon's own user is checked in place as before,
+  and pays for no child.
+
   **`process_envars` owns the envar directives — all of them.** It runs
   for every personality whatever that personality's `setup_fork` does,
   which is why the schizo hook deliberately does not repeat them: applying

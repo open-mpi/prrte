@@ -1178,6 +1178,114 @@ than appending a second, so the destruct after a reuse finds the group
 that is. The PMIx servers screen their own clients' requests against what
 they hold; this is the DVM-wide half (N07).
 
+**One group ID, two memberships: every participant fails.** The PMIx
+server checks that the calls *it* collects for one ID name the same
+members, but it sees only its own node. Two jobs on different nodes, each
+constructing a group of its own procs under one ID, pass that check and
+used to meet on one tracker here - counted together, and released into one
+group with each other's group info and endpoints. A contribution must now
+name the tracker's members (`prte_grpcomm_same_members()`: order and
+repeats ignored, a namespace wildcard is that whole job). One that does not
+marks the tracker (`conflict`, `add_conflict()`): it then waits for the
+daemons of *both* memberships, so each subtree is still counted once, and
+resolves as `PMIX_ERR_BAD_PARAM` for every participant of either. A call
+that arrives after the tracker converged is too late to fail it and is
+answered on its own (`pnd->conflict`, and the release's own comparison),
+never with the group. **All fail, deliberately not "all but the first"**:
+which call came first depends on which daemon you ask, and an outcome that
+turned on it could not be reconstructed by anyone debugging it.
+
+That leaves a window, accepted knowingly: once a colliding operation has
+been failed and its trackers are gone, a construct of the same ID arriving
+afterwards collides with nothing and succeeds. Whether a late caller fails
+depends on how late it is. Refusing the ID for good would be worse - it
+could never be used again - so suspect this when one of several runs reusing
+a group ID fails and another does not. Bootstrap, follower and add-members
+operations list only some of their members, or none, and are not compared;
+the PMIx server exempts the same three.
+
+**Who took part travels only when it says something.** A PMIx server hands
+an operation up with a success status only once every local member has
+called, so a contribution that succeeded says it all: everyone there took
+part. Only one handed up timed out - by its own timer, or by the expiry
+below - is partial, and its `PMIX_LOCAL_PARTICIPANTS` names the local procs
+that had called, a namespace all of whose procs on that node had given once
+as `PMIX_RANK_LOCAL_PEERS`. `prte_grpcomm_group()` packs that - on the PMIx
+thread, before the thread-shift, since nothing on this daemon reads it -
+into a blob carrying this daemon's rank, because "local" means its node
+(`prte_grpcomm_participant_blob()`). Every contribution and rollup ends
+with `[known][count][blobs]` (`pack_participants()`), which for an ordinary
+operation is "known, none" - this deliberately keeps per-proc lists off the
+collective paths, the fence's hottest among them. A relay copies its
+children's blobs into its own rollup unopened; `punknown` latches when a
+timed-out contribution arrived without a list. Only the controller reads
+the blobs, to name who did not take part (`prte_grpcomm_nonparticipants()`):
+a member did not if, and only if, its daemon sent a blob and the blob does
+not name it - directly, or as the pair of its namespace and that daemon, a
+`PMIX_RANK_LOCAL_PEERS` entry being kept as that pair rather than expanded
+through the job map, which would cost a walk of the whole job per daemon.
+
+**One deadline.** A PMIx server hands an operation up only once every local
+member has called, so the nodes holding a member that never calls send
+nothing, a relay above one holds its whole subtree back, and each server's
+own `PMIX_TIMEOUT` starts when its own first member calls. So the
+controller sets the deadline, once (`expire_group_op()`): on its own timer
+(`group_timeout`), or on the first word that a server ran out of time - a
+contribution carrying `PMIX_ERR_TIMEOUT`, which every daemon reports to the
+controller as soon as it sees one (`note_timed_out()`), on
+`PRTE_RML_TAG_GROUP_EXPIRE`, because its parent may hold that contribution
+back. The controller then broadcasts the expiry order on the same tag.
+Each daemon hosting a member whose own contribution is not yet in calls
+`PMIx_server_collective_expire()`; if its server held nothing - no member
+there called - it contributes an empty list with the timeout status itself
+(`contribute_nothing()`). A server that did hold something hands it up
+through the ordinary upcall, whose event is queued ahead of the expiry's
+completion, so `expire_done()` finds `my_contribution` already set. Every
+subtree then completes, and the controller computes the non-participants
+from what each node had when the order reached it, says them in the
+`collective-nonparticipants` help topic and the verbose output, and
+releases with `PMIX_ERR_TIMEOUT` and the list, which each daemon gives its
+participants as `PMIX_COLLECTIVE_NONPARTICIPANTS`. Ordering the expiry
+restarts the controller's timer from that moment, whatever ordered it: if
+the expiry does not complete either - a daemon lost meanwhile - the
+operation is aborted as it used to be. **The restart is the point.** When
+a server's own deadline came first and asked for the expiry, the
+controller's original timer, armed at the first contribution, is still
+pending, and left alone it fires while the expiry's rollup is on its way
+and aborts the operation with nobody named. A member that calls
+after the deadline opens a new round, its own server's timer hands it up
+timed out, and the same expiry ends it, so it is answered, not hung.
+Bootstrap and follower operations are not expired: their calls go to the
+host one at a time, so no server holds anything collecting, and they time
+out by abort as before.
+
+**Fence, connect and disconnect follow the same protocol**, on
+`PRTE_RML_TAG_FENCE_EXPIRE` (`expire_fence_op()`, `note_fence_timed_out()`,
+`prte_grpcomm_fence_expire()`), with two differences. A fence's payload is
+the rest of its message, so the participant blobs cannot follow it: they
+travel in the contribution's directives under `PRTE_GRPCOMM_PARTICIPANTS`,
+one byte object of `[known][count][blobs]` (`prte_grpcomm_parts_to_bo()`,
+`prte_grpcomm_parts_merge()`), which `tree_gather_answer()` puts back when
+it rebuilds the directives for its rollup; `pack_fence_info()` leaves the
+server's own `PMIX_LOCAL_PARTICIPANTS` out of the directives it forwards,
+with a shallow copy of the array so an ordinary fence pays no deep copy.
+And the order carries the operation, purpose and round, so a daemon whose
+server held nothing (`fence_contribute_nothing()`) contributes to the right
+tracker. These operations return nothing to their callers, so the
+controller names the members that did not take part only in the
+`collective-nonparticipants` help topic - which reaches the tool that
+launched the job - and the verbose output.
+
+**A destruct must name the group's members.** A PMIx server holding a
+record of the group hands up its recorded members whatever its client
+named; one with no record - a node with no member, and a client older than
+PMIx v7.0, which still names a list - hands up the caller's list, and that
+destruct used to end the group on every daemon. The master now refuses a
+destruct whose members differ from its `live_groups` record
+(`prte_grpcomm_group_members_differ()`, `PMIX_ERR_NOT_A_MEMBER`), and a
+refused destruct (`destruct_refused()`) ends nothing - not the master's
+record, not any daemon's `prte_pmix_server_globals.groups` entry.
+
 **`ft_collective` means "some *surviving* participant asked for it."** It
 is accumulated by sticky-OR as contributions merge, so a participant that
 requested it and then died before rolling up is not visible. This is a

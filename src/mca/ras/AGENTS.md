@@ -658,6 +658,70 @@ EXTEND's reservation keeps the owner it has.
   Slurm for the requested user and group is not done; the note on
   `prte_ras_slurm_serve_extend_req()` says what it would take.
 
+### Who assigns an allocation's id
+
+An allocation's `PMIX_ALLOC_ID` is assigned by whatever grants it, and is
+how the allocation is named from then on. A requester names its request
+with `PMIX_ALLOC_REQ_ID`, which need not be unique and is returned to it
+alongside the `PMIX_ALLOC_ID`. So:
+
+- `prte_ras_base_modify()` refuses a `PMIX_ALLOC_NEW` that carries a
+  `PMIX_ALLOC_ID` (`ras-base:alloc-id-requested`, `PMIX_ERR_BAD_PARAM`)
+  before any module sees it. An EXTEND or RELEASE may carry one: it names
+  the allocation the request is for.
+- The scheduler's answer carries the id (`ras/pmix` folds it into the
+  request in `merge_answer()`); with no scheduler, `ras/hosts` assigns one
+  (`assign_alloc_id()`); `ras/slurm` uses the SLURM job id.
+- `ras_base_prepare_grow()` refuses a NEW that creates a reservation with no
+  id (`ras-base:alloc-id-missing`) or with one that already names a
+  reservation (`ras-base:alloc-id-in-use`, `PMIX_ERR_EXISTS`).
+  `create_reservation()` never makes one up. Keeping the ids unique is the
+  scheduler's job; the check stops a duplicate from making two
+  reservations answer to one name.
+- A session control `PMIX_SESSION_INSTANTIATE` must carry the scheduler's
+  `PMIX_ALLOC_ID` too (`session_instantiate()` in
+  `src/prted/pmix/pmix_server_session.c`), with the same two refusals.
+
+**A `PMIX_ALLOC_REQ_ID` is turned into the `PMIX_ALLOC_ID` where it comes
+in, and everything past that point works by `PMIX_ALLOC_ID`.** A req_id need
+not be unique, so it names an allocation only to the job that requested it
+(`session->requested_by`, set by `prte_session_set_requested_by()` and,
+unlike `session->requestor`, never refreshed), and only if that job made
+one request under it: `prte_get_session_object_from_refid()` takes the
+requesting namespace and refuses more than one match with
+`PRTE_ERR_BAD_PARAM` (`ras-base:req-id-ambiguous`). The places that take
+one:
+
+- an EXTEND naming only a req_id has the `PMIX_ALLOC_ID` added in
+  `prte_ras_base_modify()` (`ras_base_resolve_req_id()`), before any module
+  or scheduler sees it. A req_id that names none of the requester's
+  allocations is left alone - `ras/slurm` reads an EXTEND's req_id as the
+  name of the new request - and the base then refuses it as not found;
+- a spawn's `PMIX_ALLOC_REQ_ID` (`PRTE_JOB_REF_ID`) is
+  resolved against the spawn's requester in `plm_base_receive.c`;
+- `ras/slurm`'s pending requests are named by the requesting namespace
+  together with the req_id, and also by their `PMIX_ALLOC_ID`.
+
+Any other job, or a later command, names the allocation by its
+`PMIX_ALLOC_ID`, which every response returns and `PMIX_QUERY_ALLOC_IDS`
+lists.
+
+**An allocation a scheduler has queued but not granted has an id too.**
+`ras/slurm`'s id is the Slurm job id, which exists from the moment the job
+is queued, so a queued extend is answered with it at once and is registered
+as a session flagged `PRTE_SESSION_FLAG_PENDING` - no nodes, but listed by
+`PMIX_QUERY_ALLOC_IDS`, reported by `PMIX_QUERY_ALLOC_PROPERTIES` with a
+`PMIX_ALLOC_STATUS` of `PMIX_OPERATION_IN_PROGRESS`, and named by a
+`PMIX_ALLOC_REQ_CANCEL` that carries the id. Every other lookup skips it
+(`src/runtime/AGENTS.md`), so a spawn, extend, release or session directive
+naming it is "not found" until it is granted; the checks that an id is free
+count it (`prte_session_id_in_use()`, `prte_session_alloc_id_in_use()`).
+The early answer goes only to a request from a PMIx client
+(`prte_pmix_server_req_t.answer_when_queued`): `PMIX_SPAWN_ALLOC` reads
+`PMIX_OPERATION_IN_PROGRESS` as the grant (`spawn_alloc_complete()`), so a
+spawn's allocation is still answered when it is granted. See
+[`slurm/AGENTS.md`](slurm/AGENTS.md).
+
 ### The time an allocation is for
 
 With no scheduler (`!prte_ras_base.scheduler_owned`), the DVM serves a

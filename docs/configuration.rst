@@ -32,6 +32,25 @@ entries commented out. Simply uncomment the options of interest and
 set them to appropriate values. The file will be installed into the
 final ``<install-location>/etc`` when ``make install`` is performed.
 
+Because this file names the DVM's key, its controller and its nodes, a
+daemon reads it only if nobody could have written it but root, the user
+the daemon runs as, the members of that user's groups, and those who
+could already have changed the PRRTE library the daemon runs. It must be
+a regular file, not a symbolic link and with no other names (hard links);
+it must be owned by root, by that user, or by the owner of the PRRTE
+library the daemon has loaded (or of the executable, when the library is
+linked into it) or of a directory above that library - the owner of an
+installation made by one user and used by others is such a user; it
+must be writable by nobody else except a group that user belongs to; and
+the directory holding it must be owned by one of those users and meet
+the same rule, unless it has the sticky bit set. The library's location
+is taken from the kernel's own record of what the daemon has mapped (on
+Linux) or from the dynamic loader; when it cannot be found, only root
+and the daemon's own user may own the file. A daemon running as root admits no group write at all, since the
+members of a group root belongs to can be ordinary users. A daemon refuses
+to start if the file does not meet these requirements, and says which one
+it failed.
+
 Configuration Options
 ---------------------
 
@@ -67,6 +86,9 @@ identifying the nodes upon which user applications can run. IP addresses can
 be provided in place of hostnames if desired. The regular expression can consist of
 a simple comma-delimited list of hostnames, or a comma-delimited list of hostname
 ranges (e.g., "linux0,linux[2-10]"), or a PMIx "native" regular expression.
+It may also be given as ``file:<path>``, naming a file that lists the nodes one
+per line; that file is held to the same requirements as the configuration file
+itself.
 
 ``DVMKeyFile=<path> (required)`` names the file holding the DVM's key.
 Every daemon of a DVM must prove to the others that it holds this key before

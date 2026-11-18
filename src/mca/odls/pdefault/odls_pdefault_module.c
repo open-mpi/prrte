@@ -428,10 +428,24 @@ static void do_child(prte_odls_spawn_caddy_t *cd, int write_fd, int gate_fd)
     /* Exec the new executable */
     execve(cd->cmd, cd->argv, cd->env);
     /* If we get here, an error has occurred.  We cannot render the
-       diagnostic here (it would require stat/getcwd/strerror/allocation);
-       the parent inspects errno and the app to distinguish, e.g., a
-       missing executable from a bad interpreter line. */
-    prte_odls_base_child_fail(write_fd, 1, PRTE_ODLS_CHILD_ERR_EXEC, errno);
+       diagnostic here (it would require getcwd/strerror/allocation), but
+       stat() is async-signal-safe, and made here it is made as the job's
+       owner: it tells a directory, and a script whose "#!" interpreter is
+       missing, from the rest. The parent used to make it - as the
+       daemon's user, which may see what the owner cannot. */
+    {
+        int err = errno;
+        struct stat sb;
+
+        if (0 == stat(cd->cmd, &sb)) {
+            if (S_ISDIR(sb.st_mode)) {
+                prte_odls_base_child_fail(write_fd, 1, PRTE_ODLS_CHILD_ERR_EXEC_ISDIR, err);
+            } else if (ENOENT == err) {
+                prte_odls_base_child_fail(write_fd, 1, PRTE_ODLS_CHILD_ERR_EXEC_INTERP, err);
+            }
+        }
+        prte_odls_base_child_fail(write_fd, 1, PRTE_ODLS_CHILD_ERR_EXEC, err);
+    }
     /* Does not return */
 }
 
@@ -466,53 +480,54 @@ static void render_child_msg(prte_odls_spawn_caddy_t *cd, prte_odls_pipe_err_msg
 
     switch (msg->which) {
     case PRTE_ODLS_CHILD_ERR_IOF_SETUP:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "iof setup failed", true,
-                       prte_process_info.nodename, cd->app->app);
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "iof setup failed", true,
+                           prte_process_info.nodename, cd->app->app);
         break;
     case PRTE_ODLS_CHILD_ERR_NEG_FD:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "neg-fd", true,
-                       prte_process_info.nodename, "/dev/null");
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "neg-fd", true,
+                           prte_process_info.nodename, "/dev/null");
         break;
     case PRTE_ODLS_CHILD_ERR_WDIR:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prun.txt", "prun:wdir-not-found", true, "prted",
-                       (NULL == cd->wdir) ? "<none>" : cd->wdir,
-                       prte_process_info.nodename, rank);
+        prte_show_help_job(cd->jdata, "help-prun.txt", "prun:wdir-not-found", true, "prted",
+                           (NULL == cd->wdir) ? "<none>" : cd->wdir,
+                           prte_process_info.nodename, rank);
         break;
     case PRTE_ODLS_CHILD_ERR_STOP_ON_EXEC:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prun.txt", "prun:stop-on-exec", true, "prted",
-                       strerror(msg->errnum), prte_process_info.nodename, rank);
+        prte_show_help_job(cd->jdata, "help-prun.txt", "prun:stop-on-exec", true, "prted",
+                           strerror(msg->errnum), prte_process_info.nodename, rank);
         break;
     case PRTE_ODLS_CHILD_ERR_BIND:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "binding generic error", true,
-                       prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "binding generic error", true,
+                           prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
         break;
     case PRTE_ODLS_CHILD_ERR_BIND_MEM:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "memory binding error", true,
-                       prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "memory binding error", true,
+                           prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
         break;
     case PRTE_ODLS_CHILD_WARN_NOT_BOUND:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "not bound", true,
-                       prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "not bound", true,
+                           prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
         break;
     case PRTE_ODLS_CHILD_WARN_MEM_NOT_BOUND:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "memory not bound", true,
-                       prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "memory not bound", true,
+                           prte_process_info.nodename, cd->app->app, bind_errmsg(msg->errnum));
         break;
     case PRTE_ODLS_CHILD_ERR_CREDENTIALS:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "credentials", true,
-                       prte_process_info.nodename, cd->app->app, (unsigned long) cd->cred_uid,
-                       (unsigned long) cd->cred_gid, strerror(msg->errnum));
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "credentials", true,
+                           prte_process_info.nodename, cd->app->app, (unsigned long) cd->cred_uid,
+                           (unsigned long) cd->cred_gid, strerror(msg->errnum));
         break;
     case PRTE_ODLS_CHILD_WARN_INCORRECT:
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "incorrectly bound", true,
-                       prte_process_info.nodename, cd->app->app);
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "incorrectly bound", true,
+                           prte_process_info.nodename, cd->app->app);
         break;
     case PRTE_ODLS_CHILD_ERR_EXEC:
+    case PRTE_ODLS_CHILD_ERR_EXEC_ISDIR:
+    case PRTE_ODLS_CHILD_ERR_EXEC_INTERP:
     default: {
         char dir[PRTE_PATH_MAX];
         const char *wdir;
         const char *errmsg;
-        struct stat statbuf;
 
         /* the child's working dir at exec time is the app's wdir if one
            was given, otherwise the daemon's cwd (it never chdir'd) */
@@ -524,25 +539,22 @@ static void render_child_msg(prte_odls_spawn_caddy_t *cd, prte_odls_pipe_err_msg
             wdir = "<unknown>";
         }
         /* strerror() alone is misleading for the two shapes that reach
-           execve() most often, so name them.  A directory is X_OK on most
-           systems - it means "searchable" - so it sails through the
-           check_context_app() test in the base and only fails here, as a
-           bare "Permission denied".  And ENOENT on a file that plainly
-           exists is not a missing executable at all: it is a script whose
-           "#!" line names an interpreter that is missing. */
-        if (0 == stat(cd->app->app, &statbuf)) {
-            if (S_ISDIR(statbuf.st_mode)) {
-                errmsg = "it is a directory, not an executable";
-            } else if (ENOENT == msg->errnum) {
-                errmsg = "the executable has a bad interpreter on its first line";
-            } else {
-                errmsg = strerror(msg->errnum);
-            }
+           execve() most often, so the child names them (it made the stat,
+           as the job's owner).  A directory is X_OK on most systems - it
+           means "searchable" - so it sails through the check_context_app()
+           test in the base and only fails here, as a bare "Permission
+           denied".  And ENOENT on a file that plainly exists is not a
+           missing executable at all: it is a script whose "#!" line names
+           an interpreter that is missing. */
+        if (PRTE_ODLS_CHILD_ERR_EXEC_ISDIR == msg->which) {
+            errmsg = "it is a directory, not an executable";
+        } else if (PRTE_ODLS_CHILD_ERR_EXEC_INTERP == msg->which) {
+            errmsg = "the executable has a bad interpreter on its first line";
         } else {
             errmsg = strerror(msg->errnum);
         }
-        prte_show_help(PRTE_JOB_NSPACE(cd->jdata), "help-prte-odls-default.txt", "execve error", true,
-                       prte_process_info.nodename, wdir, cd->app->app, errmsg);
+        prte_show_help_job(cd->jdata, "help-prte-odls-default.txt", "execve error", true,
+                           prte_process_info.nodename, wdir, cd->app->app, errmsg);
         break;
     }
     }

@@ -2318,6 +2318,46 @@ test_runtime() {
     fi
     cleanup_swarm
 
+    banner "runtime/data_server: a process may have only so many lookups waiting"
+    # A PMIX_WAIT lookup stays parked until a publish answers it, its
+    # timeout runs out or its process ends, so one process using
+    # PMIx_Lookup_nb could park any number.  prte_data_server_max_waiting
+    # (64) bounds it per process: the ones beyond are refused at once with
+    # PMIX_ERR_OUT_OF_RESOURCE, and a publish still answers the ones parked.
+    if ! RUN "test -x $DS"; then
+        skp "dataserver client not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:2,node2:2,node3:2'; then
+        bad "could not start a DVM for the waiting-lookup limit test"
+    else
+        PRUN_BG /tmp/ds-manywait.out "--host node3:1 -n 1 $DS manywait prte.test.manywait 70 60"
+        for _ in $(seq 1 20); do
+            RUN 'grep -q "^REFUSED" /tmp/ds-manywait.out 2>/dev/null' && break
+            sleep 1
+        done
+        out=$(RUN 'cat /tmp/ds-manywait.out 2>/dev/null' | tr -d '\r')
+        if ! echo "$out" | grep -q "^REFUSED"; then
+            bad "the waiting lookups never reported: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        else
+            echo "$out" | grep -q "^REFUSED 6$" \
+                && ok "the lookups beyond the limit were refused at once" \
+                || bad "not just the lookups beyond the limit were refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            out=$(PRUN "--host node2:1 -n 1 $DS publish prte.test.manywait here session 5" 2>&1)
+            echo "$out" | grep -q '^PUBLISHED prte.test.manywait' \
+                || bad "the publish never happened: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            for _ in $(seq 1 20); do
+                RUN 'grep -q "^ANSWERED" /tmp/ds-manywait.out 2>/dev/null' && break
+                sleep 1
+            done
+            out=$(RUN 'cat /tmp/ds-manywait.out 2>/dev/null' | tr -d '\r')
+            echo "$out" | grep -q "^ANSWERED 64 REFUSED 6 OTHER 0$" \
+                && ok "the publish answered every lookup that was waiting" \
+                || bad "the waiting lookups were not all answered: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    RUN 'rm -f /tmp/ds-manywait.out'
+    cleanup_swarm
+
     banner "runtime/data_server: unpublish removes the data"
     # Only the publisher may unpublish its own keys, so this runs in one
     # process: publish, confirm, unpublish, confirm gone.
@@ -3129,7 +3169,8 @@ test_runtime() {
         # The file pmix_server_uri names says which server every publish
         # and lookup goes to, so the master reads it only if it is the file
         # at that name (not a symbolic link), has one name, cannot be
-        # written by its group or others, and is owned by root or the
+        # written by others - nor by its group, unless the DVM's user is
+        # in that group and is not root - and is owned by root or the
         # DVM's own user.  A DVM is pointed at each variant of the server's
         # own file in turn; a failed attach fails every request after it,
         # so a publish says which were read.  The 0644 copy is the control.
@@ -3139,7 +3180,11 @@ test_runtime() {
              cp /tmp/ds-server.uri /tmp/ds-gw.uri && chmod 0664 /tmp/ds-gw.uri &&
              cp /tmp/ds-server.uri /tmp/ds-hl.uri && chmod 0644 /tmp/ds-hl.uri &&
              ln /tmp/ds-hl.uri /tmp/ds-hl2.uri' >/dev/null 2>&1
-        for v in copy:read link:refused gw:refused hl:refused; do
+        # a group-writable copy is the DVM user's own group's: read unless
+        # the DVM runs as root, which takes no group write
+        gw=refused
+        [ "$(RUN 'id -u' | tr -d '\r')" = 0 ] || gw=read
+        for v in copy:read link:refused gw:$gw hl:refused; do
             f=${v%%:*}; want=${v##*:}
             if ! dvm_start_uri /tmp/ds-c.uri 'node8:2' "--prtemca pmix_server_uri file:/tmp/ds-$f.uri"; then
                 bad "could not start a DVM pointed at the $f file"
@@ -3780,6 +3825,66 @@ test_prted() {
         RUN 'pkill -f "sleep 120"' >/dev/null 2>&1
         RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     fi
+    cleanup_swarm
+
+    banner "prted: a job-control signal reaches every target it names, and only those"
+    # PMIX_JOB_CTRL_SIGNAL with several targets used to signal only the job
+    # of the first and report success, and a target naming one rank signalled
+    # the whole of its job.  Each proc traps SIGUSR1 and leaves a marker named
+    # for its job and rank, so which procs got the signal is plain - a signal
+    # that killed would end the rest of the job with it.  A fourth job, never
+    # named, must get nothing.
+    for n in 1 2; do kill_stray "$n" sleep; done
+    # five procs on node2: the four jobs' and nothing else, so it needs
+    # five slots there
+    if ! RUN "test -x $ROLETOOL"; then
+        skp "roletool not installed -- re-run ./build.sh"
+    elif ! prted_dvm_start 'node1:4,node2:8'; then
+        bad "could not start a DVM for the multi-target signal test"
+    else
+        uri=$(RUN "head -1 $PRTED_URI" 2>/dev/null | tr -d '\r\n')
+        ON 2 'rm -f /tmp/sigmark.*; printf "#!/bin/sh\necho NS=\$PMIX_NAMESPACE RANK=\$PMIX_RANK\ntrap \"touch /tmp/sigmark.\$PMIX_NAMESPACE.\$PMIX_RANK\" USR1\nwhile :; do sleep 1; done\n" > /tmp/sigtgt.sh && chmod +x /tmp/sigtgt.sh'
+        PRUN_BG /tmp/sigA.out '--host node2:1 -n 1 /tmp/sigtgt.sh'
+        PRUN_BG /tmp/sigB.out '--host node2:1 -n 1 /tmp/sigtgt.sh'
+        PRUN_BG /tmp/sigC.out '--host node2:2 -n 2 /tmp/sigtgt.sh'
+        PRUN_BG /tmp/sigD.out '--host node2:1 -n 1 /tmp/sigtgt.sh'
+        sleep 10
+        nsA=$(RUN 'sed -n "s/^NS=\([^ ]*\) .*/\1/p" /tmp/sigA.out' | tr -d '\r' | head -1)
+        nsB=$(RUN 'sed -n "s/^NS=\([^ ]*\) .*/\1/p" /tmp/sigB.out' | tr -d '\r' | head -1)
+        nsC=$(RUN 'sed -n "s/^NS=\([^ ]*\) .*/\1/p" /tmp/sigC.out' | tr -d '\r' | head -1)
+        nsD=$(RUN 'sed -n "s/^NS=\([^ ]*\) .*/\1/p" /tmp/sigD.out' | tr -d '\r' | head -1)
+        n=$(ON 2 'pgrep -c -f /tmp/sigtgt.sh' 2>/dev/null | tr -d ' \r')
+        if [ -z "$nsA" ] || [ -z "$nsB" ] || [ -z "$nsC" ] || [ -z "$nsD" ] || [ "$n" != 5 ]; then
+            bad "could not get four jobs running on node2 (saw $n procs; A=$nsA B=$nsB C=$nsC D=$nsD)"
+        else
+            out=$(RUN "timeout 60 $ROLETOOL '$uri' signal 10 '$nsA:*' '$nsB:*'" 2>&1)
+            sleep 4
+            marks=$(ON 2 'ls /tmp/sigmark.* 2>/dev/null' | tr -d '\r' | sed 's|/tmp/sigmark\.||' | sort | tr '\n' ' ')
+            expect=$(printf '%s\n' "$nsA.0" "$nsB.0" | sort | tr '\n' ' ')
+            if ! echo "$out" | grep -q "ROLE SIGNAL PMIX_SUCCESS"; then
+                bad "the two-job signal failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            elif [ "$marks" = "$expect" ]; then
+                ok "a signal naming two jobs reached both, and no other"
+            else
+                bad "a signal naming two jobs reached [$marks]; expected [$expect]"
+            fi
+            ON 2 'rm -f /tmp/sigmark.*'
+            out=$(RUN "timeout 60 $ROLETOOL '$uri' signal 10 '$nsC:1'" 2>&1)
+            sleep 4
+            marks=$(ON 2 'ls /tmp/sigmark.* 2>/dev/null' | tr -d '\r' | sed 's|/tmp/sigmark\.||' | tr '\n' ' ')
+            if ! echo "$out" | grep -q "ROLE SIGNAL PMIX_SUCCESS"; then
+                bad "the one-rank signal failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            elif [ "$marks" = "$nsC.1 " ]; then
+                ok "a signal naming one rank reached that rank only"
+            else
+                bad "a signal naming rank 1 of a job reached [$marks]; expected [$nsC.1]"
+            fi
+        fi
+        ON 2 'pkill -f /tmp/sigtgt.sh; true'
+        RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    fi
+    ON 2 'rm -f /tmp/sigtgt.sh /tmp/sigmark.*; true'
+    RUN 'rm -f /tmp/sigA.out /tmp/sigB.out /tmp/sigC.out /tmp/sigD.out'
     cleanup_swarm
 
     banner "prted: a tool attached to a NON-MASTER daemon completes its job"
@@ -4715,6 +4820,54 @@ test_requesters() {
     fi
     RUN 'pkill -f "roletool.*alloc"; rm -f /tmp/rqalloc.out; true'
 
+    banner "requesters: a request id names an allocation only to the job that made it"
+    # wait for a held "roletool alloc-reqid" to have shown its properties
+    rq_reqid_done() {
+        for _ in $(seq 1 20); do
+            RUN 'grep -q "^ROLE ALLOCPROPS \|^ROLE REQID-EXTEND PMIX_ERR\|^ROLE ALLOC PMIX_ERR" /tmp/rqalloc.out 2>/dev/null' && break
+            sleep 1
+        done
+        RUN 'cat /tmp/rqalloc.out 2>/dev/null' | tr -d '\r'
+    }
+    EXEC_TOOL_BG 1 "$rq alloc-reqid swarm-req 1 30 > /tmp/rqalloc.out 2>&1"
+    aid=$(rq_alloc_id)
+    if [ -z "$aid" ]; then
+        bad "a user could not ask for an allocation under a request id: $(RUN 'cat /tmp/rqalloc.out' 2>&1 | tr '\n' ' ' | tail -c 250)"
+    else
+        out=$(rq_reqid_done)
+        echo "$out" | grep -q "ROLE REQID-EXTEND PMIX_SUCCESS" \
+            && ok "the job that made a request extends the allocation by its request id" \
+            || bad "the requester could not extend by its request id: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q "ROLE ALLOCPROP pmix.alloc.reqid swarm-req$" \
+            && ok "an allocation's properties give its request id" \
+            || bad "the request id is not among the properties: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q "ROLE ALLOCPROP pmix.cmd.line .*roletool.*alloc-reqid" \
+            && ok "...and the command line that requested it" \
+            || bad "the requesting command line is not among the properties: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q "ROLE ALLOCPROP pmix.euid 65534$" \
+            && ok "...and its owner" \
+            || bad "the owner is not among the properties: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(RUN "timeout 60 $rq alloc-extend-reqid swarm-req 600" 2>&1)
+        echo "$out" | grep -q "ROLE REQID-EXTEND PMIX_ERR_NOT_FOUND" \
+            && ok "a later command of the same user cannot name it by request id" \
+            || bad "another command named the allocation by request id: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        out=$(RUN "timeout 60 $rq2 allocprops '$aid'" 2>&1)
+        echo "$out" | grep -q "ROLE ALLOCPROPS PMIX_ERR_NO_PERMISSIONS" \
+            && ok "another user is not told its properties" \
+            || bad "another user's query of the allocation was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    RUN 'pkill -f "roletool.*alloc"; rm -f /tmp/rqalloc.out; true'
+    EXEC_TOOL_BG 1 "$rq alloc-reqid swarm-dup 2 30 > /tmp/rqalloc.out 2>&1"
+    out=$(rq_reqid_done)
+    if [ 2 -ne "$(echo "$out" | grep -c '^ROLE ALLOCATED ')" ]; then
+        bad "a user could not make two requests under one request id: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    else
+        echo "$out" | grep -q "ROLE REQID-EXTEND PMIX_ERR_BAD_PARAM" \
+            && ok "a request id a job used twice names neither allocation" \
+            || bad "a request id used twice was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    RUN 'pkill -f "roletool.*alloc"; rm -f /tmp/rqalloc.out; true'
+
     banner "requesters: the time an allocation is asked for is applied"
     # With no scheduler the DVM serves PMIX_ALLOC_TIME itself, on a DVM that
     # is not elastic too - an extend naming no nodes does not resize it. The
@@ -4812,8 +4965,56 @@ test_requesters() {
             else
                 ok "another user is not shown root's reservation"
             fi
+            out=$(RUN "timeout 60 $rq allocprops roletool.4272" 2>&1 | tr -d '\r')
+            echo "$out" | grep -q "ROLE ALLOCPROPS PMIX_ERR_NO_PERMISSIONS" \
+                && ok "...nor told its properties" \
+                || bad "another user's query of root's reservation was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            out=$(RUN "timeout 60 $rq allocnodes roletool.4272" 2>&1 | tr -d '\r')
+            echo "$out" | grep -q "ROLE ALLOCNODES PMIX_ERR_NO_PERMISSIONS" \
+                && ok "...nor told its nodes" \
+                || bad "another user was told the nodes of root's reservation: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            out=$(RUN "timeout 60 $rq allocnodes" 2>&1 | tr -d '\r')
+            if ! echo "$out" | grep -q "ROLE ALLOCNODES PMIX_SUCCESS"; then
+                bad "another user's query of the DVM's nodes failed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            elif echo "$out" | grep -q "^ROLE ALLOCNODE node2$"; then
+                bad "another user was told of the node root's reservation holds"
+            elif echo "$out" | grep -q "^ROLE ALLOCNODE "; then
+                ok "...and the DVM's nodes it is told leave that one out"
+            else
+                bad "another user was told of no nodes at all: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            fi
+            out=$(RUN "timeout 60 $ROLETOOL '$uri' allocnodes roletool.4272" 2>&1 | tr -d '\r')
+            echo "$out" | grep -q "^ROLE ALLOCNODE node2$" \
+                && ok "root is told its reservation's nodes" \
+                || bad "root was not told its own reservation's nodes: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
             RUN "timeout 60 $SESSCTL terminate 4272" >/dev/null 2>&1
         fi
+
+        banner "requesters: an allocation's id is the scheduler's to give"
+        out=$(RUN "timeout 60 $ROLETOOL '$uri' instantiate-id 4279 node2:2 -" 2>&1)
+        if echo "$out" | grep -q "ROLE SESSION PMIX_ERR_BAD_PARAM"; then
+            ok "an instantiation with no allocation id is refused"
+        else
+            bad "an instantiation with no allocation id was not refused: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            RUN "timeout 60 $SESSCTL terminate 4279" >/dev/null 2>&1
+        fi
+        out=$(RUN "timeout 60 $ROLETOOL '$uri' instantiate-id 4279 node2:2 swarm-dup-id" 2>&1)
+        if ! echo "$out" | grep -q "ROLE SESSION PMIX_SUCCESS"; then
+            bad "could not instantiate session 4279: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        else
+            out=$(RUN "timeout 60 $ROLETOOL '$uri' instantiate-id 4280 node3:2 swarm-dup-id" 2>&1)
+            if echo "$out" | grep -q "ROLE SESSION PMIX_ERR_EXISTS"; then
+                ok "an instantiation whose allocation id is in use is refused"
+            else
+                bad "a second session was given an allocation id in use: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+                RUN "timeout 60 $SESSCTL terminate 4280" >/dev/null 2>&1
+            fi
+            RUN "timeout 60 $SESSCTL terminate 4279" >/dev/null 2>&1
+        fi
+        out=$(RUN "timeout 60 $ROLETOOL '$uri' alloc-naming swarm-own-id" 2>&1)
+        echo "$out" | grep -q "ROLE ALLOC PMIX_ERR_BAD_PARAM" \
+            && ok "a new allocation request naming its own allocation id is refused" \
+            || bad "a new allocation request named its own allocation id: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
 
         banner "requesters: a session is its requester's, whatever job it names"
         ON 1 'printf "#!/bin/sh\necho NS=\$PMIX_NAMESPACE\nexec sleep 60\n" > /tmp/rqowner.sh && chmod +x /tmp/rqowner.sh'
@@ -4831,13 +5032,22 @@ test_requesters() {
             if ! echo "$out" | grep -q "ROLE SESSION PMIX_SUCCESS"; then
                 bad "a listed user could not create session 4273: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
             else
-                out=$(RUN "timeout 60 $ROLETOOL '$uri' allocids" 2>&1 | tr -d '\r')
-                if echo "$out" | grep -q "ROLE ALLOCID $ons\.4273$"; then
-                    bad "a session another user created was recorded as root's job's"
-                elif echo "$out" | grep -q 'ROLE ALLOCID .*\.4273$'; then
+                # the allocation id is the one roletool gave as the
+                # scheduler would, so it says nothing of the requester: the
+                # session is its creator's if its creator is shown it
+                out=$(RUN "timeout 60 $rq allocids" 2>&1 | tr -d '\r')
+                if echo "$out" | grep -q 'ROLE ALLOCID roletool\.4273$'; then
                     ok "a session naming root's job as requester is its creator's"
                 else
-                    bad "session 4273 is not listed: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+                    bad "session 4273 is not listed to its creator: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+                fi
+                out=$(RUN "timeout 60 $ROLETOOL '$uri' allocprops roletool.4273" 2>&1 | tr -d '\r')
+                if ! echo "$out" | grep -q "ROLE ALLOCPROP pmix.requestor "; then
+                    bad "session 4273's requester is not given: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+                elif echo "$out" | grep -q "ROLE ALLOCPROP pmix.requestor $ons:"; then
+                    bad "a session another user created was recorded as requested by root's job"
+                else
+                    ok "...and was requested by its creator"
                 fi
                 RUN "timeout 60 $SESSCTL terminate 4273" >/dev/null 2>&1
             fi
@@ -5064,6 +5274,29 @@ test_run_as() {
     [ "$n" = 0 ] \
         && ok "the job's directories are removed when it ends" \
         || bad "$n of the job's directories were left behind"
+
+    banner "run-as: its executable is found, and its directory checked, as that user"
+    # The daemon used to resolve a naked program name, and enter the working
+    # directory, as itself - root - before the process became the user. A
+    # PATH whose first directory only root can enter then named a copy there
+    # the user cannot run, and the job failed; searched as the user, the
+    # copy in the next directory is the one found. And a working directory
+    # only root can enter passed the daemon's check.
+    ON 2 'mkdir -p /root/runas-bin && chmod 700 /root/runas-bin && printf "#!/bin/sh\necho RUNAS-PATH root-copy\n" > /root/runas-bin/runas-which && chmod 755 /root/runas-bin/runas-which'
+    ON 2 'mkdir -p /tmp/runas-bin && printf "#!/bin/sh\necho RUNAS-PATH user-copy\n" > /tmp/runas-bin/runas-which && chmod 755 /tmp/runas-bin/runas-which'
+    out=$(RUN "cd /tmp && timeout 60 $rq -n 1 --host node2 -x PATH=/root/runas-bin:/tmp/runas-bin:/usr/bin:/bin runas-which" 2>&1)
+    echo "$out" | grep -q '^RUNAS-PATH user-copy' \
+        && ok "a program on PATH is the one the user can run" \
+        || bad "the user's job did not run the copy it can reach: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    out=$(RUN "cd /tmp && timeout 60 $rq -n 1 --host node2 --wdir /root/runas-bin hostname" 2>&1)
+    if echo "$out" | tr -d '\r' | grep -q '^node2$'; then
+        bad "the user's job ran in a directory only root can enter"
+    elif echo "$out" | grep -qi "working directory\|wdir"; then
+        ok "a working directory only root can enter is refused for the user"
+    else
+        bad "a root-only working directory was not refused as one: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    fi
+    ON 2 'rm -rf /root/runas-bin /tmp/runas-bin; true'
 
     banner "run-as: root's own job still runs as root"
     out=$(RUN "cd /tmp && timeout 60 prun --dvm-uri '$uri' -n 2 --map-by node sh -c 'echo RUNAS \$(id -u)'" 2>&1)
@@ -6528,6 +6761,8 @@ test_grpcomm() {
     test_grpcomm_invite
     test_grpcomm_ft
     test_grpcomm_reuse
+    test_grpcomm_collision
+    test_grpcomm_nonparticipants
     test_fence_straggler
     test_fence_early_arrival
     test_low_radix_release
@@ -6535,6 +6770,177 @@ test_grpcomm() {
     test_xcast_grow_new_parent
     test_xcast_grow_known_parent
     test_grow_window_broadcast
+}
+
+test_grpcomm_collision() {
+    local out n i
+
+    if ! have_nodes 5; then
+        skp "group ID collision: needs 5 nodes, this run has $NNODES"
+        return
+    fi
+
+    banner "grpcomm: two jobs constructing one group ID fail, both of them"
+    # Each job constructs a group of its own procs under the same ID, on
+    # nodes of its own. Each node's PMIx server sees only its own job's
+    # calls, which agree, so the two only meet in grpcomm - where they used
+    # to land on one tracker: whichever arrived first decided which daemons
+    # were expected, the other was counted anyway, and the construct could
+    # complete early and hand B's ranks a group of A's members. Now a
+    # contribution naming other members marks the tracker, which waits for
+    # both jobs' daemons and fails every participant - deliberately not "all
+    # but the first", since which one is first depends on where you look.
+    #
+    # A's last rank holds its construct back, so A's is in flight - its
+    # first rank's contribution already in - when B's arrives. B therefore
+    # cannot finish before A's last rank contributes.
+    cleanup_swarm
+    if ! RUN "test -x $GC"; then
+        skp "groupcon client not installed -- re-run ./build.sh"
+        return
+    fi
+    if ! prted_dvm_start 'node1:1,node2:1,node3:1,node4:1,node5:1'; then
+        bad "could not start a DVM for the group ID collision test"
+        cleanup_swarm
+        return
+    fi
+
+    RUN 'rm -f /tmp/grp-collide-a.out' >/dev/null 2>&1
+    PRUN_BG /tmp/grp-collide-a.out "--host node2:1,node3:1 -n 2 --map-by node $GC --hold-last 15 collidegrp"
+    sleep 5
+    out=$(PRUN "--host node4:1,node5:1 -n 2 --map-by node $GC collidegrp" 2>&1)
+    n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_ERR_BAD_PARAM')
+    [ "$n" = 2 ] \
+        && ok "the second job's construct of the same ID failed on both its ranks" \
+        || bad "$n of 2 of the second job's ranks failed: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    echo "$out" | grep -q 'CONSTRUCT PMIX_SUCCESS' \
+        && bad "...but one of them was handed a group" \
+        || ok "...and neither was handed a group"
+    for i in $(seq 1 30); do
+        [ "$(RUN 'grep -c " DONE " /tmp/grp-collide-a.out' 2>/dev/null | tr -d '\r')" = 2 ] && break
+        sleep 1
+    done
+    out=$(RUN 'cat /tmp/grp-collide-a.out' 2>&1)
+    n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_ERR_BAD_PARAM')
+    [ "$n" = 2 ] \
+        && ok "...and so did the first job's, on both its ranks" \
+        || bad "$n of 2 of the first job's ranks failed: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    # A rank prints DONE before it exits, and the job's slots come back only
+    # once the DVM has finished ending it - so wait for its prun to exit
+    # before asking for those nodes again. The bracket keeps the pattern from
+    # matching the shell that runs pgrep.
+    for i in $(seq 1 30); do
+        RUN 'pgrep -f "[h]old-last 15 collidegrp" >/dev/null' || break
+        sleep 1
+    done
+
+    # the ID is not left unusable: once neither is in flight, it constructs
+    out=$(PRUN "--host node2:1,node3:1 -n 2 --map-by node $GC collidegrp" 2>&1)
+    n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+    [ "$n" = 2 ] \
+        && ok "...and the ID constructs normally once neither is in flight" \
+        || bad "$n of 2 ranks constructed the ID afterwards: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+
+    out=$(PRUN "--host node1:1,node2:1,node3:1,node4:1,node5:1 -n 5 --map-by node hostname" 2>&1)
+    n=$(echo "$out" | grep -c '^node')
+    [ "$n" = 5 ] \
+        && ok "...and the DVM still runs a follow-on job on every node" \
+        || bad "the DVM could not run a follow-on job after the collision ($n of 5)"
+
+    RUN 'rm -f /tmp/grp-collide-a.out' >/dev/null 2>&1
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
+}
+
+test_grpcomm_nonparticipants() {
+    local out n early
+
+    if ! have_nodes 5; then
+        skp "group construct timeout: needs 5 nodes, this run has $NNODES"
+        return
+    fi
+
+    banner "grpcomm: a construct that times out names the member that never called"
+    # Five ranks, two on node2; the last (rank 4, on node2) holds back well
+    # past the construct's PMIX_TIMEOUT. A PMIx server hands an operation up
+    # only once every local member has called, so node2's server - with rank
+    # 0 in and rank 4 not - used to send nothing, and the construct could
+    # only be aborted, saying nothing of who was missing. Now the deadline
+    # makes every server hand up what it has (PMIx_server_collective_expire),
+    # node2's says rank 0 took part, and the ranks that called are told the
+    # one that did not. Rank 4, calling after the deadline, times out on its
+    # own rather than hanging. Every rank lingers 20s after its answer
+    # (groupcon's "seconds"): a rank whose construct failed exits non-zero,
+    # which ends the job, and rank 4 has to get its own answer first.
+    cleanup_swarm
+    if ! RUN "test -x $GC"; then
+        skp "groupcon client not installed -- re-run ./build.sh"
+        return
+    fi
+    if ! prted_dvm_start 'node1:1,node2:2,node3:1,node4:1,node5:1'; then
+        bad "could not start a DVM for the group timeout test"
+        cleanup_swarm
+        return
+    fi
+
+    # Run twice: once with every rank but the last calling at once, so the
+    # controller's own timer sets the deadline; once with ranks 1-3 calling
+    # 3s late, so node2's PMIx timer - started by rank 0 - runs out before
+    # the controller has armed its own, and node2's server asks for the
+    # expiry. Either way it is one deadline and the same answer.
+    for mode in "" "--delay-others 3"; do
+        out=$(PRUN "--host node2:2,node3:1,node4:1,node5:1 -n 5 --map-by node $GC --timeout 4 $mode --hold-last 12 tmogrp 20" 2>&1)
+        early=$(echo "$out" | awk '$1=="GRP" && $3=="CONSTRUCT" && $4=="PMIX_ERR_TIMEOUT" && $2!="4"' | wc -l | tr -d ' ')
+        [ "$early" = 4 ] \
+            && ok "the four ranks that called were failed with PMIX_ERR_TIMEOUT" \
+            || bad "$early of 4 ranks that called timed out: $(echo "$out" | tr '\n' ' ' | tail -c 400)"
+        n=$(echo "$out" | awk '$1=="GRP" && $2!="4" && $3=="NONPART" && $4=="1" && $5 ~ /:4$/' | wc -l | tr -d ' ')
+        [ "$n" = 4 ] \
+            && ok "...and each was told rank 4, and only rank 4, never took part" \
+            || bad "$n of 4 were told rank 4 alone did not take part: $(echo "$out" | grep NONPART | tr '\n' ' ')"
+        # node2 held rank 0, which called, and rank 4, which did not: what makes
+        # the list exact is that node2 still reported rank 0
+        echo "$out" | awk '$1=="GRP" && $2!="4" && $3=="NONPART"' | grep -q ':0\b' \
+            && bad "rank 0, which called, was reported as not taking part" \
+            || ok "...not rank 0, which shares its node and did call"
+        echo "$out" | awk '$1=="GRP" && $2=="4" && $3=="CONSTRUCT"' | grep -q 'PMIX_ERR_TIMEOUT' \
+            && ok "rank 4, calling after the deadline, timed out rather than hanging" \
+            || bad "rank 4 did not time out: $(echo "$out" | awk '$2=="4"' | tr '\n' ' ')"
+    done
+
+    out=$(PRUN "--host node2:2,node3:1,node4:1,node5:1 -n 5 --map-by node $GC tmogrp-after" 2>&1)
+    n=$(echo "$out" | grep -c 'CONSTRUCT PMIX_SUCCESS')
+    [ "$n" = 5 ] \
+        && ok "...and the DVM constructs groups normally afterwards" \
+        || bad "$n of 5 ranks constructed a group afterwards: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
+
+    banner "grpcomm: a fence that times out names the member that never called"
+    # The same layout, through PMIx_Fence - which connect and disconnect
+    # share in PRRTE. A fence returns nothing to its callers, so the members
+    # that never called are named by the controller, in the
+    # collective-nonparticipants help topic - which reaches the prun that
+    # launched the job.
+    if ! prted_dvm_start 'node1:1,node2:2,node3:1,node4:1,node5:1'; then
+        bad "could not start a DVM for the fence timeout test"
+        cleanup_swarm
+        return
+    fi
+    out=$(PRUN "--host node2:2,node3:1,node4:1,node5:1 -n 5 --map-by node $GC --fence --timeout 4 --delay 12 fencegrp 20" 2>&1)
+    n=$(echo "$out" | awk '$1=="GRP" && $2!="4" && $3=="FENCE" && $4=="PMIX_ERR_TIMEOUT"' | wc -l | tr -d ' ')
+    [ "$n" = 4 ] \
+        && ok "the four ranks that called the fence were failed with PMIX_ERR_TIMEOUT" \
+        || bad "$n of 4 ranks that called the fence timed out: $(echo "$out" | tr '\n' ' ' | tail -c 400)"
+    echo "$out" | grep 'did not take part (1)' | grep -q ':4$' \
+        && ok "...and the controller named rank 4, alone, as never taking part" \
+        || bad "the controller did not name rank 4: $(echo "$out" | grep -A1 'did not take part' | tr '\n' ' ' | tail -c 400)"
+    echo "$out" | awk '$1=="GRP" && $2=="4" && $3=="FENCE"' | grep -q 'PMIX_ERR_TIMEOUT' \
+        && ok "rank 4, calling the fence after the deadline, timed out rather than hanging" \
+        || bad "rank 4 did not time out of the fence: $(echo "$out" | awk '$2=="4"' | tr '\n' ' ')"
+    RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
+    cleanup_swarm
 }
 
 test_xcast_grow_new_parent() {
@@ -10246,6 +10652,41 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
         EXEC_SH "$n" 'rm -rf /root/pfsym /root/pfsym.tar /root/pfsym-target' >/dev/null 2>&1
     done
 
+    banner "filem: a refused archive is reported to the tool that sent it, and only that tool"
+    # The refusal is made on each receiving daemon and relayed to the master,
+    # which logs it as its own output - and every tool connected to a
+    # persistent DVM is registered for that. The archive's first chunk names
+    # the job it was sent for, so the master tells only whoever asked for
+    # that job. Here one prun sits idle while another preloads an archive the
+    # daemons on node2 and node3 refuse.
+    EXEC_SH 1 'rm -rf /root/pfdot /root/pfdot.tar && mkdir -p /root/pfdot/a \
+        && echo OUTSIDE > /root/pfdot/x.txt \
+        && tar cf /root/pfdot.tar -C /root/pfdot/a -P ../x.txt' >/dev/null 2>&1
+    if ! RUN 'tar tf /root/pfdot.tar | grep -qx ../x.txt'; then
+        bad "could not build an archive with a .. member on node1"
+    elif prted_dvm_start node1:1,node2:1,node3:1; then
+        PRUN_BG /tmp/pfdot-idle.out -n 1 --host node1 sleep 20
+        sleep 3
+        out=$(RUN "cd /root && timeout -k 5 60 prun --dvm-uri file:$PRTED_URI --host node2:1,node3:1 \
+                     -np 2 --map-by node --preload-files /root/pfdot.tar -- hostname" 2>&1); rc=$?
+        [ "$rc" != 0 ] \
+            && ok "the archive was refused" \
+            || bad "the archive was accepted (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        echo "$out" | grep -q 'x.txt' \
+            && ok "the tool that sent it was told, naming the member" \
+            || bad "the sending tool was not told: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        sleep 20
+        idle=$(RUN 'cat /tmp/pfdot-idle.out 2>/dev/null')
+        echo "$idle" | grep -q 'x.txt\|not unpacked' \
+            && bad "the idle tool was told about another's archive: $(echo "$idle" | tr '\n' ' ' | tail -c 250)" \
+            || ok "the idle tool was not told"
+        RUN "rm -f /tmp/pfdot-idle.out; timeout -k 5 30 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
+    else
+        bad "could not start a DVM for the archive-refusal report"
+    fi
+    cleanup_swarm
+    EXEC_SH 1 'rm -rf /root/pfdot /root/pfdot.tar' >/dev/null 2>&1
+
     fi   # FS_SHARED
     _fl="filem: --preload-files refuses a name that steps out of the directory"
     if [ "$FS_SHARED" != 0 ]; then skp "${_fl}: $WORKDIR is shared, so staging cannot be proved"; else
@@ -12105,6 +12546,20 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
             [ "$(prted_count 1)" = 0 ] \
                 && ok "the controller refused to start without a key" \
                 || bad "controller started without a DVM key"
+        fi
+
+        # prte.conf names the key, the controller and the nodes, so it is
+        # read only if nobody but root or the daemon's own user could have
+        # written it.  One that anybody can write is refused, saying why.
+        if bootstrap_write_conf "node1" "node2,node3,node4" && \
+           bootstrap_vol "chmod 0666 $BOOT_CONF"; then
+            out=$(RUN 'timeout 40 prted --bootstrap 2>&1' || true)
+            echo "$out" | grep -q "can be written by anyone" \
+                && ok "a prte.conf anybody can write is refused with a diagnostic" \
+                || bad "a writable prte.conf was not refused: $(echo "$out" | tr '\n' ' ' | head -c 200)"
+            [ "$(prted_count 1)" = 0 ] \
+                && ok "the controller refused to start on it" \
+                || bad "controller started on a prte.conf anybody can write"
         fi
         bootstrap_restore_conf
         cleanup_swarm

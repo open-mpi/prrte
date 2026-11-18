@@ -374,6 +374,80 @@ PRTE_EXPORT void prte_grpcomm_group_formed(const char *grpid, const pmix_proc_t 
 /* The controller completed a destruct of this ID (master only) */
 PRTE_EXPORT void prte_grpcomm_group_ended(const char *grpid);
 
+/* Do two lists name the same procs? Order and repeats do not matter, and a
+ * namespace's wildcard rank stands for every proc of that job, so it
+ * matches a list of each of them - the comparison the PMIx server makes
+ * between two local calls of one group ID (grp_lists_match). Exported for
+ * the unit test. */
+PRTE_EXPORT bool prte_grpcomm_same_members(const pmix_proc_t *a, size_t na,
+                                           const pmix_proc_t *b, size_t nb);
+
+/* Who took part in a collective that ran out of time.
+ *
+ * A PMIx server hands an operation up with a success status only once every
+ * local member has called, so then there is nothing to say. Only one handed
+ * up timed out - its own timer, or the controller's expiry - is partial, and
+ * then its PMIX_LOCAL_PARTICIPANTS names the local procs that had called, a
+ * namespace all of whose procs on that node had given once as
+ * PMIX_RANK_LOCAL_PEERS. A daemon packs that list, with its own rank so the
+ * controller knows which node "local" was, into a blob; the blobs travel up
+ * the tree unopened, and only the controller reads them. Ordinary operations
+ * carry none, which keeps this off the fence's hot path.
+ *
+ * Hence the controller's rule: a member did not take part if, and only if,
+ * its daemon sent a blob and the blob does not name it. */
+
+/* The blob for this daemon from an upcall's directives. bo is left empty
+ * unless the local status is PMIX_ERR_TIMEOUT - or the call is a bootstrap
+ * leader's or a follower's (solo), each one proc, which the controller
+ * counts by who it is; *known is false when a blob was wanted and the
+ * server sent no list. */
+PRTE_EXPORT pmix_status_t prte_grpcomm_participant_blob(const pmix_info_t *dirs, size_t ndirs,
+                                                        bool solo, pmix_byte_object_t *bo,
+                                                        bool *known);
+
+/* the procs a blob names, as given - the caller frees *procs */
+PRTE_EXPORT pmix_status_t prte_grpcomm_blob_procs(const pmix_byte_object_t *bo,
+                                                  pmix_proc_t **procs, size_t *nprocs);
+
+/* A fence carries its participant blobs in its directives, under this key,
+ * as one byte object holding [known][count][blobs]: its payload is the rest
+ * of the message, so nothing can follow it. */
+#define PRTE_GRPCOMM_PARTICIPANTS "prte.coll.parts"
+
+/* Pack known and the blobs into one byte object, and merge one back into a
+ * tracker's blobs - a byte object that cannot be read leaves who took part
+ * unknown. */
+PRTE_EXPORT pmix_status_t prte_grpcomm_parts_to_bo(bool known, pmix_data_buffer_t *blobs,
+                                                   size_t nblobs, pmix_byte_object_t *bo);
+PRTE_EXPORT void prte_grpcomm_parts_merge(const pmix_value_t *val, pmix_data_buffer_t *blobs,
+                                          size_t *nblobs, bool *unknown);
+
+/* A blob for this daemon naming nobody - a daemon whose PMIx server held
+ * no part of an operation that ran out of time. */
+PRTE_EXPORT pmix_status_t prte_grpcomm_empty_participant_blob(pmix_byte_object_t *bo);
+
+/* The members - the procs a collective names, a namespace's wildcard
+ * standing for its procs, and any added members - that were alive, run under
+ * a daemon that sent one of the nblobs blobs packed one after another in
+ * blobs, and are not named in it.
+ * *out is NULL and *nout 0 when every live member took part; the caller
+ * frees *out. Exported for the unit test. */
+PRTE_EXPORT pmix_status_t prte_grpcomm_nonparticipants(const pmix_proc_t *members, size_t nmembers,
+                                                       const pmix_proc_t *added, size_t nadded,
+                                                       pmix_data_buffer_t *blobs, size_t nblobs,
+                                                       pmix_proc_t **out, size_t *nout);
+
+/* "ns:r, ns:r, ... and N more", naming at most max of them, for a message;
+ * the caller frees it */
+PRTE_EXPORT char *prte_grpcomm_procs_string(const pmix_proc_t *procs, size_t nprocs, size_t max);
+
+/* Does the controller hold a live group of this ID whose members are not
+ * these? A destruct must name the group's own members. */
+PRTE_EXPORT bool prte_grpcomm_group_members_differ(const char *grpid,
+                                                   const pmix_proc_t *members,
+                                                   size_t nmembers);
+
 /* Did this set of participants lose anyone to a failed daemon? Unlike the
  * single-process test, a wildcard entry is expanded through the job map, so
  * a collective whose membership is written as a whole namespace is answered
@@ -562,6 +636,13 @@ typedef struct {
     // a late answer cannot come back to a tracker it already released.
     prte_event_t tev;
     bool tev_active;
+    /* who took part, from the contributions that ran out of time - see
+     * prte_grpcomm_participant_blob() - and whether the operation has been
+     * expired (on the controller) or the expiry asked for (elsewhere) */
+    pmix_data_buffer_t *pblobs;
+    size_t npblobs;
+    bool punknown;
+    bool expired;
     /* callback function */
     pmix_modex_cbfunc_t cbfunc;
     /* user-provided callback data */
@@ -602,6 +683,23 @@ typedef struct {
     // set when an abort has been broadcast for this op but the tracker has
     // not yet been deleted by the returning release
     bool aborting;
+    // set when contributions naming different members reached this tracker
+    // under one ID - see prte_grpcomm_same_members(). The operation then
+    // fails for every participant of either membership
+    bool conflict;
+    // who took part: one packed blob per daemon whose PMIx server reported
+    // its local participants (prte_grpcomm_participant_blob()), gathered up
+    // the tree; punknown once any contribution arrived without a list
+    pmix_data_buffer_t *pblobs;
+    size_t npblobs;
+    bool punknown;
+    // the operation ran out of time: on the controller, the expiry has been
+    // ordered; elsewhere, the controller has been asked for it - each once
+    bool expired;
+    // the bootstrap leaders and followers counted so far, by who they are,
+    // so a repeated call does not count twice
+    pmix_proc_t *solo_seen;
+    size_t nsolo_seen;
 
     /*** BOOTSTRAP TRACKERS ***/
     // "leaders" are group members reporting as
@@ -657,6 +755,10 @@ typedef struct {
     pmix_list_item_t super;
     pmix_info_cbfunc_t cbfunc;
     void *cbdata;
+    // this call named members other than the tracker's, and reached it too
+    // late to fail the operation: it is answered PMIX_ERR_BAD_PARAM, and
+    // never with the group the tracker forms
+    bool conflict;
 } prte_grpcomm_grp_pending_t;
 PMIX_CLASS_DECLARATION(prte_grpcomm_grp_pending_t);
 
@@ -672,6 +774,10 @@ typedef struct {
     prte_grpcomm_fence_purpose_t purpose;
     pmix_modex_cbfunc_t cbfunc;
     void *cbdata;
+    /* PMIX_LOCAL_PARTICIPANTS from the upcall, packed before the
+     * thread-shift - see prte_grpcomm_participant_blob() */
+    pmix_byte_object_t pbo;
+    bool pknown;
 } prte_pmix_fence_caddy_t;
 PMIX_CLASS_DECLARATION(prte_pmix_fence_caddy_t);
 
@@ -839,6 +945,16 @@ PRTE_EXPORT extern
 void prte_grpcomm_grp_release(int status, pmix_proc_t *sender,
                                 	 pmix_data_buffer_t *buffer,
                                 	 prte_rml_tag_t tag, void *cbdata);
+
+/* a fence, connect or disconnect that ran out of time - see "One deadline" */
+PRTE_EXPORT void prte_grpcomm_fence_expire(int status, pmix_proc_t *sender,
+                                           pmix_data_buffer_t *buffer, prte_rml_tag_t tag,
+                                           void *cbdata);
+
+/* a group operation that ran out of time - see "One deadline" in AGENTS.md */
+PRTE_EXPORT void prte_grpcomm_grp_expire(int status, pmix_proc_t *sender,
+                                         pmix_data_buffer_t *buffer, prte_rml_tag_t tag,
+                                         void *cbdata);
 
 END_C_DECLS
 

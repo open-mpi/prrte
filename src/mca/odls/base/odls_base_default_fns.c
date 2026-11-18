@@ -36,6 +36,12 @@
 #    include <sys/wait.h>
 #endif
 #include <errno.h>
+#include <fcntl.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #ifdef HAVE_SYS_STAT_H
 #    include <sys/stat.h>
 #endif /* HAVE_SYS_STAT_H */
@@ -1035,8 +1041,8 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
             goto REPORT_ERROR;
         }
         if (NULL == jdata->schizo) {
-            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-schizo-base.txt", "no-proxy", true,
-                           prte_tool_basename, "NULL");
+            prte_show_help_job(jdata, "help-schizo-base.txt", "no-proxy", true,
+                               prte_tool_basename, "NULL");
             rc = PRTE_ERR_NOT_FOUND;
             goto REPORT_ERROR;
         }
@@ -1066,8 +1072,8 @@ int prte_odls_base_default_construct_child_list(pmix_data_buffer_t *buffer, pmix
         }
         jdata->schizo = (struct prte_schizo_base_module_t*)prte_schizo_base_detect_proxy(tmp);
         if (NULL == jdata->schizo) {
-            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-schizo-base.txt", "no-proxy", true,
-                           prte_tool_basename, (NULL == tmp) ? "NULL" : tmp);
+            prte_show_help_job(jdata, "help-schizo-base.txt", "no-proxy", true,
+                               prte_tool_basename, (NULL == tmp) ? "NULL" : tmp);
             if (NULL != tmp) {
                 free(tmp);
             }
@@ -1316,6 +1322,215 @@ REPORT_ERROR:
     return rc;
 }
 
+/*
+ * The working directory and the executable, checked as the job's owner.
+ *
+ * pmix_util_check_context_cwd() and _app() decide where a job runs and what
+ * it runs - chdir() into the directory, fall back to the home directory when
+ * the directory was not one the user asked for, search PATH for a naked
+ * name, access(X_OK) - and they decide it as whoever calls them. Here that
+ * is the daemon's user, which for a job of another user's is root: a
+ * directory or program only root can reach passed, a naked name could
+ * resolve to one the owner cannot run, the fallback went to root's own home
+ * rather than the owner's, and the daemon itself moved into directories the
+ * user named. So for a job of another user's, each check is made in a
+ * child that is the owner (prte_pmix_server_work_as), and the daemon reads
+ * the answers back. They are two children, at the two places the checks
+ * have always been made: the directory in setup_path(), before anything is
+ * placed in it, and the executable once the job's environment is complete -
+ * the env directives that set its PATH are applied in between. A job of the
+ * daemon's own user is checked in place, as before: the identity is
+ * already the right one, and the launch path pays for no child.
+ *
+ * The child writes a status, then the directory it used, the absolute
+ * directory it ended up in and the executable it resolved, each as a length
+ * and its bytes, into the daemon's temporary file. The owner's home
+ * directory is looked up before the fork: NSS is not safe to call in it.
+ */
+typedef struct {
+    const char *cwd;  /* app->cwd, if there is one */
+    bool check_cwd;   /* decide the directory, or only enter it */
+    bool usercwd;     /* the user asked for that directory */
+    const char *home; /* the owner's home directory, or NULL */
+    const char *app;  /* app->app, NULL if it is not to be checked */
+    char **env;       /* app->env, for its PATH */
+    int out;          /* the daemon's temporary file */
+} prte_odls_owner_check_t;
+
+static int put_bytes(int fd, off_t *off, const void *p, size_t n)
+{
+    const char *b = (const char *) p;
+    ssize_t nw;
+
+    while (0 < n) {
+        nw = pwrite(fd, b, n, *off);
+        if (0 > nw && EINTR == errno) {
+            continue;
+        }
+        if (0 >= nw) {
+            return -1;
+        }
+        b += nw;
+        n -= (size_t) nw;
+        *off += nw;
+    }
+    return 0;
+}
+
+static int put_str(int fd, off_t *off, const char *s)
+{
+    uint32_t len = (NULL == s) ? 0 : (uint32_t) strlen(s);
+
+    if (0 != put_bytes(fd, off, &len, sizeof(len))) {
+        return -1;
+    }
+    return (0 == len) ? 0 : put_bytes(fd, off, s, len);
+}
+
+static int owner_check_fn(void *arg)
+{
+    prte_odls_owner_check_t *oc = (prte_odls_owner_check_t *) arg;
+    int32_t status = PMIX_SUCCESS;
+    const char *used = oc->cwd;
+    char dir[PRTE_PATH_MAX];
+    char *app = NULL;
+    off_t off = 0;
+
+    /* as pmix_util_check_context_cwd() does, but as the owner, and falling
+     * back to the owner's home directory - or, when the directory was
+     * decided already, only entering it, so a relative program is looked
+     * up from there */
+    if (NULL != oc->cwd && 0 != chdir(oc->cwd)) {
+        if (!oc->check_cwd || oc->usercwd) {
+            status = PMIX_ERR_JOB_WDIR_NOT_ACCESSIBLE;
+        } else if (NULL != oc->home) {
+            if (0 != chdir(oc->home)) {
+                status = PMIX_ERR_JOB_WDIR_NOT_ACCESSIBLE;
+            } else {
+                used = oc->home;
+            }
+        }
+    }
+    dir[0] = '\0';
+    if (PMIX_SUCCESS == status && NULL == getcwd(dir, sizeof(dir))) {
+        status = PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    if (PMIX_SUCCESS == status && NULL != oc->app) {
+        app = strdup(oc->app);
+        status = (NULL == app) ? PRTE_ERR_OUT_OF_RESOURCE
+                               : pmix_util_check_context_app(&app, (char *) used, oc->env);
+    }
+    if (0 != put_bytes(oc->out, &off, &status, sizeof(status)) ||
+        0 != put_str(oc->out, &off, used) || 0 != put_str(oc->out, &off, dir) ||
+        0 != put_str(oc->out, &off, app)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int get_str(int fd, off_t *off, char **s)
+{
+    uint32_t len;
+
+    *s = NULL;
+    if (sizeof(len) != pread(fd, &len, sizeof(len), *off)) {
+        return -1;
+    }
+    *off += sizeof(len);
+    if (0 == len) {
+        return 0;
+    }
+    if (4 * PRTE_PATH_MAX < len || NULL == (*s = (char *) malloc(len + 1))) {
+        return -1;
+    }
+    if ((ssize_t) len != pread(fd, *s, len, *off)) {
+        free(*s);
+        *s = NULL;
+        return -1;
+    }
+    (*s)[len] = '\0';
+    *off += len;
+    return 0;
+}
+
+int prte_odls_base_check_as_owner(prte_app_context_t *app, char **wdir, uid_t uid, gid_t gid,
+                                  bool usercwd, bool check_cwd, bool check_app)
+{
+    prte_odls_owner_check_t oc;
+    struct passwd pwd, *pwp = NULL;
+    char pwbuf[4096];
+    char *used = NULL, *dir = NULL, *exe = NULL;
+    int32_t status;
+    off_t off = 0;
+    FILE *tf;
+    int rc;
+
+    memset(&oc, 0, sizeof(oc));
+    oc.cwd = app->cwd;
+    oc.check_cwd = check_cwd;
+    oc.usercwd = usercwd;
+    if (0 == getpwuid_r(uid, &pwd, pwbuf, sizeof(pwbuf), &pwp) && NULL != pwp) {
+        oc.home = pwp->pw_dir;
+    }
+    oc.app = check_app ? app->app : NULL;
+    oc.env = app->env;
+    tf = tmpfile();
+    if (NULL == tf) {
+        return PRTE_ERR_OUT_OF_RESOURCE;
+    }
+    /* nothing we launch should inherit it */
+    (void) fcntl(fileno(tf), F_SETFD, FD_CLOEXEC);
+    oc.out = fileno(tf);
+    if (0 != prte_pmix_server_work_as(uid, gid, owner_check_fn, &oc)) {
+        /* it did not answer in time - the directory is on a filesystem
+         * that has stopped answering - or could not be run */
+        fclose(tf);
+        return PMIX_ERR_JOB_WDIR_NOT_ACCESSIBLE;
+    }
+    if (sizeof(status) != pread(fileno(tf), &status, sizeof(status), 0)) {
+        fclose(tf);
+        return PRTE_ERROR;
+    }
+    off = sizeof(status);
+    if (0 != get_str(fileno(tf), &off, &used) || 0 != get_str(fileno(tf), &off, &dir) ||
+        0 != get_str(fileno(tf), &off, &exe)) {
+        fclose(tf);
+        free(used);
+        free(dir);
+        free(exe);
+        return PRTE_ERROR;
+    }
+    fclose(tf);
+    rc = status;
+    if (PMIX_SUCCESS == rc && check_cwd) {
+        /* the directory the job runs in: the fallback, if it came to that */
+        if (NULL != used && (NULL == app->cwd || 0 != strcmp(used, app->cwd))) {
+            free(app->cwd);
+            app->cwd = used;
+            used = NULL;
+        }
+        if (NULL != dir && NULL != wdir) {
+            if (NULL != *wdir) {
+                free(*wdir);
+            }
+            *wdir = dir;
+            PMIx_Setenv("PWD", dir, true, &app->env);
+            dir = NULL;
+        }
+    }
+    if (PMIX_SUCCESS == rc) {
+        if (NULL != exe) {
+            free(app->app);
+            app->app = exe;
+            exe = NULL;
+        }
+    }
+    free(used);
+    free(dir);
+    free(exe);
+    return rc;
+}
+
 static int setup_path(prte_job_t *job, prte_app_context_t *app, char **wdir)
 {
     int rc = PRTE_SUCCESS;
@@ -1361,6 +1576,21 @@ static int setup_path(prte_job_t *job, prte_app_context_t *app, char **wdir)
         */
         if (PRTE_ATTR_IS_TRUE(&app->attributes, PRTE_APP_USER_CWD)) {
             usercwd = true;
+        }
+        /* a job of another user's is checked as that user - see
+         * prte_odls_base_check_as_owner(). Its executable is checked later,
+         * where everyone's is: the job's environment, and with it its PATH,
+         * is not complete until the env directives have been applied */
+        {
+            uid_t uid;
+            gid_t gid;
+            bool change = false;
+
+            if (NULL != job &&
+                PRTE_SUCCESS == prte_pmix_server_job_run_as(job, &uid, &gid, &change) && change) {
+                rc = prte_odls_base_check_as_owner(app, wdir, uid, gid, usercwd, true, false);
+                goto CLEANUP;
+            }
         }
         rc = pmix_util_check_context_cwd(&app->cwd, true, usercwd);
         if (PMIX_SUCCESS != rc) {
@@ -1669,8 +1899,9 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
         }
         cd->cmd = pmix_path_findv(cd->argv[0], X_OK, prte_launch_environ, NULL);
         if (NULL == cd->cmd) {
-            prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt", "prte-odls-base:fork-agent-not-found", true,
-                           prte_process_info.nodename, ptr);
+            prte_show_help_job(jobdat, "help-prte-odls-base.txt",
+                               "prte-odls-base:fork-agent-not-found", true,
+                               prte_process_info.nodename, ptr);
             rc = PRTE_ERR_NOT_FOUND;
             state = PRTE_PROC_STATE_FAILED_TO_LAUNCH;
             goto errorout;
@@ -1684,8 +1915,9 @@ void prte_odls_base_spawn_proc(int fd, short sd, void *cbdata)
         }
         cd->cmd = pmix_path_findv(cd->argv[0], X_OK, prte_launch_environ, NULL);
         if (NULL == cd->cmd) {
-            prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt", "prte-odls-base:fork-agent-not-found", true,
-                           prte_process_info.nodename, cd->argv[0]);
+            prte_show_help_job(jobdat, "help-prte-odls-base.txt",
+                               "prte-odls-base:fork-agent-not-found", true,
+                               prte_process_info.nodename, cd->argv[0]);
             rc = PRTE_ERR_NOT_FOUND;
             state = PRTE_PROC_STATE_FAILED_TO_LAUNCH;
             goto errorout;
@@ -2038,16 +2270,16 @@ static int spawn_caddy_credentials(prte_odls_spawn_caddy_t *cd, prte_job_t *jobd
     cd->cred_switch = false;
     rc = prte_pmix_server_job_run_as(jobdat, &cd->cred_uid, &cd->cred_gid, &change);
     if (PRTE_ERR_PERM == rc) {
-        prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt", "run-as-refused",
-                       true, prte_process_info.nodename, PRTE_JOB_NSPACE(jobdat),
-                       (unsigned long) prte_pmix_server_job_owner(jobdat),
-                       (unsigned long) prte_process_info.euid);
+        prte_show_help_job(jobdat, "help-prte-odls-base.txt", "run-as-refused",
+                           true, prte_process_info.nodename, PRTE_JOB_NSPACE(jobdat),
+                           (unsigned long) prte_pmix_server_job_owner(jobdat),
+                           (unsigned long) prte_process_info.euid);
         return PRTE_ERR_SILENT;
     }
     if (PRTE_SUCCESS != rc) {
-        prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt", "run-as-no-group",
-                       true, prte_process_info.nodename, PRTE_JOB_NSPACE(jobdat),
-                       (unsigned long) prte_pmix_server_job_owner(jobdat));
+        prte_show_help_job(jobdat, "help-prte-odls-base.txt", "run-as-no-group",
+                           true, prte_process_info.nodename, PRTE_JOB_NSPACE(jobdat),
+                           (unsigned long) prte_pmix_server_job_owner(jobdat));
         return PRTE_ERR_SILENT;
     }
     if (!change) {
@@ -2119,8 +2351,8 @@ static int xterm_select(prte_odls_spawn_caddy_t *cd, prte_job_t *jobdat, prte_pr
     }
     rc = prte_parse_xterm_option(cd->xterm_spec, &ranges, &nranges, &all, &hold, &badrank);
     if (PRTE_ERR_VALUE_OUT_OF_BOUNDS == rc) {
-        prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt",
-                       "prte-odls-base:xterm-neg-rank", true, (int) badrank);
+        prte_show_help_job(jobdat, "help-prte-odls-base.txt",
+                           "prte-odls-base:xterm-neg-rank", true, (int) badrank);
         return PRTE_ERR_BAD_PARAM;
     } else if (PRTE_SUCCESS != rc) {
         PRTE_ERROR_LOG(rc);
@@ -2128,10 +2360,10 @@ static int xterm_select(prte_odls_spawn_caddy_t *cd, prte_job_t *jobdat, prte_pr
     }
     for (n = 0; n < nranges; n++) {
         if (jobdat->num_procs <= ranges[n].hi) {
-            prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt",
-                           "prte-odls-base:xterm-rank-out-of-bounds", true,
-                           prte_process_info.nodename, (int) ranges[n].hi,
-                           (int) jobdat->num_procs);
+            prte_show_help_job(jobdat, "help-prte-odls-base.txt",
+                               "prte-odls-base:xterm-rank-out-of-bounds", true,
+                               prte_process_info.nodename, (int) ranges[n].hi,
+                               (int) jobdat->num_procs);
             free(ranges);
             return PRTE_ERR_BAD_PARAM;
         }
@@ -2144,8 +2376,8 @@ static int xterm_select(prte_odls_spawn_caddy_t *cd, prte_job_t *jobdat, prte_pr
 
     path = pmix_find_absolute_path("xterm");
     if (NULL == path) {
-        prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-base.txt",
-                       "prte-odls-base:xterm-not-found", true, prte_process_info.nodename);
+        prte_show_help_job(jobdat, "help-prte-odls-base.txt",
+                           "prte-odls-base:xterm-not-found", true, prte_process_info.nodename);
         return PRTE_ERR_NOT_FOUND;
     }
     PMIx_Argv_append_nosize(&cd->xterm_argv, path);
@@ -2414,7 +2646,24 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
             goto GETOUT;
         }
 
-        rc = pmix_util_check_context_app(&app->app, app->cwd, app->env);
+        /* found and checked as the job's owner, for a job of another
+         * user's (prte_odls_base_check_as_owner): here, with the job's
+         * environment complete, so it is searched for on the PATH the job
+         * will have. Folded into setup_path(), it was searched for before
+         * the env directives were applied, and a PATH given with -x was
+         * not the one searched. */
+        {
+            uid_t ouid;
+            gid_t ogid;
+            bool change = false;
+
+            if (PRTE_SUCCESS == prte_pmix_server_job_run_as(jobdat, &ouid, &ogid, &change) &&
+                change) {
+                rc = prte_odls_base_check_as_owner(app, NULL, ouid, ogid, false, false, true);
+            } else {
+                rc = pmix_util_check_context_app(&app->app, app->cwd, app->env);
+            }
+        }
         /* do not ERROR_LOG - it will be reported elsewhere */
         if (PMIX_SUCCESS != rc) {
             /* Deliberately NOT converted - see the note in setup_path().
@@ -2431,8 +2680,8 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
         if (PRTE_SUCCESS != (rc = prte_util_init_sys_limits(&msg))) {
             /* the "Application name" field is a %s - pass the app's
              * executable, not the app_context object itself */
-            prte_show_help(PRTE_JOB_NSPACE(jobdat), "help-prte-odls-default.txt", "set limit", true,
-                           prte_process_info.nodename, app->app, __FILE__, __LINE__, msg);
+            prte_show_help_job(jobdat, "help-prte-odls-default.txt", "set limit", true,
+                               prte_process_info.nodename, app->app, __FILE__, __LINE__, msg);
             /* flag this app's procs and abort the whole job (see setup_fork) */
             PRTE_ODLS_SET_ERROR(job, rc, j);
             PRTE_ACTIVATE_JOB_STATE(jobdat, PRTE_JOB_STATE_FAILED_TO_LAUNCH);

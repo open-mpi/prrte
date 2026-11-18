@@ -18,6 +18,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #include "src/class/pmix_list.h"
@@ -69,8 +70,8 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
     char *hosts, **hostlist = NULL;
     bool check;
     prte_app_context_t *app;
-    uid_t uid;
-    gid_t gid;
+    pmix_info_t *req = NULL;
+    size_t nreq = 0;
 
     /* We first see if we were given a rank/seqfile - if so, use it
      * as the hosts will be taken from the mapping */
@@ -81,9 +82,12 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
                              "%s ras:hosts:allocate parsing rank/seqfile %s",
                              PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), hosts));
 
-        /* a rank/seqfile was provided - parse it, as the job's owner */
-        prte_pmix_server_job_user(jdata, &uid, &gid);
-        rc = prte_util_add_hostfile_nodes(nodes, hosts, uid, gid);
+        /* a rank/seqfile was provided - parse it, for the job's owner */
+        rc = prte_requester_info_job(jdata, &req, &nreq);
+        if (PRTE_SUCCESS == rc) {
+            rc = prte_util_add_hostfile_nodes(nodes, hosts, req, nreq);
+            PMIX_INFO_FREE(req, nreq);
+        }
         if (PRTE_SUCCESS != rc) {
             free(hosts);
             return rc;
@@ -125,7 +129,11 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
             PMIX_OUTPUT_VERBOSE((5, prte_ras_base_framework.framework_output,
                                  "%s ras:base:allocate adding dash_hosts",
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
-            rc = prte_util_add_dash_host_nodes(nodes, hosts);
+            rc = prte_requester_info_job(jdata, &req, &nreq);
+            if (PRTE_SUCCESS == rc) {
+                rc = prte_util_add_dash_host_nodes(nodes, hosts, req, nreq);
+                PMIX_INFO_FREE(req, nreq);
+            }
             if (PRTE_SUCCESS != rc) {
                 free(hosts);
                 return rc;
@@ -180,20 +188,23 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
                  * here with one.)  The user asked for specific hosts and named
                  * none, so say so rather than carrying on with an allocation
                  * they did not ask for. */
-                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-hostfile.txt", "no-hostfile", true, hosts);
+                prte_show_help_job(jdata, "help-hostfile.txt", "no-hostfile", true, hosts);
                 free(hosts);
                 return PRTE_ERR_SILENT;
             }
             free(hosts);
-            /* read as the job's owner, who named them */
-            prte_pmix_server_job_user(jdata, &uid, &gid);
-            for (j=0; NULL != hostlist[j]; j++) {
-                if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(nodes, hostlist[j], uid, gid))) {
-                    PMIx_Argv_free(hostlist);
-                    return rc;
-                }
+            /* read for the job's owner, who named them */
+            rc = prte_requester_info_job(jdata, &req, &nreq);
+            for (j = 0; PRTE_SUCCESS == rc && NULL != hostlist[j]; j++) {
+                rc = prte_util_add_hostfile_nodes(nodes, hostlist[j], req, nreq);
+            }
+            if (NULL != req) {
+                PMIX_INFO_FREE(req, nreq);
             }
             PMIx_Argv_free(hostlist);
+            if (PRTE_SUCCESS != rc) {
+                return rc;
+            }
         }
     }
 
@@ -212,8 +223,7 @@ static int allocate(prte_job_t *jdata, pmix_list_t *nodes)
         /* a default hostfile was provided - parse it. It is the DVM's own
          * configuration, so read as ourselves */
         if (PRTE_SUCCESS != (rc = prte_util_add_hostfile_nodes(nodes, prte_default_hostfile,
-                                                               prte_process_info.euid,
-                                                               prte_process_info.egid))) {
+                                                               NULL, 0))) {
             return rc;
         }
     }
@@ -306,12 +316,15 @@ static bool parse_slots(const char *value, int *result)
     return true;
 }
 
-/* Read the hosts a request adds from hostfile, as uid/gid - whoever named
- * it. What is wrong with the file is said to nspace: the job a spawn's
- * --add-hostfile came with, whose tool is waiting on it. */
-static pmix_status_t read_hostfile(const char *nspace, char *hostfile, pmix_list_t *nodes,
-                                   uid_t uid, gid_t gid, prte_node_index_t *pidx)
+/* Read the hosts a request adds from hostfile, for the requester rq
+ * describes: as their user and group, and what is wrong with the file is
+ * told to them - the tool behind the job a spawn's --add-hostfile came
+ * with, or that made the allocation request. */
+static pmix_status_t read_hostfile(const pmix_info_t *rq, size_t nrq, char *hostfile,
+                                   pmix_list_t *nodes, prte_node_index_t *pidx)
 {
+    uid_t uid;
+    gid_t gid;
     prte_textfile_t tf;
     char *line, *cptr, *ptr, *ndname;
     bool addslots, failed = false;
@@ -325,14 +338,16 @@ static pmix_status_t read_hostfile(const char *nspace, char *hostfile, pmix_list
      * of a FIFO with no writer would block that thread for good, so the
      * open is non-blocking and only a regular file is read - and it is
      * made as whoever named the file */
+    prte_requester_ids(rq, nrq, &uid, &gid);
     rc = prte_textfile_open(&tf, hostfile, uid, gid);
     if (PRTE_ERR_BAD_PARAM == rc) {
-        prte_show_help(nspace, "help-ras-base.txt",
+        prte_show_help_info(rq, nrq, "help-ras-base.txt",
                        "ras-base:addhost-not-a-file", true, hostfile);
         return PMIX_ERR_SILENT;
     }
     if (PRTE_SUCCESS != rc) {
-        prte_show_help(nspace, "help-ras-base.txt", "ras-base:addhost-not-found", true, hostfile);
+        prte_show_help_info(rq, nrq, "help-ras-base.txt", "ras-base:addhost-not-found", true,
+                            hostfile);
         return PMIX_ERR_SILENT;
     }
     /* a line at a time, within the limits every file we read is held to
@@ -396,7 +411,7 @@ static pmix_status_t read_hostfile(const char *nspace, char *hostfile, pmix_list
             addslots = true;
         }
         if (!parse_slots(ptr, &slots)) {
-            prte_show_help(nspace, "help-ras-base.txt", "ras-base:bad-slots", true,
+            prte_show_help_info(rq, nrq, "help-ras-base.txt", "ras-base:bad-slots", true,
                            cptr, hostfile, ptr);
             prte_textfile_close(&tf);
             free(line);
@@ -413,14 +428,14 @@ process:
          * a host can have. */
         ndname = cptr;
         if (NULL != strchr(ndname, '@')) {
-            prte_show_help(nspace, "help-ras-base.txt",
+            prte_show_help_info(rq, nrq, "help-ras-base.txt",
                            "ras-base:addhost-user-host", true, cptr, hostfile);
             prte_textfile_close(&tf);
             free(line);
             return PMIX_ERR_BAD_PARAM;
         }
         if (!prte_util_host_name_ok(ndname)) {
-            prte_show_help(nspace, "help-ras-base.txt",
+            prte_show_help_info(rq, nrq, "help-ras-base.txt",
                            "ras-base:addhost-bad-name", true, cptr, hostfile);
             prte_textfile_close(&tf);
             free(line);
@@ -457,7 +472,7 @@ process:
             } else if (0 > slots && -1 != slots) {
                 // cannot have a new node with negative slots - the -1
                 // is a marker for a node without slots being specified
-                prte_show_help(nspace, "help-ras-base.txt", "negative-slots", true,
+                prte_show_help_info(rq, nrq, "help-ras-base.txt", "negative-slots", true,
                                ndname, slots);
                 PMIX_RELEASE(node);
                 free(line);
@@ -471,8 +486,8 @@ process:
     failed = tf.failed;
     prte_textfile_close(&tf);
     if (failed) {
-        if (!prte_textfile_report_limit(&tf, nspace, hostfile)) {
-            prte_show_help(nspace, "help-prte-util.txt", "file-read-failed", true, hostfile);
+        if (!prte_textfile_report_limit(&tf, rq, nrq, hostfile)) {
+            prte_show_help_info(rq, nrq, "help-prte-util.txt", "file-read-failed", true, hostfile);
         }
         return PMIX_ERR_SILENT;
     }
@@ -483,8 +498,8 @@ process:
  * the pool (prte_node_index_t) rather than walking the pool once per line,
  * which made a long file quadratic. Nothing here changes the pool: new
  * nodes go on the caller's list, for prte_ras_base_node_insert(). */
-static pmix_status_t process_hostfile(const char *nspace, char *hostfile, pmix_list_t *nodes,
-                                      uid_t uid, gid_t gid)
+static pmix_status_t process_hostfile(const pmix_info_t *rq, size_t nrq, char *hostfile,
+                                      pmix_list_t *nodes)
 {
     prte_node_index_t pidx;
     pmix_status_t rc;
@@ -494,32 +509,65 @@ static pmix_status_t process_hostfile(const char *nspace, char *hostfile, pmix_l
         prte_node_index_destruct(&pidx);
         return PMIX_ERR_OUT_OF_RESOURCE;
     }
-    rc = read_hostfile(nspace, hostfile, nodes, uid, gid, &pidx);
+    rc = read_hostfile(rq, nrq, hostfile, nodes, &pidx);
     prte_node_index_destruct(&pidx);
     return rc;
 }
 
-static pmix_status_t modify(prte_pmix_server_req_t *req)
+/* Whether a PMIX_ALLOC_NEW creates a reservation, and so needs an id: an
+ * add-host grows the general pool, and a request to share the nodes puts
+ * them there (see ras_base_prepare_grow), and neither has an allocation to
+ * name. */
+static bool makes_reservation(const prte_pmix_server_req_t *req)
+{
+    size_t n;
+
+    for (n = 0; n < req->ninfo; n++) {
+        if (PMIx_Check_key(req->info[n].key, PMIX_ADD_HOST) ||
+            PMIx_Check_key(req->info[n].key, PMIX_ADD_HOSTFILE)) {
+            return false;
+        }
+#if defined(PMIX_ALLOC_SHARE)
+        if (PMIx_Check_key(req->info[n].key, PMIX_ALLOC_SHARE) &&
+            PMIX_INFO_TRUE(&req->info[n])) {
+            return false;
+        }
+#endif
+    }
+    return true;
+}
+
+/* With no scheduler, this component grants the allocation, so it assigns
+ * the allocation's PMIX_ALLOC_ID - as a scheduler's answer would carry one.
+ * The ids are numbers counted from 1, skipping any already naming a
+ * reservation. The id is added to the request's info, where
+ * prte_ras_base_complete_request() records it with the reservation, along
+ * with the requester's PMIX_ALLOC_REQ_ID, and returns both. */
+static uint32_t hosts_alloc_counter = 0;
+
+static pmix_status_t assign_alloc_id(prte_pmix_server_req_t *req)
+{
+    char id[16];
+
+    do {
+        if (0 == ++hosts_alloc_counter) {
+            hosts_alloc_counter = 1;
+        }
+        snprintf(id, sizeof(id), "%u", hosts_alloc_counter);
+    } while (prte_session_alloc_id_in_use(id));
+
+    return prte_ras_base_add_alloc_id(req, id);
+}
+
+static pmix_status_t modify_for(prte_pmix_server_req_t *req, const pmix_info_t *rq, size_t nrq)
 {
     int rc;
     pmix_list_t nodes;
     size_t n, k;
     char **hostfiles;
     bool handled = false;
-    uid_t uid;
-    gid_t gid;
-    const char *nspace = PRTE_PROC_MY_NAME->nspace;
 
     PMIX_CONSTRUCT(&nodes, pmix_list_t);
-
-    /* A file of hosts is read as whoever named it: the owner of the job a
-     * spawn's add-hostfile came with, or the requester of an allocation. */
-    if (NULL != req->jdata) {
-        prte_pmix_server_job_user(req->jdata, &uid, &gid);
-        nspace = PRTE_JOB_NSPACE(req->jdata);
-    } else {
-        prte_pmix_server_request_user(req->info, req->ninfo, &uid, &gid);
-    }
 
     // look for applicable directives
     for (n=0; n < req->ninfo; n++) {
@@ -538,7 +586,7 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
                 continue;
             }
             for (k=0; NULL != hostfiles[k]; k++) {
-                rc = process_hostfile(nspace, hostfiles[k], &nodes, uid, gid);
+                rc = process_hostfile(rq, nrq, hostfiles[k], &nodes);
                 if (PMIX_SUCCESS != rc) {
                     PMIX_LIST_DESTRUCT(&nodes);
                     PMIx_Argv_free(hostfiles);
@@ -561,7 +609,7 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
             }
             // comma-delimited list of hosts to add or delete
             PMIX_CONSTRUCT(&dhnodes, pmix_list_t);
-            rc = prte_util_add_dash_host_nodes(&dhnodes, req->info[n].value.data.string);
+            rc = prte_util_add_dash_host_nodes(&dhnodes, req->info[n].value.data.string, rq, nrq);
             if (PRTE_SUCCESS != rc) {
                 PRTE_ERROR_LOG(rc);
                 PMIX_LIST_DESTRUCT(&dhnodes);
@@ -611,9 +659,21 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
      * It also makes our answer say whom the allocation is for, as every
      * module's must: there is no scheduler here to ask, so the allocation is
      * granted for exactly the PMIX_ALLOC_UID/GID the request carries, which
-     * prte_ras_base_alloc_owner checked or filled in before we were called. */
+     * prte_ras_base_alloc_owner checked or filled in before we were called.
+     *
+     * A PMIX_ALLOC_NEW that creates a reservation is given its PMIX_ALLOC_ID
+     * here (assign_alloc_id). */
     switch (req->allocdir) {
     case PMIX_ALLOC_NEW:
+        if (makes_reservation(req)) {
+            rc = assign_alloc_id(req);
+            if (PMIX_SUCCESS != rc) {
+                req->pstatus = rc;
+                return rc;
+            }
+        }
+        handled = true;
+        break;
     case PMIX_ALLOC_EXTEND:
     case PMIX_ALLOC_RELEASE:
         handled = true;
@@ -628,4 +688,31 @@ static pmix_status_t modify(prte_pmix_server_req_t *req)
         return PMIX_OPERATION_SUCCEEDED;
     }
     return PMIX_ERR_TAKE_NEXT_OPTION;
+}
+
+/* A file or host list a request names is read as whoever named it - the
+ * owner of the job a spawn's add-hostfile came with, or the requester of
+ * an allocation - and what is wrong with it is told to them. */
+static pmix_status_t modify(prte_pmix_server_req_t *req)
+{
+    pmix_info_t *rq;
+    size_t nrq;
+    pmix_status_t rc;
+    uid_t uid;
+    gid_t gid;
+    int prc;
+
+    if (NULL != req->jdata) {
+        prc = prte_requester_info_job(req->jdata, &rq, &nrq);
+    } else {
+        prte_pmix_server_request_user(req->info, req->ninfo, &uid, &gid);
+        prc = prte_requester_info_proc(&req->tproc, uid, gid, &rq, &nrq);
+    }
+    if (PRTE_SUCCESS != prc) {
+        req->pstatus = prte_pmix_convert_rc(prc);
+        return req->pstatus;
+    }
+    rc = modify_for(req, rq, nrq);
+    PMIX_INFO_FREE(rq, nrq);
+    return rc;
 }

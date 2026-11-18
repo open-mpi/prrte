@@ -579,8 +579,8 @@ static pmix_status_t parse_directives(prte_pmix_server_req_t *req,
         /* A host naming an account to reach it as: the DVM reaches every
          * node as its own user and runs no daemon as another, so this is
          * refused from anyone, as it is in every other list of hosts */
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt", "ras-base:user-host",
-                       true, "SESSION CONTROL");
+        prte_show_help_proc(&req->tproc, "help-ras-base.txt", "ras-base:user-host",
+                            true, "SESSION CONTROL");
         return PMIX_ERR_BAD_PARAM;
     }
     if (1 < ctl->nops) {
@@ -859,7 +859,7 @@ static pmix_status_t session_extend(prte_session_t *session, prte_sessctrl_t *ct
     if (NULL != ctl->nodelists) {
         pmix_status_t prc = PMIX_SUCCESS;
         for (i = 0; NULL != ctl->nodelists[i]; i++) {
-            ret = prte_ras_base_insert_node_string(ctl->nodelists[i], session);
+            ret = prte_ras_base_insert_node_string(ctl->nodelists[i], session, &ctl->requestor);
             if (PRTE_SUCCESS != ret) {
                 PRTE_ERROR_LOG(ret);
                 prc = prte_pmix_convert_rc(ret);
@@ -933,9 +933,9 @@ static prte_job_t *build_session_job(prte_sessctrl_t *ctl, prte_session_t *sessi
         /* no component claims the requested personality. Every later use of
          * jdata->schizo is an unchecked dereference, so refuse here rather
          * than dereference a NULL module later */
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-schizo-base.txt", "no-proxy", true, prte_tool_basename,
-                       (NULL == ctl->personality) ? "NULL"
-                                                  : ctl->personality->value.data.string);
+        prte_show_help_proc(&ctl->requestor, "help-schizo-base.txt", "no-proxy", true,
+                            prte_tool_basename,
+                            (NULL == ctl->personality) ? "NULL" : ctl->personality->value.data.string);
         *status = PMIX_ERR_NOT_FOUND;
         goto error;
     }
@@ -1196,7 +1196,27 @@ static pmix_status_t session_instantiate(prte_pmix_server_req_t *req,
          * default (unreserved) pool - neither can be instantiated */
         return PMIX_ERR_BAD_PARAM;
     }
-    if (NULL != prte_get_session_object(req->sessionID)) {
+    if (prte_session_id_in_use(req->sessionID)) {
+        return PMIX_ERR_EXISTS;
+    }
+    /* The scheduler names the allocation it is instantiating with its own
+     * PMIX_ALLOC_ID, which is how the session is named in allocation
+     * requests from then on - the DVM has no id of its own to give it.
+     * Keeping the ids unique is the scheduler's job, but one that already
+     * names a session would leave both unreachable by it. */
+    if (NULL == ctl->alloc_refid) {
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s session ctrl: instantiate of session %u names no "
+                            "allocation id (PMIX_ALLOC_ID)",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), req->sessionID);
+        return PMIX_ERR_BAD_PARAM;
+    }
+    if (prte_session_alloc_id_in_use(ctl->alloc_refid)) {
+        pmix_output_verbose(2, prte_pmix_server_globals.output,
+                            "%s session ctrl: instantiate of session %u names allocation "
+                            "id %s, which another session already has",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), req->sessionID,
+                            ctl->alloc_refid);
         return PMIX_ERR_EXISTS;
     }
     if (NULL != ctl->apps && NULL == ctl->nodelists) {
@@ -1241,18 +1261,19 @@ static pmix_status_t session_instantiate(prte_pmix_server_req_t *req,
          * reservation and persists until explicitly terminated. */
         session->flags |= PRTE_SESSION_FLAG_AUTO_COMPLETE;
     }
-    if (NULL != ctl->alloc_refid) {
-        session->alloc_refid = strdup(ctl->alloc_refid);
-    } else {
-        pmix_asprintf(&session->alloc_refid, "%s.%u", ctl->requestor.nspace,
-                      session->session_id);
-    }
+    session->alloc_refid = strdup(ctl->alloc_refid);
     if (NULL != ctl->user_refid) {
         session->user_refid = strdup(ctl->user_refid);
+    }
+    if (NULL == session->alloc_refid ||
+        (NULL != ctl->user_refid && NULL == session->user_refid)) {
+        PMIX_RELEASE(session);
+        return PMIX_ERR_NOMEM;
     }
     session->inheritance = ctl->inheritance;
     PMIX_LOAD_NSPACE(session->owner, ctl->requestor.nspace);
     PMIX_XFER_PROCID(&session->requestor, &ctl->requestor);
+    prte_session_set_requested_by(session, &ctl->requestor);
     {
         prte_job_t *reqjob = prte_get_job_data_object(ctl->requestor.nspace);
 
@@ -1286,7 +1307,7 @@ static pmix_status_t session_instantiate(prte_pmix_server_req_t *req,
      * withheld from general use by their session backpointer. */
     if (NULL != ctl->nodelists) {
         for (i = 0; NULL != ctl->nodelists[i]; i++) {
-            ret = prte_ras_base_insert_node_string(ctl->nodelists[i], session);
+            ret = prte_ras_base_insert_node_string(ctl->nodelists[i], session, &ctl->requestor);
             if (PRTE_SUCCESS != ret) {
                 PRTE_ERROR_LOG(ret);
                 rc = prte_pmix_convert_rc(ret);
@@ -1468,6 +1489,11 @@ static pmix_status_t apply_to_all(prte_pmix_server_req_t *req,
         if (NULL == session || session == prte_default_session) {
             continue;
         }
+        /* a pending allocation has nothing in it to operate on yet - the
+         * scheduler has not granted it (PRTE_SESSION_FLAG_PENDING) */
+        if (PRTE_FLAG_TEST(session, PRTE_SESSION_FLAG_PENDING)) {
+            continue;
+        }
         if (!AUTHORIZED(session, req)) {
             continue;
         }
@@ -1512,11 +1538,11 @@ static bool grant_permitted(prte_pmix_server_req_t *req, prte_sessctrl_t *ctl)
 
     ok = prte_pmix_server_dvm_permitted(&req->tproc, req->info, req->ninfo);
     if (!ok && NULL != ctl->nodelists) {
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-ras-base.txt",
-                       "ras-base:grow-not-permitted", true,
-                       (PRTE_SESSCTRL_INSTANTIATE == ctl->op) ? "SESSION INSTANTIATE"
+        prte_show_help_proc(&req->tproc, "help-ras-base.txt",
+                            "ras-base:grow-not-permitted", true,
+                            (PRTE_SESSCTRL_INSTANTIATE == ctl->op) ? "SESSION INSTANTIATE"
                                                          : "SESSION EXTEND",
-                       "hosts");
+                            "hosts");
     }
     return ok;
 }

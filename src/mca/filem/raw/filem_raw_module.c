@@ -652,8 +652,8 @@ static int raw_preposition_files(prte_job_t *jdata,
         if (NULL == fs->remote_target || '\0' == fs->remote_target[0] ||
             0 == strcmp(fs->remote_target, ".") ||
             prte_filem_base_has_dotdot(fs->remote_target)) {
-            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-filem-raw.txt", "preload-bad-path", true,
-                           fs->local_target);
+            prte_show_help_job(jdata, "help-prte-filem-raw.txt", "preload-bad-path", true,
+                               fs->local_target);
             PMIX_LIST_DESTRUCT(&fsets);
             if (NULL != cbfunc) {
                 cbfunc(PRTE_ERR_BAD_PARAM, cbdata);
@@ -677,8 +677,8 @@ static int raw_preposition_files(prte_job_t *jdata,
             prte_filem_base_file_set_t *fs2 = (prte_filem_base_file_set_t *) itm;
             if (0 == strcmp(fs->remote_target, fs2->remote_target) &&
                 !same_source(fs->local_target, fs2->local_target)) {
-                prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-filem-raw.txt", "preload-name-clash", true,
-                               fs->local_target, fs2->local_target, fs->remote_target);
+                prte_show_help_job(jdata, "help-prte-filem-raw.txt", "preload-name-clash", true,
+                                   fs->local_target, fs2->local_target, fs->remote_target);
                 PMIX_LIST_DESTRUCT(&fsets);
                 if (NULL != cbfunc) {
                     cbfunc(PRTE_ERR_PRELOAD_CONFLICT, cbdata);
@@ -830,6 +830,7 @@ static int raw_preposition_files(prte_job_t *jdata,
         }
 
         xfer = PMIX_NEW(prte_filem_raw_xfer_t);
+        PMIX_LOAD_NSPACE(xfer->nspace, jdata->nspace);
         /* every daemon in the DVM as it stands right now is a target of the
          * broadcast about to start, and is therefore expected to ack.  The
          * set is fixed here rather than re-read as acks arrive - see
@@ -1014,7 +1015,7 @@ done:
  * We refuse to overwrite anything that is not already exactly what we
  * would have written - see same_contents().
  */
-static int place_file(char *my_dir, char *wdir, char *fname)
+static int place_file(const pmix_nspace_t nspace, char *my_dir, char *wdir, char *fname)
 {
     char *src = NULL, *dest = NULL, *tmpname = NULL, *subdir = NULL;
     const char *leaf;
@@ -1080,7 +1081,7 @@ static int place_file(char *my_dir, char *wdir, char *fname)
                                  PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), fname, dest));
             goto cleanup;
         }
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-filem-raw.txt", "preload-collision", true,
+        prte_show_help(nspace, "help-prte-filem-raw.txt", "preload-collision", true,
                        fname, wdir, prte_process_info.nodename);
         rc = PRTE_ERR_PRELOAD_CONFLICT;
         goto cleanup;
@@ -1331,7 +1332,8 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
                 if (PRTE_FILEM_TYPE_EXE == inbnd->type) {
                     rc = create_link(prte_process_info.top_session_dir, wdir, inbnd->link_pts[k]);
                 } else {
-                    rc = place_file(prte_process_info.top_session_dir, wdir, inbnd->link_pts[k]);
+                    rc = place_file(jdata->nspace, prte_process_info.top_session_dir, wdir,
+                                    inbnd->link_pts[k]);
                 }
                 if (PRTE_SUCCESS != rc) {
                     if (PRTE_ERR_PRELOAD_CONFLICT != rc) {
@@ -1362,8 +1364,8 @@ static int raw_link_local_files(prte_job_t *jdata, prte_app_context_t *app)
             }
         }
         if (!staged) {
-            prte_show_help(PRTE_JOB_NSPACE(jdata), "help-prte-filem-raw.txt", "preload-not-staged", true,
-                           files[j], prte_process_info.nodename);
+            prte_show_help_job(jdata, "help-prte-filem-raw.txt", "preload-not-staged", true,
+                               files[j], prte_process_info.nodename);
             PMIx_Argv_free(files);
             return PRTE_ERR_FILE_OPEN_FAILURE;
         }
@@ -1448,11 +1450,15 @@ static void send_chunk(int xxx, short argc, void *cbdata)
     if (PMIX_SUCCESS == rc) {
         rc = PMIx_Data_pack(NULL, &chunk, data, numbytes, PMIX_BYTE);
     }
-    /* if it is the first chunk, then add the file type and permissions */
+    /* if it is the first chunk, then add the file type, the permissions
+     * and the job whose transfer it is - recv_files() unpacks the same */
     if (PMIX_SUCCESS == rc && 0 == rev->nchunk) {
         rc = PMIx_Data_pack(NULL, &chunk, &rev->type, 1, PMIX_INT32);
         if (PMIX_SUCCESS == rc) {
             rc = PMIx_Data_pack(NULL, &chunk, &rev->mode, 1, PMIX_UINT32);
+        }
+        if (PMIX_SUCCESS == rc) {
+            rc = PMIx_Data_pack(NULL, &chunk, &rev->nspace, 1, PMIX_PROC_NSPACE);
         }
     }
     if (PMIX_SUCCESS != rc) {
@@ -1671,7 +1677,10 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
     pmix_list_item_t *item;
     int32_t type = PRTE_FILEM_TYPE_UNKNOWN;
     uint32_t mode = 0;
+    pmix_nspace_t nspace;
     PRTE_HIDE_UNUSED_PARAMS(status, sender, tag, cbdata);
+
+    PMIX_LOAD_NSPACE(nspace, NULL);
 
     /* unpack the data */
     n = 1;
@@ -1715,13 +1724,18 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
             return;
         }
     }
-    /* if the chunk is 0, then additional info should be present */
+    /* if the chunk is 0, then additional info should be present - see
+     * send_chunk() for the order */
     if (0 == nchunk) {
         n = 1;
         rc = PMIx_Data_unpack(NULL, buffer, &type, &n, PMIX_INT32);
         if (PMIX_SUCCESS == rc) {
             n = 1;
             rc = PMIx_Data_unpack(NULL, buffer, &mode, &n, PMIX_UINT32);
+        }
+        if (PMIX_SUCCESS == rc) {
+            n = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &nspace, &n, PMIX_PROC_NSPACE);
         }
         if (PMIX_SUCCESS != rc) {
             PMIX_ERROR_LOG(rc);
@@ -1772,6 +1786,7 @@ static void recv_files(int status, pmix_proc_t *sender, pmix_data_buffer_t *buff
          * writing the file we are about to write
          */
         incoming->mode = (mode & 0777) | S_IRUSR | S_IWUSR;
+        PMIX_LOAD_NSPACE(incoming->nspace, nspace);
 
         PMIX_OUTPUT_VERBOSE((1, prte_filem_base_framework.framework_output,
                              "%s filem:raw: opening target file %s",
@@ -1907,7 +1922,9 @@ static void write_handler(int fd, short event, void *cbdata)
                     return;
                 }
                 if (!prte_filem_base_archive_members_ok(members, &bad)) {
-                    prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-prte-filem-raw.txt",
+                    /* about the job that sent it: the master tells
+                     * whoever asked for that job */
+                    prte_show_help(sink->nspace, "help-prte-filem-raw.txt",
                                    "preload-archive-refused", true, sink->file, bad,
                                    prte_process_info.nodename);
                     PMIx_Argv_free(members);
@@ -2038,6 +2055,7 @@ static void xfer_construct(prte_filem_raw_xfer_t *ptr)
     ptr->pending = false;
     ptr->src = NULL;
     ptr->file = NULL;
+    PMIX_LOAD_NSPACE(ptr->nspace, NULL);
     ptr->nchunk = 0;
     ptr->status = PRTE_SUCCESS;
     ptr->inflight = 0;
@@ -2087,6 +2105,7 @@ static void in_construct(prte_filem_raw_incoming_t *ptr)
     ptr->file = NULL;
     ptr->fullpath = NULL;
     ptr->mode = S_IRUSR | S_IWUSR;
+    PMIX_LOAD_NSPACE(ptr->nspace, NULL);
     ptr->link_pts = NULL;
     PMIX_CONSTRUCT(&ptr->outputs, pmix_list_t);
 }

@@ -541,7 +541,7 @@ AC_CHECK_FUNCS([asprintf snprintf vasprintf vsnprintf fork setsid strsignal sysl
 # test can succeed against a libc that ships the symbol without a
 # prototype, and an implicit declaration is a hard error under
 # --enable-devel-check.
-AC_CHECK_FUNCS([close_range closefrom])
+AC_CHECK_FUNCS([close_range closefrom dladdr])
 AC_CHECK_DECLS([close_range, closefrom], [], [], [[
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
@@ -679,10 +679,11 @@ AC_INCLUDES_DEFAULT
 #endif])
 
 # We need Python if we are building in a git clone
-# (not a distribution tarball)
+# (not a distribution tarball).  In a git worktree, .git is a file
+# rather than a directory, so test only that it exists.
 AC_MSG_CHECKING([if we need Python])
 prte_need_python=no
-AS_IF([test -d "${PRTE_TOP_SRCDIR}/.git"],
+AS_IF([test -e "${PRTE_TOP_SRCDIR}/.git"],
       [prte_need_python=yes],
       [prte_need_python=no])
 AC_MSG_RESULT([$prte_need_python])
@@ -705,6 +706,17 @@ AS_IF([test $prte_have_good_python -eq 1],
 OAC_SETUP_SPHINX([$srcdir/docs/_build/html/index.html],
                  [[https://docs.prrte.org/en/main/developers/prerequisites.html#sphinx-and-therefore-python]],
                  [$srcdir/docs/requirements.txt])
+
+# The docs build runs its generator scripts with $(PYTHON).  The Python
+# check above looks for an interpreter only in a git clone, but a
+# tarball build renders the docs too whenever Sphinx is usable.  Find
+# the interpreter here in that case, so that $(PYTHON) is never empty
+# when the docs are built.
+AS_IF([test -n "$SPHINX_BUILD" && test $prte_have_good_python -eq 0],
+      [AM_PATH_PYTHON([$python_min_version],
+                      [prte_have_good_python=1],
+                      [AC_MSG_ERROR([Building the docs requires Python >= $python_min_version. Install it, or configure with --disable-sphinx.])])
+       PRTE_SUMMARY_ADD([Required Packages], [Python], [], [yes ($PYTHON_VERSION)])])
 
 AS_IF([test -n "$OAC_MAKEDIST_DISABLE"],
       [AS_IF([test -n "$PRTE_MAKEDIST_DISABLE"],

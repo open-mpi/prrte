@@ -51,6 +51,12 @@
  *    stepped past the terminating NUL, and ranges excluded their upper
  *    bound.
  *
+ *  - a message about a request went to every tool connected to the DVM.
+ *    test_show_help_target checks whom the requester info array names as
+ *    its PMIX_LOG_TARGET: a job's launch proxy, followed up to the tool at
+ *    the top of the tree; the scheduler, with PMIX_REQUESTOR, for a
+ *    requester the DVM has no job for; nobody for the DVM's own job.
+ *
  * Everything is driven through the exported entry points, so the tests keep
  * working if the internals are rearranged.
  */
@@ -80,6 +86,7 @@
 #include "src/util/attr.h"
 #include "src/util/nidmap.h"
 #include "src/util/proc_info.h"
+#include "src/util/prte_show_help.h"
 
 #include "src/runtime/data_server/ds.h"
 #include "src/runtime/data_server/prte_data_server.h"
@@ -292,7 +299,7 @@ static int test_job_catchup_skips_pending_launch(void)
 static int test_session_registry(void)
 {
     int failures = 0;
-    prte_session_t *s1, *s2, *dup;
+    prte_session_t *s1, *s2, *dup, *found;
 
     reset_globals();
 
@@ -300,10 +307,17 @@ static int test_session_registry(void)
     s1->session_id = 100;
     s1->alloc_refid = strdup("alloc-100");
     s1->user_refid = strdup("user-100");
+    /* a user refid names a session only to the job that requested it */
+    PMIX_LOAD_PROCID(&s1->requested_by, "ns-100", 0);
     CHECK("session: insert succeeds", PRTE_SUCCESS == prte_set_session_object(s1));
     CHECK("session: lookup by id", s1 == prte_get_session_object(100));
     CHECK("session: lookup by alloc refid", s1 == prte_get_session_object_from_id("alloc-100"));
-    CHECK("session: lookup by user refid", s1 == prte_get_session_object_from_refid("user-100"));
+    CHECK("session: lookup by user refid",
+          PRTE_SUCCESS == prte_get_session_object_from_refid("ns-100", "user-100", &found) &&
+              s1 == found);
+    CHECK("session: ...only for the job that requested it",
+          PRTE_ERR_NOT_FOUND == prte_get_session_object_from_refid("ns-200", "user-100", &found) &&
+              NULL == found);
 
     /* A reservation may carry an alloc id without a user reference id -
      * PMIX_ALLOC_REQ_ID is the requester's own optional label.  The refid
@@ -315,10 +329,13 @@ static int test_session_registry(void)
     s2->alloc_refid = strdup("alloc-200");
     /* user_refid deliberately left NULL */
     CHECK("session: second insert succeeds", PRTE_SUCCESS == prte_set_session_object(s2));
+    PMIX_LOAD_PROCID(&s2->requested_by, "ns-100", 0);
     CHECK("session: refid lookup survives a session with no user refid",
-          s1 == prte_get_session_object_from_refid("user-100"));
+          PRTE_SUCCESS == prte_get_session_object_from_refid("ns-100", "user-100", &found) &&
+              s1 == found);
     CHECK("session: refid lookup misses cleanly",
-          NULL == prte_get_session_object_from_refid("user-999"));
+          PRTE_ERR_NOT_FOUND == prte_get_session_object_from_refid("ns-100", "user-999", &found) &&
+              NULL == found);
     CHECK("session: alloc-id lookup still works alongside it",
           s2 == prte_get_session_object_from_id("alloc-200"));
     /* symmetrically, a session with no alloc_refid must not break that one */
@@ -326,7 +343,12 @@ static int test_session_registry(void)
 
     /* NULL keys are a miss, not a crash */
     CHECK("session: NULL alloc id misses", NULL == prte_get_session_object_from_id(NULL));
-    CHECK("session: NULL user refid misses", NULL == prte_get_session_object_from_refid(NULL));
+    CHECK("session: NULL user refid misses",
+          PRTE_ERR_NOT_FOUND == prte_get_session_object_from_refid("ns-100", NULL, &found) &&
+              NULL == found);
+    CHECK("session: NULL namespace misses",
+          PRTE_ERR_NOT_FOUND == prte_get_session_object_from_refid(NULL, "user-100", &found) &&
+              NULL == found);
     CHECK("session: unknown id misses", NULL == prte_get_session_object(4242));
 
     /* session ids are unique */
@@ -334,6 +356,71 @@ static int test_session_registry(void)
     dup->session_id = 100;
     CHECK("session: duplicate id refused", PRTE_EXISTS == prte_set_session_object(dup));
     PMIX_RELEASE(dup);
+
+    reset_globals();
+    return failures;
+}
+
+/* A pending session - an allocation the scheduler has queued and not granted
+ * (PRTE_SESSION_FLAG_PENDING) - holds no nodes, so the ordinary lookups must
+ * not hand it to anyone who would spawn onto it, extend, release or control
+ * it: naming it is "not found", as it was before the scheduler answered.
+ * Only the lookups that say so find it, and the id checks count it as taken,
+ * or a second session could be registered under an id that is about to be
+ * granted. Once granted it is found like any other. */
+static int test_session_pending(void)
+{
+    int failures = 0;
+    prte_session_t *s, *found;
+    prte_proc_type_t saved;
+    int rc;
+
+    reset_globals();
+
+    s = PMIX_NEW(prte_session_t);
+    s->session_id = 300;
+    s->alloc_refid = strdup("300");
+    s->user_refid = strdup("req-300");
+    PMIX_LOAD_PROCID(&s->requested_by, "ns-300", 0);
+    PRTE_FLAG_SET(s, PRTE_SESSION_FLAG_PENDING);
+    CHECK("pending: insert succeeds", PRTE_SUCCESS == prte_set_session_object(s));
+
+    CHECK("pending: hidden from the session-id lookup", NULL == prte_get_session_object(300));
+    CHECK("pending: hidden from the alloc-id lookup", NULL == prte_get_session_object_from_id("300"));
+    CHECK("pending: hidden from the req-id lookup",
+          PRTE_ERR_NOT_FOUND == prte_get_session_object_from_refid("ns-300", "req-300", &found) &&
+              NULL == found);
+    CHECK("pending: found by the pending lookup", s == prte_get_pending_session("300"));
+    CHECK("pending: the pending lookup misses an unknown id", NULL == prte_get_pending_session("301"));
+    CHECK("pending: the pending lookup misses NULL", NULL == prte_get_pending_session(NULL));
+    CHECK("pending: its session id is in use", prte_session_id_in_use(300));
+    CHECK("pending: its alloc id is in use", prte_session_alloc_id_in_use("300"));
+    CHECK("pending: an unknown session id is not", !prte_session_id_in_use(301));
+    CHECK("pending: an unknown alloc id is not", !prte_session_alloc_id_in_use("301"));
+
+    /* the allocation queries report it; listing its nodes does not, since
+     * it has none */
+    saved = prte_process_info.proc_type;
+    prte_process_info.proc_type = PRTE_PROC_MASTER;
+    found = NULL;
+    rc = prte_get_allocation_session("300", &found);
+    CHECK("pending: the allocation-session accessor finds it",
+          PRTE_SUCCESS == rc && s == found);
+    {
+        pmix_pointer_array_t *nodes = NULL;
+        CHECK("pending: the allocated-nodes accessor does not",
+              PRTE_ERR_NOT_FOUND == prte_get_allocated_nodes("300", &nodes) && NULL == nodes);
+    }
+    prte_process_info.proc_type = saved;
+
+    /* granted: found as any other session */
+    PRTE_FLAG_UNSET(s, PRTE_SESSION_FLAG_PENDING);
+    CHECK("granted: found by session id", s == prte_get_session_object(300));
+    CHECK("granted: found by alloc id", s == prte_get_session_object_from_id("300"));
+    CHECK("granted: found by req id from its requester",
+          PRTE_SUCCESS == prte_get_session_object_from_refid("ns-300", "req-300", &found) &&
+              s == found);
+    CHECK("granted: no longer found by the pending lookup", NULL == prte_get_pending_session("300"));
 
     reset_globals();
     return failures;
@@ -1564,6 +1651,8 @@ static void ds_store_open(void)
     pmix_pointer_array_init(&prte_data_store.store, 1, INT_MAX, 1);
     PMIX_CONSTRUCT(&prte_data_store.pending, pmix_list_t);
     PMIX_CONSTRUCT(&prte_data_store.usage, pmix_list_t);
+    PMIX_CONSTRUCT(&prte_data_store.waiting, pmix_hash_table_t);
+    pmix_hash_table_init(&prte_data_store.waiting, 128);
 }
 
 static void ds_store_close(void)
@@ -1571,6 +1660,8 @@ static void ds_store_close(void)
     PMIX_DESTRUCT(&prte_data_store.store);
     PMIX_LIST_DESTRUCT(&prte_data_store.pending);
     PMIX_LIST_DESTRUCT(&prte_data_store.usage);
+    /* every test takes what it parked back off, so nothing is counted */
+    PMIX_DESTRUCT(&prte_data_store.waiting);
 }
 
 static prte_data_object_t *ds_store_item(const char *key, const char *val,
@@ -2081,6 +2172,122 @@ static int test_data_server_wire_count(void)
 
     if (0 == failures) {
         fprintf(stdout, "PASSED test_data_server_wire_count\n");
+    }
+    return failures;
+}
+
+/* A lookup that waits for data (PMIX_WAIT) is parked until a publish
+ * answers it, its own timeout runs out or its process ends, and a process
+ * using PMIx_Lookup_nb could park any number. Each process may have
+ * prte_data_store.max_waiting parked at once; one beyond that is refused
+ * PMIX_ERR_OUT_OF_RESOURCE at once, and the count comes down as they
+ * leave. */
+static pmix_status_t ds_wait_lookup(const char *nspace, pmix_rank_t rank)
+{
+    pmix_data_buffer_t buf, *answer;
+    pmix_proc_t requestor, sender;
+    size_t n = 1;
+    char *key = "prte.test.never.published";
+    pmix_info_t info;
+    bool wait = true;
+    pmix_status_t rc;
+
+    PMIX_DATA_BUFFER_CONSTRUCT(&buf);
+    PMIX_LOAD_PROCID(&requestor, nspace, rank);
+    PMIx_Data_pack(NULL, &buf, &requestor, 1, PMIX_PROC);
+    PMIx_Data_pack(NULL, &buf, &n, 1, PMIX_SIZE);
+    PMIx_Data_pack(NULL, &buf, &key, 1, PMIX_STRING);
+    PMIX_INFO_LOAD(&info, PMIX_WAIT, &wait, PMIX_BOOL);
+    PMIx_Data_pack(NULL, &buf, &n, 1, PMIX_SIZE);
+    PMIx_Data_pack(NULL, &buf, &info, 1, PMIX_INFO);
+    PMIX_INFO_DESTRUCT(&info);
+    PMIX_LOAD_PROCID(&sender, "prte-daemons", 1);
+    /* a parked lookup disposes of the answer buffer itself */
+    PMIX_DATA_BUFFER_CREATE(answer);
+    rc = prte_ds_lookup(&sender, 0, &buf, answer);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_DATA_BUFFER_RELEASE(answer);
+    }
+    PMIX_DATA_BUFFER_DESTRUCT(&buf);
+    return rc;
+}
+
+static size_t ds_parked_by(const char *nspace, pmix_rank_t rank)
+{
+    prte_data_req_t *req;
+    size_t count = 0;
+
+    PMIX_LIST_FOREACH(req, &prte_data_store.pending, prte_data_req_t) {
+        if (PMIX_CHECK_NSPACE(req->requestor.nspace, nspace) && rank == req->requestor.rank) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static int test_data_server_max_waiting(void)
+{
+    int failures = 0, i;
+    int saved = prte_data_store.max_waiting;
+    prte_data_req_t *req;
+    pmix_proc_t a;
+    bool ok;
+
+    ds_store_open();
+    prte_data_store.max_waiting = 3;
+    PMIX_LOAD_PROCID(&a, "waiting.job1", 0);
+
+    ok = true;
+    for (i = 0; i < 3; i++) {
+        ok = ok && (PMIX_SUCCESS == ds_wait_lookup("waiting.job1", 0));
+    }
+    CHECK("max_waiting: a process parks up to the limit", ok && 3 == ds_parked_by("waiting.job1", 0));
+    fprintf(stdout, "-- the next case refuses a lookup; the message it prints is expected --\n");
+    CHECK("max_waiting: one beyond it is refused",
+          PMIX_ERR_OUT_OF_RESOURCE == ds_wait_lookup("waiting.job1", 0) &&
+              3 == ds_parked_by("waiting.job1", 0));
+    CHECK("max_waiting: another process of the same job is not",
+          PMIX_SUCCESS == ds_wait_lookup("waiting.job1", 1));
+
+    /* one answered: the process may wait on another */
+    PMIX_LIST_FOREACH(req, &prte_data_store.pending, prte_data_req_t) {
+        if (PMIX_CHECK_PROCID(&req->requestor, &a)) {
+            break;
+        }
+    }
+    prte_ds_unpark(req);
+    PMIX_RELEASE(req);
+    CHECK("max_waiting: one leaving lets the process wait again",
+          PMIX_SUCCESS == ds_wait_lookup("waiting.job1", 0) &&
+              3 == ds_parked_by("waiting.job1", 0));
+
+    /* the process's lookups purged: its count starts again from nothing */
+    prte_data_server_purge_local(&a, PMIX_PERSIST_PROC, UINT32_MAX);
+    CHECK("max_waiting: a purge takes the process's lookups",
+          0 == ds_parked_by("waiting.job1", 0) && 1 == ds_parked_by("waiting.job1", 1));
+    ok = true;
+    for (i = 0; i < 3; i++) {
+        ok = ok && (PMIX_SUCCESS == ds_wait_lookup("waiting.job1", 0));
+    }
+    CHECK("max_waiting: ...and its count with them", ok);
+
+    /* 0 removes the cap */
+    prte_data_store.max_waiting = 0;
+    CHECK("max_waiting: 0 removes the limit", PMIX_SUCCESS == ds_wait_lookup("waiting.job1", 0) &&
+                                                  4 == ds_parked_by("waiting.job1", 0));
+
+    while (NULL != (req = (prte_data_req_t *) pmix_list_get_first(&prte_data_store.pending)) &&
+           (pmix_list_item_t *) req != pmix_list_get_end(&prte_data_store.pending)) {
+        prte_ds_unpark(req);
+        PMIX_RELEASE(req);
+    }
+    CHECK("max_waiting: nothing is counted once nothing waits",
+          0 == pmix_hash_table_get_size(&prte_data_store.waiting));
+    prte_data_store.max_waiting = saved;
+    ds_store_close();
+
+    if (0 == failures) {
+        fprintf(stdout, "PASSED test_data_server_max_waiting\n");
     }
     return failures;
 }
@@ -3080,6 +3287,216 @@ static int test_worker_pool(void)
 
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* whom a message about a request is for                              */
+/* ------------------------------------------------------------------ */
+
+/* the procs a requester info array's PMIX_LOG_TARGET names, or NULL */
+static const pmix_data_array_t *info_target(const pmix_info_t *info, size_t ninfo)
+{
+    size_t n;
+
+    for (n = 0; n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], PMIX_LOG_TARGET) && PMIX_DATA_ARRAY == info[n].value.type) {
+            return info[n].value.data.darray;
+        }
+    }
+    return NULL;
+}
+
+/* does the array target exactly the one proc nspace:rank? */
+static bool targets_only(const pmix_info_t *info, size_t ninfo, const char *nspace,
+                         pmix_rank_t rank)
+{
+    const pmix_data_array_t *d = info_target(info, ninfo);
+    const pmix_proc_t *p;
+
+    if (NULL == d || PMIX_PROC != d->type || 1 != d->size) {
+        return false;
+    }
+    p = (const pmix_proc_t *) d->array;
+    return PMIX_CHECK_NSPACE(p->nspace, nspace) && rank == p->rank;
+}
+
+static const pmix_info_t *info_find(const pmix_info_t *info, size_t ninfo, const char *key)
+{
+    size_t n;
+
+    for (n = 0; n < ninfo; n++) {
+        if (PMIX_CHECK_KEY(&info[n], key)) {
+            return &info[n];
+        }
+    }
+    return NULL;
+}
+
+static void set_proxy(prte_job_t *jdata, const char *nspace, pmix_rank_t rank)
+{
+    pmix_proc_t proxy;
+
+    PMIX_LOAD_PROCID(&proxy, nspace, rank);
+    prte_set_attribute(&jdata->attributes, PRTE_JOB_LAUNCH_PROXY, PRTE_ATTR_GLOBAL, &proxy,
+                       PMIX_PROC);
+}
+
+static int test_show_help_target(void)
+{
+    int failures = 0;
+    prte_job_t *tool, *sched, *parent, *child, *own, *orphan, *self, *loopa, *loopb;
+    pmix_info_t *info;
+    size_t ninfo;
+    pmix_proc_t who;
+    const pmix_info_t *e;
+    pmix_info_t ids[2];
+    uint32_t u32;
+    uid_t uid;
+    gid_t gid;
+
+    reset_globals();
+    prte_pmix_server_globals.scheduler_connected = false;
+
+    tool = make_job("sh.tool");
+    PRTE_FLAG_SET(tool, PRTE_JOB_FLAG_TOOL);
+    prte_set_job_data_object(tool);
+    parent = make_job("sh.parent");
+    set_proxy(parent, "sh.tool", 0);
+    prte_set_job_data_object(parent);
+    /* spawned by rank 3 of the parent job, which the tool started */
+    child = make_job("sh.child");
+    set_proxy(child, "sh.parent", 3);
+    prte_set_job_data_object(child);
+    /* the DVM's own: nobody asked for it */
+    own = make_job("sh.own");
+    prte_set_job_data_object(own);
+    /* asked for by a process this DVM has no job for */
+    orphan = make_job("sh.orphan");
+    set_proxy(orphan, "sh.elsewhere", 5);
+    prte_set_job_data_object(orphan);
+    /* prterun: the HNP is the tool */
+    self = make_job("sh.self");
+    set_proxy(self, PRTE_PROC_MY_NAME->nspace, PRTE_PROC_MY_NAME->rank);
+    prte_set_job_data_object(self);
+    /* two jobs that name each other - nothing makes one, but nothing may
+     * spin on one either */
+    loopa = make_job("sh.loopa");
+    set_proxy(loopa, "sh.loopb", 0);
+    prte_set_job_data_object(loopa);
+    loopb = make_job("sh.loopb");
+    set_proxy(loopb, "sh.loopa", 0);
+    prte_set_job_data_object(loopb);
+
+    CHECK("target: a tool's job",
+          PRTE_SUCCESS == prte_requester_info_job(parent, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.tool", 0));
+    e = info_find(info, ninfo, PMIX_NSPACE);
+    CHECK("target: duplicates are scoped to the job",
+          NULL != e && PMIX_STRING == e->value.type &&
+          0 == strcmp(e->value.data.string, "sh.parent"));
+    CHECK("target: whose permissions travel with it",
+          NULL != info_find(info, ninfo, PMIX_USERID) &&
+          NULL != info_find(info, ninfo, PMIX_GRPID));
+    CHECK("target: no requestor for a tool of ours",
+          NULL == info_find(info, ninfo, PMIX_REQUESTOR));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: a spawned job reaches the tool at the top",
+          PRTE_SUCCESS == prte_requester_info_job(child, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.tool", 0));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: the DVM's own job has none",
+          PRTE_SUCCESS == prte_requester_info_job(own, &info, &ninfo) &&
+          NULL == info_target(info, ninfo));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: nor does no job",
+          PRTE_SUCCESS == prte_requester_info_job(NULL, &info, &ninfo) &&
+          NULL == info_target(info, ninfo));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: a requester with no job, and no scheduler, is itself",
+          PRTE_SUCCESS == prte_requester_info_job(orphan, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.elsewhere", 5) &&
+          NULL == info_find(info, ninfo, PMIX_REQUESTOR));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: prterun's job is the HNP's",
+          PRTE_SUCCESS == prte_requester_info_job(self, &info, &ninfo) &&
+          targets_only(info, ninfo, PRTE_PROC_MY_NAME->nspace, PRTE_PROC_MY_NAME->rank));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: a loop of jobs ends",
+          PRTE_SUCCESS == prte_requester_info_job(loopa, &info, &ninfo) &&
+          NULL != info_target(info, ninfo));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: a tool's own job is the tool",
+          PRTE_SUCCESS == prte_requester_info_job(tool, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.tool", PMIX_RANK_WILDCARD));
+    PMIX_INFO_FREE(info, ninfo);
+
+    PMIX_LOAD_PROCID(&who, "sh.tool", 0);
+    CHECK("target: a tool's own request",
+          PRTE_SUCCESS == prte_requester_info_proc(&who, 11, 12, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.tool", 0));
+    prte_requester_ids(info, ninfo, &uid, &gid);
+    CHECK("target: the user and group given", 11 == uid && 12 == gid);
+    PMIX_INFO_FREE(info, ninfo);
+
+    PMIX_LOAD_PROCID(&who, "sh.parent", 1);
+    CHECK("target: an application's request reaches its tool",
+          PRTE_SUCCESS == prte_requester_info_proc(&who, 11, 12, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.tool", 0));
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: no requester is the DVM",
+          PRTE_SUCCESS == prte_requester_info_proc(NULL, 11, 12, &info, &ninfo) &&
+          NULL == info_target(info, ninfo));
+    PMIX_INFO_FREE(info, ninfo);
+
+    /* with a scheduler, a requester we have no job for came through it */
+    sched = make_job("sh.sched");
+    PRTE_FLAG_SET(sched, PRTE_JOB_FLAG_TOOL);
+    prte_set_job_data_object(sched);
+    PMIX_LOAD_PROCID(&prte_pmix_server_globals.scheduler, "sh.sched", 0);
+    prte_pmix_server_globals.scheduler_connected = true;
+
+    CHECK("target: through the scheduler",
+          PRTE_SUCCESS == prte_requester_info_job(orphan, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.sched", 0));
+    e = info_find(info, ninfo, PMIX_REQUESTOR);
+    CHECK("target: naming whom it is for",
+          NULL != e && PMIX_PROC == e->value.type &&
+          PMIX_CHECK_NSPACE(e->value.data.proc->nspace, "sh.elsewhere") &&
+          5 == e->value.data.proc->rank);
+    PMIX_INFO_FREE(info, ninfo);
+
+    CHECK("target: a tool of ours still directly",
+          PRTE_SUCCESS == prte_requester_info_job(parent, &info, &ninfo) &&
+          targets_only(info, ninfo, "sh.tool", 0) &&
+          NULL == info_find(info, ninfo, PMIX_REQUESTOR));
+    PMIX_INFO_FREE(info, ninfo);
+
+    prte_pmix_server_globals.scheduler_connected = false;
+    PMIX_LOAD_PROCID(&prte_pmix_server_globals.scheduler, NULL, PMIX_RANK_INVALID);
+
+    /* the ids of an array that names none, or names them wrongly, are ours */
+    prte_requester_ids(NULL, 0, &uid, &gid);
+    CHECK("ids: none named is our own",
+          prte_process_info.euid == uid && prte_process_info.egid == gid);
+    PMIX_INFO_LOAD(&ids[0], PMIX_USERID, "7", PMIX_STRING);
+    u32 = 8;
+    PMIX_INFO_LOAD(&ids[1], PMIX_GRPID, &u32, PMIX_UINT32);
+    prte_requester_ids(ids, 2, &uid, &gid);
+    CHECK("ids: a user of the wrong type is not taken",
+          prte_process_info.euid == uid && 8 == gid);
+    PMIX_INFO_DESTRUCT(&ids[0]);
+    PMIX_INFO_DESTRUCT(&ids[1]);
+
+    reset_globals();
+    return failures;
+}
+
 int main(void)
 {
     int rc, failures = 0;
@@ -3123,6 +3540,7 @@ int main(void)
 
     failures += test_job_registry();
     failures += test_session_registry();
+    failures += test_session_pending();
     failures += test_session_ownership();
     failures += test_session_job_backref();
     failures += test_proc_lookups();
@@ -3148,6 +3566,7 @@ int main(void)
     failures += test_data_server_collect();
     failures += test_data_server_cap();
     failures += test_data_server_purge_parked();
+    failures += test_data_server_max_waiting();
     failures += test_data_server_wire_count();
     failures += test_count_fits();
     failures += test_data_server_unpublish_reach();
@@ -3158,6 +3577,7 @@ int main(void)
     failures += test_job_catchup_skips_pending_launch();
     failures += test_worker_pool();
     failures += test_paramfile_ordering();
+    failures += test_show_help_target();
 
     if (paramfile_written) {
         unlink(paramfile);
