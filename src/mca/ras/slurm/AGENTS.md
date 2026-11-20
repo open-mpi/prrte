@@ -105,9 +105,15 @@ deviation* and the framework guide.
   under the same req_id. Either way the record's user decides who may: it
   records the user the PMIx server named for the extend that made it, and
   only that user, root and the DVM's own user may cancel it
-  (`prte_ras_slurm_pending_req_permitted()`). An id naming a granted
-  allocation is not found - that is a release. The extend path's own
-  cleanup calls `prte_ras_slurm_cancel_pending_req()` directly.
+  (`prte_ras_slurm_pending_req_permitted()`). A cancel naming an extend
+  Slurm has already granted, by id or by the requesting job's req_id, has
+  nothing to cancel. `answer_granted()` answers `PMIX_ERR_EXISTS` with the
+  `PMIX_ALLOC_ID` if the requester may release it
+  (`prte_pmix_server_session_permitted()`, the release rule), else not
+  found, so it reveals nothing the requester could not already list or
+  release. A req_id used for more than one granted extend is refused as
+  ambiguous (`ras-base:req-id-ambiguous`). The extend path's own cleanup
+  calls `prte_ras_slurm_cancel_pending_req()` directly.
 
 ### Whom an extend is for: the DVM's own user, for now
 
@@ -247,7 +253,11 @@ arrives as the phase-two event, `PMIX_ERR_DVM_MOD` carrying the cause; the
 grow campaign sends `PMIX_DVM_IS_READY` as it always did. That is what lets
 a requester, or a process it passes the id to, cancel a request Slurm has
 queued, and it means a client's wait for phase two includes the time the job
-spends queued.
+spends queued. So the session records the grant (`session->granted`), and
+the grow's `PMIX_DVM_IS_READY` and the allocation properties carry it as
+`PMIX_ALLOC_GRANT_TIME`. It is when `salloc_wait_cb` reaped salloc, which
+exits as the job leaves `PENDING`; `extend_wait_complete` copies it to the
+session, which only exists after several more Slurm queries.
 
 - **Only for a request a PMIx client made** (`req->answer_when_queued`, set
   by `pmix_server_alloc_fn()` and by the master's relay of one). The
