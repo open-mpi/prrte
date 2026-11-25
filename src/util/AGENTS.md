@@ -202,7 +202,7 @@ writable, inspecting it through an `O_NOFOLLOW` descriptor - cheap, and it
 keeps the rule should a directory ever be composed elsewhere.
 
 **A job whose processes run as its owner has directories that are the
-owner's.** A root daemon starts another user's job as that user
+owner's.** A root daemon starts a job owned by a different user as that user
 (`prte_pmix_server_job_run_as`, see `src/mca/odls/AGENTS.md`), and those
 processes are handed their job and rank directories as `PMIX_NSDIR` and
 `PMIX_PROCDIR` - where an MPI library keeps its shared-memory files. So
@@ -308,7 +308,9 @@ Each launcher has its own channel: `plm/ssh` the ssh's stdin (read by
 `prte_dvm_key_from_fd` before the prted daemonizes, since daemonizing replaces
 stdin), `plm/slurm`/`lsf`/`pals` the launcher's environment
 (`prte_dvm_key_setenv`, scrubbed from an `env` array with
-`prte_dvm_key_scrub_array` before it is freed), and a bootstrapped DVM the
+`prte_dvm_key_scrub_array` before it is freed), `plm/tm` a pipe to its TM
+helper, which adds it to the environment `tm_spawn()` hands each prted and
+puts it nowhere else, and a bootstrapped DVM the
 `DVMKeyFile` named in `prte.conf`. A new launcher must pick a channel of the
 same kind, or its daemons are no longer the only processes that can join.
 
@@ -340,6 +342,41 @@ to the same `prte_node_t` the daemon reports itself as.
 `prte_keep_fqdn_hostnames` and `prte_strip_prefix` are MCA parameters read
 here, and the stripping has to happen *here* so the names exchanged through
 the modex match the names found locally.
+
+### A host name takes its final form where it enters
+
+Unless `prte_keep_fqdn_hostnames` is set, PRRTE knows a host by its name
+without its domain. **That is decided once, at the point a name enters the
+system, by `prte_hostname_strip_domain()`** - and nothing after that point
+deals with domains at all: every comparison is between names already in the
+same form, so `prte_check_host_is_local()`, `prte_node_match()` and the node
+index stay plain string comparisons. The entry points are:
+
+| Where a name enters | Who strips it |
+|---------------------|---------------|
+| our own hostname | `prte_setup_hostname()` (the qualified name is kept as an alias) |
+| an allocation, from any `ras` component | `prte_ras_base_node_insert()`, over the whole list **before** it compares any name |
+| a hostfile, including a rankfile read as one | `hostfile_parse_host()` |
+| `--host` (adding, filtering, and `compute_slots`) | `dash_host.c` |
+| a rankfile | `prte_util_parse_rankfile()` |
+| `--add-hostfile` | `ras/hosts`' own reader, for its lookup |
+| a request's or command line's node list that is only looked up (`--display topo/cpus`, a release, `--activate`) | `ras_base_match_given()` in `ras_base_allocate.c` |
+| a query's `PMIX_HOSTNAME` qualifier | `pmix_server_queries.c`, on its own copy |
+| an LSF affinity file | `rmaps/lsf` |
+
+Where a name is kept, the form it was written in stays on the node as an
+alias and as `rawname`, which is what `plm/ssh` launches to - the short name
+is not necessarily resolvable. A name that goes back to a resource manager
+(the node lists `ras/slurm` hands to `salloc`/`scontrol`) is passed as the
+RM wrote it, not stripped.
+
+Moving the stripping to one place downstream instead - `node_insert`, which
+the hostfile and `--host` *filters* never reach, and which stripped only
+after its comparisons - is how a node file naming the HNP's node
+`n01.cluster.org` on a host calling itself `n01` came to start a second
+daemon beside the HNP, and a hostfile naming `n02.cluster.org` came to
+select nothing from an allocation that held `n02`. A new way for host names
+to come in needs its own entry in that table.
 
 ---
 

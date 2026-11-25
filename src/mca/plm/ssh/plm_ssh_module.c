@@ -226,15 +226,6 @@ static int ssh_init(void)
                             "%s plm:ssh: using \"%s\" for launching\n",
                             PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), ssh_agent_path);
 
-    } else if (prte_mca_plm_ssh_component.using_tmrsh) {
-        // transfer the argv across
-        ssh_agent_argv = PMIx_Argv_copy(prte_mca_plm_ssh_component.agent_argv);
-        ssh_agent_path = strdup(prte_mca_plm_ssh_component.agent_argv[0]);
-        pmix_output_verbose(1, prte_plm_base_framework.framework_output,
-                            "%s plm:ssh: using \"%s\" for launching\n",
-                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), ssh_agent_path);
-
-
     } else {
         /* not using qrsh or llspawn - use MCA-specified agent */
         if (PRTE_SUCCESS != (rc = launch_agent_setup(prte_mca_plm_ssh_component.agent, NULL))) {
@@ -798,8 +789,9 @@ static int setup_launch(int *argcptr, char ***argvptr, char *nodename, int *node
 
     value = PMIx_Argv_join(argv, ' ');
     if (sysconf(_SC_ARG_MAX) < (int) strlen(value)) {
-        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-ssh.txt", "cmd-line-too-long", true, strlen(value),
-                       sysconf(_SC_ARG_MAX));
+        /* the topic prints both with %d */
+        prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-ssh.txt", "cmd-line-too-long", true,
+                       (int) strlen(value), (int) sysconf(_SC_ARG_MAX));
         free(value);
         PMIx_Argv_free(argv);
         return PRTE_ERR_SILENT;
@@ -1273,9 +1265,17 @@ static void launch_daemons(int fd, short args, void *cbdata)
     PMIX_OUTPUT_VERBOSE((1, prte_plm_base_framework.framework_output, "%s plm:ssh: launching vm",
                          PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
 
-    if ((0 < pmix_output_get_verbosity(prte_plm_base_framework.framework_output)
-         || prte_leave_session_attached)
-        && prte_mca_plm_ssh_component.num_concurrent < map->num_new_daemons) {
+    /* The sessions are held open by exactly the options that make
+     * setup_launch() withhold --daemonize from the daemon - --debug-daemons,
+     * --debug-daemons-file and --leave-session-attached - so those are what
+     * this tests.  Testing only the last let --debug-daemons walk into the
+     * deadlock described below; and plm verbosity, which this also used to
+     * test, holds nothing open: a daemonized prted puts its stdio on
+     * /dev/null and its ssh session closes, so a verbose launch was refused
+     * for no reason. */
+    if ((prte_debug_daemons_flag || prte_debug_daemons_file_flag ||
+         prte_leave_session_attached) &&
+        prte_mca_plm_ssh_component.num_concurrent < map->num_new_daemons) {
         /**
          * If we are in '--debug-daemons' we keep the ssh connection
          * alive for the span of the run. If we use this option
@@ -1289,9 +1289,9 @@ static void launch_daemons(int fd, short args, void *cbdata)
          * As we cannot run in this situation, pretty print the error
          * and return an error code.
          */
+        /* the help says everything: no error log after it */
         prte_show_help(PRTE_PROC_MY_NAME->nspace, "help-plm-ssh.txt", "deadlock-params", true,
                        prte_mca_plm_ssh_component.num_concurrent, map->num_new_daemons);
-        PRTE_ERROR_LOG(PRTE_ERR_FATAL);
         rc = PRTE_ERR_SILENT;
         goto cleanup;
     }
@@ -1470,7 +1470,15 @@ cleanup:
     PMIx_Argv_free(argv);
     free(prefix_dir);
     free(pmix_prefix);
-    PRTE_ACTIVATE_JOB_STATE(state->jdata, PRTE_JOB_STATE_FAILED_TO_START);
+    /* Every path here is taken before a single daemon has been started -
+     * the forks happen later, in process_launch_list(), and a daemon that
+     * fails there is reported by ssh_wait_daemon().  So this is a job that
+     * never launched, not one whose daemons failed to start: errmgr/dvm
+     * answers FAILED_TO_START with the "failed-daemon-launch" checklist,
+     * which here would follow - and bury - the reason already given, such
+     * as a --host outside the allocation that setup_virtual_machine()
+     * refused. */
+    PRTE_ACTIVATE_JOB_STATE(state->jdata, PRTE_JOB_STATE_NEVER_LAUNCHED);
     PMIX_RELEASE(state);
 }
 

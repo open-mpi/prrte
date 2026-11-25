@@ -128,6 +128,28 @@ applied at the job level:
   a network or fabric device is named by its own GUIDs or MAC address,
   which hwloc always has.
 
+  **NVIDIA GPUs do not need NVML.** The NVIDIA kernel driver publishes
+  each GPU's ``GPU-<uuid>`` itself, in
+  ``/proc/driver/nvidia/gpus/<PCI bus id>/information``. When a daemon
+  discovers its node and hwloc has recorded no identity for an NVIDIA
+  GPU, the identity is read from that file instead -- it is the same
+  value NVML reports -- so mapping by GPU works with a distribution's
+  hwloc. A GPU the driver does not list (the driver is not loaded, or a
+  container hides it) or lists before the GPU has been initialized (the
+  driver then prints the identity as ``?`` characters) is still unnamed,
+  and the request is still refused. Starting ``nvidia-persistenced`` keeps
+  the GPUs initialized. A node described by ``hwloc_use_topo_file`` is
+  never given an identity this way, since the file may describe some
+  other machine.
+
+  Because a GPU's identity can now depend on the driver's state when the
+  daemon starts, ``--uniform-nodes`` deserves care with GPU mapping. That
+  option makes every node take the topology of the first daemon to report,
+  so the check is made against that node alone. A different node whose
+  driver cannot name one of its GPUs is mapped anyway, and its processes
+  are told nothing, so each sees every GPU on its node. Without
+  ``--uniform-nodes`` that node is refused.
+
   Given that identity, each process is also handed its GPUs in the
   variable its vendor's runtime reads -- ``CUDA_VISIBLE_DEVICES`` for
   NVIDIA, ``ROCR_VISIBLE_DEVICES`` for AMD -- naming them by the vendor's
@@ -160,15 +182,19 @@ applied at the job level:
   or Intel's in RoCE mode), with ``FI_VERBS_DEVICE_NAME`` as well unless
   that name would also select another device on the node;
   ``FI_EFA_IFACE`` for an EFA device; ``FI_CXI_DEVICE_NAME`` for a
-  Slingshot NIC; and ``PSM3_NIC`` for a single Cornelis Omni-Path adapter.
-  The device is named by the name those libraries accept -- ``mlx5_0`` --
-  which is the name hwloc gave it, so unlike the GPU case there is no
-  identity that can be missing. Nothing is set for an adapter whose fabric
-  has no component behind it, or where the variable cannot name the device
-  exactly, and no variable that takes a device *unit number* is set at
-  all (``HFI_UNIT``, ``FI_OPX_HFI_SELECT``): a unit number is meaningful
-  only against the enumeration it came from, and a wrong one there does
-  not fail, it quietly puts the process on another adapter.
+  Slingshot NIC; and ``FI_OPX_HFI_SELECT`` for a single Cornelis
+  Omni-Path adapter. The device is named by the name those
+  libraries accept -- ``mlx5_0`` -- which is the name hwloc gave it, even
+  when the device was given as another name for the same adapter, such as
+  its network interface; so unlike the GPU case there is no identity that
+  can be missing. Nothing is set for an adapter whose fabric has no
+  component behind it, or where the variable cannot name the device
+  exactly. ``FI_OPX_HFI_SELECT`` takes a unit number, and is set because
+  OPX opens unit *N* as the device named ``hfi1_N``; no other variable
+  that takes a device *unit number* is set (``HFI_UNIT``): a unit number
+  is otherwise meaningful only against the enumeration it came from, and
+  a wrong one there does not fail, it quietly puts the process on another
+  adapter.
 
   The assignment is also readable directly, whether or not a device
   variable was set, as the ``PMIX_DEVICE_ID`` key of the process's own

@@ -5208,7 +5208,7 @@ test_grow_authz() {
 }
 
 # A job's processes run as the user the job belongs to. On a root DVM that
-# takes other users' tools, another user's job runs as that user on every
+# takes other users' tools, a job of a different user runs as that user on every
 # node - as its processes see themselves, as their PMIx server judges them,
 # and in the session directories they are given. A DVM that cannot become
 # the user (not root) refuses the job, and no DVM acts for another user on a
@@ -5217,7 +5217,7 @@ test_run_as() {
     local out uri n rq jd ownuri
     local probe=/tmp/runas-probe.sh
 
-    banner "run-as: another user's job runs as that user, on every node"
+    banner "run-as: a job of a different user runs as that user, on every node"
     cleanup_swarm
     if ! RUN 'test "$(id -u)" = 0 && command -v setpriv >/dev/null'; then
         skp "running a job as a second user needs root and setpriv on the head node"
@@ -5235,7 +5235,7 @@ test_run_as() {
     n=$(echo "$out" | grep -c '^RUNAS node[12] 65534 65534 65534$')
     [ "$n" = 4 ] \
         && ok "all 4 processes, on both nodes, run as user 65534 with its group alone" \
-        || bad "another user's job did not run as that user (matched $n of 4): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        || bad "a job of a different user did not run as that user (matched $n of 4): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
 
     banner "run-as: such a process is a client its PMIx server accepts"
     # PMIx_Init, then gets of every peer's placement - across the two nodes
@@ -5320,7 +5320,7 @@ test_run_as() {
     out=$(RUN "cd /tmp && timeout 60 $rq --hostfile /tmp/runas-hosts -n 2 hostname" 2>&1)
     if echo "$out" | grep -q "unable to open the hostfile" &&
        [ "$(echo "$out" | grep -c '^node[12]$')" = 0 ]; then
-        ok "root's private hostfile is not opened for another user's job"
+        ok "root's private hostfile is not opened for a job of a different user"
     else
         bad "root's private hostfile was read for another user: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
     fi
@@ -5369,7 +5369,7 @@ test_run_as() {
     RUN 'timeout -k 5 30 pterm' >/dev/null 2>&1
     cleanup_swarm
 
-    banner "run-as: a DVM not running as root refuses another user's job"
+    banner "run-as: a DVM not running as root refuses a job of a different user"
     ON 1 'mkdir -p /tmp/runas-dvm && chown 65533:65533 /tmp/runas-dvm'
     ownuri=/tmp/runas-dvm/dvm.uri
     EXEC_SH_BG 1 "cd /tmp/runas-dvm && setpriv --reuid=65533 --regid=65533 --clear-groups env HOME=/tmp/runas-dvm TMPDIR=/tmp/runas-dvm timeout -k 5 120 prte --report-uri $ownuri --prtemca prte_pmix_no_foreign_tools 0 --host node1:2 > /tmp/runas-dvm/prte.out 2>&1"
@@ -5389,11 +5389,11 @@ test_run_as() {
         # a tool trusts another user's server only when told to
         out=$(RUN "cd /tmp && timeout 60 setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=/tmp PMIX_MCA_ptl_base_server_access=users=65533 prun --dvm-uri '$uri' -n 1 sh -c 'echo RUNAS \$(id -u)'" 2>&1)
         if echo "$out" | grep -q '^RUNAS'; then
-            bad "a DVM of user 65533 ran another user's job"
+            bad "a DVM of user 65533 ran a job of a different user"
         elif echo "$out" | grep -q "cannot run" && echo "$out" | grep -q "PMIX_ERR_NO_PERMISSIONS"; then
-            ok "another user's job is refused, saying why"
+            ok "a job of a different user is refused, saying why"
         else
-            bad "another user's job failed oddly: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+            bad "a job of a different user failed oddly: $(echo "$out" | tr '\n' ' ' | tail -c 250)"
         fi
     fi
     ON 1 'pkill -u 65533 -x prte; sleep 1; true'
@@ -5606,7 +5606,7 @@ test_tools() {
         RUN "timeout -k 5 60 prun --dvm-uri file:$PRTED_URI --host node2:1 -np 1 hostname" >/dev/null 2>&1
         t1=$(date +%s)
         [ $((t1 - t0)) -lt 25 ] \
-            && ok "a prun is not held up by another user's job on the same DVM ($((t1 - t0))s)" \
+            && ok "a prun is not held up by a job of a different user on the same DVM ($((t1 - t0))s)" \
             || bad "prun waited on a job outside its own spawn tree ($((t1 - t0))s)"
         RUN "timeout -k 5 30 pterm --dvm-uri file:$PRTED_URI" >/dev/null 2>&1
         sleep 3
@@ -8518,6 +8518,35 @@ test_errmgr() {
         EXEC_SH "$n" 'rm -f /tmp/partial-app' >/dev/null 2>&1
     done
     cleanup_swarm
+
+    banner "errmgr: a launch refused before any daemon starts is not called a daemon failure"
+    # setup_virtual_machine() refuses a host the allocation does not hold,
+    # and says so, before a single daemon is started.  The launchers used to
+    # report every failure of theirs as FAILED_TO_START, which errmgr/dvm
+    # answers with the "failed-daemon-launch" checklist - firewalls, missing
+    # libraries, /tmp - printed after, and burying, the real reason.  They
+    # now report NEVER_LAUNCHED for a failure before the launch.  The
+    # allocation here is the --host list, and the hostfile names nodes
+    # outside it.
+    cleanup_swarm
+    RUN "printf 'node2 slots=1\nnode3 slots=1\n' > /tmp/errmgr_outside.txt"
+    out=$(RUN 'timeout -k 5 60 prterun --hostfile /tmp/errmgr_outside.txt --host node5 -n 1 hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && [ "$rc" != 124 ] && echo "$out" | grep -q 'not present in\|not included in' \
+        && ok "a host outside the allocation is refused, saying so (rc=$rc)" \
+        || bad "no refusal of a host outside the allocation (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    echo "$out" | grep -q 'unable to reliably start one or more daemons' \
+        && bad "...and the refusal was followed by the daemon-launch checklist" \
+        || ok "...and nothing claims a daemon failed to start"
+    RUN 'rm -f /tmp/errmgr_outside.txt' >/dev/null 2>&1
+    # the checklist still belongs to a launch that really failed
+    out=$(RUN 'timeout -k 5 60 prterun --prtemca prte_launch_agent /nonexistent/prted \
+                  --host node2:1,node3:1 -np 2 --map-by node hostname' 2>&1)
+    rc=$?
+    [ "$rc" != 0 ] && [ "$rc" != 124 ] && echo "$out" | grep -q 'failed to report back' \
+        && ok "a daemon that cannot start is still reported as one (rc=$rc)" \
+        || bad "a daemon that could not start was not reported (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+    cleanup_swarm
 }
 
 ########################################################################
@@ -11182,6 +11211,41 @@ gcc -o /root/staged_marker /root/staged_marker.c' >/dev/null 2>&1
     [ "$c" = 0 ] && ok "no daemons linger after flat/throttled launches" || bad "$c stray prted"
 
     fi   # have_nodes 5
+    banner "plm/ssh: the deadlock guard refuses exactly what holds sessions open"
+    # --debug-daemons, --debug-daemons-file and --leave-session-attached keep
+    # each daemon's ssh session open for the life of the job (setup_launch()
+    # withholds --daemonize), so with fewer launch slots than daemons the
+    # launch can never finish: the slots are never given back.  launch_daemons
+    # refuses that up front with "deadlock-params".  The guard used to test
+    # only --leave-session-attached, so --debug-daemons and
+    # --debug-daemons-file hung instead - and it also tested plm verbosity,
+    # which holds nothing open, so a merely verbose launch was refused.
+    cleanup_swarm
+    for opt in --debug-daemons --debug-daemons-file --leave-session-attached; do
+        bounded 60 RUN "prterun $opt --prtemca plm_ssh_num_concurrent 1 \
+                          --host node2:1,node3:1 -np 2 --map-by node hostname"
+        rc=$?
+        out=$(cat "$BOUT"); rm -f "$BOUT"
+        if [ "$rc" = 124 ]; then
+            bad "$opt with fewer launch slots than daemons hung instead of being refused"
+        elif [ "$rc" != 0 ] && echo "$out" | grep -q 'will cause the system to deadlock'; then
+            ok "$opt with fewer launch slots than daemons is refused (rc=$rc)"
+        else
+            bad "$opt with fewer launch slots than daemons was not refused (rc=$rc): $(echo "$out" | tr '\n' ' ' | tail -c 250)"
+        fi
+        echo "$out" | grep -q 'unable to reliably start one or more daemons' \
+            && bad "...and the refusal was followed by the daemon-launch checklist" \
+            || ok "...and nothing claims a daemon failed to start"
+        cleanup_swarm
+    done
+    bounded 90 RUN 'prterun --prtemca plm_base_verbose 1 --prtemca plm_ssh_num_concurrent 1 \
+                      --host node2:1,node3:1 -np 2 --map-by node hostname'
+    rc=$?
+    n=$(grep -cE '^node[23]$' "$BOUT"); rm -f "$BOUT"
+    [ "$rc" = 0 ] && [ "$n" = 2 ] \
+        && ok "a verbose launch with one launch slot runs (verbosity holds no session open)" \
+        || bad "a verbose launch with one launch slot did not run (rc=$rc, procs=$n)"
+    cleanup_swarm
     banner "plm/ssh: prted cmd line survives an mca value containing '='"
     # prte_plm_base_prted_append_basic_args replicates PRTE_MCA_*/PMIX_MCA_*
     # env vars onto the prted command line. Splitting those on every '='

@@ -150,7 +150,6 @@ bool prte_static_ports = false;
 char *prte_oob_static_ports = NULL;
 
 bool prte_keep_fqdn_hostnames = false;
-bool prte_have_fqdn_allocation = false;
 bool prte_show_resolved_nodenames = false;
 bool prte_do_not_resolve = false;
 int prte_hostname_cutoff = 1000;
@@ -1345,6 +1344,7 @@ static void session_con(prte_session_t *s)
     s->owner_gid = PRTE_INVALID_GID;
     s->inheritance = PRTE_INHERIT_DEFAULT_VALUE;
     s->acquisition = 0;
+    memset(&s->granted, 0, sizeof(struct timeval));
 }
 static void session_des(prte_session_t *s)
 {

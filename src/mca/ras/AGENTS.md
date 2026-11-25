@@ -186,8 +186,8 @@ answers `PMIX_ERR_NOT_SUPPORTED` to anything that is not EXTEND/RELEASE/CANCEL
 and the driver reads that as "ask the next module", so a `PMIX_ALLOC_NEW`
 naming hostnames inside a Slurm allocation was served by `ras/hosts` — answered
 `PMIX_SUCCESS` with an allocation id minted, while Slurm was never asked and
-had granted nothing. The daemon launch on the un-allocated node then failed
-and took the DVM down. `docs/todo.rst` records what supporting mixed
+had granted nothing. The daemon launch on the un-allocated node then failed,
+and the DVM terminated. `docs/todo.rst` records what supporting mixed
 allocators would actually take.
 
 ## Who may add a node
@@ -529,10 +529,18 @@ input list.** Walk it carefully before touching allocation code:
   job its nodes' core counts instead of its allocation.
   `prte_set_slots_override` is the deliberate escape hatch: it re-sizes
   even the given ones.
-- **FQDN normalization.** `normalize_node()` truncates an FQDN to the
-  short name, keeping the full name as `rawname` and an alias (unless
-  `prte_keep_fqdn_hostnames` or the name is an IP). Sets
-  `prte_have_fqdn_allocation`.
+- **FQDN normalization, first.** `normalize_node()` truncates an FQDN to
+  the short name with `prte_hostname_strip_domain()`, keeping the full
+  name as `rawname` (which `plm/ssh` launches to) and an alias, unless
+  `prte_keep_fqdn_hostnames` is set or the name is an IP. It runs over
+  the whole list **before anything compares a name** - the
+  `launch_orted_on_hn` check, the HNP dedup, the pool lookup. An
+  allocation is where a resource manager's names enter the system, and
+  the rule is that a name takes its final form where it enters, so that
+  nothing downstream deals with domains. Normalizing after the lookup
+  instead is how a PBS node file naming the HNP's node
+  `n01.cluster.org`, on a host that calls itself `n01`, got that node
+  into the pool twice and a second daemon started beside the HNP.
 - **`DO_NOT_LAUNCH` daemons.** When the daemon job carries
   `PRTE_JOB_DO_NOT_LAUNCH` (offline mapper tests), a synthetic
   `prte_proc_t` daemon is attached to each node so the mapper sees a
@@ -712,7 +720,9 @@ is queued, so a queued extend is answered with it at once and is registered
 as a session flagged `PRTE_SESSION_FLAG_PENDING` - no nodes, but listed by
 `PMIX_QUERY_ALLOC_IDS`, reported by `PMIX_QUERY_ALLOC_PROPERTIES` with a
 `PMIX_ALLOC_STATUS` of `PMIX_OPERATION_IN_PROGRESS`, and named by a
-`PMIX_ALLOC_REQ_CANCEL` that carries the id. Every other lookup skips it
+`PMIX_ALLOC_REQ_CANCEL` that carries the id; once granted, such a cancel gets
+`PMIX_ERR_EXISTS` with the id, if the requester may release it. Every other
+lookup skips it
 (`src/runtime/AGENTS.md`), so a spawn, extend, release or session directive
 naming it is "not found" until it is granted; the checks that an id is free
 count it (`prte_session_id_in_use()`, `prte_session_alloc_id_in_use()`).
@@ -1018,7 +1028,7 @@ references. Where they land decides whether the tree even builds:
 
 So **every component with a testbuild stub must be in the default
 `--enable-mca-dso` list** in [`config/prte_mca.m4`](../../../config/prte_mca.m4)
-— today `plm-lsf`, `plm-tm`, `ras-lsf`, `ras-flux` and `ras-slurm`
+— today `plm-lsf`, `ras-lsf`, `ras-flux` and `ras-slurm`
 (`ras/slurm` is on the list because it compiles the jansson parser). That
 is also the right layout regardless of the stubs: it keeps a third-party
 dependency out of `libprrte` and therefore out of every PRRTE tool.

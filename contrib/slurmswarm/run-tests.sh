@@ -1363,6 +1363,7 @@ test_elastic() {
     elastic_reextend_reuse_group "$jid"
     elastic_release_during_grow_group "$jid"
     elastic_pending_cancel_group "$jid"
+    elastic_cancel_after_grant_group "$jid"
     elastic_tainted_hostname_group
     dvm_stop
     elastic_external_cancel_group
@@ -1965,6 +1966,63 @@ elastic_pending_cancel_group() {
     SA 'pgrep -x prte >/dev/null' && ok "HNP survived the cancellation" \
                                   || bad "HNP died during the cancellation"
     SA 'pkill -x elastic' >/dev/null 2>&1
+    drop_extra_jobs "$jid"
+}
+
+elastic_cancel_after_grant_group() {
+    local jid=$1 ajid out p1 gt p2
+
+    banner "ras/slurm: a cancel the grant has overtaken says so"
+    # Once Slurm grants an extend its pending record is gone, so there is no
+    # request left to cancel - only an allocation to release. A cancel naming
+    # it, by the req_id from the job that made it or by the id from anyone who
+    # may release it, is answered PMIX_ERR_EXISTS with that id. Anyone else is
+    # answered not found, as before.
+    out=$(SA 'timeout 180 elastic extend 1 --req-id late-req --cancel-after-grant' 2>&1)
+    ajid=$(echo "$out" | sed -n 's/^>>> ALLOC_ID \([0-9][0-9]*\).*/\1/p' | head -1)
+    if [ -z "$ajid" ] || ! echo "$out" | grep -q '>>> SUCCESS'; then
+        bad "the extend to cancel late was not granted: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+        skp "the late-cancel cases need a granted extend"
+        [ -n "$ajid" ] && SA "timeout 180 elastic release-id $ajid" >/dev/null 2>&1
+        drop_extra_jobs "$jid"
+        return
+    fi
+    echo "$out" | grep -q 'CANCEL AFTER GRANT REJECTED: PMIX_ERR_EXISTS' &&
+        [ "$(echo "$out" | sed -n 's/^>>> ALLOC_ID //p' | sort -u)" = "$ajid" ] \
+        && ok "a cancel by req_id after the grant says it exists, naming job $ajid" \
+        || bad "the requester's late cancel was not answered EXISTS with the id: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+
+    # An immediate grant can precede phase one, so PMIX_ALLOC_GRANT_TIME is
+    # bounded by the request and phase two, by this cluster's one clock.
+    rq=$(echo "$out" | sed -n 's/^>>> REQUEST AT //p' | head -1)
+    gt=$(echo "$out" | sed -n 's/^>>> GRANT_TIME //p' | head -1)
+    p2=$(echo "$out" | sed -n 's/^>>> PHASE 2 AT //p' | head -1)
+    [ -n "$rq" ] && [ -n "$gt" ] && [ -n "$p2" ] &&
+        awk -v a="$rq" -v g="$gt" -v b="$p2" 'BEGIN { exit !(a <= g && g <= b) }' \
+        && ok "PMIX_DVM_IS_READY carries the grant time, between the request and phase two" \
+        || bad "no grant time between the request ($rq) and phase two ($p2): '$gt'"
+
+    out=$(SA "timeout 60 elastic cancel-id $ajid" 2>&1)
+    echo "$out" | grep -q 'REJECTED: PMIX_ERR_EXISTS' &&
+        echo "$out" | grep -qx ">>> ALLOC_ID $ajid" \
+        && ok "a cancel by PMIX_ALLOC_ID after the grant says it exists, with the id" \
+        || bad "a late cancel by id was not answered EXISTS with the id: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+
+    out=$(SA 'timeout 60 elastic cancel late-req' 2>&1)
+    echo "$out" | grep -q 'REJECTED: PMIX_ERR_NOT_FOUND' &&
+        ! echo "$out" | grep -q '>>> ALLOC_ID' \
+        && ok "a cancel by req_id from another job is still not found, and names no id" \
+        || bad "another job's late cancel by req_id was answered: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+
+    [ "$(SQ "squeue -h -j $ajid -o '%T'" | tr -d ' \r')" = RUNNING ] \
+        && ok "the late cancels left job $ajid running" \
+        || bad "a late cancel changed job $ajid: $(SQ "squeue -h -j $ajid -o '%T'" | tr -d '\r')"
+
+    out=$(SA "timeout 180 elastic release-id $ajid" 2>&1)
+    echo "$out" | grep -q '>>> SUCCESS' \
+        && ok "the allocation the cancel named is released normally" \
+        || bad "releasing $ajid after the late cancels failed: $(echo "$out" | tr '\n' ' ' | tail -c 300)"
+    sleep 4
     drop_extra_jobs "$jid"
 }
 

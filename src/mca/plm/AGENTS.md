@@ -74,6 +74,7 @@ plm/
     help-plm-base.txt         # user-facing error text
   ssh/                        # DEFAULT/fallback (pri 10): rsh/ssh tree-spawn — the reference impl
   slurm/                      # SLURM (pri 75): one srun launches all prteds
+  tm/                         # PBS (pri 75): daemons as PBS tasks via a libexec TM helper
   lsf/                        # LSF (pri 75): lsb_launch() API call
   pals/                       # Cray PALS (pri 100, only built where PALS exists): aprun
 ```
@@ -151,7 +152,8 @@ environment and either offers itself or bows out:
 | `pals` | 100 (MCA `plm_pals_priority`) | Always offers itself — **but only built where Cray PALS is detected** (`PRTE_CHECK_PALS`), so it is simply absent elsewhere. |
 | `slurm` | 75 | a Slurm job id is in the environment and Slurm answers `--version` — both via [`common/slurm`](../common/slurm/AGENTS.md), which probes once for every Slurm component. |
 | `lsf` | 75 | `LSB_JOBID` set, IBM CSM **not** enabled (`CSM_ALLOCATION_ID` unset), and `lsb_init()` succeeds. Only built when LSF headers/libs are found. |
-| `ssh` | 10 (MCA `plm_ssh_priority`) | Always available once a launch agent (`ssh`/`rsh`, or `qrsh`/`llspawn`/`pbs_tmrsh`) is found in PATH. The **default/fallback**. |
+| `tm` | 75 | `PBS_ENVIRONMENT` and `PBS_JOBID` set, and the TM helper `prte_tm_spawn` is installed in `<libexecdir>/prte` (without it: a `no-helper` warning, and `ssh` launches). Built when configure finds the TM library (`--with-tm`, or under `--with-pbs`); only the helper links it. |
+| `ssh` | 10 (MCA `plm_ssh_priority`) | Always available once a launch agent (`ssh`/`rsh`, or `qrsh`/`llspawn`) is found in PATH. The **default/fallback**. |
 
 Because it is pick-one, in a SLURM allocation `slurm` (75) beats `ssh`
 (10); on a bare cluster only `ssh` is present. `ssh` is deliberately the
@@ -548,6 +550,8 @@ captures the single biggest behavioral difference between the launchers:
 - **`ssh` → `true`.** We `ssh` to a *specific* host, so we know exactly
   which node each daemon vpid lands on at launch time; the node↔daemon
   binding is verified immediately (`PRTE_NODE_FLAG_LOC_VERIFIED`).
+- **`tm` → `true`.** Its helper `tm_spawn()`s each vpid on the node named
+  for it.
 - **`slurm` → `true`.** `srun` starts the daemons in the order the
   nodelist gives (`--distribution=arbitrary`), and the list is in vpid
   order.
@@ -571,11 +575,24 @@ placed daemons) or wireup stalls.
   progress thread waiting for `ssh`/`srun`/`aprun`. Components that fork
   a launcher process register a `prte_wait_cb` (SIGCHLD) to notice its
   exit rather than waiting on it.
-- **State activation, not inline error handling.** On any launch error,
-  `PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_FAILED_TO_START)` (or
-  `FAILED_TO_LAUNCH`) and let the errmgr/state machine unwind — every
+- **State activation, not inline error handling.** On a launch error,
+  activate a failure state and let the errmgr/state machine unwind — every
   component's `launch_daemons` funnels errors to a `cleanup:` label that
   does exactly this. Don't try to tear down inline.
+- **Which failure state says whether a launch was tried.** A failure
+  before any daemon has been started — `setup_virtual_machine` refusing a
+  `--host` outside the allocation, a launcher refusing its own
+  configuration — is `PRTE_JOB_STATE_NEVER_LAUNCHED`. Only a failure of the
+  launch itself (the `srun`/`aprun` fork, `lsb_launch()`, a daemon that
+  never reported) is `FAILED_TO_START` or `FAILED_TO_LAUNCH`. The
+  difference is what the user sees: `errmgr/dvm` follows those two with the
+  `failed-daemon-launch` checklist (firewalls, missing libraries, ...),
+  which after a pre-launch refusal only buries the reason already given.
+  The requester is told `PMIX_ERR_JOB_FAILED_TO_LAUNCH` either way.
+  `plm/ssh` forks nothing in `launch_daemons` (that is
+  `process_launch_list`), so its whole `cleanup:` is pre-launch; `slurm`,
+  `lsf` and `pals` switch their `failed_state` just before the launch
+  call.
 - **`map->num_new_daemons == 0` fast-path.** Every component's
   `launch_daemons` must handle "no new daemons" by jumping straight to
   `DAEMONS_LAUNCHED`→`DAEMONS_REPORTED`. This is what makes application
@@ -672,5 +689,7 @@ The base and each component directory have their own `AGENTS.md`:
 - [`ssh/AGENTS.md`](ssh/AGENTS.md) — the default/fallback; **read this
   second** — rsh/ssh tree-spawn is the reference implementation.
 - [`slurm/AGENTS.md`](slurm/AGENTS.md) — one `srun` launches all prteds.
+- [`tm/AGENTS.md`](tm/AGENTS.md) — PBS: the TM helper in libexec, and why
+  PRRTE never loads the TM library itself.
 - [`lsf/AGENTS.md`](lsf/AGENTS.md) — the `lsb_launch()` LSF API.
 - [`pals/AGENTS.md`](pals/AGENTS.md) — Cray PALS `aprun`.

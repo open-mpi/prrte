@@ -24,29 +24,40 @@
 # $HEADER$
 #
 
-# PRTE_CHECK_PBS(prefix, [action-if-found], [action-if-not-found])
+# PRTE_SETUP_PBS
 # --------------------------------------------------------
-AC_DEFUN([PRTE_CHECK_PBS],[
-    PRTE_VAR_SCOPE_PUSH([prte_check_pbs_save_PATH])
-
-	AC_ARG_WITH([pbs],
+# Decide, once, whether PBS support is being built: --with-pbs, or
+# --with-tm, which asks for PBS daemon launch and so for PBS support as
+# well. Sets prte_check_pbs_happy. Everything that needs the answer gets it
+# through PRTE_CHECK_PBS, which requires this, so the components that ask
+# - ras/pbs and plm/tm - may be configured in either order.
+AC_DEFUN([PRTE_SETUP_PBS],[
+    AC_ARG_WITH([pbs],
            [AS_HELP_STRING([--with-pbs],
-                           [Build PBS scheduler and launch components (default: no)])])
+                           [Build PBS support (default: no). Launching the daemons as PBS tasks also needs PBS's TM library, which is then required: see --with-tm and --without-tm])])
 
-    prte_check_pbs_save_PATH="$PATH"
-    PRTE_PBSTRMSH_PATH=
-	if test -z "$with_pbs" || test "$with_pbs" = "no" ; then
-            prte_check_pbs_happy="no"
-	elif test "$with_pbs" = ""  || test "$with_pbs" = "yes"; then
+    prte_check_pbs_why=
+    if test "$with_pbs" = "no" ; then
+        prte_check_pbs_happy="no"
+        AS_IF([test -n "$with_tm" && test "$with_tm" != "no"],
+              [AC_MSG_WARN([--with-tm asks for daemon launch through PBS's TM])
+               AC_MSG_WARN([library, which needs PBS support, but --without-pbs])
+               AC_MSG_WARN([was also given. Drop one of the two.])
+               AC_MSG_ERROR([Cannot continue])])
+    elif test -n "$with_pbs" ; then
         prte_check_pbs_happy="yes"
+    elif test -n "$with_tm" && test "$with_tm" != "no" ; then
+        # a PBS launcher without the PBS allocator would take its nodes
+        # from somewhere other than the job, and could start daemons on
+        # none of them that are not in it
+        prte_check_pbs_happy="yes"
+        prte_check_pbs_why=" (implied by --with-tm)"
     else
-        prte_check_pbs_happy="yes"
-        PATH="$with_pbs/bin:$PATH"
+        prte_check_pbs_happy="no"
     fi
 
     AS_IF([test "$prte_check_pbs_happy" = "yes"],
-          [ # unless user asked, only build pbs component on linux
-            # as that is the platforms that PBS supports
+          [ # PBS supports only linux
             case $host in
             *-linux*)
                     prte_check_pbs_happy="yes"
@@ -54,37 +65,22 @@ AC_DEFUN([PRTE_CHECK_PBS],[
             *)
                     AC_MSG_WARN([PBS support was requested, but we are not on])
                     AC_MSG_WARN([a supported environment (linux). PBS support])
-                    AC_MSG_WARN([threfore cannot be built. Please correct and])
+                    AC_MSG_WARN([therefore cannot be built. Please correct and])
                     AC_MSG_WARN([try again.])
                     AC_MSG_ERROR([Cannot continue])
                     ;;
             esac
         ])
 
-    AS_IF([test "$prte_check_pbs_happy" = "yes"],
-          [AC_MSG_CHECKING([for pbs_tmrsh in PATH])
-           PRTE_WHICH([pbs_tmrsh], [PRTE_PBSTRMSH_PATH])
-           if test "$PRTE_PBSTRMSH_PATH" = ""; then
-             if test "$with_pbs" != "" && test "$with_pbs" != "yes" ; then
-                AC_MSG_RESULT([no])
-                AC_MSG_WARN([PBS path was specified, but pbs_tmrsh was not found])
-                AC_MSG_WARN([in $with_pbs/bin. Please correct the path and try again])
-                AC_MSG_ERROR([Cannot continue])
-             else
-                AC_MSG_RESULT([no])
-             fi
-           else
-             AC_MSG_RESULT([yes: $PRTE_PBSTRMSH_PATH])
-           fi
-          ])
+    PRTE_SUMMARY_ADD([Resource Managers], [PBS], [], [${prte_check_pbs_happy}${prte_check_pbs_why}])
+])
 
-    PATH="$prte_check_pbs_save_PATH"
-    PRTE_SUMMARY_ADD([Resource Managers], [PBS], [], [$prte_check_pbs_happy])
+# PRTE_CHECK_PBS(prefix, [action-if-found], [action-if-not-found])
+# --------------------------------------------------------
+AC_DEFUN([PRTE_CHECK_PBS],[
+    AC_REQUIRE([PRTE_SETUP_PBS])
 
-    AC_SUBST(PRTE_PBSTRMSH_PATH)
     AS_IF([test "$prte_check_pbs_happy" = "yes"],
           [$2],
           [$3])
-
-    PRTE_VAR_SCOPE_POP
 ])

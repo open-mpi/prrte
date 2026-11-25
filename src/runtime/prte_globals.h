@@ -356,6 +356,9 @@ typedef struct{
     /* Order in which this DVM acquired its allocations, from 1; 0 until the
      * session is registered. Served as PMIX_ALLOC_SEQUENCE. */
     uint32_t acquisition;
+    /* when the scheduler granted the allocation, zero if unknown; served as
+     * PMIX_ALLOC_GRANT_TIME */
+    struct timeval granted;
 } prte_session_t;
 PRTE_EXPORT PMIX_CLASS_DECLARATION(prte_session_t);
 
@@ -925,7 +928,6 @@ PRTE_EXPORT extern char *prte_oob_static_ports;
 
 /* nodename flags */
 PRTE_EXPORT extern bool prte_keep_fqdn_hostnames;
-PRTE_EXPORT extern bool prte_have_fqdn_allocation;
 PRTE_EXPORT extern bool prte_show_resolved_nodenames;
 PRTE_EXPORT extern int prte_hostname_cutoff;
 PRTE_EXPORT extern bool prte_do_not_resolve;

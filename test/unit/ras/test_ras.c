@@ -843,6 +843,98 @@ static int test_hnp_dedup(void)
 }
 
 /*
+ * An allocation is where a resource manager's names enter the system, so
+ * node_insert puts them in the form every comparison expects - without
+ * their domain, unless prte_keep_fqdn_hostnames - BEFORE it compares any.
+ * It used to shorten a name only once it had decided the node was new:
+ *
+ *  - a PBS node file naming the HNP's node "n01.cluster.org", on a host
+ *    whose gethostname() says "n01", was not taken for the HNP's node, went
+ *    into the pool a second time, and had a daemon started beside the HNP
+ *    that nothing was ever launched through;
+ *  - "--add-host n02.cluster.org" on a DVM that already held "n02" missed
+ *    the pool entry the same way and added a second "n02".
+ *
+ * Neither needs a name resolved: prte_do_not_resolve is on here.
+ */
+static int test_insert_fqdn_at_entry(void)
+{
+    int failures = 0;
+    pmix_list_t nodes;
+    prte_node_t *hnp, *nd;
+    char *save;
+    char **save_aliases;
+    bool save_resolve, save_keep;
+    int before, rc;
+
+    hnp = (prte_node_t *) pmix_pointer_array_get_item(prte_node_pool, 0);
+    CHECK("entry: node at index 0", NULL != hnp);
+    if (NULL == hnp) {
+        return failures;
+    }
+
+    /* this node goes by its short name and has no qualified alias - as on
+     * a host whose gethostname() returns the short one - and the pool's
+     * entry for it is named that way */
+    save = prte_process_info.nodename;
+    save_aliases = prte_process_info.aliases;
+    save_resolve = prte_do_not_resolve;
+    save_keep = prte_keep_fqdn_hostnames;
+    prte_process_info.nodename = strdup(hnp->name);
+    prte_process_info.aliases = NULL;
+    prte_do_not_resolve = true;
+    prte_keep_fqdn_hostnames = false;
+
+    /* the allocation names this node with its domain */
+    before = pool_count();
+    prte_ras_base.total_slots_alloc = 0;
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    nd = mknode(&nodes, "x", 7);
+    free(nd->name);
+    pmix_asprintf(&nd->name, "%s.cluster.test", hnp->name);
+    rc = prte_ras_base_node_insert(&nodes, NULL);
+    PMIX_DESTRUCT(&nodes);
+    CHECK("entry: hnp rc", PRTE_SUCCESS == rc);
+    CHECK("entry: the qualified hnp entry is the hnp's node", pool_count() == before);
+    CHECK("entry: the hnp's node takes its slots", 7 == hnp->slots);
+    CHECK("entry: and counts them once", 7 == prte_ras_base.total_slots_alloc);
+
+    /* a node the pool holds by its short name, named again with a domain */
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    mknode(&nodes, "unittest-entry-n02", 2);
+    rc = prte_ras_base_node_insert(&nodes, NULL);
+    PMIX_DESTRUCT(&nodes);
+    CHECK("entry: short node rc", PRTE_SUCCESS == rc);
+    before = pool_count();
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    mknode(&nodes, "unittest-entry-n02.cluster.test", 2);
+    rc = prte_ras_base_node_insert(&nodes, NULL);
+    PMIX_DESTRUCT(&nodes);
+    CHECK("entry: qualified duplicate rc", PRTE_SUCCESS == rc);
+    CHECK("entry: the qualified name is the node the pool holds", pool_count() == before);
+
+    /* kept whole, the two are different names - and different nodes */
+    prte_keep_fqdn_hostnames = true;
+    PMIX_CONSTRUCT(&nodes, pmix_list_t);
+    mknode(&nodes, "unittest-entry-n02.other.test", 2);
+    rc = prte_ras_base_node_insert(&nodes, NULL);
+    PMIX_DESTRUCT(&nodes);
+    CHECK("entry: kept rc", PRTE_SUCCESS == rc);
+    CHECK("entry: a kept qualified name is a node of its own", pool_count() == before + 1);
+    nd = prte_node_match(NULL, "unittest-entry-n02.other.test");
+    CHECK("entry: and keeps its name whole",
+          NULL != nd && 0 == strcmp(nd->name, "unittest-entry-n02.other.test"));
+
+    PMIx_Argv_free(prte_process_info.aliases);
+    free(prte_process_info.nodename);
+    prte_process_info.nodename = save;
+    prte_process_info.aliases = save_aliases;
+    prte_do_not_resolve = save_resolve;
+    prte_keep_fqdn_hostnames = save_keep;
+    return failures;
+}
+
+/*
  * Every component fills in the same vtable and the driver dereferences the
  * slots it uses without further checks beyond a NULL test on allocate.
  */
@@ -1203,6 +1295,71 @@ static int test_pmix_gate(void)
                   PMIX_ERR_UNREACH == mod->modify(req));
             PMIX_RELEASE(req);
             prte_pmix_server_globals.scheduler_lookup_done = saved;
+        }
+
+        /* With a scheduler, modify() sends it a relay copy of the request -
+         * the requester's PMIX_USERID and PMIX_GRPID renamed to their
+         * PMIX_ORIGIN_ forms, and PMIX_REQUESTOR added - and the request
+         * itself must keep its own info. The request is completed here once
+         * the scheduler answers, and a release by allocation id checks the
+         * requester's PMIX_USERID there: when modify() pointed the request
+         * at the copy, that check found none, and the release was refused
+         * PMIX_ERR_NO_PERMISSIONS after the scheduler had made it.
+         *
+         * A scheduler that is connected and already the primary server lets
+         * prte_pmix_set_scheduler() succeed without going near PMIx; the
+         * send itself then fails, since this process is connected to
+         * nothing, and that is the point at which the old code had already
+         * repointed the request. */
+        if (NULL != mod->modify) {
+            prte_pmix_server_req_t *req;
+            bool saved_connected = prte_pmix_server_globals.scheduler_connected;
+            bool saved_primary_set = prte_pmix_server_globals.primary_server_set;
+            pmix_proc_t saved_sched, saved_primary;
+            pmix_info_t *info;
+            uint32_t uid = 4242, gid = 4343, got = 0;
+            bool sawuid = false, sawreq = false;
+            size_t n;
+
+            PMIX_XFER_PROCID(&saved_sched, &prte_pmix_server_globals.scheduler);
+            PMIX_XFER_PROCID(&saved_primary, &prte_pmix_server_globals.primary_server);
+            PMIX_LOAD_PROCID(&prte_pmix_server_globals.scheduler, "test-scheduler", 0);
+            PMIX_XFER_PROCID(&prte_pmix_server_globals.primary_server,
+                             &prte_pmix_server_globals.scheduler);
+            prte_pmix_server_globals.scheduler_connected = true;
+            prte_pmix_server_globals.primary_server_set = true;
+
+            PMIX_INFO_CREATE(info, 3);
+            PMIX_INFO_LOAD(&info[0], PMIX_ALLOC_ID, "test-alloc", PMIX_STRING);
+            PMIX_INFO_LOAD(&info[1], PMIX_USERID, &uid, PMIX_UINT32);
+            PMIX_INFO_LOAD(&info[2], PMIX_GRPID, &gid, PMIX_UINT32);
+            req = PMIX_NEW(prte_pmix_server_req_t);
+            req->allocdir = PMIX_ALLOC_RELEASE;
+            req->info = info;
+            req->ninfo = 3;
+            req->copy = true;
+
+            CHECK("pmix: modify does not report a send that failed",
+                  PMIX_SUCCESS != mod->modify(req));
+            CHECK("pmix: modify leaves the request its own info",
+                  info == req->info && 3 == req->ninfo);
+            for (n = 0; NULL != req->info && n < req->ninfo; n++) {
+                if (PMIx_Check_key(req->info[n].key, PMIX_USERID) &&
+                    PMIX_SUCCESS == PMIx_Value_get_number(&req->info[n].value, &got,
+                                                          PMIX_UINT32)) {
+                    sawuid = (uid == got);
+                } else if (PMIx_Check_key(req->info[n].key, PMIX_REQUESTOR)) {
+                    sawreq = true;
+                }
+            }
+            CHECK("pmix: the request keeps the requester's PMIX_USERID", sawuid);
+            CHECK("pmix: the request is not given the scheduler's PMIX_REQUESTOR", !sawreq);
+            PMIX_RELEASE(req);
+
+            prte_pmix_server_globals.scheduler_connected = saved_connected;
+            prte_pmix_server_globals.primary_server_set = saved_primary_set;
+            PMIX_XFER_PROCID(&prte_pmix_server_globals.scheduler, &saved_sched);
+            PMIX_XFER_PROCID(&prte_pmix_server_globals.primary_server, &saved_primary);
         }
     }
 
@@ -3324,6 +3481,7 @@ int main(void)
     failures += test_bootstrap_file_refused();
     failures += test_preassigned_index();
     failures += test_hnp_dedup();
+    failures += test_insert_fqdn_at_entry();
     failures += test_flag_string();
     failures += test_dvm_growing();
     failures += test_resize_requires_elastic();

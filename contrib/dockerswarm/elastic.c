@@ -41,6 +41,11 @@
  *                   phase one as soon as Slurm has QUEUED the job, so the
  *                   wait includes however long it stays queued - which is
  *                   why contrib/slurmswarm sets the variable
+ *   --cancel-after-grant
+ *                   once phase two reports the grow done, cancel the request
+ *                   by its own req-id from this same job. There is nothing
+ *                   left to cancel, and the answer says so: PMIX_ERR_EXISTS
+ *                   with the PMIX_ALLOC_ID to release instead
  *
  * A req_id names a request only to the job that made it, and every run of
  * this tool is a job of its own - so "cancel <req-id>" from a second run
@@ -145,6 +150,15 @@ static pmix_proc_t myproc;
  * spawn needs in order to target those nodes */
 static char alloc_id[PMIX_MAX_KEYLEN + 1];
 
+/* this host's clock at a step; comparable to PMIX_ALLOC_GRANT_TIME where
+ * the nodes share a clock */
+static void print_clock(const char *what) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    fprintf(stderr, ">>> %s AT %ld.%06ld\n", what, (long) ts.tv_sec, ts.tv_nsec / 1000);
+}
+
 /* handler registration callback */
 static void reg_cb(pmix_status_t status, size_t evref, void *cbdata) {
     lock_t *l = (lock_t *) cbdata;
@@ -159,6 +173,7 @@ static void alloc_cb(pmix_status_t status, pmix_info_t *info, size_t ninfo,
     size_t n;
     fprintf(stderr, ">>> PHASE 1 (acceptance): allocation request returned %s\n",
             PMIx_Error_string(status));
+    print_clock("PHASE 1");
     for (n = 0; n < ninfo; n++) {
         if (PMIX_STRING == info[n].value.type) {
             fprintf(stderr, "      info[%zu] %s = %s\n", n, info[n].key,
@@ -193,8 +208,14 @@ static void completion_evh(size_t evhdlr_id, pmix_status_t status,
 
     fprintf(stderr, "\n>>> PHASE 2 (completion): received event %s (%d)\n",
             PMIx_Error_string(status), status);
+    print_clock("PHASE 2");
     for (n = 0; n < ninfo; n++) {
         fprintf(stderr, "      payload[%zu] key=%s\n", n, info[n].key);
+        if (PMIX_CHECK_KEY(&info[n], PMIX_ALLOC_GRANT_TIME) &&
+            PMIX_TIMEVAL == info[n].value.type) {
+            fprintf(stderr, ">>> GRANT_TIME %ld.%06ld\n", (long) info[n].value.data.tv.tv_sec,
+                    (long) info[n].value.data.tv.tv_usec);
+        }
     }
     if (PMIX_DVM_IS_READY == status) {
         fprintf(stderr, ">>> SUCCESS: the DVM now reflects the requested size\n");
@@ -407,7 +428,8 @@ static void usage(const char *me) {
             "\n"
             "Every op but the cancels waits for the phase-two completion event,\n"
             "for --wait-secs <n> (default 60); --no-wait is what a DVM outside\n"
-            "elastic mode needs.\n", me);
+            "elastic mode needs. --cancel-after-grant then cancels the request\n"
+            "by its own req-id.\n", me);
 }
 
 int main(int argc, char **argv) {
@@ -428,6 +450,7 @@ int main(int argc, char **argv) {
     int wait_opt = -1;          /* an explicit --wait/--no-wait, if given */
     long wait_secs = 60;
     bool send_req_id = true;
+    bool cancel_after_grant = false;
     const char *wait_env = getenv("ELASTIC_WAIT_SECS");
     int rcexit = 0, i;
 
@@ -464,6 +487,8 @@ int main(int argc, char **argv) {
             wait_opt = 1;
         } else if (0 == strcmp(argv[i], "--no-wait")) {
             wait_opt = 0;
+        } else if (0 == strcmp(argv[i], "--cancel-after-grant")) {
+            cancel_after_grant = true;
         } else if (0 == strcmp(argv[i], "--wait-secs") && i + 1 < argc) {
             char *end;
             wait_secs = strtol(argv[++i], &end, 10);
@@ -609,6 +634,7 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "requesting %s [%s] ...\n", op, arg);
     }
+    print_clock("REQUEST");
     rc = PMIx_Allocation_request_nb(directive, info, ninfo, alloc_cb, &alloclock);
     if (PMIX_SUCCESS != rc && PMIX_OPERATION_SUCCEEDED != rc) {
         fprintf(stderr, "PMIx_Allocation_request_nb failed immediately: %s\n",
@@ -644,6 +670,27 @@ int main(int argc, char **argv) {
             }
         }
         pthread_mutex_unlock(&complete_lock.mtx);
+    }
+
+    /* cancel by req-id after the grant, from the requesting job */
+    if (cancel_after_grant && PMIX_DVM_IS_READY == complete_lock.status) {
+        pmix_info_t cinfo;
+
+        PMIX_INFO_LOAD(&cinfo, PMIX_ALLOC_REQ_ID, req_id, PMIX_STRING);
+        fprintf(stderr, "requesting cancel-after-grant (req-id %s) ...\n", req_id);
+        lock_init(&alloclock);
+        rc = PMIx_Allocation_request_nb(PMIX_ALLOC_REQ_CANCEL, &cinfo, 1, alloc_cb, &alloclock);
+        /* PMIX_OPERATION_SUCCEEDED: done already, and no callback follows */
+        if (PMIX_SUCCESS == rc) {
+            lock_wait(&alloclock);
+            rc = alloclock.status;
+        }
+        PMIX_INFO_DESTRUCT(&cinfo);
+        if (PMIX_SUCCESS == rc || PMIX_OPERATION_SUCCEEDED == rc) {
+            fprintf(stderr, ">>> CANCEL AFTER GRANT ACCEPTED\n");
+        } else {
+            fprintf(stderr, ">>> CANCEL AFTER GRANT REJECTED: %s\n", PMIx_Error_string(rc));
+        }
     }
 
     /* only meaningful once the DVM actually reflects the new nodes */
